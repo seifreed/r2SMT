@@ -81,7 +81,7 @@ jobs:
           tar czf "$TARBALL" -C target/${{ matrix.triple }}/release r2smt
           echo "tarball=$TARBALL" >> "$GITHUB_ENV"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: r2smt-${{ matrix.triple }}
           path: ${{ env.tarball }}
