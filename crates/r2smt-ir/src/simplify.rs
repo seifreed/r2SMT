@@ -130,8 +130,10 @@ fn structurally_equal(a: &Expr, b: &Expr) -> bool {
 }
 
 fn fold_add(a: Expr, b: Expr) -> Expr {
-    if let (Some((va, ba)), Some((vb, _))) = (as_const(&a), as_const(&b)) {
-        return Expr::konst(va.wrapping_add(vb) & width_mask(ba), ba);
+    if let (Some((va, ba)), Some((vb, bb))) = (as_const(&a), as_const(&b)) {
+        let w = ba.max(bb);
+        let r = (va & width_mask(ba)).wrapping_add(vb & width_mask(bb)) & width_mask(w);
+        return Expr::konst(r, w);
     }
     if matches!(&a, Expr::Const { value: 0, .. }) {
         return b;
@@ -143,8 +145,10 @@ fn fold_add(a: Expr, b: Expr) -> Expr {
 }
 
 fn fold_sub(a: Expr, b: Expr) -> Expr {
-    if let (Some((va, ba)), Some((vb, _))) = (as_const(&a), as_const(&b)) {
-        return Expr::konst(va.wrapping_sub(vb) & width_mask(ba), ba);
+    if let (Some((va, ba)), Some((vb, bb))) = (as_const(&a), as_const(&b)) {
+        let w = ba.max(bb);
+        let r = (va & width_mask(ba)).wrapping_sub(vb & width_mask(bb)) & width_mask(w);
+        return Expr::konst(r, w);
     }
     if matches!(&b, Expr::Const { value: 0, .. }) {
         return a;
@@ -158,8 +162,10 @@ fn fold_sub(a: Expr, b: Expr) -> Expr {
 }
 
 fn fold_mul(a: Expr, b: Expr) -> Expr {
-    if let (Some((va, ba)), Some((vb, _))) = (as_const(&a), as_const(&b)) {
-        return Expr::konst(va.wrapping_mul(vb) & width_mask(ba), ba);
+    if let (Some((va, ba)), Some((vb, bb))) = (as_const(&a), as_const(&b)) {
+        let w = ba.max(bb);
+        let r = (va & width_mask(ba)).wrapping_mul(vb & width_mask(bb)) & width_mask(w);
+        return Expr::konst(r, w);
     }
     if let Some((0, bits)) = as_const(&a) {
         return Expr::konst(0, bits);
@@ -177,8 +183,10 @@ fn fold_mul(a: Expr, b: Expr) -> Expr {
 }
 
 fn fold_and(a: Expr, b: Expr) -> Expr {
-    if let (Some((va, ba)), Some((vb, _))) = (as_const(&a), as_const(&b)) {
-        return Expr::konst((va & vb) & width_mask(ba), ba);
+    if let (Some((va, ba)), Some((vb, bb))) = (as_const(&a), as_const(&b)) {
+        let w = ba.max(bb);
+        let r = (va & width_mask(ba)) & (vb & width_mask(bb));
+        return Expr::konst(r & width_mask(w), w);
     }
     if let Some((0, bits)) = as_const(&a) {
         return Expr::konst(0, bits);
@@ -193,8 +201,10 @@ fn fold_and(a: Expr, b: Expr) -> Expr {
 }
 
 fn fold_or(a: Expr, b: Expr) -> Expr {
-    if let (Some((va, ba)), Some((vb, _))) = (as_const(&a), as_const(&b)) {
-        return Expr::konst((va | vb) & width_mask(ba), ba);
+    if let (Some((va, ba)), Some((vb, bb))) = (as_const(&a), as_const(&b)) {
+        let w = ba.max(bb);
+        let r = (va & width_mask(ba)) | (vb & width_mask(bb));
+        return Expr::konst(r & width_mask(w), w);
     }
     if matches!(&a, Expr::Const { value: 0, .. }) {
         return b;
@@ -202,13 +212,19 @@ fn fold_or(a: Expr, b: Expr) -> Expr {
     if matches!(&b, Expr::Const { value: 0, .. }) {
         return a;
     }
+    // `x | all_ones_W = all_ones_W` only when the all-ones constant is
+    // at least as wide as the other operand: otherwise the result's
+    // high bits come from `x`, not from the constant, and absorbing
+    // would fabricate a definitive value (and a confident verdict).
     if let Some((va, bits)) = as_const(&a)
         && va == width_mask(bits)
+        && expr_bits(&b).is_some_and(|other| bits >= other)
     {
         return Expr::konst(va, bits);
     }
     if let Some((vb, bits)) = as_const(&b)
         && vb == width_mask(bits)
+        && expr_bits(&a).is_some_and(|other| bits >= other)
     {
         return Expr::konst(vb, bits);
     }
@@ -219,8 +235,10 @@ fn fold_or(a: Expr, b: Expr) -> Expr {
 }
 
 fn fold_xor(a: Expr, b: Expr) -> Expr {
-    if let (Some((va, ba)), Some((vb, _))) = (as_const(&a), as_const(&b)) {
-        return Expr::konst((va ^ vb) & width_mask(ba), ba);
+    if let (Some((va, ba)), Some((vb, bb))) = (as_const(&a), as_const(&b)) {
+        let w = ba.max(bb);
+        let r = (va & width_mask(ba)) ^ (vb & width_mask(bb));
+        return Expr::konst(r & width_mask(w), w);
     }
     if matches!(&a, Expr::Const { value: 0, .. }) {
         return b;
@@ -237,8 +255,9 @@ fn fold_xor(a: Expr, b: Expr) -> Expr {
 }
 
 fn fold_eq(a: Expr, b: Expr) -> Expr {
-    if let (Some((va, _)), Some((vb, _))) = (as_const(&a), as_const(&b)) {
-        return Expr::konst(u64::from(va == vb), 1);
+    if let (Some((va, ba)), Some((vb, bb))) = (as_const(&a), as_const(&b)) {
+        let eq = (va & width_mask(ba)) == (vb & width_mask(bb));
+        return Expr::konst(u64::from(eq), 1);
     }
     if structurally_equal(&a, &b) {
         return Expr::konst(1, 1);
@@ -247,8 +266,9 @@ fn fold_eq(a: Expr, b: Expr) -> Expr {
 }
 
 fn fold_ne(a: Expr, b: Expr) -> Expr {
-    if let (Some((va, _)), Some((vb, _))) = (as_const(&a), as_const(&b)) {
-        return Expr::konst(u64::from(va != vb), 1);
+    if let (Some((va, ba)), Some((vb, bb))) = (as_const(&a), as_const(&b)) {
+        let ne = (va & width_mask(ba)) != (vb & width_mask(bb));
+        return Expr::konst(u64::from(ne), 1);
     }
     if structurally_equal(&a, &b) {
         return Expr::konst(0, 1);
@@ -440,6 +460,59 @@ mod tests {
     fn ne_of_distinct_consts_folds_to_one() {
         let e = Expr::ne(Expr::konst(1, 32), Expr::konst(2, 32));
         assert_eq!(simplify_expr(&e), Expr::konst(1, 1));
+    }
+
+    #[test]
+    fn eq_of_out_of_width_const_matches_in_width_twin() {
+        // P-code emits negative constants as full 64-bit two's complement
+        // even when the varnode size is 4 (e.g. `(const,0xff..fc,4)` == -4).
+        // At the declared 32-bit width both encode 0xfffffffc, so `==` is true.
+        let e = Expr::eq(
+            Expr::konst(0xffff_ffff_ffff_fffc, 32),
+            Expr::konst(0x0000_0000_ffff_fffc, 32),
+        );
+        assert_eq!(simplify_expr(&e), Expr::konst(1, 1));
+    }
+
+    #[test]
+    fn add_of_mixed_width_consts_uses_max_width_not_first_operand() {
+        // BV `+` result width is max(ba,bb), narrower operand
+        // zero-extended. `0:32 + 0x1_0000_0000:64 == 0x1_0000_0000:64`
+        // is TRUE; masking to the first operand's 32 bits would fold
+        // it to AlwaysFalse — a True↔False flip.
+        let e = Expr::eq(
+            Expr::add(Expr::konst(0, 32), Expr::konst(0x1_0000_0000, 64)),
+            Expr::konst(0x1_0000_0000, 64),
+        );
+        assert_eq!(simplify_expr(&e), Expr::konst(1, 1));
+    }
+
+    #[test]
+    fn mul_of_mixed_width_consts_does_not_truncate_to_narrow_operand() {
+        // 2:8 * 0x80:32 = 0x100 at width 32; masking to 8 bits would
+        // wrongly yield 0.
+        let e = Expr::mul(Expr::konst(2, 8), Expr::konst(0x80, 32));
+        assert_eq!(simplify_expr(&e), Expr::konst(0x100, 32));
+    }
+
+    #[test]
+    fn or_with_narrow_all_ones_does_not_absorb_wider_operand() {
+        // `0xFF:8 | rax:32` is NOT 0xFF — the high 24 bits come from
+        // `rax`. The all-ones absorbing rule must not fire here.
+        let e = Expr::bv_or(Expr::konst(0xFF, 8), Expr::Var(Var::new("rax", 32)));
+        assert!(
+            !matches!(simplify_expr(&e), Expr::Const { .. }),
+            "narrow all-ones must not absorb a wider operand"
+        );
+    }
+
+    #[test]
+    fn ne_of_out_of_width_const_matches_in_width_twin() {
+        let e = Expr::ne(
+            Expr::konst(0xffff_ffff_ffff_fffc, 32),
+            Expr::konst(0x0000_0000_ffff_fffc, 32),
+        );
+        assert_eq!(simplify_expr(&e), Expr::konst(0, 1));
     }
 
     #[test]
