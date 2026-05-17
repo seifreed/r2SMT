@@ -140,3 +140,14 @@ CLAUDE.md decomposition watchlist, not mandated by the hard rule
   effect.rs 1116, registers.rs 924, slice.rs 884, parse.rs 844,
   plan.rs 819. Next: effect.rs per-ISA, then lift.rs, registers.rs
   (2-phase), parse/plan/slice.
+
+- 2026-05-17 iter9: effect.rs per-ISA split (clean seam, NO interleaved
+  consts — all fn; zero cross-ISA calls). effect.rs 1116→321 (header +
+  InstructionKind/InstructionEffect + 9 shared helpers + analyze
+  dispatcher + other_effect); effect/x86.rs 365, effect/aarch64.rs 255,
+  effect/aarch32.rs 207. Key: child modules see parent-private items, so
+  shared helpers needed NO pub change; only analyze_{x86,aarch64,aarch32}
+  → pub(super). Compiler-driven (cargo fix trimmed per-ISA-unused super
+  imports) + doc_markdown backtick fix (`AArch32`/`AArch64`). 495 tests/
+  0 fail; all 5 gates GREEN. Remaining prod >800: lift.rs 1818,
+  registers.rs 924, slice.rs 884, parse.rs 844, plan.rs 819.
