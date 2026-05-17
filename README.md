@@ -24,241 +24,161 @@
 
 ---
 
-## Overview
+## What it does
 
-**r2SMT** is a Rust 2024 toolchain that combines radare2 with an SMT solver
-(Z3) to perform symbolic analysis of obfuscated binaries. It lifts radare2
-disassembly into a typed IR, renames it into SSA form, and asks the solver
-whether each conditional branch is feasible — detecting **opaque predicates**,
-**dead branches**, and **constant conditions**, then optionally annotating or
-patching the binary to neutralise them.
+`r2SMT` asks an SMT solver whether each conditional branch in a binary can
+*actually* go both ways. Branches that can't are **opaque predicates**, **dead
+branches**, or **constant conditions** — classic obfuscation. It then lets you
+annotate or patch the binary to neutralise them.
 
-It is sample-agnostic by policy: every analysis seam (r2 ingestion, IR lifting,
-SMT encoding, solver dispatch, projection, CLI) is general-purpose and never
-hardcodes values from a single malware family.
-
-> Conceptual sibling of the Python+IDA original *MicroSMT*. r2SMT is a clean
-> Rust reimplementation on top of radare2 with multi-architecture support,
-> a durable patch manifest, and rollback.
-
-### Key Features
-
-| Feature | Description |
-|---------|-------------|
-| **Typed IR + SSA** | Bit-vector `Expr` / `IrStmt` model with single-pass SSA renaming |
-| **SMT backend** | Z3-backed verdicts: `AlwaysTrue` / `AlwaysFalse` / `BothPossible` / `Unsound` / `Timeout` |
-| **Multi-arch** | x86, x86_64, AArch64, and AArch32 (incl. Thumb) lifters |
-| **Classified findings** | `opaque_predicate`, `dead_branch`, `constant_condition`, `real_branch`, `suspicious_but_unknown` with confidence ladder |
-| **Backward slicing** | Bounded data-flow slicer with explicit truncation reasons |
-| **Safe patching** | Byte-level rewrites with full-file backup, SHA-256 manifest, and reverse rollback |
-| **Live annotations** | Write-back `CCu` comments through a live r2 session + project save |
-| **CLI + crates** | Use as a command-line tool or as a Rust workspace of ports/adapters |
-| **Robust on real corpora** | No-CFG skip, transient-spawn retry, and a data-as-code block filter |
-
-### Supported Outputs
-
-```text
-AST / IR        Normalized Program model (JSON)
-Findings        Stable JSON Report, human Markdown summary
-Annotations     radare2 script (CCu comments + commented-out wa suggestions)
-Patching        Applied bytes + JSON manifest (pre/post SHA-256, rollback)
-```
+Pipeline: `radare2 disasm → typed IR → backward slice → SSA → Z3 → verdict`.
+Sample-agnostic by design (no hardcoded family IOCs). Lifters: x86 / x86_64 /
+AArch64 / AArch32 (incl. Thumb).
 
 ---
 
-## Installation
-
-### From Releases (Recommended)
-
-Prebuilt, self-contained binaries (vendored Z3, no runtime dependency) are
-published for Linux and macOS on x86_64 and aarch64:
+## Install
 
 ```bash
-curl -fL https://github.com/seifreed/r2SMT/releases/latest/download/r2smt-$(uname -s)-$(uname -m).tar.gz \
-  | tar -xz
-./r2smt version
-```
-
-### From Source
-
-```bash
+# From source — links Z3, so install libz3 first
+#   macOS:  brew install z3
+#   Debian: apt-get install libz3-dev
 git clone https://github.com/seifreed/r2SMT.git
-cd r2SMT
-cargo build --release
+cd r2SMT && cargo build --release
 ./target/release/r2smt version
+
+# Prebuilt (vendored Z3, no runtime deps) — Linux/macOS, x86_64/aarch64
+curl -fL https://github.com/seifreed/r2SMT/releases/latest/download/r2smt-$(uname -s)-$(uname -m).tar.gz | tar -xz
+
+# Or via r2pm
+r2pm -ci r2smt
 ```
 
-Requires `radare2` on `PATH` (tested with r2 ≥ 6.1). Building from source
-links Z3; install `libz3` (macOS: `brew install z3`, Debian/Ubuntu:
-`apt-get install libz3-dev`) or build with the vendored feature.
-
-### Via r2pm
-
-```bash
-r2pm -ci r2smt                 # prebuilt tarball, falls back to source build
-USE_PREBUILT=0 r2pm -ci r2smt  # always build from source (dev path)
-```
+Needs `radare2` ≥ 6.1 on `PATH`.
 
 ---
 
-## Quick Start
+## 60-second start
 
 ```bash
-# Inspect the normalized program model
-r2smt analyze sample.bin --dump-program | head
+# 1. What conditional branches exist?
+r2smt branches ./sample
 
-# Collect every conditional-branch candidate
-r2smt branches sample.bin
+# 2. Solve them all and print classified findings
+r2smt solve ./sample
 
-# Run the full pipeline and emit classified findings
-r2smt solve sample.bin --json findings.json --markdown report.md
+# 3. Drill into one suspicious address — one-line verdict
+r2smt at ./sample 0x401234
 ```
 
----
-
-## Usage
-
-### Command Line Interface
-
-```bash
-# Solve and export a JSON report plus an r2 annotation script
-r2smt solve sample.bin --json findings.json --r2-script annotate.r2
-
-# Apply only high-confidence findings as live r2 comments, then save a project
-r2smt annotate sample.bin --min-confidence high --save-project deob
-
-# Plan a conservative byte patch (dry-run), then apply with backup + manifest
-r2smt patch sample.bin --min-confidence high
-r2smt patch sample.bin --min-confidence high --apply \
-  --backup sample.bak --manifest sample.manifest.json
-
-# Roll the patch back from the manifest
-r2smt patch sample.bin --rollback --manifest sample.manifest.json
-```
-
-### Commands
-
-| Command | Description |
-|---------|-------------|
-| `r2smt version` | Print the build version |
-| `r2smt analyze` | Open with r2, run `aaa`, emit the normalized Program model |
-| `r2smt branches` | Collect `jcc` / `setcc` / `cmovcc` / ARM conditional candidates |
-| `r2smt slice` | Backward data-flow slice of each branch (complete / truncated) |
-| `r2smt lift` | Lift each slice into the r2SMT IR + symbolic flag condition |
-| `r2smt ssa` | Full pipeline through SSA renaming with free-input reporting |
-| `r2smt solve` | Full pipeline + Z3 → classified findings and reports |
-| `r2smt at` | Interactive single-branch verdict at an address (drive from r2 via `$r2smt-at`) |
-| `r2smt annotate` | Write findings back as live `CCu` comments / save project |
-| `r2smt patch` | Derive, apply, and roll back conservative byte patches |
-
-### Common Flags
-
-| Option | Description |
-|--------|-------------|
-| `--at <addr>` / `--function <addr>` | Restrict analysis to one branch / function |
-| `--max-instructions N` | Slicer instruction budget |
-| `--allow-memory` / `--allow-calls` | Widen slicing past memory ops / calls |
-| `--timeout-ms MS` | Per-branch Z3 timeout |
-| `--min-confidence <conf>` | Gate findings by confidence (`high`/`medium`/`low`) |
-| `--json` / `--markdown` / `--r2-script <file>` | Machine + human + r2 outputs |
-| `--apply` / `--backup` / `--manifest` / `--rollback` | Patch lifecycle controls |
-
----
-
-## Architecture
-
-r2SMT is a Clean-Architecture workspace: inner layers never import outer
-layers, ports define contracts, and adapters are wired only at the CLI.
+`solve` prints one classified line per branch, e.g.:
 
 ```text
-crates/
-  r2smt-common   Foundation: Error, Result, Address, Arch
-  r2smt-ir       Program model + BinaryProvider/Annotator/BytePatcher ports + IR
-  r2smt-r2pipe   radare2 adapter (live session, pure JSON parsers)
-  r2smt-esil     ESIL-first lifting helpers
-  r2smt-slicer   Branch collector + bounded backward slicer + per-ISA lifter
-  r2smt-ssa      Single-pass SSA rename over lifted slices
-  r2smt-smt      Z3 backend + textual SMT-LIB renderer
-  r2smt-core     Orchestration + decision engine (Finding / Confidence)
-  r2smt-report   Renderers: JSON / Markdown / r2 script + patch suggestions
-  r2smt-patch    PatchPlan / PatchManifest, apply, rollback
-  r2smt-cli      The `r2smt` binary
+0x00401234  opaque_predicate    AlwaysFalse   high     je   → never taken
+0x004012a0  dead_branch         AlwaysTrue    high     jne  → always taken
+0x00401310  real_branch         BothPossible  high     jg   (genuine)
 ```
-
-Pipeline: **radare2 → IR → backward slice → lift → SSA → Z3 → classify →
-report / annotate / patch**.
 
 ---
 
-## Quality Gates
+## Recipes
+
+Every analysis command takes `--at <addr>` (one branch), `--function <addr>`
+(one function), and `--timeout-ms <ms>` (per-branch solver budget).
+
+**Dump the normalized program model:**
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
-cargo deny check
-cargo audit
-./scripts/quality-gates.sh check
+r2smt analyze ./sample --dump-program --json program.json
 ```
 
-Engineering invariants are enforced repo-wide: zero `unwrap`/`expect`/`panic`
-in production code, zero `unsafe`, `#![deny(missing_docs)]`, and a strict
-sample-agnostic policy. See [`CLAUDE.md`](CLAUDE.md).
+**Solve and export reports for triage:**
+
+```bash
+# JSON Report + human Markdown + an r2 annotation script, one pass
+r2smt solve ./sample --json findings.json --markdown findings.md --r2-script annotate.r2
+
+# Also surface genuine + unknown branches, give the solver more time
+r2smt solve ./sample --include-real --include-suspicious --timeout-ms 5000
+```
+
+**See exactly what the solver sees (stage by stage):**
+
+```bash
+r2smt slice ./sample --at 0x401234   # bounded backward data-flow slice
+r2smt lift  ./sample --at 0x401234   # that slice lifted to IR
+r2smt ssa   ./sample --at 0x401234   # IR after SSA renaming
+```
+
+**Annotate a live radare2 session:**
+
+```bash
+r2smt annotate ./sample --dry-run                                  # preview
+r2smt annotate ./sample --min-confidence high --save-project triage # apply + save
+```
+
+…or from inside r2, on the branch under the cursor:
+
+```text
+[0x00401234]> #!pipe r2smt at "${R2_FILE}" $$
+```
+
+**Patch — always backed up, always reversible:**
+
+```bash
+r2smt patch ./sample                                  # plan only, writes nothing
+r2smt patch ./sample --apply --min-confidence high    # backup + manifest + patch
+r2smt patch ./sample --rollback                       # restore originals from manifest
+```
+
+`--apply` writes `<sample>.r2smt.bak` and `<sample>.r2smt.manifest.json`
+(pre/post SHA-256); `--rollback` replays the manifest in reverse.
+
+**Sweep a directory (one isolated r2 process per sample, aggregated):**
+
+```bash
+r2smt batch ./corpus --threads 8 --json corpus.json --markdown corpus.md
+```
+
+**Reach deeper — all of these are sound** (they can only widen a verdict to
+`BothPossible`, never fabricate one):
+
+```bash
+r2smt solve ./sample --allow-memory --allow-calls --max-blocks 4 \
+  --unknowns-on-truncation --allow-join-merge --solver cvc5
+```
+
+---
+
+## Verdicts & findings
+
+| Verdict | Meaning |
+|---|---|
+| `AlwaysTrue` / `AlwaysFalse` | Branch can only go one way → obfuscation |
+| `BothPossible` | Genuine branch (real control flow) |
+| `Unsound` / `Timeout` | Slice truncated or solver gave up — not actionable |
+
+| Finding kind | Notes |
+|---|---|
+| `opaque_predicate`, `dead_branch`, `constant_condition` | actionable; confidence `high` (clean slice) → `medium` (some unmodeled inputs) → `unknown` |
+| `real_branch`, `suspicious_but_unknown` | informational — opt in with `--include-real` / `--include-suspicious` |
+
+Patching only acts at `--min-confidence high` by default; lower it explicitly
+and at your own risk.
 
 ---
 
 ## Requirements
 
-- Rust 1.85+ (edition 2024)
+- Rust 1.85+ (edition 2024) to build from source
 - `radare2` ≥ 6.1 on `PATH`
-- Z3 (system `libz3` or the vendored build feature)
-
----
-
-## Documentation
-
-- [`SPEC.md`](SPEC.md) — full design spec and phase roadmap
-- [`CLAUDE.md`](CLAUDE.md) — enforced engineering rules and architecture map
-
----
-
-## Contributing
-
-Contributions are welcome.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-All changes must pass the quality gates above without `#[allow(...)]`
-bypasses and must carry a regression artifact for any behavioural change.
-
----
-
-## Support the Project
-
-If this project is useful in your workflows, you can support development:
-
-<a href="https://buymeacoffee.com/seifreed" target="_blank">
-  <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50">
-</a>
+- Z3 (system `libz3`, or the vendored build feature)
 
 ---
 
 ## License
 
-This project is dual-licensed under **MIT OR Apache-2.0** at your option.
-See [LICENSE](LICENSE).
+Dual-licensed under **MIT OR Apache-2.0** at your option — see [LICENSE](LICENSE).
 
-**Attribution**
-- Author: **Marc Rivero López** | [@seifreed](https://github.com/seifreed)
-- Repository: [github.com/seifreed/r2SMT](https://github.com/seifreed/r2SMT)
-
----
-
-<p align="center">
-  <sub>Built for practical malware deobfuscation and symbolic-analysis automation</sub>
-</p>
+- Author: **Marc Rivero López** — [@seifreed](https://github.com/seifreed)
+- Support: <a href="https://buymeacoffee.com/seifreed">Buy Me a Coffee</a>
