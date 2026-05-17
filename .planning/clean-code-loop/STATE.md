@@ -110,3 +110,13 @@ CLAUDE.md decomposition watchlist, not mandated by the hard rule
   crate::support (+ move compute_findings/dispatch_solver/
   resolve_folded_branch/analyze_one/attach_pseudocode/keep_finding to
   support.rs). main.rs still >800 — continue next iterations.
+- 2026-05-17 iter6: main.rs step 2/N — moved the 4 cross-command shared
+  helpers (attach_pseudocode+MAX_PSEUDOCODE_BYTES, compute_findings,
+  dispatch_solver, resolve_folded_branch) to support.rs (pub(crate)).
+  main.rs 1296→1131; support.rs 124→297. Compiler-driven imports
+  (cargo fix). 495 tests/0 fail (verified via per-binary breakdown — a
+  transient "430" was parallel-stdout grep interleaving, NOT lost tests);
+  all 5 gates GREEN. Remaining single-caller helpers stay with their
+  command group. Next: extract command groups to commands/{patch,batch,
+  solve,annotate,at}.rs (+ their owned structs/single-caller helpers)
+  importing crate::support, until main.rs<800.
