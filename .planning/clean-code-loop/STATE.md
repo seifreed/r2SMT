@@ -165,3 +165,19 @@ CLAUDE.md decomposition watchlist, not mandated by the hard rule
   Remaining prod >800: lift.rs 1305 (NEXT: extract aarch64+aarch32
   clusters; aarch32→aarch64 cross-calls need those aarch64 entrypoints
   pub(crate)), registers.rs 924, slice.rs 884, parse.rs 844, plan.rs 819.
+
+- 2026-05-17 iter11: lift.rs step 2/2 — extracted AArch64 cluster
+  (lift_instruction_aarch64 + mov/arith3/aarch64_set_arith_flags/cmp/
+  csel/cs_arith/cset/tst) -> lift/aarch64.rs (399) and AArch32 cluster
+  (lift_instruction_aarch32 + rsb/bic/cmn/teq/predicated/mvn) ->
+  lift/aarch32.rs (253). Key: pub(super) == pub(in lift) is visible to
+  ALL lift descendants, so the 5 cross-module aarch64 entrypoints
+  (instruction + arith3/cmp/mov/tst, called by root dispatcher AND the
+  aarch32 sibling) + lift_instruction_aarch32 just need pub(super) — no
+  pub(crate). Built FIRST TRY. **lift.rs 1818->681 — UNDER 800,
+  decomposition COMPLETE** (lift/{merge,x86,aarch64,aarch32}.rs).
+  Compiler-driven super:: imports for root free fns; cargo fix.
+  495 tests/0 fail; all 5 gates GREEN — lifter behavior preserved.
+  Remaining prod >800 (4 files, all modestly over): registers.rs 924,
+  slice.rs 884, parse.rs 844, plan.rs 819. Next: registers.rs 2-phase
+  (reorder-contiguous commit, then extract commit).
