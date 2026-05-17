@@ -151,3 +151,17 @@ CLAUDE.md decomposition watchlist, not mandated by the hard rule
   imports) + doc_markdown backtick fix (`AArch32`/`AArch64`). 495 tests/
   0 fail; all 5 gates GREEN. Remaining prod >800: lift.rs 1818,
   registers.rs 924, slice.rs 884, parse.rs 844, plan.rs 819.
+
+- 2026-05-17 iter10: lift.rs step 1/2 (highest-stakes file, safest-first).
+  Extracted Φ-merge trio (lower_merge/fold_arm/subst_expr free fns) →
+  lift/merge.rs (142; lower_merge pub(super), called by root lift_slice)
+  + x86 handler cluster (lift_instruction_x86 pub(super) + lift_mov/
+  mov_extending/lea/xor/bitwise/add_sub/imul/cmp/test/shift) →
+  lift/x86.rs (399, second `impl LiftCtx` block). x86 has zero cross-ISA
+  deps; shared infra stays in root impl (child sees ancestor-private —
+  no pub change). lift.rs 1818→1305. Compiler-driven (super:: imports
+  for root free fns nonzero_width/lift_branch_condition; cargo fix).
+  495 tests/0 fail; all 5 gates GREEN — lifter behavior preserved.
+  Remaining prod >800: lift.rs 1305 (NEXT: extract aarch64+aarch32
+  clusters; aarch32→aarch64 cross-calls need those aarch64 entrypoints
+  pub(crate)), registers.rs 924, slice.rs 884, parse.rs 844, plan.rs 819.
