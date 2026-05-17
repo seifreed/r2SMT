@@ -80,3 +80,15 @@ CLAUDE.md decomposition watchlist, not mandated by the hard rule
   JSON fixture at col 0 — needs bespoke handling). 495 tests pass / 0 fail;
   all 5 gates GREEN. Remaining >800 prod: lift.rs 1818, main.rs 1590,
   parse.rs 1469, effect.rs 1116, registers.rs 924, slice.rs 884, plan.rs 819.
+- 2026-05-17 iter4: bespoke parse.rs test extraction (1469→844). Verbatim
+  body move (NO de-indent — the pdgsd `"\`-continuation fixture has
+  semantically-meaningful leading spaces in string content), then rustfmt
+  re-indents code while leaving string literals byte-exact. Preserved the
+  single `#![allow(clippy::unwrap_used)]` header (no canonical-allow
+  duplication). Fixture verified byte-identical post-fmt; the two
+  fixture-dependent tests (split_pdgsd_*) pass. 495 tests / 0 fail; all
+  5 gates GREEN. Remaining >800 prod: lift.rs 1818, main.rs 1590,
+  effect.rs 1116, registers.rs 924, slice.rs 884, parse.rs 844,
+  plan.rs 819 — all need *genuine* code splits now (per-ISA / per-cmd /
+  per-subcommand seams; watchlist prescribes the seams). slice/parse/plan
+  only modestly over — apply DRY-with-a-brake; split only on a real seam.
