@@ -197,3 +197,15 @@ CLAUDE.md decomposition watchlist, not mandated by the hard rule
   x86/aarch64/aarch32 blocks -> registers/{x86,aarch64,aarch32}.rs
   (pub(super) on the 6 dispatched entrypoints: x86/aarch64/arm32 _layout
   + _alias; rest private; child sees ancestor-private builders).
+
+- 2026-05-17 iter13: registers.rs PHASE 2/2 (extract). The contiguous
+  banner-delimited blocks → registers/{x86.rs 197, aarch64.rs 300,
+  aarch32.rs 209}; registers.rs 933→241 (header + RegisterLayout+impl +
+  register_layout/alias_for dispatchers + 10 const builders + mod decls
+  + use of the 6 pub(super) entrypoints + tests). pub(super)=pub(in
+  registers) on x86/aarch64/arm32 _layout+_alias; const builders stay
+  root-private (children use super::). Built FIRST TRY. 495 tests/0 fail;
+  all 5 gates GREEN — register layout behavior preserved.
+  **registers.rs COMPLETE 924→241.** Remaining prod >800 (3, all
+  modestly over): slice.rs 884, parse.rs 844, plan.rs 819 — per-domain
+  seam, DRY-with-a-brake (split only on a real cohesive seam).
