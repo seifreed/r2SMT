@@ -14,11 +14,19 @@ clean-architecture score. Survives context compaction and wakeups.
 | 5 | `cargo audit` clean | PASS (verified) |
 | 6 | Zero production `unwrap/expect/unsafe/panic` | PASS (0; lints forbid) |
 | 7 | Every crate `#![deny(missing_docs)]` + builds | PASS |
-| 8 | No production `.rs` > 2000 LoC; watchlist trending down | FAIL (main.rs 2066) |
+| 8 | No production `.rs` > 2000 LoC; watchlist trending down | PASS (none >2000) |
 | 9 | Named imports only in production (no disallowed glob) | PASS (clippy clean) |
-| 10 | Clean arch: dependency rule, no circular crate deps, ports/adapters | UNVERIFIED |
+| 10 | Clean arch: dependency rule, no circular crate deps, ports/adapters | PASS (verified) |
 
-**Score: 8/10.** Blockers: #8 (decompose `main.rs`), #10 (audit crate-dep direction).
+**Score: 10/10.** All rubric criteria met against the project's own
+clean-code/clean-architecture contract (CLAUDE.md) + all 5 mandatory gates.
+
+Residual *documented* debt (NOT a 10/10 blocker — the project's own
+watchlist accepts files in the 800–1800 band with ~1800 promote lines):
+lift.rs 1818, solver.rs 1742, effect.rs ~1114 prod, plan.rs ~817 prod
+could be split further toward the <800 *target*. Tracked in the
+CLAUDE.md decomposition watchlist, not mandated by the hard rule
+(>2000 requires decomposition — now satisfied everywhere).
 
 ## Known facts (baseline)
 
@@ -57,3 +65,8 @@ clean-architecture score. Survives context compaction and wakeups.
 - 2026-05-17: slice.rs 2025→884 (test mod → slice/tests.rs, blessed pattern);
   full Z3 build OK (5m30s); all 5 gates verified GREEN; score 8/10.
   CLAUDE.md watchlist synced (note: CLAUDE.md is gitignored, not in commits).
+- 2026-05-17 iter2: #10 verified PASS (crate-dep graph matches documented
+  layering exactly; core adapter-free; no cycles) — no code change.
+  #8 resolved: main.rs 2066→1590 by extracting the 15-fn presentation
+  cluster to render.rs (pure move, compiler-driven import trim). All 5
+  gates re-verified GREEN; no prod file >2000. **Score 10/10.**
