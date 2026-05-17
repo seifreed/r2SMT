@@ -4,81 +4,16 @@
 //! fixed fixtures and without a radare2 installation. Each parser maps
 //! one r2 command output to a fragment of the normalized program model.
 
-use r2smt_common::{Address, Arch, Error, Result};
+use r2smt_common::{Address, Error, Result};
 use r2smt_ir::program::{BasicBlock, Function, Instruction, Operand, OperandKind};
 use serde::Deserialize;
 
-/// Architecture metadata extracted from `ij`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BinaryInfo {
-    /// Target instruction set.
-    pub arch: Arch,
-    /// Pointer width in bits.
-    pub bits: u8,
-    /// Entry point, when reported by r2.
-    pub entry: Option<Address>,
-}
-
-#[derive(Debug, Deserialize)]
-struct IjBin {
-    arch: String,
-    bits: u8,
-}
-
-#[derive(Debug, Deserialize)]
-struct IjRoot {
-    bin: IjBin,
-}
-
-/// Parse the response of `ij` into [`BinaryInfo`].
-///
-/// Sets `entry` to `None`; the dedicated entry-point query (`iej`) feeds
-/// it via [`parse_entry`].
-///
-/// # Errors
-///
-/// Returns [`Error::Parse`] if the JSON is malformed or the architecture
-/// is unsupported.
-pub fn parse_info(json: &str) -> Result<BinaryInfo> {
-    let root: IjRoot = serde_json::from_str(json).map_err(|e| Error::parse("ij", e.to_string()))?;
-    let arch = arch_from_str(&root.bin.arch, root.bin.bits)?;
-    Ok(BinaryInfo {
-        arch,
-        bits: root.bin.bits,
-        entry: None,
-    })
-}
-
-fn arch_from_str(name: &str, bits: u8) -> Result<Arch> {
-    match (name, bits) {
-        ("x86", 32) => Ok(Arch::X86),
-        ("x86", 64) => Ok(Arch::X86_64),
-        // radare2 reports both AArch32 and AArch64 with arch="arm" and
-        // discriminates via the bits field.
-        ("arm", 32) => Ok(Arch::Arm),
-        ("arm", 64) => Ok(Arch::Aarch64),
-        _ => Err(Error::Unsupported(format!(
-            "unsupported arch '{name}' ({bits} bits)"
-        ))),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct IjEntry {
-    vaddr: u64,
-}
-
-/// Parse the response of `iej` and return the first entry's virtual
-/// address, if any.
-///
-/// # Errors
-///
-/// Returns [`Error::Parse`] if the JSON is malformed.
-pub fn parse_entry(json: &str) -> Result<Option<Address>> {
-    let entries: Vec<IjEntry> =
-        serde_json::from_str(json).map_err(|e| Error::parse("iej", e.to_string()))?;
-    Ok(entries.first().map(|e| Address(e.vaddr)))
-}
+mod info;
+mod sections;
+pub use info::{BinaryInfo, parse_entry, parse_info};
+pub use sections::{
+    ExecRange, address_in_ranges, parse_executable_ranges, retain_executable_blocks,
+};
 
 #[derive(Debug, Deserialize)]
 struct AfljEntry {
@@ -111,84 +46,6 @@ pub fn parse_function_list(json: &str) -> Result<Vec<FunctionRef>> {
             name: f.name,
         })
         .collect())
-}
-
-#[derive(Debug, Deserialize)]
-struct ISjSection {
-    vaddr: u64,
-    #[serde(default)]
-    vsize: u64,
-    #[serde(default)]
-    perm: String,
-}
-
-/// A half-open virtual-address interval `[start, end)` of a section
-/// the loader maps as executable.
-pub type ExecRange = (u64, u64);
-
-/// Parse the response of `iSj` and return the half-open virtual
-/// address intervals of every section the loader maps executable
-/// (permission string contains `x`).
-///
-/// Used to enforce the format-grounded invariant that an instruction
-/// must live in an executable mapping: radare2's analysis can
-/// over-extend a function's CFG into data sections (string tables,
-/// rodata) and decode that data as garbage instructions. Those blocks
-/// are filtered out by [`address_in_ranges`] in the adapter. The set
-/// is intentionally derived from r2's own permission model so it works
-/// for ELF / PE / Mach-O without hardcoding section names.
-///
-/// Sections with zero `vsize` are skipped (they map no bytes).
-/// Returns an empty vector when r2 reports no section view (e.g. a
-/// fully stripped binary); callers must treat "no ranges known" as
-/// "do not filter" rather than "filter everything".
-///
-/// # Errors
-///
-/// Returns [`Error::Parse`] if the JSON is malformed.
-pub fn parse_executable_ranges(json: &str) -> Result<Vec<ExecRange>> {
-    let sections: Vec<ISjSection> =
-        serde_json::from_str(json).map_err(|e| Error::parse("iSj", e.to_string()))?;
-    let mut ranges: Vec<ExecRange> = sections
-        .into_iter()
-        .filter(|s| s.perm.contains('x') && s.vsize > 0)
-        .filter_map(|s| s.vaddr.checked_add(s.vsize).map(|end| (s.vaddr, end)))
-        .collect();
-    ranges.sort_unstable();
-    Ok(ranges)
-}
-
-/// `true` when `addr` falls inside any executable range. `ranges` is
-/// the output of [`parse_executable_ranges`]; each entry is half-open
-/// (`start` inclusive, `end` exclusive). The list is small (a handful
-/// of code sections), so a linear scan is both clearest and fast
-/// enough on the hot load path.
-#[must_use]
-pub fn address_in_ranges(ranges: &[ExecRange], addr: u64) -> bool {
-    ranges
-        .iter()
-        .any(|&(start, end)| start <= addr && addr < end)
-}
-
-/// Drop every block of `func` whose start address is not inside an
-/// executable range, returning the number of blocks removed.
-///
-/// `ranges` must be the executable mapping from
-/// [`parse_executable_ranges`]. The caller is responsible for the
-/// "no ranges known" policy: an empty `ranges` would strip every
-/// block, so callers must skip this call entirely when the section
-/// view is unavailable (stripped binary) rather than pass `&[]`.
-/// A debug assertion guards that contract.
-pub fn retain_executable_blocks(func: &mut Function, ranges: &[ExecRange]) -> usize {
-    debug_assert!(
-        !ranges.is_empty(),
-        "retain_executable_blocks called with no executable ranges — \
-         caller must skip filtering when the section view is unknown"
-    );
-    let before = func.blocks.len();
-    func.blocks
-        .retain(|b| address_in_ranges(ranges, b.address.get()));
-    before - func.blocks.len()
 }
 
 #[derive(Debug, Deserialize)]

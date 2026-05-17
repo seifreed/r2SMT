@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
+use r2smt_common::Arch;
+
 use super::*;
 
 const IJ_FIXTURE: &str = r#"{

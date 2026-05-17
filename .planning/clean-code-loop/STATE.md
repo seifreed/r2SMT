@@ -223,3 +223,22 @@ CLAUDE.md decomposition watchlist, not mandated by the hard rule
   used by lift/merge.rs). slice.rs 884→675. 495 tests/0 fail; all 5
   gates GREEN. **slice.rs COMPLETE.** Remaining prod >800 (2, modest):
   parse.rs 844, plan.rs 819.
+
+- 2026-05-17 iter15: parse.rs split — extracted the two fully self-
+  contained watchlist-named groups: parse/info.rs (77; ij+iej:
+  BinaryInfo/IjBin/IjRoot/parse_info/arch_from_str/IjEntry/parse_entry)
+  + parse/sections.rs (84; isj: ExecRange/ISjSection/
+  parse_executable_ranges/address_in_ranges/retain_executable_blocks).
+  Both zero cross-group refs. pub items re-exported from parse.rs root
+  (pub use info::{BinaryInfo,parse_entry,parse_info}; pub use
+  sections::{ExecRange,...}) so `pub mod parse` API + provider.rs
+  parse::X paths unchanged. DRY-with-a-brake: `functions` group LEFT in
+  root — it shares decode_hex_bytes/split_disasm with the aoj parser;
+  splitting would relocate/duplicate shared helpers for marginal gain
+  (premature). Root stays a cohesive r2-JSON-parser module at 701<800.
+  Fixed parse/tests.rs (added explicit use r2smt_common::Arch — cargo
+  fix dropped Arch from root prod; test relied on super::*). parse.rs
+  844→701. 495 tests/0 fail; all 5 gates GREEN. **parse.rs COMPLETE.**
+  Remaining prod >800 (LAST 1): plan.rs 819 (only 19 over; watchlist
+  seam = per-ISA planners plan/{x86,aarch64,thumb}.rs — evaluate
+  DRY-with-a-brake next).
