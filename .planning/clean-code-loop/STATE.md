@@ -70,3 +70,13 @@ CLAUDE.md decomposition watchlist, not mandated by the hard rule
   #8 resolved: main.rs 2066→1590 by extracting the 15-fn presentation
   cluster to render.rs (pure move, compiler-driven import trim). All 5
   gates re-verified GREEN; no prod file >2000. **Score 10/10.**
+- 2026-05-17 iter3 (user-requested deeper <800 pass): test-module
+  relocation pass — extracted inline `mod tests` to sibling `<stem>/tests.rs`
+  for effect/registers/solver/plan/finding/machine (blessed pattern).
+  Prod LoC: effect 1590→1116, registers 1354→924, solver 1742→157,
+  plan 1543→819, finding 1052→451, machine 884→592. Removed 3 redundant
+  subset `#![allow]` lines (clippy `duplicated_attributes`, surfaced by
+  extraction — DRY cleanup, not a bypass). parse.rs SKIPPED (raw-string
+  JSON fixture at col 0 — needs bespoke handling). 495 tests pass / 0 fail;
+  all 5 gates GREEN. Remaining >800 prod: lift.rs 1818, main.rs 1590,
+  parse.rs 1469, effect.rs 1116, registers.rs 924, slice.rs 884, plan.rs 819.
