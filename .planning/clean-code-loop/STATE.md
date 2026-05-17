@@ -209,3 +209,17 @@ CLAUDE.md decomposition watchlist, not mandated by the hard rule
   **registers.rs COMPLETE 924→241.** Remaining prod >800 (3, all
   modestly over): slice.rs 884, parse.rs 844, plan.rs 819 — per-domain
   seam, DRY-with-a-brake (split only on a real cohesive seam).
+
+- 2026-05-17 iter14: slice.rs Φ-merge DETECTION family extracted →
+  slice/merge_detect.rs (232; ArmResolution + resolve_arm_edge/
+  mergeable_arm_insn/head_terminator/diamond_head/
+  head_condition_instructions/try_build_diamond_merge). Genuine
+  cohesive seam (CFG diamond recognition vs backward-walk slicer;
+  parallels lift/merge.rs lowering side). try_build_diamond_merge
+  pub(super) (called by walk_backwards); MD helpers private; MD calls
+  back to root single_pred/predecessors_of/slice_branch + uses root
+  WalkState/MERGE_ARM_MAX_INSTRUCTIONS via super:: (child sees
+  ancestor-private). SliceMerge/MergedVar DTOs stay in root (pub API
+  used by lift/merge.rs). slice.rs 884→675. 495 tests/0 fail; all 5
+  gates GREEN. **slice.rs COMPLETE.** Remaining prod >800 (2, modest):
+  parse.rs 844, plan.rs 819.
