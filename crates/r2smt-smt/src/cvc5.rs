@@ -14,6 +14,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use r2smt_common::smt::{SmtResult, SolveOptions};
+use r2smt_ir::{Expr, IrStmt};
 use r2smt_slicer::SliceStatus;
 use r2smt_ssa::SsaLiftedSlice;
 use tracing::debug;
@@ -51,6 +52,16 @@ pub fn solve_branch_cvc5(
     if !is_complete && !slice.treat_truncation_as_inputs {
         return Ok(SmtResult::Unsound);
     }
+    // The SMT-LIB renderer cannot model `Expr::Unknown` as a sound free
+    // variable — it emits a constant placeholder, which *under*-
+    // approximates the value set and can fabricate an `AlwaysX` verdict
+    // (a constant has less freedom than the free var the Z3 backend
+    // mints). Decline rather than answer unsoundly, mirroring the
+    // truncated-slice guard above. The Z3 backend stays precise on
+    // `Unknown`; CVC5 precision here is intentionally deferred.
+    if slice_contains_unknown(slice) {
+        return Ok(SmtResult::Unsound);
+    }
     let script_taken = emit_query(slice, &options, true);
     let script_not_taken = emit_query(slice, &options, false);
     let taken = run_cvc5(&script_taken, options.timeout_ms)?;
@@ -65,6 +76,64 @@ pub fn solve_branch_cvc5(
         "cvc5 verdict"
     );
     Ok(verdict)
+}
+
+/// Whether any expression rendered into the SMT-LIB query carries an
+/// [`Expr::Unknown`] node. The text backend has no sound encoding for
+/// it (see [`solve_branch_cvc5`]), so such slices are declined.
+fn slice_contains_unknown(slice: &SsaLiftedSlice) -> bool {
+    if expr_has_unknown(&slice.condition) {
+        return true;
+    }
+    slice.statements.iter().any(|stmt| match stmt {
+        IrStmt::Assign { src, .. } => expr_has_unknown(src),
+        IrStmt::StoreMem { address, value, .. } => {
+            expr_has_unknown(address) || expr_has_unknown(value)
+        }
+        IrStmt::LoadMem { address, .. } => expr_has_unknown(address),
+        IrStmt::Unsupported { .. } | IrStmt::Nop => false,
+    })
+}
+
+/// Exhaustive recursive check for an [`Expr::Unknown`] anywhere in the
+/// tree. Written without a wildcard arm so a new `Expr` variant forces
+/// this to be revisited rather than silently treated as Unknown-free.
+fn expr_has_unknown(expr: &Expr) -> bool {
+    match expr {
+        Expr::Unknown(_) => true,
+        Expr::Var(_) | Expr::Const { .. } => false,
+        Expr::Add(a, b)
+        | Expr::Sub(a, b)
+        | Expr::Mul(a, b)
+        | Expr::UDiv(a, b)
+        | Expr::URem(a, b)
+        | Expr::SDiv(a, b)
+        | Expr::SRem(a, b)
+        | Expr::And(a, b)
+        | Expr::Or(a, b)
+        | Expr::Xor(a, b)
+        | Expr::Shl(a, b)
+        | Expr::LShr(a, b)
+        | Expr::AShr(a, b)
+        | Expr::Eq(a, b)
+        | Expr::Ne(a, b)
+        | Expr::Ult(a, b)
+        | Expr::Ule(a, b)
+        | Expr::Slt(a, b)
+        | Expr::Sle(a, b)
+        | Expr::BoolAnd(a, b)
+        | Expr::BoolOr(a, b)
+        | Expr::Concat { high: a, low: b } => expr_has_unknown(a) || expr_has_unknown(b),
+        Expr::BoolNot(inner)
+        | Expr::Extract { src: inner, .. }
+        | Expr::ZeroExtend { src: inner, .. }
+        | Expr::SignExtend { src: inner, .. } => expr_has_unknown(inner),
+        Expr::Ite {
+            cond,
+            then_expr,
+            else_expr,
+        } => expr_has_unknown(cond) || expr_has_unknown(then_expr) || expr_has_unknown(else_expr),
+    }
 }
 
 /// `(check-sat)` outcome from a single CVC5 run.
@@ -150,5 +219,86 @@ mod tests {
     fn parse_verdict_reports_unrecognised_output() {
         let err = parse_verdict("garbage output").expect_err("should fail");
         assert!(matches!(err, Cvc5Error::UnrecognisedVerdict(_)));
+    }
+
+    #[test]
+    fn slice_with_unknown_is_declined_without_spawning_cvc5() {
+        use r2smt_common::{Address, Arch};
+        use r2smt_ir::program::{BasicBlock, Function, Instruction, Operand, OperandKind, Program};
+        use r2smt_slicer::{SliceLimits, collect_branches, lift_slice, slice_branch};
+        use r2smt_ssa::ssa_convert;
+
+        // `cmp eax, <unmodeled>` makes ZF carry an `Expr::Unknown`. The
+        // text backend cannot render it as a sound free var, so the
+        // CVC5 path must decline (return Unsound) *before* spawning the
+        // subprocess — this also makes the test deterministic on hosts
+        // without `cvc5` installed.
+        let program = Program {
+            arch: Arch::X86_64,
+            bits: 64,
+            entry: Some(Address(0x40_1000)),
+            functions: vec![Function {
+                address: Address(0x40_1000),
+                name: Some("sym.main".into()),
+                blocks: vec![BasicBlock {
+                    address: Address(0x40_1000),
+                    instructions: vec![
+                        Instruction {
+                            address: Address(0x40_1000),
+                            size: 3,
+                            bytes: vec![],
+                            mnemonic: "cmp".into(),
+                            operands: vec![
+                                Operand {
+                                    raw: "eax".into(),
+                                    kind: OperandKind::Register,
+                                },
+                                Operand {
+                                    raw: "junk".into(),
+                                    kind: OperandKind::Unknown,
+                                },
+                            ],
+                            esil: None,
+                            pcode: None,
+                            is_thumb: false,
+                        },
+                        Instruction {
+                            address: Address(0x40_1003),
+                            size: 6,
+                            bytes: vec![],
+                            mnemonic: "jne".into(),
+                            operands: vec![Operand {
+                                raw: "0x401080".into(),
+                                kind: OperandKind::Immediate,
+                            }],
+                            esil: None,
+                            pcode: None,
+                            is_thumb: false,
+                        },
+                    ],
+                    successors: vec![],
+                }],
+                is_thumb: false,
+            }],
+        };
+        let cand = collect_branches(&program)
+            .into_iter()
+            .next()
+            .expect("a branch");
+        let slice = slice_branch(
+            &cand,
+            &program.functions[0],
+            &SliceLimits::default(),
+            program.arch,
+        );
+        let ssa = ssa_convert(&lift_slice(&slice, program.arch));
+        assert!(
+            slice_contains_unknown(&ssa),
+            "the lifted slice should carry an Expr::Unknown"
+        );
+        assert_eq!(
+            solve_branch_cvc5(&ssa, SolveOptions::default()),
+            Ok(SmtResult::Unsound)
+        );
     }
 }

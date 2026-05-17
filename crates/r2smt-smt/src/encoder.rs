@@ -195,7 +195,15 @@ impl Encoder {
                 };
                 Encoded::Bv(result)
             }
-            Expr::Unknown(_) => Encoded::Bv(self.fresh_unknown(32)),
+            // Mint at the maximum modelled width (64). A free var
+            // narrower than its consumer is *zero-extended* by
+            // `match_widths` / `encode_as_bv_with_width`, which caps
+            // the unmodelled value's range (e.g. a 64-bit operand
+            // would only range over `[0, 2^32)`), fabricating a
+            // confident `AlwaysX` and breaking the "Unknowns only
+            // weaken, never fabricate" invariant. A 64-bit free var is
+            // only ever *truncated* downstream, which stays sound.
+            Expr::Unknown(_) => Encoded::Bv(self.fresh_unknown(64)),
         }
     }
 

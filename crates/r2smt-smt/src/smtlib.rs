@@ -170,10 +170,13 @@ fn render_expr(expr: &Expr) -> (String, u8) {
                 }
             }
         }
-        // Unknown surfaces as a freshly named unconstrained value;
-        // the actual declaration happens at the slice level. Here
-        // we just emit a placeholder so the formula parses — callers
-        // must arrange for that name to be declared too.
+        // `Unknown` has no sound text encoding here: a constant under-
+        // approximates the value set (unlike the Z3 backend's fresh
+        // free var). This constant placeholder only keeps the script
+        // parseable for render-only consumers; the CVC5 *verdict* path
+        // (`crate::cvc5::solve_branch_cvc5`) declines any slice that
+        // contains an `Unknown` before this is ever solved, so no
+        // verdict is derived from this placeholder.
         Expr::Unknown(_) => ("(_ bv0 1)".to_string(), 1),
     }
 }

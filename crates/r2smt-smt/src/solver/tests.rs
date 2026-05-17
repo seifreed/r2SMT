@@ -54,8 +54,18 @@ fn program_with_arch(insns: Vec<Instruction>, arch: Arch) -> Program {
     }
 }
 
+/// Per-branch solver timeout for the full-pipeline verdict tests.
+/// Deliberately far larger than the production `SolveOptions` default
+/// (500 ms): `cargo test --all` runs every crate's test binary
+/// concurrently, and multiplication-heavy opaque predicates can exceed
+/// a tight budget under that CPU saturation, flaking into `Timeout`.
+/// A correct solve completes in well under a second even loaded, so
+/// this only bounds a genuinely stuck solver — it never masks a real
+/// "cannot decide" failure.
+const TEST_SOLVE_TIMEOUT_MS: u32 = 10_000;
+
 fn solve_first(program: &Program) -> SmtResult {
-    solve_first_with_timeout(program, SolveOptions::default().timeout_ms)
+    solve_first_with_timeout(program, TEST_SOLVE_TIMEOUT_MS)
 }
 
 fn solve_first_with_timeout(program: &Program, timeout_ms: u32) -> SmtResult {
@@ -70,6 +80,87 @@ fn solve_first_with_timeout(program: &Program, timeout_ms: u32) -> SmtResult {
     let lifted = lift_slice(&slice, program.arch);
     let ssa = ssa_convert(&lifted);
     solve_branch(&ssa, SolveOptions { timeout_ms })
+}
+
+#[test]
+fn wide_unknown_operand_does_not_fabricate_dead_branch() {
+    // `mov rax, 0x100000000 ; cmp rax, <unmodelled> ; je` — the
+    // unmodelled operand is an arbitrary 64-bit value that CAN equal
+    // 2^32, so the branch is real (BothPossible). Minting the Unknown
+    // free var at 32 bits and zero-extending it would cap its range
+    // at [0, 2^32) and fabricate a confident AlwaysFalse / DeadBranch.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            10,
+            "mov",
+            vec![
+                op("rax", OperandKind::Register),
+                op("0x100000000", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_100a,
+            3,
+            "cmp",
+            vec![
+                op("rax", OperandKind::Register),
+                op("zzz", OperandKind::Unknown),
+            ],
+        ),
+        insn(
+            0x40_100d,
+            6,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::BothPossible);
+}
+
+#[test]
+fn x86_shift_count_is_masked_modulo_operand_width() {
+    // `shl eax, 32` is a HARDWARE NO-OP: x86 masks the count to 5 bits
+    // (32 & 0x1F = 0). With eax=1 fixed, `jz` is never taken
+    // (AlwaysFalse). An unmasked `bvshl(1, 32)` yields 0 in SMT-LIB,
+    // which would fabricate ZF=1 → a confident AlwaysTrue (verdict flip
+    // at High confidence). Fully constant slice → deterministic solve.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            5,
+            "mov",
+            vec![
+                op("eax", OperandKind::Register),
+                op("1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1005,
+            3,
+            "shl",
+            vec![
+                op("eax", OperandKind::Register),
+                op("32", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            2,
+            "test",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_100a,
+            6,
+            "jz",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysFalse);
 }
 
 #[test]
@@ -349,7 +440,7 @@ fn polynomial_identity_x_squared_eq_x_squared_is_always_true() {
     // identity slower than the 500 ms default; give it the same
     // generous budget as the sibling polynomial regression so the
     // assertion does not flake on loaded hosts.
-    let verdict = solve_first_with_timeout(&program, 5_000);
+    let verdict = solve_first_with_timeout(&program, TEST_SOLVE_TIMEOUT_MS);
     assert_eq!(verdict, SmtResult::AlwaysTrue);
 }
 
@@ -444,7 +535,7 @@ fn polynomial_offset_x_squared_plus_seven_minus_x_squared_eq_seven_is_always_tru
     // longer to discharge polynomial identities; give the solver a
     // larger budget than the 500 ms default so this regression does
     // not flake on slow hosts.
-    let verdict = solve_first_with_timeout(&program, 5_000);
+    let verdict = solve_first_with_timeout(&program, TEST_SOLVE_TIMEOUT_MS);
     assert_eq!(verdict, SmtResult::AlwaysTrue);
 }
 
