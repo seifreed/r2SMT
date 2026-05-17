@@ -1,0 +1,25 @@
+[package]
+name         = "r2smt-smt"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+description = "Z3 backend for r2SMT — encodes SSA lifted slices and reports opaque-predicate verdicts."
+
+[lints]
+workspace = true
+
+[dependencies]
+r2smt-common = { workspace = true }
+r2smt-ir     = { workspace = true }
+r2smt-slicer = { workspace = true }
+r2smt-ssa    = { workspace = true }
+z3           = { workspace = true }
+serde        = { workspace = true }
+tracing      = { workspace = true }
+
+[dev-dependencies]
+r2smt-ir   = { workspace = true, features = ["testing"] }
+serde_json = { workspace = true }

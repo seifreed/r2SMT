@@ -1,0 +1,28 @@
+[package]
+name         = "r2smt-patch"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+description = "Safe binary patching for r2SMT: plans, manifests, backups, and rollback."
+
+[lints]
+workspace = true
+
+[dependencies]
+r2smt-common = { workspace = true }
+r2smt-ir     = { workspace = true }
+r2smt-core   = { workspace = true }
+r2smt-report = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+sha2         = { workspace = true }
+hex          = { workspace = true }
+tracing      = { workspace = true }
+
+[dev-dependencies]
+r2smt-ir     = { workspace = true, features = ["testing"] }
+r2smt-slicer = { workspace = true }
+tempfile     = { workspace = true }

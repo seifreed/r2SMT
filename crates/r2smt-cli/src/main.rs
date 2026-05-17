@@ -1,0 +1,2066 @@
+#![deny(missing_docs)]
+// A CLI is the one layer that legitimately writes to standard streams.
+// The workspace lints deny `print_stdout` / `print_stderr` everywhere
+// else; we relax the rule here so user-facing output and error messages
+// can flow normally.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
+//! `r2smt` command-line entrypoint.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use r2smt_common::{Address, Arch};
+use r2smt_core::{
+    Confidence, Finding, FindingKind, classify_finding_with_pretty, classify_lowered_upstream,
+    dump_program, prepare_ssa, reconcile_folded,
+};
+use r2smt_ir::Annotator;
+use r2smt_ir::BinaryProvider;
+use r2smt_ir::Decompiler;
+use r2smt_ir::NameHints;
+use r2smt_ir::program::Function;
+use r2smt_ir::program::Program;
+use r2smt_patch::{ApplyConfig, PatchManifest, apply_plan, build_plan, rollback_from_manifest};
+use r2smt_r2pipe::{AnalysisLevel, R2PipeProvider};
+use r2smt_report::{
+    Annotation, BatchOutcome, BatchReport, BatchSampleEntry, BatchSampleSummary, Report,
+};
+use r2smt_slicer::{
+    BranchCandidate, LiftedSlice, Slice, SliceLimits, SliceStatus, collect_branches,
+    collect_function_branches, lift_slice, slice_branch,
+};
+use r2smt_smt::{SolveOptions, solve_branch_with_pretty};
+use r2smt_ssa::SsaLiftedSlice;
+use rayon::ThreadPoolBuilder;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use tracing::error;
+use tracing_subscriber::EnvFilter;
+
+mod args;
+use args::{Cli, Command, SolverArg};
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    if let Err(e) = init_tracing(cli.verbose) {
+        eprintln!("r2smt: failed to initialise tracing: {e:#}");
+        return ExitCode::FAILURE;
+    }
+
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            error!(target: "r2smt::cli", "{err:#}");
+            eprintln!("r2smt: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn init_tracing(verbosity: u8) -> Result<()> {
+    let default_level = match verbosity {
+        0 => "info",
+        1 => "debug",
+        _ => "trace",
+    };
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .try_init()
+        .map_err(|e| anyhow::anyhow!("tracing init failed: {e}"))?;
+    Ok(())
+}
+
+// Each subcommand dispatch is a single short block; the function is
+// long because there are many subcommands. Allow the pedantic lint
+// for this dispatcher specifically.
+#[allow(clippy::too_many_lines)]
+fn run(cli: Cli) -> Result<()> {
+    let deep = cli.deep_analysis;
+    let ir_pcode = cli.ir.wants_pcode();
+    match cli.command {
+        Command::Version => {
+            println!("r2smt {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Command::Analyze {
+            file,
+            dump_program: dump_flag,
+            json,
+        } => analyze(&file, deep, dump_flag, json.as_deref()),
+        Command::Branches {
+            file,
+            function,
+            json,
+        } => branches(&file, deep, function.as_deref(), json.as_deref()),
+        Command::Slice {
+            file,
+            at,
+            function,
+            max_instructions,
+            allow_memory,
+            allow_calls,
+            unknowns_on_truncation,
+            solver: _,
+            max_blocks,
+            json,
+        } => {
+            let mut limits = SliceLimits::default();
+            if let Some(n) = max_instructions {
+                limits.max_instructions = n;
+            }
+            limits.allow_memory = allow_memory;
+            limits.allow_calls = allow_calls;
+            limits.unknowns_on_truncation = unknowns_on_truncation;
+            if let Some(n) = max_blocks {
+                limits.max_basic_blocks = n;
+            }
+            slice(
+                &file,
+                deep,
+                at.as_deref(),
+                function.as_deref(),
+                &limits,
+                json.as_deref(),
+            )
+        }
+        Command::Lift {
+            file,
+            at,
+            function,
+            max_instructions,
+            allow_memory,
+            allow_calls,
+            unknowns_on_truncation,
+            solver: _,
+            max_blocks,
+            json,
+        } => {
+            let mut limits = SliceLimits::default();
+            if let Some(n) = max_instructions {
+                limits.max_instructions = n;
+            }
+            limits.allow_memory = allow_memory;
+            limits.allow_calls = allow_calls;
+            limits.unknowns_on_truncation = unknowns_on_truncation;
+            if let Some(n) = max_blocks {
+                limits.max_basic_blocks = n;
+            }
+            lift(
+                &file,
+                deep,
+                at.as_deref(),
+                function.as_deref(),
+                &limits,
+                json.as_deref(),
+            )
+        }
+        Command::Annotate {
+            file,
+            at,
+            function,
+            max_instructions,
+            timeout_ms,
+            allow_memory,
+            allow_calls,
+            unknowns_on_truncation,
+            solver,
+            max_blocks,
+            min_confidence,
+            dry_run,
+            save_project,
+        } => {
+            let mut limits = SliceLimits::default();
+            if let Some(n) = max_instructions {
+                limits.max_instructions = n;
+            }
+            limits.allow_memory = allow_memory;
+            limits.allow_calls = allow_calls;
+            limits.unknowns_on_truncation = unknowns_on_truncation;
+            if let Some(n) = max_blocks {
+                limits.max_basic_blocks = n;
+            }
+            let options = SolveOptions {
+                timeout_ms: timeout_ms.unwrap_or(SolveOptions::default().timeout_ms),
+            };
+            let plan = AnnotatePlan {
+                min_confidence: min_confidence.to_confidence(),
+                dry_run,
+                save_project: save_project.as_deref(),
+            };
+            annotate(
+                &file,
+                deep,
+                at.as_deref(),
+                function.as_deref(),
+                &limits,
+                options,
+                &plan,
+                solver,
+            )
+        }
+        Command::Patch {
+            file,
+            at,
+            function,
+            max_instructions,
+            timeout_ms,
+            allow_memory,
+            allow_calls,
+            unknowns_on_truncation,
+            solver,
+            max_blocks,
+            min_confidence,
+            apply,
+            backup,
+            manifest,
+            rollback,
+        } => {
+            let mut limits = SliceLimits::default();
+            if let Some(n) = max_instructions {
+                limits.max_instructions = n;
+            }
+            limits.allow_memory = allow_memory;
+            limits.allow_calls = allow_calls;
+            limits.unknowns_on_truncation = unknowns_on_truncation;
+            if let Some(n) = max_blocks {
+                limits.max_basic_blocks = n;
+            }
+            let options = SolveOptions {
+                timeout_ms: timeout_ms.unwrap_or(SolveOptions::default().timeout_ms),
+            };
+            let cfg = PatchCli {
+                min_confidence: min_confidence.to_confidence(),
+                apply,
+                backup: backup.as_deref(),
+                manifest: manifest.as_deref(),
+                rollback,
+                solver,
+            };
+            patch(
+                &file,
+                deep,
+                at.as_deref(),
+                function.as_deref(),
+                &limits,
+                options,
+                &cfg,
+                ir_pcode,
+            )
+        }
+        Command::Solve {
+            file,
+            at,
+            function,
+            max_instructions,
+            timeout_ms,
+            allow_memory,
+            allow_calls,
+            unknowns_on_truncation,
+            solver,
+            max_blocks,
+            min_confidence,
+            include_real,
+            include_suspicious,
+            json,
+            markdown,
+            r2_script,
+            with_decompiler,
+            allow_join_merge,
+        } => {
+            let mut limits = SliceLimits::default();
+            if let Some(n) = max_instructions {
+                limits.max_instructions = n;
+            }
+            limits.allow_memory = allow_memory;
+            limits.allow_calls = allow_calls;
+            limits.unknowns_on_truncation = unknowns_on_truncation;
+            limits.allow_join_merge = allow_join_merge;
+            if let Some(n) = max_blocks {
+                limits.max_basic_blocks = n;
+            }
+            let options = SolveOptions {
+                timeout_ms: timeout_ms.unwrap_or(SolveOptions::default().timeout_ms),
+            };
+            let filters = SolveFilters {
+                min_confidence: min_confidence.to_confidence(),
+                include_real,
+                include_suspicious,
+            };
+            let outputs = SolveOutputs {
+                json: json.as_deref(),
+                markdown: markdown.as_deref(),
+                r2_script: r2_script.as_deref(),
+            };
+            solve(
+                &file,
+                deep,
+                at.as_deref(),
+                function.as_deref(),
+                &limits,
+                options,
+                &filters,
+                &outputs,
+                solver,
+                with_decompiler,
+                ir_pcode,
+            )
+        }
+        Command::Batch {
+            dir,
+            threads,
+            max_instructions,
+            timeout_ms,
+            allow_memory,
+            allow_calls,
+            unknowns_on_truncation,
+            solver,
+            max_blocks,
+            json,
+            markdown,
+            with_decompiler,
+            allow_join_merge,
+        } => {
+            let mut limits = SliceLimits::default();
+            if let Some(n) = max_instructions {
+                limits.max_instructions = n;
+            }
+            limits.allow_memory = allow_memory;
+            limits.allow_calls = allow_calls;
+            limits.unknowns_on_truncation = unknowns_on_truncation;
+            limits.allow_join_merge = allow_join_merge;
+            if let Some(n) = max_blocks {
+                limits.max_basic_blocks = n;
+            }
+            let options = SolveOptions {
+                timeout_ms: timeout_ms.unwrap_or(SolveOptions::default().timeout_ms),
+            };
+            batch(
+                &dir,
+                deep,
+                threads,
+                &limits,
+                options,
+                solver,
+                with_decompiler,
+                ir_pcode,
+                json.as_deref(),
+                markdown.as_deref(),
+            )
+        }
+        Command::At {
+            file,
+            addr,
+            patch: do_patch,
+            timeout_ms,
+            max_instructions,
+            allow_memory,
+            allow_calls,
+            solver,
+            with_decompiler,
+            quiet,
+            explain,
+            allow_join_merge,
+        } => {
+            let mut limits = SliceLimits::default();
+            if let Some(n) = max_instructions {
+                limits.max_instructions = n;
+            }
+            limits.allow_memory = allow_memory;
+            limits.allow_calls = allow_calls;
+            limits.allow_join_merge = allow_join_merge;
+            let options = SolveOptions {
+                timeout_ms: timeout_ms.unwrap_or(SolveOptions::default().timeout_ms),
+            };
+            let verbosity = if quiet {
+                AtVerbosity::Quiet
+            } else if explain {
+                AtVerbosity::Explain
+            } else {
+                AtVerbosity::Normal
+            };
+            at_command(
+                &file,
+                deep,
+                &addr,
+                &limits,
+                options,
+                solver,
+                &AtOptions {
+                    do_patch,
+                    with_decompiler,
+                    ir_pcode,
+                    verbosity,
+                },
+            )
+        }
+        Command::Ssa {
+            file,
+            at,
+            function,
+            max_instructions,
+            allow_memory,
+            allow_calls,
+            unknowns_on_truncation,
+            solver: _,
+            max_blocks,
+            json,
+        } => {
+            let mut limits = SliceLimits::default();
+            if let Some(n) = max_instructions {
+                limits.max_instructions = n;
+            }
+            limits.allow_memory = allow_memory;
+            limits.allow_calls = allow_calls;
+            limits.unknowns_on_truncation = unknowns_on_truncation;
+            if let Some(n) = max_blocks {
+                limits.max_basic_blocks = n;
+            }
+            ssa(
+                &file,
+                deep,
+                at.as_deref(),
+                function.as_deref(),
+                &limits,
+                json.as_deref(),
+            )
+        }
+    }
+}
+
+fn analyze(file: &Path, deep: bool, dump_flag: bool, json_out: Option<&Path>) -> Result<()> {
+    if !file.exists() {
+        anyhow::bail!("input file does not exist: {}", file.display());
+    }
+
+    let mut provider = open_provider(file, deep)?;
+
+    let program = dump_program(&mut provider)
+        .with_context(|| format!("dumping program from {}", file.display()))?;
+
+    if dump_flag || json_out.is_some() {
+        emit_program_json(&program, json_out)?;
+    } else {
+        print_summary(&program);
+    }
+    Ok(())
+}
+
+fn emit_program_json(program: &Program, json_out: Option<&Path>) -> Result<()> {
+    let json = serde_json::to_string_pretty(program).context("serialising Program to JSON")?;
+    if let Some(path) = json_out {
+        fs::write(path, &json).with_context(|| format!("writing JSON to {}", path.display()))?;
+    } else {
+        println!("{json}");
+    }
+    Ok(())
+}
+
+fn branches(
+    file: &Path,
+    deep: bool,
+    function: Option<&str>,
+    json_out: Option<&Path>,
+) -> Result<()> {
+    if !file.exists() {
+        anyhow::bail!("input file does not exist: {}", file.display());
+    }
+
+    let mut provider = open_provider(file, deep)?;
+    let program = dump_program(&mut provider)
+        .with_context(|| format!("loading program from {}", file.display()))?;
+
+    let candidates = match function {
+        None => collect_branches(&program),
+        Some(raw) => {
+            let address: Address = raw
+                .parse()
+                .with_context(|| format!("parsing --function value '{raw}'"))?;
+            let function = program
+                .functions
+                .iter()
+                .find(|f| f.address == address)
+                .ok_or_else(|| anyhow::anyhow!("no function at {address} in {}", file.display()))?;
+            collect_function_branches(function, program.arch)
+        }
+    };
+
+    if let Some(path) = json_out {
+        let json = serde_json::to_string_pretty(&candidates)
+            .context("serialising branch candidates to JSON")?;
+        fs::write(path, &json).with_context(|| format!("writing JSON to {}", path.display()))?;
+    } else {
+        print_branch_summary(&candidates);
+    }
+    Ok(())
+}
+
+fn print_branch_summary(candidates: &[BranchCandidate]) {
+    println!("candidates: {}", candidates.len());
+    let mut jcc = 0usize;
+    let mut setcc = 0usize;
+    let mut cmovcc = 0usize;
+    for cand in candidates {
+        match cand.kind {
+            r2smt_slicer::BranchKind::Jcc => jcc += 1,
+            r2smt_slicer::BranchKind::SetCc => setcc += 1,
+            r2smt_slicer::BranchKind::CMovCc => cmovcc += 1,
+            // `BranchKind` is `#[non_exhaustive]`; ignore future variants.
+            _ => {}
+        }
+    }
+    println!("  jcc:     {jcc}");
+    println!("  setcc:   {setcc}");
+    println!("  cmovcc:  {cmovcc}");
+    let resolved = candidates
+        .iter()
+        .filter(|c| c.taken_target.is_some())
+        .count();
+    println!("  with resolved taken target: {resolved}");
+
+    if !candidates.is_empty() {
+        println!();
+        println!("first {} candidates:", candidates.len().min(5));
+        for cand in candidates.iter().take(5) {
+            let target = cand
+                .taken_target
+                .map_or_else(|| "?".to_string(), |t| t.to_string());
+            println!(
+                "  {addr}  {kind:?} {mnem:<8} → {target}   ({formula})",
+                addr = cand.address,
+                kind = cand.kind,
+                mnem = cand.mnemonic,
+                formula = cand.formula,
+            );
+        }
+    }
+}
+
+fn slice(
+    file: &Path,
+    deep: bool,
+    at: Option<&str>,
+    function_filter: Option<&str>,
+    limits: &SliceLimits,
+    json_out: Option<&Path>,
+) -> Result<()> {
+    if !file.exists() {
+        anyhow::bail!("input file does not exist: {}", file.display());
+    }
+
+    let mut provider = open_provider(file, deep)?;
+    let program = dump_program(&mut provider)
+        .with_context(|| format!("loading program from {}", file.display()))?;
+
+    let (ctx, filtered) = resolve_targets(&mut provider, file, program, at, function_filter)?;
+
+    let mut slices: Vec<Slice> = Vec::with_capacity(filtered.len());
+    for cand in &filtered {
+        let Some(function) = ctx.find_function(cand.function) else {
+            continue;
+        };
+        slices.push(slice_branch(cand, function, limits, ctx.program.arch));
+    }
+
+    if let Some(path) = json_out {
+        let json = serde_json::to_string_pretty(&slices).context("serialising slices to JSON")?;
+        fs::write(path, &json).with_context(|| format!("writing JSON to {}", path.display()))?;
+    } else {
+        let functions: Vec<Function> = ctx.all_functions().cloned().collect();
+        print_slice_summary(&slices, at.is_some(), &functions);
+    }
+    Ok(())
+}
+
+fn print_slice_summary(slices: &[Slice], explicit_at: bool, functions: &[Function]) {
+    let total = slices.len();
+    let complete = slices
+        .iter()
+        .filter(|s| matches!(s.status, SliceStatus::Complete))
+        .count();
+    let truncated = total - complete;
+
+    println!("slices: {total} (complete: {complete}, truncated: {truncated})");
+    if total > 0 {
+        let mut len_sum = 0usize;
+        let mut len_max = 0usize;
+        for s in slices
+            .iter()
+            .filter(|s| matches!(s.status, SliceStatus::Complete))
+        {
+            len_sum += s.instructions.len();
+            len_max = len_max.max(s.instructions.len());
+        }
+        if complete > 0 {
+            // `cast_precision_loss`: slice counts stay well below 2^53; the
+            // average is rendered at 2-decimal precision for the operator.
+            #[allow(clippy::cast_precision_loss)]
+            let avg = len_sum as f64 / complete as f64;
+            println!("  complete slice length: avg {avg:.2}, max {len_max}");
+        }
+        if truncated > 0 {
+            let mut by_reason: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for s in slices {
+                if let SliceStatus::Truncated { reason } = &s.status {
+                    let bucket = reason_bucket(reason);
+                    *by_reason.entry(bucket).or_insert(0) += 1;
+                }
+            }
+            println!("  truncation reasons:");
+            for (reason, count) in by_reason {
+                println!("    {count:>6}  {reason}");
+            }
+        }
+    }
+
+    if explicit_at && total == 1 {
+        println!();
+        print_slice_detail(&slices[0], functions);
+    } else if total > 0 && total <= 5 {
+        println!();
+        for s in slices {
+            print_slice_detail(s, functions);
+            println!();
+        }
+    }
+}
+
+fn print_slice_detail(slice: &Slice, functions: &[Function]) {
+    let fname = functions
+        .iter()
+        .find(|f| f.address == slice.branch.function)
+        .and_then(|f| f.name.as_deref())
+        .unwrap_or("<anon>");
+    println!(
+        "branch {addr}  {kind:?} {mnem:<6}  fn={fname}  cond={cond}",
+        addr = slice.branch.address,
+        kind = slice.branch.kind,
+        mnem = slice.branch.mnemonic,
+        cond = slice.branch.formula,
+    );
+    match &slice.status {
+        SliceStatus::Complete => println!("  status: complete"),
+        SliceStatus::Truncated { reason } => println!("  status: truncated ({reason})"),
+    }
+    if !slice.roots.is_empty() {
+        println!("  roots:  {roots}", roots = slice.roots.join(", "));
+    }
+    for insn in &slice.instructions {
+        let operands: String = insn
+            .operands
+            .iter()
+            .map(|o| o.raw.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "    {addr}  {mnem:<6} {operands}",
+            addr = insn.address,
+            mnem = insn.mnemonic
+        );
+    }
+}
+
+fn lift(
+    file: &Path,
+    deep: bool,
+    at: Option<&str>,
+    function_filter: Option<&str>,
+    limits: &SliceLimits,
+    json_out: Option<&Path>,
+) -> Result<()> {
+    if !file.exists() {
+        anyhow::bail!("input file does not exist: {}", file.display());
+    }
+
+    let mut provider = open_provider(file, deep)?;
+    let program = dump_program(&mut provider)
+        .with_context(|| format!("loading program from {}", file.display()))?;
+    let arch = program.arch;
+
+    let (ctx, filtered) = resolve_targets(&mut provider, file, program, at, function_filter)?;
+
+    let mut lifts: Vec<LiftedSlice> = Vec::with_capacity(filtered.len());
+    for cand in &filtered {
+        let Some(function) = ctx.find_function(cand.function) else {
+            continue;
+        };
+        let slice = slice_branch(cand, function, limits, ctx.program.arch);
+        lifts.push(lift_slice(&slice, arch));
+    }
+
+    if let Some(path) = json_out {
+        let json =
+            serde_json::to_string_pretty(&lifts).context("serialising lifted slices to JSON")?;
+        fs::write(path, &json).with_context(|| format!("writing JSON to {}", path.display()))?;
+    } else {
+        let functions: Vec<Function> = ctx.all_functions().cloned().collect();
+        print_lift_summary(&lifts, at.is_some(), &functions);
+    }
+    Ok(())
+}
+
+fn print_lift_summary(lifts: &[LiftedSlice], explicit_at: bool, functions: &[Function]) {
+    let total = lifts.len();
+    let complete = lifts
+        .iter()
+        .filter(|l| matches!(l.status, SliceStatus::Complete))
+        .count();
+    let truncated = total - complete;
+    println!("lifted slices: {total} (complete: {complete}, truncated: {truncated})");
+    if total == 0 {
+        return;
+    }
+    let stmt_total: usize = lifts.iter().map(|l| l.statements.len()).sum();
+    let unsupported: usize = lifts
+        .iter()
+        .flat_map(|l| &l.statements)
+        .filter(|s| matches!(s, r2smt_ir::IrStmt::Unsupported { .. }))
+        .count();
+    println!("  ir statements:  {stmt_total} ({unsupported} unsupported)",);
+
+    if explicit_at && total == 1 {
+        println!();
+        print_lift_detail(&lifts[0], functions);
+    } else if total <= 3 {
+        println!();
+        for l in lifts {
+            print_lift_detail(l, functions);
+            println!();
+        }
+    }
+}
+
+fn print_lift_detail(lifted: &LiftedSlice, functions: &[Function]) {
+    let fname = functions
+        .iter()
+        .find(|f| f.address == lifted.branch.function)
+        .and_then(|f| f.name.as_deref())
+        .unwrap_or("<anon>");
+    println!(
+        "branch {addr}  {kind:?} {mnem:<6}  fn={fname}",
+        addr = lifted.branch.address,
+        kind = lifted.branch.kind,
+        mnem = lifted.branch.mnemonic,
+    );
+    match &lifted.status {
+        SliceStatus::Complete => println!("  status: complete"),
+        SliceStatus::Truncated { reason } => println!("  status: truncated ({reason})"),
+    }
+    println!("  IR ({n} statements):", n = lifted.statements.len());
+    for stmt in &lifted.statements {
+        println!("    {stmt}");
+    }
+    println!("  branch condition: {cond}", cond = lifted.condition);
+}
+
+struct SolveFilters {
+    min_confidence: Confidence,
+    include_real: bool,
+    include_suspicious: bool,
+}
+
+struct AnnotatePlan<'a> {
+    min_confidence: Confidence,
+    dry_run: bool,
+    save_project: Option<&'a str>,
+}
+
+fn analysis_level(deep: bool) -> AnalysisLevel {
+    if deep {
+        AnalysisLevel::Deep
+    } else {
+        AnalysisLevel::Standard
+    }
+}
+
+fn open_provider(file: &Path, deep: bool) -> Result<R2PipeProvider> {
+    R2PipeProvider::open_with_analysis(file, false, analysis_level(deep))
+        .with_context(|| format!("opening {} with radare2", file.display()))
+}
+
+fn open_provider_writable(file: &Path, deep: bool) -> Result<R2PipeProvider> {
+    R2PipeProvider::open_with_analysis(file, true, analysis_level(deep))
+        .with_context(|| format!("opening {} with radare2 (-w)", file.display()))
+}
+
+/// Owns the [`Program`] returned by r2 plus any synthesised functions
+/// produced by the shellcode finder. Subcommands look up branches
+/// against the union, so candidates created from a synthetic block
+/// still resolve.
+struct AnalysisContext {
+    program: Program,
+    extra_functions: Vec<Function>,
+}
+
+impl AnalysisContext {
+    fn new(program: Program) -> Self {
+        Self {
+            program,
+            extra_functions: Vec::new(),
+        }
+    }
+
+    fn find_function(&self, address: Address) -> Option<&Function> {
+        self.program
+            .functions
+            .iter()
+            .find(|f| f.address == address)
+            .or_else(|| self.extra_functions.iter().find(|f| f.address == address))
+    }
+
+    fn all_functions(&self) -> impl Iterator<Item = &Function> {
+        self.program
+            .functions
+            .iter()
+            .chain(self.extra_functions.iter())
+    }
+}
+
+/// Build the list of candidate branches the user asked about, plus
+/// the augmented [`AnalysisContext`] (potentially extended with a
+/// synthetic block when `--at addr` points outside any analysed
+/// function).
+fn resolve_targets(
+    provider: &mut R2PipeProvider,
+    file: &Path,
+    program: Program,
+    at: Option<&str>,
+    function_filter: Option<&str>,
+) -> Result<(AnalysisContext, Vec<BranchCandidate>)> {
+    let mut ctx = AnalysisContext::new(program);
+
+    let candidates: Vec<BranchCandidate> = match function_filter {
+        None => collect_branches(&ctx.program),
+        Some(raw) => {
+            let address: Address = raw
+                .parse()
+                .with_context(|| format!("parsing --function value '{raw}'"))?;
+            let function = ctx
+                .program
+                .functions
+                .iter()
+                .find(|f| f.address == address)
+                .ok_or_else(|| anyhow::anyhow!("no function at {address} in {}", file.display()))?;
+            collect_function_branches(function, ctx.program.arch)
+        }
+    };
+
+    let filtered: Vec<BranchCandidate> = if let Some(at_raw) = at {
+        let target: Address = at_raw
+            .parse()
+            .with_context(|| format!("parsing --at value '{at_raw}'"))?;
+        if let Some(found) = candidates.into_iter().find(|c| c.address == target) {
+            vec![found]
+        } else {
+            // Shellcode / unanalysed region fallback: synthesise the
+            // basic block around `target` and look for the branch
+            // inside it.
+            let func = provider
+                .load_block_at(target)
+                .with_context(|| format!("synthesising block at {target}"))?;
+            let synth_candidates = collect_function_branches(&func, ctx.program.arch);
+            let candidate = synth_candidates
+                .into_iter()
+                .find(|c| c.address == target)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no candidate at {target} (program had no match; synthetic block at {} had no conditional branch at the requested address)",
+                        func.address,
+                    )
+                })?;
+            ctx.extra_functions.push(func);
+            vec![candidate]
+        }
+    } else {
+        candidates
+    };
+
+    Ok((ctx, filtered))
+}
+
+struct PatchCli<'a> {
+    min_confidence: Confidence,
+    apply: bool,
+    backup: Option<&'a Path>,
+    manifest: Option<&'a Path>,
+    rollback: bool,
+    solver: SolverArg,
+}
+
+const DEFAULT_BACKUP_SUFFIX: &str = ".r2smt.bak";
+const DEFAULT_MANIFEST_SUFFIX: &str = ".r2smt.manifest.json";
+
+fn default_backup_path(file: &Path) -> PathBuf {
+    let mut s = file.as_os_str().to_owned();
+    s.push(DEFAULT_BACKUP_SUFFIX);
+    PathBuf::from(s)
+}
+
+fn default_manifest_path(file: &Path) -> PathBuf {
+    let mut s = file.as_os_str().to_owned();
+    s.push(DEFAULT_MANIFEST_SUFFIX);
+    PathBuf::from(s)
+}
+
+// `clippy::too_many_arguments`: same rationale as `solve` / `batch` —
+// a CLI driver threading independent, read-at-distinct-stages knobs
+// (`ir_pcode` is the 8th). A params struct would only relocate noise.
+#[allow(clippy::too_many_arguments)]
+fn patch(
+    file: &Path,
+    deep: bool,
+    at: Option<&str>,
+    function_filter: Option<&str>,
+    limits: &SliceLimits,
+    options: SolveOptions,
+    cfg: &PatchCli<'_>,
+    ir_pcode: bool,
+) -> Result<()> {
+    if !file.exists() {
+        anyhow::bail!("input file does not exist: {}", file.display());
+    }
+    if cfg.rollback {
+        return patch_rollback(file, deep, cfg);
+    }
+
+    // Read-only pipeline first: open without write access so we can
+    // plan and (optionally) bail out before any disk mutation.
+    let (arch, findings) = compute_findings(
+        file,
+        deep,
+        at,
+        function_filter,
+        limits,
+        options,
+        cfg.solver,
+        false,
+        ir_pcode,
+    )?;
+    let actionable: Vec<Finding> = findings
+        .into_iter()
+        .filter(Finding::is_actionable)
+        .collect();
+    println!(
+        "candidate findings: {n} (min_confidence={mc:?})",
+        n = actionable.len(),
+        mc = cfg.min_confidence,
+    );
+
+    if !cfg.apply {
+        println!();
+        patch_dry_run_plan(file, deep, arch, &actionable, cfg)?;
+        return Ok(());
+    }
+
+    // Apply path: backup → open writable → plan → apply → write manifest.
+    let backup = cfg
+        .backup
+        .map_or_else(|| default_backup_path(file), Path::to_path_buf);
+    let manifest_path = cfg
+        .manifest
+        .map_or_else(|| default_manifest_path(file), Path::to_path_buf);
+
+    if backup.exists() {
+        anyhow::bail!(
+            "refusing to overwrite existing backup at {} — move or delete it first",
+            backup.display()
+        );
+    }
+    fs::copy(file, &backup)
+        .with_context(|| format!("backing up {} to {}", file.display(), backup.display()))?;
+    println!("backup: {}", backup.display());
+
+    let mut provider = open_provider_writable(file, deep)?;
+    let plan = build_plan(&actionable, cfg.min_confidence, arch, &mut provider)
+        .with_context(|| "building patch plan")?;
+    println!("plan: {} operations", plan.operations.len());
+    for skip in &plan.skipped {
+        println!("  skipped {addr}: {reason}", addr = skip.0, reason = skip.1);
+    }
+    if plan.operations.is_empty() {
+        println!("nothing to apply");
+        return Ok(());
+    }
+
+    let apply_cfg = ApplyConfig {
+        binary_path: file.to_path_buf(),
+        backup_path: backup.clone(),
+        r2smt_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let manifest =
+        apply_plan(&mut provider, &plan, &apply_cfg).with_context(|| "applying patch plan")?;
+    drop(provider);
+
+    manifest
+        .write_to(&manifest_path)
+        .with_context(|| format!("writing manifest to {}", manifest_path.display()))?;
+    println!();
+    println!("applied:  {} operations", manifest.operations.len());
+    println!("manifest: {}", manifest_path.display());
+    println!("before SHA-256: {}", manifest.binary_sha256_before);
+    println!("after  SHA-256: {}", manifest.binary_sha256_after);
+    Ok(())
+}
+
+fn patch_dry_run_plan(
+    file: &Path,
+    deep: bool,
+    arch: Arch,
+    actionable: &[Finding],
+    cfg: &PatchCli<'_>,
+) -> Result<()> {
+    let mut provider = open_provider(file, deep)?;
+    let plan = build_plan(actionable, cfg.min_confidence, arch, &mut provider)
+        .with_context(|| "building patch plan")?;
+    println!("planned operations: {}", plan.operations.len());
+    for op in &plan.operations {
+        println!(
+            "  {addr}  {strategy:<22}  size={size}  → {bytes}",
+            addr = op.address,
+            strategy = op.strategy.as_str(),
+            size = op.size,
+            bytes = hex_preview(&op.new_bytes),
+        );
+    }
+    if !plan.skipped.is_empty() {
+        println!();
+        println!("skipped: {}", plan.skipped.len());
+        for (addr, reason) in &plan.skipped {
+            println!("  {addr}  {reason}");
+        }
+    }
+    println!();
+    println!("dry-run: re-run with --apply to write the changes");
+    Ok(())
+}
+
+fn patch_rollback(file: &Path, deep: bool, cfg: &PatchCli<'_>) -> Result<()> {
+    let manifest_path = cfg
+        .manifest
+        .map_or_else(|| default_manifest_path(file), Path::to_path_buf);
+    let manifest = PatchManifest::read_from(&manifest_path)
+        .with_context(|| format!("reading manifest at {}", manifest_path.display()))?;
+    println!(
+        "rolling back {n} operation(s) from {path}",
+        n = manifest.operations.len(),
+        path = manifest_path.display(),
+    );
+    let mut provider = open_provider_writable(file, deep)?;
+    rollback_from_manifest(&mut provider, &manifest).with_context(|| "rolling back manifest")?;
+    drop(provider);
+    println!("rollback completed");
+    Ok(())
+}
+
+/// Per-function pseudocode byte budget. Host-Side Safety: the cache
+/// is keyed by function (a finite set) and every entry is truncated
+/// on a UTF-8 boundary so a pathological decompilation cannot blow
+/// host RAM or the `CCu` payload.
+const MAX_PSEUDOCODE_BYTES: usize = 16 * 1024;
+
+fn truncate_on_char_boundary(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
+    out.push_str("\n… [truncated]");
+    out
+}
+
+/// Attach decompiler pseudocode to every finding, one decompile per
+/// function (cached). Best-effort: a missing backend or transport
+/// hiccup leaves `pseudocode` as `None` and never fails the run.
+fn attach_pseudocode(provider: &mut R2PipeProvider, findings: &mut [Finding]) {
+    let mut cache: std::collections::BTreeMap<Address, Option<String>> =
+        std::collections::BTreeMap::new();
+    for f in findings.iter_mut() {
+        let entry = cache.entry(f.function).or_insert_with(|| {
+            provider
+                .pseudocode(f.function)
+                .ok()
+                .flatten()
+                .map(|s| truncate_on_char_boundary(&s, MAX_PSEUDOCODE_BYTES))
+        });
+        f.pseudocode = entry.clone();
+    }
+}
+
+// `clippy::too_many_arguments`: same rationale as `solve` / `annotate`
+// — a CLI driver threading through independent, read-at-distinct-stages
+// knobs (the `with_decompiler` opt-in is the 8th). A params struct
+// would only relocate the noise.
+#[allow(clippy::too_many_arguments)]
+fn compute_findings(
+    file: &Path,
+    deep: bool,
+    at: Option<&str>,
+    function_filter: Option<&str>,
+    limits: &SliceLimits,
+    options: SolveOptions,
+    solver: SolverArg,
+    with_decompiler: bool,
+    ir_pcode: bool,
+) -> Result<(Arch, Vec<Finding>)> {
+    let mut provider = open_provider(file, deep)?;
+    provider.set_attach_pcode(ir_pcode);
+    let program = dump_program(&mut provider)
+        .with_context(|| format!("loading program from {}", file.display()))?;
+    let arch = program.arch;
+
+    let (ctx, filtered) = resolve_targets(&mut provider, file, program, at, function_filter)?;
+
+    let mut hint_cache: std::collections::BTreeMap<Address, NameHints> =
+        std::collections::BTreeMap::new();
+    let mut findings: Vec<Finding> = Vec::with_capacity(filtered.len());
+    for cand in &filtered {
+        if let Some(finding) = resolve_folded_branch(
+            &mut provider,
+            cand,
+            ctx.program.arch,
+            limits,
+            solver,
+            options,
+        )? {
+            findings.push(finding);
+            continue;
+        }
+        let Some(function) = ctx.find_function(cand.function) else {
+            continue;
+        };
+        let ssa = prepare_ssa(function, cand, limits, ctx.program.arch);
+        let (verdict, z3_pretty) = dispatch_solver(solver, &ssa, options)?;
+        let hints = hint_cache
+            .entry(cand.function)
+            .or_insert_with(|| provider.name_hints(cand.function).unwrap_or_default());
+        findings.push(classify_finding_with_pretty(
+            &ssa, verdict, z3_pretty, hints,
+        ));
+    }
+    if with_decompiler {
+        attach_pseudocode(&mut provider, &mut findings);
+    }
+    Ok((arch, findings))
+}
+
+/// Analyse one sample end-to-end and return its [`Report`]. Mirrors
+/// the core of `solve()` with no stdout / file side effects, so it is
+/// safe to call from a parallel batch worker: the radare2 session is
+/// created and dropped entirely within this call — nothing crosses
+/// the thread boundary.
+fn analyze_one(
+    file: &Path,
+    deep: bool,
+    limits: &SliceLimits,
+    options: SolveOptions,
+    solver: SolverArg,
+    with_decompiler: bool,
+    ir_pcode: bool,
+) -> Result<Report> {
+    if !file.exists() {
+        anyhow::bail!("input file does not exist: {}", file.display());
+    }
+    let mut provider = open_provider(file, deep)?;
+    provider.set_attach_pcode(ir_pcode);
+    let program = dump_program(&mut provider)
+        .with_context(|| format!("loading program from {}", file.display()))?;
+    let arch = program.arch;
+    let bits = program.bits;
+    let function_count = program.functions.len();
+
+    let (ctx, filtered) = resolve_targets(&mut provider, file, program, None, None)?;
+
+    let mut hint_cache: std::collections::BTreeMap<Address, NameHints> =
+        std::collections::BTreeMap::new();
+    let mut findings: Vec<Finding> = Vec::with_capacity(filtered.len());
+    for cand in &filtered {
+        if let Some(finding) = resolve_folded_branch(
+            &mut provider,
+            cand,
+            ctx.program.arch,
+            limits,
+            solver,
+            options,
+        )? {
+            findings.push(finding);
+            continue;
+        }
+        let Some(function) = ctx.find_function(cand.function) else {
+            continue;
+        };
+        let ssa = prepare_ssa(function, cand, limits, ctx.program.arch);
+        let (verdict, z3_pretty) = dispatch_solver(solver, &ssa, options)?;
+        let hints = hint_cache
+            .entry(cand.function)
+            .or_insert_with(|| provider.name_hints(cand.function).unwrap_or_default());
+        findings.push(classify_finding_with_pretty(
+            &ssa, verdict, z3_pretty, hints,
+        ));
+    }
+    if with_decompiler {
+        attach_pseudocode(&mut provider, &mut findings);
+    }
+
+    Ok(Report::from_findings(
+        env!("CARGO_PKG_VERSION"),
+        file.display().to_string(),
+        arch,
+        bits,
+        function_count,
+        findings,
+    ))
+}
+
+// `clippy::too_many_arguments`: same rationale as `solve` / `annotate`
+// — a CLI driver threading through independent, read-at-distinct-stages
+// knobs. Splitting into a struct would only move the noise.
+#[allow(clippy::too_many_arguments)]
+fn batch(
+    dir: &Path,
+    deep: bool,
+    threads: Option<usize>,
+    limits: &SliceLimits,
+    options: SolveOptions,
+    solver: SolverArg,
+    with_decompiler: bool,
+    ir_pcode: bool,
+    json_out: Option<&Path>,
+    markdown_out: Option<&Path>,
+) -> Result<()> {
+    if !dir.is_dir() {
+        anyhow::bail!("not a directory: {}", dir.display());
+    }
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .with_context(|| format!("reading directory {}", dir.display()))?
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        println!("no files to analyze in {}", dir.display());
+        return Ok(());
+    }
+
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(threads.unwrap_or(0))
+        .build()
+        .context("building rayon thread pool")?;
+
+    // `collect()` on an indexed parallel iterator preserves input
+    // order, so the aggregate is deterministic regardless of
+    // `--threads`. The full per-sample `Report` is downsampled to a
+    // bounded `BatchSampleSummary` and dropped inside the worker —
+    // unbounded finding vectors never accumulate across the sweep.
+    let entries: Vec<BatchSampleEntry> = pool.install(|| {
+        files
+            .par_iter()
+            .map(|path| {
+                let outcome = match analyze_one(
+                    path,
+                    deep,
+                    limits,
+                    options,
+                    solver,
+                    with_decompiler,
+                    ir_pcode,
+                ) {
+                    Ok(report) => BatchOutcome::Analyzed {
+                        summary: BatchSampleSummary::from_report(&report),
+                    },
+                    Err(err) => BatchOutcome::Failed {
+                        error: format!("{err:#}"),
+                    },
+                };
+                BatchSampleEntry {
+                    path: path.display().to_string(),
+                    outcome,
+                }
+            })
+            .collect()
+    });
+
+    let report = BatchReport::new(
+        env!("CARGO_PKG_VERSION"),
+        dir.display().to_string(),
+        entries,
+    );
+
+    let any_file = json_out.is_some() || markdown_out.is_some();
+    if let Some(path) = json_out {
+        let json = report.render_json().context("serialising batch report")?;
+        fs::write(path, json).with_context(|| format!("writing JSON to {}", path.display()))?;
+    }
+    if let Some(path) = markdown_out {
+        fs::write(path, report.render_markdown())
+            .with_context(|| format!("writing Markdown to {}", path.display()))?;
+    }
+    if !any_file {
+        print!("{}", report.render_markdown());
+    }
+    Ok(())
+}
+
+/// How much `at_command` prints below the one-line verdict.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AtVerbosity {
+    /// Verdict line only (ideal for sweeps).
+    Quiet,
+    /// Verdict plus decompiled context (when fetched).
+    Normal,
+    /// Also the solver-simplified formula and slice evidence.
+    Explain,
+}
+
+/// Output / mode toggles for [`at_command`], grouped so the function
+/// keeps a narrow signature.
+struct AtOptions {
+    /// Apply the conservative patch when the verdict is actionable at
+    /// high confidence.
+    do_patch: bool,
+    /// Fetch and print decompiler pseudocode for the owning function.
+    with_decompiler: bool,
+    /// Attach r2ghidra P-code IR (prefer it; ESIL fallback).
+    ir_pcode: bool,
+    /// How much detail to print below the verdict.
+    verbosity: AtVerbosity,
+}
+
+/// Interactive single-branch entrypoint (`r2smt at`). Reuses the full
+/// solve pipeline (folded-branch re-derivation + budget retry +
+/// optimizer + SMT) for exactly the branch at `addr`, prints a compact
+/// one-line verdict suitable for a live r2 shell-out, and — when
+/// `opts.do_patch` and the verdict is actionable at `high` confidence
+/// — delegates to the existing patch path (backup + manifest next to
+/// the binary). Analysis logic stays in the use-case crates; this is
+/// a thin combinator.
+fn at_command(
+    file: &Path,
+    deep: bool,
+    addr: &str,
+    limits: &SliceLimits,
+    options: SolveOptions,
+    solver: SolverArg,
+    opts: &AtOptions,
+) -> Result<()> {
+    if !file.exists() {
+        anyhow::bail!("input file does not exist: {}", file.display());
+    }
+    let (_arch, findings) = compute_findings(
+        file,
+        deep,
+        Some(addr),
+        None,
+        limits,
+        options,
+        solver,
+        opts.with_decompiler,
+        opts.ir_pcode,
+    )?;
+    let Some(finding) = findings.first() else {
+        println!("r2smt: no conditional branch at {addr}");
+        return Ok(());
+    };
+    println!(
+        "@ {addr} {mnem}  {verdict:?}  {kind:?}/{conf:?}  {formula}",
+        addr = finding.address,
+        mnem = finding.mnemonic,
+        verdict = finding.verdict,
+        kind = finding.kind,
+        conf = finding.confidence,
+        formula = finding.formula_pretty,
+    );
+    if opts.verbosity != AtVerbosity::Quiet {
+        if opts.verbosity == AtVerbosity::Explain {
+            if let Some(z3) = &finding.formula_z3_pretty
+                && !z3.is_empty()
+                && z3.as_str() != finding.formula_pretty
+            {
+                println!("  solver-simplified: {z3}");
+            }
+            if !finding.evidence.inputs.is_empty() {
+                println!("  free inputs: {}", finding.evidence.inputs.join(", "));
+            }
+            println!(
+                "  IR statements: {stmt}, unknowns: {unk}",
+                stmt = finding.evidence.statement_count,
+                unk = finding.evidence.unknown_count,
+            );
+        }
+        if let Some(code) = &finding.pseudocode {
+            println!("--- decompiled context ---");
+            println!("{code}");
+        }
+    }
+    if !opts.do_patch {
+        return Ok(());
+    }
+    if !(finding.is_actionable() && finding.confidence == Confidence::High) {
+        println!(
+            "  not patched: needs an actionable verdict at high confidence (got {kind:?}/{conf:?})",
+            kind = finding.kind,
+            conf = finding.confidence,
+        );
+        return Ok(());
+    }
+    let backup = file.with_extension("r2smt.bak");
+    let manifest = file.with_extension("r2smt.manifest.json");
+    let cfg = PatchCli {
+        min_confidence: Confidence::High,
+        apply: true,
+        backup: Some(backup.as_path()),
+        manifest: Some(manifest.as_path()),
+        rollback: false,
+        solver,
+    };
+    patch(
+        file,
+        deep,
+        Some(addr),
+        None,
+        limits,
+        options,
+        &cfg,
+        opts.ir_pcode,
+    )
+}
+
+/// Dispatch a single solve request to the selected backend. CVC5
+/// failures (subprocess missing, garbled output) are surfaced as
+/// `Err(anyhow::Error)` so the CLI can return a clear message to the
+/// user; the Z3 path is infallible by contract and always succeeds.
+///
+/// Returns the verdict plus the C-style infix rendering of the
+/// post-`aggressive_simplify` Z3 formula when the Z3 backend was
+/// used; CVC5 has no Z3 AST so it returns `None`.
+fn dispatch_solver(
+    solver: SolverArg,
+    slice: &r2smt_ssa::SsaLiftedSlice,
+    options: SolveOptions,
+) -> Result<(r2smt_common::smt::SmtResult, Option<String>)> {
+    match solver {
+        SolverArg::Z3 => {
+            let outcome = solve_branch_with_pretty(slice, options);
+            Ok((outcome.verdict, outcome.formula_z3_pretty))
+        }
+        SolverArg::Cvc5 => r2smt_smt::solve_branch_cvc5(slice, options)
+            .map(|v| (v, None))
+            .map_err(|err| match err {
+                r2smt_smt::Cvc5Error::NotFound(detail) => anyhow::anyhow!(
+                    "cvc5 backend: cvc5 binary not found on PATH ({detail}); install it with `brew install cvc5` / `apt install cvc5`"
+                ),
+                r2smt_smt::Cvc5Error::SubprocessError(detail) => {
+                    anyhow::anyhow!("cvc5 backend: subprocess failed: {detail}")
+                }
+                r2smt_smt::Cvc5Error::UnrecognisedVerdict(out) => {
+                    anyhow::anyhow!("cvc5 backend: unrecognised stdout: {out}")
+                }
+            }),
+    }
+}
+
+fn hex_preview(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Per-branch analysis-maturity fallback (always active).
+///
+/// Returns `Ok(None)` for branches radare2 did **not** fold (the
+/// caller's normal slice → solve pipeline handles them unchanged). For
+/// a branch `aaa` already collapsed to a single successor, it
+/// independently re-derives a verdict: `BinaryProvider::load_block_at`
+/// performs a *raw linear decode* of the containing block (its
+/// shellcode-synthesis step does not apply r2's CFG folding), so the
+/// genuine two-way `jcc` reappears and goes through the full
+/// slice → optimize → SMT pipeline. The result is then reconciled
+/// against the CFG shortcut via [`reconcile_folded`]: a sound SMT
+/// proof wins; an inconclusive one falls back to r2's CFG verdict.
+///
+/// Cost is bounded — at most one extra block synthesis + one SMT
+/// solve per folded branch — and accepted by design (always-on).
+fn resolve_folded_branch(
+    provider: &mut R2PipeProvider,
+    cand: &BranchCandidate,
+    arch: r2smt_common::Arch,
+    limits: &SliceLimits,
+    solver: SolverArg,
+    options: SolveOptions,
+) -> Result<Option<Finding>> {
+    if cand.upstream_resolved.is_none() {
+        return Ok(None);
+    }
+    let rederived = match provider.load_block_at(cand.address) {
+        Ok(synth) => collect_function_branches(&synth, arch)
+            .iter()
+            .find(|c| c.address == cand.address)
+            .map(|scand| {
+                let ssa = prepare_ssa(&synth, scand, limits, arch);
+                let (verdict, z3) = dispatch_solver(solver, &ssa, options)?;
+                Ok::<_, anyhow::Error>(classify_finding_with_pretty(
+                    &ssa,
+                    verdict,
+                    z3,
+                    &NameHints::default(),
+                ))
+            })
+            .transpose()?,
+        // Synthesis failed (unmapped / undecodable): no re-derivation,
+        // the CFG shortcut below is the only evidence available.
+        Err(_) => None,
+    };
+    Ok(reconcile_folded(rederived, classify_lowered_upstream(cand)))
+}
+
+// Argument count crosses clippy's 7-arg threshold because every CLI
+// subcommand orchestrates an end-to-end pipeline (file, analysis
+// depth, address / function selectors, slice limits, solve options,
+// per-command plan, solver backend). Grouping these into a single
+// config struct would only shuffle field names without reducing
+// surface area; the parameters are independent and read at distinct
+// stages. Same rationale applies to `solve` below.
+#[allow(clippy::too_many_arguments)]
+fn annotate(
+    file: &Path,
+    deep: bool,
+    at: Option<&str>,
+    function_filter: Option<&str>,
+    limits: &SliceLimits,
+    options: SolveOptions,
+    plan: &AnnotatePlan<'_>,
+    solver: SolverArg,
+) -> Result<()> {
+    if !file.exists() {
+        anyhow::bail!("input file does not exist: {}", file.display());
+    }
+
+    let mut provider = open_provider(file, deep)?;
+    let program = dump_program(&mut provider)
+        .with_context(|| format!("loading program from {}", file.display()))?;
+    let arch = program.arch;
+    let bits = program.bits;
+    let function_count = program.functions.len();
+
+    let (ctx, filtered) = resolve_targets(&mut provider, file, program, at, function_filter)?;
+    let merged_functions: Vec<Function> = ctx.all_functions().cloned().collect();
+
+    let mut findings: Vec<Finding> = Vec::with_capacity(filtered.len());
+    for cand in &filtered {
+        if let Some(finding) = resolve_folded_branch(
+            &mut provider,
+            cand,
+            ctx.program.arch,
+            limits,
+            solver,
+            options,
+        )? {
+            findings.push(finding);
+            continue;
+        }
+        let Some(function) = ctx.find_function(cand.function) else {
+            continue;
+        };
+        let ssa = prepare_ssa(function, cand, limits, ctx.program.arch);
+        let (verdict, z3_pretty) = dispatch_solver(solver, &ssa, options)?;
+        findings.push(classify_finding_with_pretty(
+            &ssa,
+            verdict,
+            z3_pretty,
+            &NameHints::default(),
+        ));
+    }
+
+    let actionable: Vec<Finding> = findings
+        .into_iter()
+        .filter(|f| {
+            f.is_actionable()
+                && matches!(
+                    f.kind,
+                    FindingKind::OpaquePredicate
+                        | FindingKind::DeadBranch
+                        | FindingKind::ConstantCondition
+                )
+                && f.confidence <= plan.min_confidence
+        })
+        .collect();
+
+    let report = Report::from_findings(
+        env!("CARGO_PKG_VERSION"),
+        file.display().to_string(),
+        arch,
+        bits,
+        function_count,
+        actionable.clone(),
+    );
+    let annotations = report.annotations(&merged_functions);
+
+    println!(
+        "annotations: {n} (from {act} actionable findings, min_confidence={mc:?})",
+        n = annotations.len(),
+        act = actionable.len(),
+        mc = plan.min_confidence,
+    );
+    print_annotation_preview(&annotations, &merged_functions, &actionable);
+
+    if plan.dry_run {
+        println!();
+        println!("dry-run: no comments applied");
+        return Ok(());
+    }
+
+    let mut applied = 0usize;
+    for ann in &annotations {
+        provider
+            .set_comment(ann.address, &ann.text)
+            .with_context(|| format!("setting comment at {addr}", addr = ann.address))?;
+        applied += 1;
+    }
+    println!();
+    println!("applied: {applied} CCu comments");
+
+    if let Some(name) = plan.save_project {
+        provider
+            .save_project(name)
+            .with_context(|| format!("saving r2 project '{name}'"))?;
+        println!("saved r2 project: {name}");
+    }
+    Ok(())
+}
+
+fn print_annotation_preview(
+    annotations: &[Annotation],
+    functions: &[Function],
+    findings: &[Finding],
+) {
+    if annotations.is_empty() {
+        return;
+    }
+    let preview = annotations.len().min(10);
+    println!();
+    println!("preview ({preview}):");
+    for ann in annotations.iter().take(preview) {
+        let kind = findings
+            .iter()
+            .find(|f| f.address == ann.address)
+            .map_or("?", |f| match f.kind {
+                FindingKind::OpaquePredicate => "opaque_predicate",
+                FindingKind::DeadBranch => "dead_branch",
+                FindingKind::ConstantCondition => "constant_condition",
+                _ => "?",
+            });
+        let fname = findings
+            .iter()
+            .find(|f| f.address == ann.address)
+            .and_then(|f| {
+                functions
+                    .iter()
+                    .find(|fun| fun.address == f.function)
+                    .and_then(|fun| fun.name.as_deref())
+            })
+            .unwrap_or("<anon>");
+        println!(
+            "  {addr}  [{kind}]  fn={fname}",
+            addr = ann.address,
+            kind = kind,
+            fname = fname,
+        );
+    }
+    if annotations.len() > preview {
+        println!("  … and {extra} more", extra = annotations.len() - preview);
+    }
+}
+
+struct SolveOutputs<'a> {
+    json: Option<&'a Path>,
+    markdown: Option<&'a Path>,
+    r2_script: Option<&'a Path>,
+}
+
+// `clippy::too_many_arguments`: same rationale as `annotate` above —
+// CLI driver passes through independent, read-at-distinct-stages knobs.
+#[allow(clippy::too_many_arguments)]
+fn solve(
+    file: &Path,
+    deep: bool,
+    at: Option<&str>,
+    function_filter: Option<&str>,
+    limits: &SliceLimits,
+    options: SolveOptions,
+    filters: &SolveFilters,
+    outputs: &SolveOutputs<'_>,
+    solver: SolverArg,
+    with_decompiler: bool,
+    ir_pcode: bool,
+) -> Result<()> {
+    if !file.exists() {
+        anyhow::bail!("input file does not exist: {}", file.display());
+    }
+
+    let mut provider = open_provider(file, deep)?;
+    provider.set_attach_pcode(ir_pcode);
+    let program = dump_program(&mut provider)
+        .with_context(|| format!("loading program from {}", file.display()))?;
+    let arch = program.arch;
+    let bits = program.bits;
+    let function_count = program.functions.len();
+
+    let (ctx, filtered) = resolve_targets(&mut provider, file, program, at, function_filter)?;
+    let merged_functions: Vec<Function> = ctx.all_functions().cloned().collect();
+
+    let mut findings: Vec<Finding> = Vec::with_capacity(filtered.len());
+    for cand in &filtered {
+        if let Some(finding) = resolve_folded_branch(
+            &mut provider,
+            cand,
+            ctx.program.arch,
+            limits,
+            solver,
+            options,
+        )? {
+            findings.push(finding);
+            continue;
+        }
+        let Some(function) = ctx.find_function(cand.function) else {
+            continue;
+        };
+        let ssa = prepare_ssa(function, cand, limits, ctx.program.arch);
+        let (verdict, z3_pretty) = dispatch_solver(solver, &ssa, options)?;
+        findings.push(classify_finding_with_pretty(
+            &ssa,
+            verdict,
+            z3_pretty,
+            &NameHints::default(),
+        ));
+    }
+
+    if with_decompiler {
+        attach_pseudocode(&mut provider, &mut findings);
+    }
+
+    let displayed: Vec<&Finding> = findings
+        .iter()
+        .filter(|f| keep_finding(f, filters))
+        .collect();
+
+    let any_file =
+        outputs.json.is_some() || outputs.markdown.is_some() || outputs.r2_script.is_some();
+    if any_file {
+        let report = Report::from_findings(
+            env!("CARGO_PKG_VERSION"),
+            file.display().to_string(),
+            arch,
+            bits,
+            function_count,
+            findings.clone(),
+        );
+        if let Some(path) = outputs.json {
+            let json = report.render_json().context("serialising report to JSON")?;
+            fs::write(path, json).with_context(|| format!("writing JSON to {}", path.display()))?;
+        }
+        if let Some(path) = outputs.markdown {
+            let md = report.render_markdown(&merged_functions);
+            fs::write(path, md)
+                .with_context(|| format!("writing Markdown to {}", path.display()))?;
+        }
+        if let Some(path) = outputs.r2_script {
+            let script = report.render_r2_script(&merged_functions);
+            fs::write(path, script)
+                .with_context(|| format!("writing r2 script to {}", path.display()))?;
+        }
+    } else {
+        print_findings_summary(&findings, &displayed, at.is_some(), &merged_functions);
+    }
+    Ok(())
+}
+
+fn keep_finding(finding: &Finding, filters: &SolveFilters) -> bool {
+    match finding.kind {
+        FindingKind::RealBranch => filters.include_real,
+        FindingKind::OpaquePredicate | FindingKind::DeadBranch | FindingKind::ConstantCondition => {
+            finding.confidence <= filters.min_confidence
+        }
+        // `FindingKind` is `#[non_exhaustive]`; SuspiciousButUnknown and
+        // any future unknown variants gate on `--include-suspicious`.
+        _ => filters.include_suspicious,
+    }
+}
+
+fn print_findings_summary(
+    all: &[Finding],
+    displayed: &[&Finding],
+    explicit_at: bool,
+    functions: &[Function],
+) {
+    let total = all.len();
+    let mut opaque = 0usize;
+    let mut dead = 0usize;
+    let mut constant = 0usize;
+    let mut real = 0usize;
+    let mut suspicious = 0usize;
+    for f in all {
+        match f.kind {
+            FindingKind::OpaquePredicate => opaque += 1,
+            FindingKind::DeadBranch => dead += 1,
+            FindingKind::ConstantCondition => constant += 1,
+            FindingKind::RealBranch => real += 1,
+            // `FindingKind` is `#[non_exhaustive]`; collapse SuspiciousButUnknown
+            // and any unforeseen future variants.
+            _ => suspicious += 1,
+        }
+    }
+    let actionable = opaque + dead + constant;
+    println!("findings: {total}");
+    println!("  opaque_predicate:    {opaque}");
+    println!("  dead_branch:         {dead}");
+    println!("  constant_condition:  {constant}");
+    println!("  real_branch:         {real}");
+    println!("  suspicious:          {suspicious}");
+    if total > 0 {
+        // `cast_precision_loss`: finding counts stay well below 2^53; pct
+        // is rendered at 2-decimal precision for the operator.
+        #[allow(clippy::cast_precision_loss)]
+        let pct = (actionable as f64) * 100.0 / (total as f64);
+        println!("  actionable (opaque | dead | constant): {actionable} ({pct:.2}%)");
+    }
+
+    let mut high = 0usize;
+    let mut medium = 0usize;
+    let mut low = 0usize;
+    let mut conf_unknown = 0usize;
+    for f in all {
+        if !matches!(
+            f.kind,
+            FindingKind::OpaquePredicate | FindingKind::DeadBranch | FindingKind::ConstantCondition
+        ) {
+            continue;
+        }
+        match f.confidence {
+            Confidence::High => high += 1,
+            Confidence::Medium => medium += 1,
+            Confidence::Low => low += 1,
+            // `Confidence` is `#[non_exhaustive]`; collapse Unknown and
+            // any future variants.
+            _ => conf_unknown += 1,
+        }
+    }
+    if actionable > 0 {
+        println!(
+            "  actionable confidence: high={high}, medium={medium}, low={low}, unknown={conf_unknown}"
+        );
+    }
+
+    if explicit_at && total == 1 {
+        println!();
+        print_finding_detail(&all[0], functions);
+        return;
+    }
+    if !displayed.is_empty() {
+        println!();
+        println!("displayed findings ({n}):", n = displayed.len());
+        let max_shown = 15;
+        for f in displayed.iter().take(max_shown) {
+            print_finding_short(f, functions);
+        }
+        if displayed.len() > max_shown {
+            println!("  … and {extra} more", extra = displayed.len() - max_shown);
+        }
+    }
+}
+
+fn print_finding_detail(f: &Finding, functions: &[Function]) {
+    let fname = functions
+        .iter()
+        .find(|fun| fun.address == f.function)
+        .and_then(|fun| fun.name.as_deref())
+        .unwrap_or("<anon>");
+    println!(
+        "branch {addr}  {mnem:<6}  fn={fname}",
+        addr = f.address,
+        mnem = f.mnemonic,
+    );
+    println!("  formula:    {formula}", formula = f.formula);
+    println!("  verdict:    {:?}", f.verdict);
+    println!("  kind:       {:?}", f.kind);
+    println!("  confidence: {:?}", f.confidence);
+    if let Some(taken) = f.taken_target {
+        println!("  taken:      {taken}");
+    }
+    if let Some(ft) = f.fallthrough_target {
+        println!("  fallthrough:{ft}");
+    }
+    if !f.evidence.inputs.is_empty() {
+        println!(
+            "  inputs:     {names}",
+            names = f.evidence.inputs.join(", ")
+        );
+    }
+    println!(
+        "  statements: {stmt}, unknown: {unk}",
+        stmt = f.evidence.statement_count,
+        unk = f.evidence.unknown_count,
+    );
+}
+
+fn print_finding_short(f: &Finding, functions: &[Function]) {
+    let fname = functions
+        .iter()
+        .find(|fun| fun.address == f.function)
+        .and_then(|fun| fun.name.as_deref())
+        .unwrap_or("<anon>");
+    println!(
+        "  {addr}  {mnem:<6}  {kind:?}/{conf:?}  fn={fname}  ({formula})",
+        addr = f.address,
+        mnem = f.mnemonic,
+        kind = f.kind,
+        conf = f.confidence,
+        formula = f.formula,
+    );
+}
+
+fn ssa(
+    file: &Path,
+    deep: bool,
+    at: Option<&str>,
+    function_filter: Option<&str>,
+    limits: &SliceLimits,
+    json_out: Option<&Path>,
+) -> Result<()> {
+    if !file.exists() {
+        anyhow::bail!("input file does not exist: {}", file.display());
+    }
+
+    let mut provider = open_provider(file, deep)?;
+    let program = dump_program(&mut provider)
+        .with_context(|| format!("loading program from {}", file.display()))?;
+
+    let (ctx, filtered) = resolve_targets(&mut provider, file, program, at, function_filter)?;
+
+    let mut ssas: Vec<SsaLiftedSlice> = Vec::with_capacity(filtered.len());
+    for cand in &filtered {
+        let Some(function) = ctx.find_function(cand.function) else {
+            continue;
+        };
+        ssas.push(prepare_ssa(function, cand, limits, ctx.program.arch));
+    }
+
+    if let Some(path) = json_out {
+        let json = serde_json::to_string_pretty(&ssas).context("serialising SSA slices to JSON")?;
+        fs::write(path, &json).with_context(|| format!("writing JSON to {}", path.display()))?;
+    } else {
+        let functions: Vec<Function> = ctx.all_functions().cloned().collect();
+        print_ssa_summary(&ssas, at.is_some(), &functions);
+    }
+    Ok(())
+}
+
+fn print_ssa_summary(ssas: &[SsaLiftedSlice], explicit_at: bool, functions: &[Function]) {
+    let total = ssas.len();
+    let complete = ssas
+        .iter()
+        .filter(|s| matches!(s.status, SliceStatus::Complete))
+        .count();
+    let truncated = total - complete;
+    println!("ssa slices: {total} (complete: {complete}, truncated: {truncated})");
+    if total == 0 {
+        return;
+    }
+    let stmt_total: usize = ssas.iter().map(|s| s.statements.len()).sum();
+    let total_defs: usize = ssas.iter().map(|s| s.defs.len()).sum();
+    let total_inputs: usize = ssas.iter().map(|s| s.inputs.len()).sum();
+    // `cast_precision_loss`: SSA def / input counts stay well below 2^53;
+    // averages are rendered at 2-decimal precision for the operator.
+    #[allow(clippy::cast_precision_loss)]
+    let avg_inputs = total_inputs as f64 / total as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let avg_defs = total_defs as f64 / total as f64;
+    println!("  statements: {stmt_total}");
+    println!("  defs avg:   {avg_defs:.2}");
+    println!("  inputs avg: {avg_inputs:.2}");
+
+    if explicit_at && total == 1 {
+        println!();
+        print_ssa_detail(&ssas[0], functions);
+    } else if total <= 3 {
+        println!();
+        for s in ssas {
+            print_ssa_detail(s, functions);
+            println!();
+        }
+    }
+}
+
+fn print_ssa_detail(ssa: &SsaLiftedSlice, functions: &[Function]) {
+    let fname = functions
+        .iter()
+        .find(|f| f.address == ssa.branch.function)
+        .and_then(|f| f.name.as_deref())
+        .unwrap_or("<anon>");
+    println!(
+        "branch {addr}  {kind:?} {mnem:<6}  fn={fname}",
+        addr = ssa.branch.address,
+        kind = ssa.branch.kind,
+        mnem = ssa.branch.mnemonic,
+    );
+    match &ssa.status {
+        SliceStatus::Complete => println!("  status: complete"),
+        SliceStatus::Truncated { reason } => println!("  status: truncated ({reason})"),
+    }
+    if !ssa.inputs.is_empty() {
+        let names: Vec<String> = ssa.inputs.iter().map(|v| v.name.clone()).collect();
+        println!("  inputs: {names}", names = names.join(", "));
+    }
+    println!(
+        "  SSA ({n} statements, {d} defs):",
+        n = ssa.statements.len(),
+        d = ssa.defs.len()
+    );
+    for stmt in &ssa.statements {
+        println!("    {stmt}");
+    }
+    println!("  branch condition: {cond}", cond = ssa.condition);
+}
+
+fn reason_bucket(reason: &str) -> String {
+    // Collapse address-specific reasons into a single bucket per kind so
+    // the summary is readable.
+    if reason.starts_with("call at") {
+        return "call encountered".into();
+    }
+    if reason.starts_with("memory access at") {
+        return "memory access encountered".into();
+    }
+    if reason.starts_with("unsupported '") {
+        return "unsupported instruction".into();
+    }
+    reason.to_string()
+}
+
+fn print_summary(program: &Program) {
+    println!("arch:      {:?}", program.arch);
+    println!("bits:      {}", program.bits);
+    if let Some(entry) = program.entry {
+        println!("entry:     {entry}");
+    }
+    println!("functions: {}", program.functions.len());
+    let total_blocks: usize = program.functions.iter().map(|f| f.blocks.len()).sum();
+    let total_insns: usize = program
+        .functions
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .map(|b| b.instructions.len())
+        .sum();
+    println!("blocks:    {total_blocks}");
+    println!("insns:     {total_insns}");
+}

@@ -1,0 +1,38 @@
+[package]
+name         = "r2smt-cli"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+description = "Command-line entrypoint for r2SMT."
+
+[[bin]]
+name = "r2smt"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+r2smt-common       = { workspace = true }
+r2smt-ir           = { workspace = true }
+r2smt-r2pipe       = { workspace = true }
+r2smt-slicer       = { workspace = true }
+r2smt-ssa          = { workspace = true }
+r2smt-smt          = { workspace = true }
+r2smt-core         = { workspace = true }
+r2smt-report       = { workspace = true }
+r2smt-patch        = { workspace = true }
+clap               = { workspace = true }
+anyhow             = { workspace = true }
+rayon              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+
+[dev-dependencies]
+tempfile           = { workspace = true }
+serde_json         = { workspace = true }

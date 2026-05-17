@@ -1,0 +1,20 @@
+[package]
+name         = "r2smt-r2pipe"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+description = "radare2 adapter implementing the r2smt BinaryProvider port via r2pipe."
+
+[lints]
+workspace = true
+
+[dependencies]
+r2smt-common = { workspace = true }
+r2smt-ir     = { workspace = true }
+r2pipe       = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tracing      = { workspace = true }

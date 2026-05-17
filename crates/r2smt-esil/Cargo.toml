@@ -1,0 +1,16 @@
+[package]
+name = "r2smt-esil"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "ESIL stack-machine lifter for r2SMT — emits IrStmt from radare2 ESIL strings."
+
+[dependencies]
+r2smt-common = { workspace = true }
+r2smt-ir     = { workspace = true }
+
+[lints]
+workspace = true

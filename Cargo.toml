@@ -1,0 +1,64 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version    = "0.1.0"
+edition    = "2024"
+license    = "MIT OR Apache-2.0"
+repository = "https://github.com/seifreed/r2SMT"
+authors    = ["r2SMT contributors"]
+rust-version = "1.85"
+
+[workspace.dependencies]
+anyhow             = "1"
+thiserror          = "2"
+clap               = { version = "4", features = ["derive"] }
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+r2pipe             = "0.8"
+z3                 = { version = "0.20", features = ["vendored"] }
+sha2               = "0.10"
+hex                = "0.4"
+tempfile           = "3"
+rayon              = "1"
+
+r2smt-common  = { path = "crates/r2smt-common",  version = "0.1.0" }
+r2smt-ir      = { path = "crates/r2smt-ir",      version = "0.1.0" }
+r2smt-r2pipe  = { path = "crates/r2smt-r2pipe",  version = "0.1.0" }
+r2smt-esil    = { path = "crates/r2smt-esil",    version = "0.1.0" }
+r2smt-pcode   = { path = "crates/r2smt-pcode",   version = "0.1.0" }
+r2smt-slicer  = { path = "crates/r2smt-slicer",  version = "0.1.0" }
+r2smt-ssa     = { path = "crates/r2smt-ssa",     version = "0.1.0" }
+r2smt-smt     = { path = "crates/r2smt-smt",     version = "0.1.0" }
+r2smt-core    = { path = "crates/r2smt-core",    version = "0.1.0" }
+r2smt-report  = { path = "crates/r2smt-report",  version = "0.1.0" }
+r2smt-patch   = { path = "crates/r2smt-patch",   version = "0.1.0" }
+
+[workspace.lints.rust]
+missing_docs              = "deny"
+unsafe_code               = "forbid"
+unreachable_pub           = "warn"
+unused_must_use           = "deny"
+elided_lifetimes_in_paths = "warn"
+
+[workspace.lints.clippy]
+all                = { level = "deny",  priority = -1 }
+pedantic           = { level = "warn",  priority = -1 }
+unwrap_used        = "deny"
+expect_used        = "deny"
+panic              = "deny"
+todo               = "warn"
+dbg_macro          = "deny"
+print_stdout       = "deny"
+print_stderr       = "deny"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+mod_module_files   = "deny"
+
+[profile.profiling]
+inherits = "release"
+debug    = true
+strip    = false
