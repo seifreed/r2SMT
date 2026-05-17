@@ -128,3 +128,15 @@ CLAUDE.md decomposition watchlist, not mandated by the hard rule
   patch(+PatchCli/default_*), solve(+SolveFilters/SolveOutputs/
   keep_finding), annotate(+AnnotatePlan), at(+AtVerbosity/AtOptions).
   1-2 more iterations → main.rs<800.
+
+- 2026-05-17 iter8: extracted patch group (PatchCli+DEFAULT_*_SUFFIX+
+  default_backup_path/default_manifest_path+patch+patch_dry_run_plan+
+  patch_rollback) -> commands/patch.rs (PatchCli pub(crate)+fields,
+  patch pub(crate); dry_run/rollback/default_* module-private). run +
+  at_command import via use commands::patch::{PatchCli, patch}.
+  **main.rs 971->796 — UNDER 800, decomposition COMPLETE** (1591->796
+  over iters5-8: support.rs+commands/{inspect,batch,patch}.rs). 495
+  tests/0 fail; all 5 gates GREEN. Remaining prod >800: lift.rs 1818,
+  effect.rs 1116, registers.rs 924, slice.rs 884, parse.rs 844,
+  plan.rs 819. Next: effect.rs per-ISA, then lift.rs, registers.rs
+  (2-phase), parse/plan/slice.
