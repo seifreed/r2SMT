@@ -242,3 +242,39 @@ CLAUDE.md decomposition watchlist, not mandated by the hard rule
   Remaining prod >800 (LAST 1): plan.rs 819 (only 19 over; watchlist
   seam = per-ISA planners plan/{x86,aarch64,thumb}.rs — evaluate
   DRY-with-a-brake next).
+
+- 2026-05-17 iter16 (FINAL): plan.rs AArch64 planner cluster extracted →
+  plan/aarch64.rs (266; classify_aarch64_mnemonic + plan_aarch64_cset/
+  csel/cs_arith + bit_value_for/parse_cs_operands/enforce_aarch64_size/
+  cs_rationale). 4 root-called entrypoints pub(super); helpers private;
+  shared model (MnemonicKind/CsArithOp/FindingDecision/PlanOperation)
+  stays in root, cluster reads via super:: (ancestor-private). Real
+  watchlist seam + completes the uniform per-ISA decomposition applied
+  to effect/lift/registers (consistency = clean-arch, not premature).
+  plan.rs 820→573. 495 tests/0 fail; all 5 gates GREEN.
+
+## ===== <800 CAMPAIGN COMPLETE (2026-05-17) =====
+
+**Every production .rs file is < 800 LoC.** `find prod >800` is empty.
+Largest prod file now: main.rs 796.
+
+Decomposed across 16 iterations (commits f6d25a8 baseline → this):
+- main.rs   2066→796  (render.rs + support.rs + commands/{inspect,batch,patch}.rs)
+- slice.rs  2025→675  (test mod → slice/tests.rs; Φ-merge → slice/merge_detect.rs)
+- lift.rs   1818→681  (lift/{merge,x86,aarch64,aarch32}.rs)
+- effect.rs 1590→321  (effect/{x86,aarch64,aarch32}.rs)
+- registers 1354→241  (2-phase reorder→extract; registers/{x86,aarch64,aarch32}.rs)
+- solver.rs 1742→157  (test mod → solver/tests.rs)
+- plan.rs   1543→573  (test mod → plan/tests.rs; plan/aarch64.rs)
+- parse.rs  1469→701  (test mod → parse/tests.rs; parse/{info,sections}.rs)
+- finding/machine/effect/registers test mods → <stem>/tests.rs
+
+Invariants held EVERY iteration: 495 tests / 0 fail (per-binary), fmt,
+clippy --all-targets --all-features -D warnings, deny, audit all green;
+behavior-preserving (pure code movement / verified pure permutation).
+Key technique: `pub(super)` (= pub(in parent)) on cross-module
+entrypoints; shared infra stays in root impl (child modules read
+ancestor-private items — no broad pub). DRY-with-a-brake applied where
+a seam was not cohesive (parse.rs `functions` group kept in root).
+
+**Clean-code/clean-architecture goal: ACHIEVED.** Loop terminates.
