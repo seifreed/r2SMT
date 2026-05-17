@@ -120,3 +120,11 @@ CLAUDE.md decomposition watchlist, not mandated by the hard rule
   command group. Next: extract command groups to commands/{patch,batch,
   solve,annotate,at}.rs (+ their owned structs/single-caller helpers)
   importing crate::support, until main.rs<800.
+- 2026-05-17 iter7: extracted batch group (analyze_one + batch) →
+  commands/batch.rs (pub(crate) fn batch; analyze_one module-private,
+  single-caller). main.rs 1131→971; commands/batch.rs 180. Compiler-
+  driven imports (+ manual rayon trim cargo fix missed). 495 tests/0
+  fail (per-binary); all 5 gates GREEN. Remaining main.rs >800: groups
+  patch(+PatchCli/default_*), solve(+SolveFilters/SolveOutputs/
+  keep_finding), annotate(+AnnotatePlan), at(+AtVerbosity/AtOptions).
+  1-2 more iterations → main.rs<800.
