@@ -23,16 +23,11 @@ use r2smt_ir::BinaryProvider;
 use r2smt_ir::Decompiler;
 use r2smt_ir::NameHints;
 use r2smt_ir::program::Function;
-use r2smt_ir::program::Program;
 use r2smt_patch::{ApplyConfig, PatchManifest, apply_plan, build_plan, rollback_from_manifest};
-use r2smt_r2pipe::{AnalysisLevel, R2PipeProvider};
+use r2smt_r2pipe::R2PipeProvider;
 use r2smt_report::{BatchOutcome, BatchReport, BatchSampleEntry, BatchSampleSummary, Report};
-use r2smt_slicer::{
-    BranchCandidate, LiftedSlice, Slice, SliceLimits, collect_branches, collect_function_branches,
-    lift_slice, slice_branch,
-};
+use r2smt_slicer::{BranchCandidate, SliceLimits, collect_function_branches};
 use r2smt_smt::{SolveOptions, solve_branch_with_pretty};
-use r2smt_ssa::SsaLiftedSlice;
 use rayon::ThreadPoolBuilder;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use tracing::error;
@@ -42,10 +37,12 @@ mod args;
 use args::{Cli, Command, SolverArg};
 mod render;
 use render::{
-    hex_preview, print_annotation_preview, print_branch_summary, print_findings_summary,
-    print_lift_summary, print_slice_summary, print_ssa_summary, print_summary,
-    truncate_on_char_boundary,
+    hex_preview, print_annotation_preview, print_findings_summary, truncate_on_char_boundary,
 };
+mod support;
+use support::{open_provider, open_provider_writable, resolve_targets};
+mod commands;
+use commands::inspect::{analyze, branches, lift, slice, ssa};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -437,148 +434,6 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn analyze(file: &Path, deep: bool, dump_flag: bool, json_out: Option<&Path>) -> Result<()> {
-    if !file.exists() {
-        anyhow::bail!("input file does not exist: {}", file.display());
-    }
-
-    let mut provider = open_provider(file, deep)?;
-
-    let program = dump_program(&mut provider)
-        .with_context(|| format!("dumping program from {}", file.display()))?;
-
-    if dump_flag || json_out.is_some() {
-        emit_program_json(&program, json_out)?;
-    } else {
-        print_summary(&program);
-    }
-    Ok(())
-}
-
-fn emit_program_json(program: &Program, json_out: Option<&Path>) -> Result<()> {
-    let json = serde_json::to_string_pretty(program).context("serialising Program to JSON")?;
-    if let Some(path) = json_out {
-        fs::write(path, &json).with_context(|| format!("writing JSON to {}", path.display()))?;
-    } else {
-        println!("{json}");
-    }
-    Ok(())
-}
-
-fn branches(
-    file: &Path,
-    deep: bool,
-    function: Option<&str>,
-    json_out: Option<&Path>,
-) -> Result<()> {
-    if !file.exists() {
-        anyhow::bail!("input file does not exist: {}", file.display());
-    }
-
-    let mut provider = open_provider(file, deep)?;
-    let program = dump_program(&mut provider)
-        .with_context(|| format!("loading program from {}", file.display()))?;
-
-    let candidates = match function {
-        None => collect_branches(&program),
-        Some(raw) => {
-            let address: Address = raw
-                .parse()
-                .with_context(|| format!("parsing --function value '{raw}'"))?;
-            let function = program
-                .functions
-                .iter()
-                .find(|f| f.address == address)
-                .ok_or_else(|| anyhow::anyhow!("no function at {address} in {}", file.display()))?;
-            collect_function_branches(function, program.arch)
-        }
-    };
-
-    if let Some(path) = json_out {
-        let json = serde_json::to_string_pretty(&candidates)
-            .context("serialising branch candidates to JSON")?;
-        fs::write(path, &json).with_context(|| format!("writing JSON to {}", path.display()))?;
-    } else {
-        print_branch_summary(&candidates);
-    }
-    Ok(())
-}
-
-fn slice(
-    file: &Path,
-    deep: bool,
-    at: Option<&str>,
-    function_filter: Option<&str>,
-    limits: &SliceLimits,
-    json_out: Option<&Path>,
-) -> Result<()> {
-    if !file.exists() {
-        anyhow::bail!("input file does not exist: {}", file.display());
-    }
-
-    let mut provider = open_provider(file, deep)?;
-    let program = dump_program(&mut provider)
-        .with_context(|| format!("loading program from {}", file.display()))?;
-
-    let (ctx, filtered) = resolve_targets(&mut provider, file, program, at, function_filter)?;
-
-    let mut slices: Vec<Slice> = Vec::with_capacity(filtered.len());
-    for cand in &filtered {
-        let Some(function) = ctx.find_function(cand.function) else {
-            continue;
-        };
-        slices.push(slice_branch(cand, function, limits, ctx.program.arch));
-    }
-
-    if let Some(path) = json_out {
-        let json = serde_json::to_string_pretty(&slices).context("serialising slices to JSON")?;
-        fs::write(path, &json).with_context(|| format!("writing JSON to {}", path.display()))?;
-    } else {
-        let functions: Vec<Function> = ctx.all_functions().cloned().collect();
-        print_slice_summary(&slices, at.is_some(), &functions);
-    }
-    Ok(())
-}
-
-fn lift(
-    file: &Path,
-    deep: bool,
-    at: Option<&str>,
-    function_filter: Option<&str>,
-    limits: &SliceLimits,
-    json_out: Option<&Path>,
-) -> Result<()> {
-    if !file.exists() {
-        anyhow::bail!("input file does not exist: {}", file.display());
-    }
-
-    let mut provider = open_provider(file, deep)?;
-    let program = dump_program(&mut provider)
-        .with_context(|| format!("loading program from {}", file.display()))?;
-    let arch = program.arch;
-
-    let (ctx, filtered) = resolve_targets(&mut provider, file, program, at, function_filter)?;
-
-    let mut lifts: Vec<LiftedSlice> = Vec::with_capacity(filtered.len());
-    for cand in &filtered {
-        let Some(function) = ctx.find_function(cand.function) else {
-            continue;
-        };
-        let slice = slice_branch(cand, function, limits, ctx.program.arch);
-        lifts.push(lift_slice(&slice, arch));
-    }
-
-    if let Some(path) = json_out {
-        let json =
-            serde_json::to_string_pretty(&lifts).context("serialising lifted slices to JSON")?;
-        fs::write(path, &json).with_context(|| format!("writing JSON to {}", path.display()))?;
-    } else {
-        let functions: Vec<Function> = ctx.all_functions().cloned().collect();
-        print_lift_summary(&lifts, at.is_some(), &functions);
-    }
-    Ok(())
-}
-
 struct SolveFilters {
     min_confidence: Confidence,
     include_real: bool,
@@ -589,119 +444,6 @@ struct AnnotatePlan<'a> {
     min_confidence: Confidence,
     dry_run: bool,
     save_project: Option<&'a str>,
-}
-
-fn analysis_level(deep: bool) -> AnalysisLevel {
-    if deep {
-        AnalysisLevel::Deep
-    } else {
-        AnalysisLevel::Standard
-    }
-}
-
-fn open_provider(file: &Path, deep: bool) -> Result<R2PipeProvider> {
-    R2PipeProvider::open_with_analysis(file, false, analysis_level(deep))
-        .with_context(|| format!("opening {} with radare2", file.display()))
-}
-
-fn open_provider_writable(file: &Path, deep: bool) -> Result<R2PipeProvider> {
-    R2PipeProvider::open_with_analysis(file, true, analysis_level(deep))
-        .with_context(|| format!("opening {} with radare2 (-w)", file.display()))
-}
-
-/// Owns the [`Program`] returned by r2 plus any synthesised functions
-/// produced by the shellcode finder. Subcommands look up branches
-/// against the union, so candidates created from a synthetic block
-/// still resolve.
-struct AnalysisContext {
-    program: Program,
-    extra_functions: Vec<Function>,
-}
-
-impl AnalysisContext {
-    fn new(program: Program) -> Self {
-        Self {
-            program,
-            extra_functions: Vec::new(),
-        }
-    }
-
-    fn find_function(&self, address: Address) -> Option<&Function> {
-        self.program
-            .functions
-            .iter()
-            .find(|f| f.address == address)
-            .or_else(|| self.extra_functions.iter().find(|f| f.address == address))
-    }
-
-    fn all_functions(&self) -> impl Iterator<Item = &Function> {
-        self.program
-            .functions
-            .iter()
-            .chain(self.extra_functions.iter())
-    }
-}
-
-/// Build the list of candidate branches the user asked about, plus
-/// the augmented [`AnalysisContext`] (potentially extended with a
-/// synthetic block when `--at addr` points outside any analysed
-/// function).
-fn resolve_targets(
-    provider: &mut R2PipeProvider,
-    file: &Path,
-    program: Program,
-    at: Option<&str>,
-    function_filter: Option<&str>,
-) -> Result<(AnalysisContext, Vec<BranchCandidate>)> {
-    let mut ctx = AnalysisContext::new(program);
-
-    let candidates: Vec<BranchCandidate> = match function_filter {
-        None => collect_branches(&ctx.program),
-        Some(raw) => {
-            let address: Address = raw
-                .parse()
-                .with_context(|| format!("parsing --function value '{raw}'"))?;
-            let function = ctx
-                .program
-                .functions
-                .iter()
-                .find(|f| f.address == address)
-                .ok_or_else(|| anyhow::anyhow!("no function at {address} in {}", file.display()))?;
-            collect_function_branches(function, ctx.program.arch)
-        }
-    };
-
-    let filtered: Vec<BranchCandidate> = if let Some(at_raw) = at {
-        let target: Address = at_raw
-            .parse()
-            .with_context(|| format!("parsing --at value '{at_raw}'"))?;
-        if let Some(found) = candidates.into_iter().find(|c| c.address == target) {
-            vec![found]
-        } else {
-            // Shellcode / unanalysed region fallback: synthesise the
-            // basic block around `target` and look for the branch
-            // inside it.
-            let func = provider
-                .load_block_at(target)
-                .with_context(|| format!("synthesising block at {target}"))?;
-            let synth_candidates = collect_function_branches(&func, ctx.program.arch);
-            let candidate = synth_candidates
-                .into_iter()
-                .find(|c| c.address == target)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "no candidate at {target} (program had no match; synthetic block at {} had no conditional branch at the requested address)",
-                        func.address,
-                    )
-                })?;
-            ctx.extra_functions.push(func);
-            vec![candidate]
-        }
-    } else {
-        candidates
-    };
-
-    Ok((ctx, filtered))
 }
 
 struct PatchCli<'a> {
@@ -1551,40 +1293,4 @@ fn keep_finding(finding: &Finding, filters: &SolveFilters) -> bool {
         // any future unknown variants gate on `--include-suspicious`.
         _ => filters.include_suspicious,
     }
-}
-
-fn ssa(
-    file: &Path,
-    deep: bool,
-    at: Option<&str>,
-    function_filter: Option<&str>,
-    limits: &SliceLimits,
-    json_out: Option<&Path>,
-) -> Result<()> {
-    if !file.exists() {
-        anyhow::bail!("input file does not exist: {}", file.display());
-    }
-
-    let mut provider = open_provider(file, deep)?;
-    let program = dump_program(&mut provider)
-        .with_context(|| format!("loading program from {}", file.display()))?;
-
-    let (ctx, filtered) = resolve_targets(&mut provider, file, program, at, function_filter)?;
-
-    let mut ssas: Vec<SsaLiftedSlice> = Vec::with_capacity(filtered.len());
-    for cand in &filtered {
-        let Some(function) = ctx.find_function(cand.function) else {
-            continue;
-        };
-        ssas.push(prepare_ssa(function, cand, limits, ctx.program.arch));
-    }
-
-    if let Some(path) = json_out {
-        let json = serde_json::to_string_pretty(&ssas).context("serialising SSA slices to JSON")?;
-        fs::write(path, &json).with_context(|| format!("writing JSON to {}", path.display()))?;
-    } else {
-        let functions: Vec<Function> = ctx.all_functions().cloned().collect();
-        print_ssa_summary(&ssas, at.is_some(), &functions);
-    }
-    Ok(())
 }

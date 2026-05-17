@@ -100,3 +100,13 @@ CLAUDE.md decomposition watchlist, not mandated by the hard rule
   submodules → verified commit. Clean-seam files split directly.
   Order: main.rs (commands/*.rs) → effect.rs (per-ISA) → lift.rs
   (merge-trio+per-ISA) → registers.rs (2-phase) → parse.rs/plan.rs/slice.rs.
+- 2026-05-17 iter5: main.rs decomposition step 1/N — created shared
+  `support.rs` (AnalysisContext+impl, analysis_level, open_provider/_writable,
+  resolve_targets; all pub(crate)) + `commands.rs` aggregator +
+  `commands/inspect.rs` (analyze/emit_program_json/branches/slice/lift/ssa).
+  main.rs 1591→1296. Compiler-driven import trim (cargo fix, 6).
+  495 tests/0 fail; all 5 gates GREEN. Remaining main.rs command groups
+  to extract → commands/{solve,annotate,patch,batch,at}.rs importing
+  crate::support (+ move compute_findings/dispatch_solver/
+  resolve_folded_branch/analyze_one/attach_pseudocode/keep_finding to
+  support.rs). main.rs still >800 — continue next iterations.
