@@ -181,3 +181,19 @@ CLAUDE.md decomposition watchlist, not mandated by the hard rule
   Remaining prod >800 (4 files, all modestly over): registers.rs 924,
   slice.rs 884, parse.rs 844, plan.rs 819. Next: registers.rs 2-phase
   (reorder-contiguous commit, then extract commit).
+
+- 2026-05-17 iter12: registers.rs 2-phase PHASE 1/2 (reorder). Accurate
+  const-fn-aware item map (47 items) + full call graph: clean per-ISA
+  EXCEPT aarch64_vector->dword (x86 const builder). Design: ALL tiny
+  RegisterLayout const-fn builders stay in shared root (children call
+  via super::, ancestor-private); extended_alias is x86-only. Reordered
+  registers.rs into contiguous blocks [shared: RegisterLayout+impl+
+  register_layout/alias_for dispatchers+10 const builders][x86: layout/
+  alias/extended_alias][AArch64 ...][AArch32 ...] + banner comments.
+  Coverage assertion (every non-blank line in exactly one unit/header/
+  tail) PASSED; item set verified byte-identical (pure permutation).
+  registers.rs 924->933 (banners; Phase 1 reorders, Phase 2 reduces).
+  495 tests/0 fail; all 5 gates GREEN. PHASE 2 next: extract contiguous
+  x86/aarch64/aarch32 blocks -> registers/{x86,aarch64,aarch32}.rs
+  (pub(super) on the 6 dispatched entrypoints: x86/aarch64/arm32 _layout
+  + _alias; rest private; child sees ancestor-private builders).

@@ -72,6 +72,8 @@
 
 use r2smt_common::Arch;
 
+// ===================== shared: RegisterLayout + dispatchers + const builders =====================
+
 /// Layout of a named register against its canonical parent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RegisterLayout {
@@ -132,6 +134,102 @@ pub fn alias_for(parent: &str, hi: u8, lo: u8, arch: Arch) -> Option<&'static st
         _ => None,
     }
 }
+
+const fn full(parent: &'static str) -> RegisterLayout {
+    RegisterLayout {
+        parent,
+        lo: 0,
+        hi: 63,
+        zero_extends_parent_64: false,
+    }
+}
+
+const fn dword(parent: &'static str) -> RegisterLayout {
+    RegisterLayout {
+        parent,
+        lo: 0,
+        hi: 31,
+        zero_extends_parent_64: true,
+    }
+}
+
+const fn word(parent: &'static str) -> RegisterLayout {
+    RegisterLayout {
+        parent,
+        lo: 0,
+        hi: 15,
+        zero_extends_parent_64: false,
+    }
+}
+
+const fn low_byte(parent: &'static str) -> RegisterLayout {
+    RegisterLayout {
+        parent,
+        lo: 0,
+        hi: 7,
+        zero_extends_parent_64: false,
+    }
+}
+
+const fn high_byte(parent: &'static str) -> RegisterLayout {
+    RegisterLayout {
+        parent,
+        lo: 8,
+        hi: 15,
+        zero_extends_parent_64: false,
+    }
+}
+
+const fn aarch64_full(parent: &'static str) -> RegisterLayout {
+    RegisterLayout {
+        parent,
+        lo: 0,
+        hi: 63,
+        zero_extends_parent_64: false,
+    }
+}
+
+const fn aarch64_dword(parent: &'static str) -> RegisterLayout {
+    RegisterLayout {
+        parent,
+        lo: 0,
+        hi: 31,
+        zero_extends_parent_64: true,
+    }
+}
+
+const fn aarch64_vector(parent: &'static str, lo: u8, hi: u8) -> RegisterLayout {
+    // SIMD slice — `zero_extends_parent_64` is GPR-specific (32→64
+    // dword zero-extension) and does not capture the SIMD write
+    // semantic of zero-extending to 128. We leave it `false` here
+    // and defer the SIMD-write modelling to the lifter.
+    RegisterLayout {
+        parent,
+        lo,
+        hi,
+        zero_extends_parent_64: false,
+    }
+}
+
+const fn arm32_full(parent: &'static str) -> RegisterLayout {
+    RegisterLayout {
+        parent,
+        lo: 0,
+        hi: 31,
+        zero_extends_parent_64: false,
+    }
+}
+
+const fn arm32_vector(parent: &'static str, lo: u8, hi: u8) -> RegisterLayout {
+    RegisterLayout {
+        parent,
+        lo,
+        hi,
+        zero_extends_parent_64: false,
+    }
+}
+
+// ===================== x86 / x86_64 =====================
 
 fn x86_layout(lower: &str) -> Option<RegisterLayout> {
     let layout = match lower {
@@ -287,6 +385,46 @@ fn x86_alias(parent: &str, hi: u8, lo: u8) -> Option<&'static str> {
     }
 }
 
+fn extended_alias(parent: &str, suffix: &str) -> Option<&'static str> {
+    match (parent, suffix) {
+        ("r8", "") => Some("r8"),
+        ("r8", "d") => Some("r8d"),
+        ("r8", "w") => Some("r8w"),
+        ("r8", "b") => Some("r8b"),
+        ("r9", "") => Some("r9"),
+        ("r9", "d") => Some("r9d"),
+        ("r9", "w") => Some("r9w"),
+        ("r9", "b") => Some("r9b"),
+        ("r10", "") => Some("r10"),
+        ("r10", "d") => Some("r10d"),
+        ("r10", "w") => Some("r10w"),
+        ("r10", "b") => Some("r10b"),
+        ("r11", "") => Some("r11"),
+        ("r11", "d") => Some("r11d"),
+        ("r11", "w") => Some("r11w"),
+        ("r11", "b") => Some("r11b"),
+        ("r12", "") => Some("r12"),
+        ("r12", "d") => Some("r12d"),
+        ("r12", "w") => Some("r12w"),
+        ("r12", "b") => Some("r12b"),
+        ("r13", "") => Some("r13"),
+        ("r13", "d") => Some("r13d"),
+        ("r13", "w") => Some("r13w"),
+        ("r13", "b") => Some("r13b"),
+        ("r14", "") => Some("r14"),
+        ("r14", "d") => Some("r14d"),
+        ("r14", "w") => Some("r14w"),
+        ("r14", "b") => Some("r14b"),
+        ("r15", "") => Some("r15"),
+        ("r15", "d") => Some("r15d"),
+        ("r15", "w") => Some("r15w"),
+        ("r15", "b") => Some("r15b"),
+        _ => None,
+    }
+}
+
+// ===================== AArch64 =====================
+
 fn aarch64_layout(lower: &str) -> Option<RegisterLayout> {
     // x0..x30 / w0..w30
     if let Some(stripped) = lower.strip_prefix('x')
@@ -376,243 +514,6 @@ fn aarch64_simd_alias(parent: &str, hi: u8) -> Option<&'static str> {
         31 => aarch64_sn_alias(n),
         15 => aarch64_hn_alias(n),
         7 => aarch64_bn_alias(n),
-        _ => None,
-    }
-}
-
-fn arm32_layout(lower: &str) -> Option<RegisterLayout> {
-    // r0..r15
-    if let Some(stripped) = lower.strip_prefix('r')
-        && let Ok(n) = stripped.parse::<u8>()
-        && n <= 15
-    {
-        return Some(arm32_full(arm32_r_name(n)));
-    }
-    // AAPCS GPR aliases (ARM IHI 0042 §5.1.1): a1..a4 are the
-    // argument / result registers (r0..r3); v1..v8 are the
-    // callee-saved variable registers (r4..r11). These are NOT
-    // separate physical registers — they alias r0..r11 and the
-    // slicer treats them as such. Real AArch32 disassemblers emit
-    // these names when the binary is built against AAPCS-aware
-    // toolchains; SIMD / NEON in AArch32 always uses qN / dN / sN
-    // spelling, so `vN` here is unambiguously a GPR.
-    if let Some(parent) = arm32_aapcs_alias(lower) {
-        return Some(arm32_full(parent));
-    }
-    // SIMD / FPU: q0..q15 / d0..d31 / s0..s31. (`vN` was a synthetic
-    // synonym in an earlier revision but collides with the AAPCS
-    // GPR alias above — real AArch32 NEON syntax does not use `vN`.)
-    if let Some(layout) = arm32_simd_layout(lower) {
-        return Some(layout);
-    }
-    match lower {
-        "sp" => Some(arm32_full("r13")),
-        "lr" => Some(arm32_full("r14")),
-        "pc" => Some(arm32_full("r15")),
-        _ => None,
-    }
-}
-
-fn arm32_aapcs_alias(lower: &str) -> Option<&'static str> {
-    match lower {
-        "a1" => Some("r0"),
-        "a2" => Some("r1"),
-        "a3" => Some("r2"),
-        "a4" => Some("r3"),
-        "v1" => Some("r4"),
-        "v2" => Some("r5"),
-        "v3" => Some("r6"),
-        "v4" => Some("r7"),
-        "v5" => Some("r8"),
-        "v6" | "sb" => Some("r9"),
-        "v7" | "sl" => Some("r10"),
-        "v8" | "fp" => Some("r11"),
-        "ip" => Some("r12"),
-        _ => None,
-    }
-}
-
-fn arm32_simd_layout(lower: &str) -> Option<RegisterLayout> {
-    let prefix = lower.chars().next()?;
-    let stripped = &lower[prefix.len_utf8()..];
-    let n: u8 = stripped.parse().ok()?;
-    match prefix {
-        'q' if n <= 15 => Some(arm32_vector(arm32_v_name(n), 0, 127)),
-        'd' if n <= 31 => {
-            let parent = arm32_v_name(n / 2);
-            let lo = (n % 2) * 64;
-            Some(arm32_vector(parent, lo, lo + 63))
-        }
-        's' if n <= 31 => {
-            let parent = arm32_v_name(n / 4);
-            let lo = (n % 4) * 32;
-            Some(arm32_vector(parent, lo, lo + 31))
-        }
-        _ => None,
-    }
-}
-
-fn arm32_alias(parent: &str, hi: u8, lo: u8) -> Option<&'static str> {
-    if let Some(stripped) = parent.strip_prefix('v')
-        && let Ok(k) = stripped.parse::<u8>()
-        && k <= 15
-    {
-        return arm32_simd_alias(k, hi, lo);
-    }
-    if hi != 31 || lo != 0 {
-        return None;
-    }
-    match parent {
-        "r13" => Some("sp"),
-        "r14" => Some("lr"),
-        "r15" => Some("pc"),
-        p => arm32_rn_alias(p),
-    }
-}
-
-fn arm32_simd_alias(k: u8, hi: u8, lo: u8) -> Option<&'static str> {
-    // `qN` is preferred over the synthetic `vN` since q-form is the
-    // 128-bit name the AArch32 disassembler actually emits.
-    match (hi, lo) {
-        (127, 0) => arm32_q_alias(k),
-        (63, 0) => arm32_d_alias(2 * k),
-        (127, 64) => arm32_d_alias(2 * k + 1),
-        (31, 0) if k < 8 => arm32_s_alias(4 * k),
-        (63, 32) if k < 8 => arm32_s_alias(4 * k + 1),
-        (95, 64) if k < 8 => arm32_s_alias(4 * k + 2),
-        (127, 96) if k < 8 => arm32_s_alias(4 * k + 3),
-        _ => None,
-    }
-}
-
-const fn full(parent: &'static str) -> RegisterLayout {
-    RegisterLayout {
-        parent,
-        lo: 0,
-        hi: 63,
-        zero_extends_parent_64: false,
-    }
-}
-
-const fn dword(parent: &'static str) -> RegisterLayout {
-    RegisterLayout {
-        parent,
-        lo: 0,
-        hi: 31,
-        zero_extends_parent_64: true,
-    }
-}
-
-const fn word(parent: &'static str) -> RegisterLayout {
-    RegisterLayout {
-        parent,
-        lo: 0,
-        hi: 15,
-        zero_extends_parent_64: false,
-    }
-}
-
-const fn low_byte(parent: &'static str) -> RegisterLayout {
-    RegisterLayout {
-        parent,
-        lo: 0,
-        hi: 7,
-        zero_extends_parent_64: false,
-    }
-}
-
-const fn high_byte(parent: &'static str) -> RegisterLayout {
-    RegisterLayout {
-        parent,
-        lo: 8,
-        hi: 15,
-        zero_extends_parent_64: false,
-    }
-}
-
-const fn aarch64_full(parent: &'static str) -> RegisterLayout {
-    RegisterLayout {
-        parent,
-        lo: 0,
-        hi: 63,
-        zero_extends_parent_64: false,
-    }
-}
-
-const fn aarch64_dword(parent: &'static str) -> RegisterLayout {
-    RegisterLayout {
-        parent,
-        lo: 0,
-        hi: 31,
-        zero_extends_parent_64: true,
-    }
-}
-
-const fn arm32_full(parent: &'static str) -> RegisterLayout {
-    RegisterLayout {
-        parent,
-        lo: 0,
-        hi: 31,
-        zero_extends_parent_64: false,
-    }
-}
-
-const fn aarch64_vector(parent: &'static str, lo: u8, hi: u8) -> RegisterLayout {
-    // SIMD slice — `zero_extends_parent_64` is GPR-specific (32→64
-    // dword zero-extension) and does not capture the SIMD write
-    // semantic of zero-extending to 128. We leave it `false` here
-    // and defer the SIMD-write modelling to the lifter.
-    RegisterLayout {
-        parent,
-        lo,
-        hi,
-        zero_extends_parent_64: false,
-    }
-}
-
-const fn arm32_vector(parent: &'static str, lo: u8, hi: u8) -> RegisterLayout {
-    RegisterLayout {
-        parent,
-        lo,
-        hi,
-        zero_extends_parent_64: false,
-    }
-}
-
-fn extended_alias(parent: &str, suffix: &str) -> Option<&'static str> {
-    match (parent, suffix) {
-        ("r8", "") => Some("r8"),
-        ("r8", "d") => Some("r8d"),
-        ("r8", "w") => Some("r8w"),
-        ("r8", "b") => Some("r8b"),
-        ("r9", "") => Some("r9"),
-        ("r9", "d") => Some("r9d"),
-        ("r9", "w") => Some("r9w"),
-        ("r9", "b") => Some("r9b"),
-        ("r10", "") => Some("r10"),
-        ("r10", "d") => Some("r10d"),
-        ("r10", "w") => Some("r10w"),
-        ("r10", "b") => Some("r10b"),
-        ("r11", "") => Some("r11"),
-        ("r11", "d") => Some("r11d"),
-        ("r11", "w") => Some("r11w"),
-        ("r11", "b") => Some("r11b"),
-        ("r12", "") => Some("r12"),
-        ("r12", "d") => Some("r12d"),
-        ("r12", "w") => Some("r12w"),
-        ("r12", "b") => Some("r12b"),
-        ("r13", "") => Some("r13"),
-        ("r13", "d") => Some("r13d"),
-        ("r13", "w") => Some("r13w"),
-        ("r13", "b") => Some("r13b"),
-        ("r14", "") => Some("r14"),
-        ("r14", "d") => Some("r14d"),
-        ("r14", "w") => Some("r14w"),
-        ("r14", "b") => Some("r14b"),
-        ("r15", "") => Some("r15"),
-        ("r15", "d") => Some("r15d"),
-        ("r15", "w") => Some("r15w"),
-        ("r15", "b") => Some("r15b"),
         _ => None,
     }
 }
@@ -819,6 +720,113 @@ const AARCH64_B_NAMES: [&str; 32] = [
     "b15", "b16", "b17", "b18", "b19", "b20", "b21", "b22", "b23", "b24", "b25", "b26", "b27",
     "b28", "b29", "b30", "b31",
 ];
+
+// ===================== AArch32 =====================
+
+fn arm32_layout(lower: &str) -> Option<RegisterLayout> {
+    // r0..r15
+    if let Some(stripped) = lower.strip_prefix('r')
+        && let Ok(n) = stripped.parse::<u8>()
+        && n <= 15
+    {
+        return Some(arm32_full(arm32_r_name(n)));
+    }
+    // AAPCS GPR aliases (ARM IHI 0042 §5.1.1): a1..a4 are the
+    // argument / result registers (r0..r3); v1..v8 are the
+    // callee-saved variable registers (r4..r11). These are NOT
+    // separate physical registers — they alias r0..r11 and the
+    // slicer treats them as such. Real AArch32 disassemblers emit
+    // these names when the binary is built against AAPCS-aware
+    // toolchains; SIMD / NEON in AArch32 always uses qN / dN / sN
+    // spelling, so `vN` here is unambiguously a GPR.
+    if let Some(parent) = arm32_aapcs_alias(lower) {
+        return Some(arm32_full(parent));
+    }
+    // SIMD / FPU: q0..q15 / d0..d31 / s0..s31. (`vN` was a synthetic
+    // synonym in an earlier revision but collides with the AAPCS
+    // GPR alias above — real AArch32 NEON syntax does not use `vN`.)
+    if let Some(layout) = arm32_simd_layout(lower) {
+        return Some(layout);
+    }
+    match lower {
+        "sp" => Some(arm32_full("r13")),
+        "lr" => Some(arm32_full("r14")),
+        "pc" => Some(arm32_full("r15")),
+        _ => None,
+    }
+}
+
+fn arm32_aapcs_alias(lower: &str) -> Option<&'static str> {
+    match lower {
+        "a1" => Some("r0"),
+        "a2" => Some("r1"),
+        "a3" => Some("r2"),
+        "a4" => Some("r3"),
+        "v1" => Some("r4"),
+        "v2" => Some("r5"),
+        "v3" => Some("r6"),
+        "v4" => Some("r7"),
+        "v5" => Some("r8"),
+        "v6" | "sb" => Some("r9"),
+        "v7" | "sl" => Some("r10"),
+        "v8" | "fp" => Some("r11"),
+        "ip" => Some("r12"),
+        _ => None,
+    }
+}
+
+fn arm32_simd_layout(lower: &str) -> Option<RegisterLayout> {
+    let prefix = lower.chars().next()?;
+    let stripped = &lower[prefix.len_utf8()..];
+    let n: u8 = stripped.parse().ok()?;
+    match prefix {
+        'q' if n <= 15 => Some(arm32_vector(arm32_v_name(n), 0, 127)),
+        'd' if n <= 31 => {
+            let parent = arm32_v_name(n / 2);
+            let lo = (n % 2) * 64;
+            Some(arm32_vector(parent, lo, lo + 63))
+        }
+        's' if n <= 31 => {
+            let parent = arm32_v_name(n / 4);
+            let lo = (n % 4) * 32;
+            Some(arm32_vector(parent, lo, lo + 31))
+        }
+        _ => None,
+    }
+}
+
+fn arm32_alias(parent: &str, hi: u8, lo: u8) -> Option<&'static str> {
+    if let Some(stripped) = parent.strip_prefix('v')
+        && let Ok(k) = stripped.parse::<u8>()
+        && k <= 15
+    {
+        return arm32_simd_alias(k, hi, lo);
+    }
+    if hi != 31 || lo != 0 {
+        return None;
+    }
+    match parent {
+        "r13" => Some("sp"),
+        "r14" => Some("lr"),
+        "r15" => Some("pc"),
+        p => arm32_rn_alias(p),
+    }
+}
+
+fn arm32_simd_alias(k: u8, hi: u8, lo: u8) -> Option<&'static str> {
+    // `qN` is preferred over the synthetic `vN` since q-form is the
+    // 128-bit name the AArch32 disassembler actually emits.
+    match (hi, lo) {
+        (127, 0) => arm32_q_alias(k),
+        (63, 0) => arm32_d_alias(2 * k),
+        (127, 64) => arm32_d_alias(2 * k + 1),
+        (31, 0) if k < 8 => arm32_s_alias(4 * k),
+        (63, 32) if k < 8 => arm32_s_alias(4 * k + 1),
+        (95, 64) if k < 8 => arm32_s_alias(4 * k + 2),
+        (127, 96) if k < 8 => arm32_s_alias(4 * k + 3),
+        _ => None,
+    }
+}
 
 const fn arm32_r_name(n: u8) -> &'static str {
     match n {
