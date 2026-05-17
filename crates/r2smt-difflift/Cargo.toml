@@ -1,0 +1,26 @@
+[package]
+name         = "r2smt-difflift"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+description = "Differential multi-lifter harness: cross-checks the P-code, ESIL and per-mnemonic lowerings of the same instruction for semantic equivalence."
+
+[lints]
+workspace = true
+
+[dependencies]
+r2smt-common = { workspace = true }
+r2smt-ir     = { workspace = true }
+r2smt-pcode  = { workspace = true }
+r2smt-esil   = { workspace = true }
+r2smt-slicer = { workspace = true }
+r2smt-ssa    = { workspace = true }
+tracing      = { workspace = true }
+
+[dev-dependencies]
+r2smt-ir   = { workspace = true, features = ["testing"] }
+r2smt-smt  = { workspace = true }
+serde_json = { workspace = true }

@@ -106,6 +106,13 @@ pub enum FindingKind {
     /// Solver returned `Unknown` / `Timeout`, or the slice was
     /// truncated. The verdict cannot be trusted yet.
     SuspiciousButUnknown,
+    /// Two independent lowerings (P-code / ESIL / per-mnemonic) of the
+    /// same instruction were proven *not* semantically equivalent by
+    /// the differential harness. This is an engine-integrity defect —
+    /// one of r2SMT's own lifters is unsound for that instruction —
+    /// not a property of the analysed sample. Produced solely by the
+    /// opt-in `--differential-lift` path, never by [`kind_for`].
+    LifterDisagreement,
 }
 
 /// How much weight to give a finding.
@@ -161,6 +168,50 @@ impl Finding {
             self.kind,
             FindingKind::OpaquePredicate | FindingKind::DeadBranch | FindingKind::ConstantCondition
         )
+    }
+}
+
+/// Build a [`FindingKind::LifterDisagreement`] finding for an
+/// instruction whose independent lowerings the differential harness
+/// proved non-equivalent.
+///
+/// `detail` is the open-domain diagnostic naming the disagreeing
+/// lowering pair. The verdict is [`SmtResult::Unsound`] and confidence
+/// [`Confidence::Unknown`]: the disagreement says nothing trustworthy
+/// about the branch — it flags r2SMT's own engine. This is never
+/// produced by the normal classify path; only the opt-in
+/// `--differential-lift` wiring constructs it.
+#[must_use]
+pub fn lifter_disagreement_finding(
+    address: Address,
+    function: Address,
+    mnemonic: String,
+    detail: String,
+) -> Finding {
+    Finding {
+        address,
+        function,
+        mnemonic,
+        condition: BranchCondition::NotEqual,
+        formula: detail.clone(),
+        formula_pretty: detail,
+        formula_z3_pretty: None,
+        verdict: SmtResult::Unsound,
+        kind: FindingKind::LifterDisagreement,
+        confidence: Confidence::Unknown,
+        taken_target: None,
+        fallthrough_target: None,
+        operands: Vec::new(),
+        is_thumb: false,
+        evidence: FindingEvidence {
+            slice_status: SliceStatus::Complete,
+            statement_count: 0,
+            input_count: 0,
+            inputs: Vec::new(),
+            unknown_count: 0,
+            upstream_resolved_to: None,
+        },
+        pseudocode: None,
     }
 }
 

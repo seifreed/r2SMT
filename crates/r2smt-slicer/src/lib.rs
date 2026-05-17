@@ -17,6 +17,6 @@ pub mod slice;
 pub use collector::{BranchCandidate, collect_branches, collect_function_branches};
 pub use condition::{BranchCondition, BranchKind};
 pub use effect::{InstructionEffect, InstructionKind, analyze, canonical_register};
-pub use lift::{LiftedSlice, lift_branch_condition, lift_slice};
+pub use lift::{LiftedSlice, lift_branch_condition, lift_per_mnemonic, lift_slice};
 pub use registers::{RegisterLayout, alias_for, register_layout};
 pub use slice::{Slice, SliceLimits, SliceStatus, slice_branch};

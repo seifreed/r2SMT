@@ -216,6 +216,40 @@ fn aarch64_branch_var(candidate: &BranchCandidate, arch: Arch) -> (Expr, u8) {
     (Expr::Unknown(raw.to_string()), bits)
 }
 
+/// Lift a single instruction through **only** the per-mnemonic
+/// handler dispatch, bypassing the P-code-first / ESIL-first ladder
+/// that [`lift_slice`] runs.
+///
+/// This is the differential-lifting seam consumed by the
+/// `r2smt-difflift` harness: it exposes the per-mnemonic lowering in
+/// isolation so it can be cross-checked against the independent ESIL
+/// ([`r2smt_esil::lift_esil`]) and P-code ([`r2smt_pcode::lift_pcode`])
+/// lowerings of the same instruction. The production dispatch ladder
+/// in [`lift_slice`] is deliberately **not** routed through this
+/// function — its observable behaviour is unchanged.
+#[must_use]
+pub fn lift_per_mnemonic(insn: &Instruction, arch: Arch) -> Vec<IrStmt> {
+    let mut ctx = LiftCtx::new(arch);
+    // Closed structural dispatch over the supported ISAs (the
+    // documented exhaustive-dispatch-table exception). Mirrors the
+    // tail of `LiftCtx::lift_instruction` *without* the ESIL / P-code
+    // short-circuits, which is the entire purpose of this seam.
+    match arch {
+        Arch::X86 | Arch::X86_64 => ctx.lift_instruction_x86(insn),
+        Arch::Aarch64 => ctx.lift_instruction_aarch64(insn),
+        Arch::Arm => ctx.lift_instruction_aarch32(insn),
+        _ => ctx.stmts.push(IrStmt::Unsupported {
+            mnemonic: insn.mnemonic.clone(),
+            comment: format!(
+                "at {addr} (arch {arch:?})",
+                addr = insn.address,
+                arch = arch
+            ),
+        }),
+    }
+    ctx.stmts
+}
+
 struct LiftCtx {
     stmts: Vec<IrStmt>,
     bits: u8,

@@ -268,6 +268,7 @@ fn run(cli: Cli) -> Result<()> {
             r2_script,
             with_decompiler,
             allow_join_merge,
+            differential_lift,
         } => {
             let mut limits = SliceLimits::default();
             if let Some(n) = max_instructions {
@@ -305,6 +306,7 @@ fn run(cli: Cli) -> Result<()> {
                 solver,
                 with_decompiler,
                 ir_pcode,
+                differential_lift,
             )
         }
         Command::Batch {
@@ -686,9 +688,14 @@ struct SolveOutputs<'a> {
     r2_script: Option<&'a Path>,
 }
 
-// `clippy::too_many_arguments`: same rationale as `annotate` above —
-// CLI driver passes through independent, read-at-distinct-stages knobs.
-#[allow(clippy::too_many_arguments)]
+// `clippy::too_many_arguments` / `fn_params_excessive_bools`: same
+// rationale as `annotate` above — this is a CLI driver threading
+// independent, read-at-distinct-stages knobs (`deep`,
+// `with_decompiler`, `ir_pcode`, `differential_lift`) straight from
+// parsed args to use-case calls. A params struct would only relocate
+// the noise without adding cohesion; the booleans are genuinely
+// independent toggles, not a missing abstraction.
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn solve(
     file: &Path,
     deep: bool,
@@ -701,6 +708,7 @@ fn solve(
     solver: SolverArg,
     with_decompiler: bool,
     ir_pcode: bool,
+    differential_lift: bool,
 ) -> Result<()> {
     if !file.exists() {
         anyhow::bail!("input file does not exist: {}", file.display());
@@ -743,6 +751,13 @@ fn solve(
         ));
     }
 
+    if differential_lift {
+        let scope: Vec<Function> = ctx.all_functions().cloned().collect();
+        let dl = run_differential_lift(&scope, ctx.program.arch, solver, options);
+        print_lifter_agreement(&dl.stats, dl.compared);
+        findings.extend(dl.findings);
+    }
+
     if with_decompiler {
         attach_pseudocode(&mut provider, &mut findings);
     }
@@ -781,6 +796,112 @@ fn solve(
         print_findings_summary(&findings, &displayed, at.is_some(), &merged_functions);
     }
     Ok(())
+}
+
+/// Bounded scan budget for the opt-in `--differential-lift` pass.
+/// Host-Side Safety: a whole-program run must not issue an unbounded
+/// number of SMT queries.
+const MAX_DIFFLIFT_COMPARISONS: usize = 50_000;
+
+/// Outcome of the differential-lift pass: the engine-integrity
+/// findings, the running agreement tally, and how many pairwise
+/// comparisons were attempted.
+struct DiffLiftRun {
+    findings: Vec<Finding>,
+    stats: r2smt_difflift::AgreementStats,
+    compared: usize,
+}
+
+/// Cross-check every instruction's independent lowerings. A proven
+/// disagreement yields one `lifter_disagreement` finding for that
+/// instruction; the agreement tally feeds the reported metric. The
+/// solve is delegated through the user-selected backend, exactly like
+/// the branch pipeline.
+fn run_differential_lift(
+    functions: &[Function],
+    arch: r2smt_common::Arch,
+    solver: SolverArg,
+    options: SolveOptions,
+) -> DiffLiftRun {
+    let mut stats = r2smt_difflift::AgreementStats::default();
+    let mut findings: Vec<Finding> = Vec::new();
+    let mut compared = 0usize;
+    'outer: for func in functions {
+        for block in &func.blocks {
+            for insn in &block.instructions {
+                let lowerings = r2smt_difflift::lower_all(insn, arch);
+                let bodies: Vec<(r2smt_difflift::Lowering, &[r2smt_ir::IrStmt])> =
+                    lowerings.available().collect();
+                let mut disagreeing: Vec<String> = Vec::new();
+                for (i, (_, sa)) in bodies.iter().enumerate() {
+                    for (lb, sb) in &bodies[i + 1..] {
+                        if compared >= MAX_DIFFLIFT_COMPARISONS {
+                            break 'outer;
+                        }
+                        compared += 1;
+                        let verdict = compare_lowerings(sa, sb, arch, solver, options);
+                        stats.record(verdict);
+                        if verdict == r2smt_difflift::DiffVerdict::Disagree {
+                            disagreeing.push(format!(
+                                "{a} vs {b}",
+                                a = bodies[i].0.as_str(),
+                                b = lb.as_str(),
+                            ));
+                        }
+                    }
+                }
+                if !disagreeing.is_empty() {
+                    findings.push(r2smt_core::lifter_disagreement_finding(
+                        insn.address,
+                        func.address,
+                        insn.mnemonic.clone(),
+                        format!(
+                            "lifter disagreement on `{mnem}`: {pairs}",
+                            mnem = insn.mnemonic,
+                            pairs = disagreeing.join(", "),
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    DiffLiftRun {
+        findings,
+        stats,
+        compared,
+    }
+}
+
+/// Resolve one pairwise lowering comparison. A solver-backend error
+/// (e.g. a missing `cvc5`) is treated as `Inconclusive` — fail-closed,
+/// never `Agree`, and never aborts the surrounding run.
+fn compare_lowerings(
+    a: &[r2smt_ir::IrStmt],
+    b: &[r2smt_ir::IrStmt],
+    arch: r2smt_common::Arch,
+    solver: SolverArg,
+    options: SolveOptions,
+) -> r2smt_difflift::DiffVerdict {
+    match r2smt_difflift::build_equivalence_query(a, b, arch) {
+        None => r2smt_difflift::DiffVerdict::Inconclusive,
+        Some(query) => match dispatch_solver(solver, &query, options) {
+            Ok((verdict, _)) => r2smt_difflift::classify_equivalence(verdict),
+            Err(_) => r2smt_difflift::DiffVerdict::Inconclusive,
+        },
+    }
+}
+
+/// Print the lifter-agreement metric line (the P22 deliverable).
+fn print_lifter_agreement(stats: &r2smt_difflift::AgreementStats, compared: usize) {
+    let rate = stats
+        .agreement_rate()
+        .map_or_else(|| "n/a".to_string(), |r| format!("{:.2}%", r * 100.0));
+    println!(
+        "lifter-agreement: {rate} (agree={a} disagree={d} inconclusive={i}) over {compared} comparisons",
+        a = stats.agree,
+        d = stats.disagree,
+        i = stats.inconclusive,
+    );
 }
 
 fn keep_finding(finding: &Finding, filters: &SolveFilters) -> bool {

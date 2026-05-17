@@ -329,6 +329,15 @@ pub(crate) enum Command {
         /// when no decompiler plugin is available.
         #[arg(long)]
         with_decompiler: bool,
+
+        /// Cross-check every instruction's P-code / ESIL / per-mnemonic
+        /// lowerings for semantic equivalence and report the
+        /// lifter-agreement rate. A proven disagreement is an
+        /// engine-integrity defect (emitted as a `lifter_disagreement`
+        /// finding). Off by default; output is byte-identical without
+        /// it.
+        #[arg(long)]
+        differential_lift: bool,
     },
 
     /// Sweep every regular file directly inside a directory, solving

@@ -471,6 +471,7 @@ dependencies = [
  "clap",
  "r2smt-common",
  "r2smt-core",
+ "r2smt-difflift",
  "r2smt-ir",
  "r2smt-patch",
  "r2smt-r2pipe",
@@ -505,6 +506,21 @@ dependencies = [
  "r2smt-slicer",
  "r2smt-ssa",
  "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "r2smt-difflift"
+version = "0.1.0"
+dependencies = [
+ "r2smt-common",
+ "r2smt-esil",
+ "r2smt-ir",
+ "r2smt-pcode",
+ "r2smt-slicer",
+ "r2smt-smt",
+ "r2smt-ssa",
  "serde_json",
  "tracing",
 ]
