@@ -32,6 +32,7 @@ r2smt-esil    = { path = "crates/r2smt-esil",    version = "0.1.0" }
 r2smt-pcode   = { path = "crates/r2smt-pcode",   version = "0.1.0" }
 r2smt-slicer  = { path = "crates/r2smt-slicer",  version = "0.1.0" }
 r2smt-ssa     = { path = "crates/r2smt-ssa",     version = "0.1.0" }
+r2smt-solver-port = { path = "crates/r2smt-solver-port", version = "0.1.0" }
 r2smt-smt     = { path = "crates/r2smt-smt",     version = "0.1.0" }
 r2smt-core    = { path = "crates/r2smt-core",    version = "0.1.0" }
 r2smt-report  = { path = "crates/r2smt-report",  version = "0.1.0" }

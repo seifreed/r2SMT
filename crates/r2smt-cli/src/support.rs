@@ -15,7 +15,7 @@ use r2smt_ir::NameHints;
 use r2smt_ir::program::{Function, Program};
 use r2smt_r2pipe::{AnalysisLevel, R2PipeProvider};
 use r2smt_slicer::{BranchCandidate, SliceLimits, collect_branches, collect_function_branches};
-use r2smt_smt::{SolveOptions, solve_branch_with_pretty};
+use r2smt_smt::SolveOptions;
 
 use crate::args::SolverArg;
 use crate::render::truncate_on_char_boundary;
@@ -227,24 +227,27 @@ pub(crate) fn dispatch_solver(
     slice: &r2smt_ssa::SsaLiftedSlice,
     options: SolveOptions,
 ) -> Result<(r2smt_common::smt::SmtResult, Option<String>)> {
+    let backend = build_solver(solver);
+    match backend.solve(slice, options) {
+        Ok(outcome) => Ok((outcome.verdict, outcome.formula_pretty)),
+        // Byte-identical to the pre-port message: the adapter's
+        // `detail()` is the original text minus the backend prefix.
+        Err(err) => Err(anyhow::anyhow!(
+            "{} backend: {}",
+            backend.name(),
+            err.detail()
+        )),
+    }
+}
+
+/// Composition-root factory — the only place that knows concrete
+/// solver adapter types. Exhaustive structural mapping over the CLI
+/// enum (no domain logic): the documented exhaustive-dispatch-table
+/// exception applies.
+fn build_solver(solver: SolverArg) -> Box<dyn r2smt_solver_port::Solver> {
     match solver {
-        SolverArg::Z3 => {
-            let outcome = solve_branch_with_pretty(slice, options);
-            Ok((outcome.verdict, outcome.formula_z3_pretty))
-        }
-        SolverArg::Cvc5 => r2smt_smt::solve_branch_cvc5(slice, options)
-            .map(|v| (v, None))
-            .map_err(|err| match err {
-                r2smt_smt::Cvc5Error::NotFound(detail) => anyhow::anyhow!(
-                    "cvc5 backend: cvc5 binary not found on PATH ({detail}); install it with `brew install cvc5` / `apt install cvc5`"
-                ),
-                r2smt_smt::Cvc5Error::SubprocessError(detail) => {
-                    anyhow::anyhow!("cvc5 backend: subprocess failed: {detail}")
-                }
-                r2smt_smt::Cvc5Error::UnrecognisedVerdict(out) => {
-                    anyhow::anyhow!("cvc5 backend: unrecognised stdout: {out}")
-                }
-            }),
+        SolverArg::Z3 => Box::new(r2smt_smt::Z3Solver),
+        SolverArg::Cvc5 => Box::new(r2smt_smt::Cvc5Solver),
     }
 }
 

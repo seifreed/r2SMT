@@ -1,0 +1,16 @@
+[package]
+name         = "r2smt-solver-port"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+description = "Solver port: the narrow contract every r2SMT SMT backend / differential oracle implements."
+
+[lints]
+workspace = true
+
+[dependencies]
+r2smt-common = { workspace = true }
+r2smt-ssa    = { workspace = true }
