@@ -10,6 +10,16 @@ use crate::registers::register_layout;
 
 use super::{BitwiseOp, ExtendKind, LiftCtx, ShiftOp, nonzero_width};
 
+/// x86 SHL/SHR/SAR/SAL mask the shift count before shifting: 5 bits
+/// for 8/16/32-bit operands, 6 bits for 64-bit operands (Intel SDM
+/// Vol. 2, "SAL/SAR/SHL/SHR"). Without this, an oversized count
+/// (e.g. `shl eax, 32`) makes Z3's `bvshl` zero the result while the
+/// CPU treats it as a no-op / small shift — flipping ZF/SF-derived
+/// verdicts.
+const X86_SHIFT_COUNT_MASK_NARROW: u64 = 0x1F;
+const X86_SHIFT_COUNT_MASK_64: u64 = 0x3F;
+const X86_WIDTH_64: u8 = 64;
+
 impl LiftCtx {
     pub(super) fn lift_instruction_x86(&mut self, insn: &Instruction) {
         let mnem = insn.mnemonic.trim().to_ascii_lowercase();
@@ -370,7 +380,13 @@ impl LiftCtx {
             return;
         }
         let lhs = self.read_operand_at(dst, dst_width);
-        let shift = self.read_operand_at(count, dst_width);
+        let raw_shift = self.read_operand_at(count, dst_width);
+        let count_mask = if dst_width == X86_WIDTH_64 {
+            X86_SHIFT_COUNT_MASK_64
+        } else {
+            X86_SHIFT_COUNT_MASK_NARROW
+        };
+        let shift = Expr::bv_and(raw_shift, Expr::konst(count_mask, dst_width));
         let computed = match op {
             ShiftOp::Shl => Expr::shl(lhs, shift),
             ShiftOp::Shr => Expr::lshr(lhs, shift),

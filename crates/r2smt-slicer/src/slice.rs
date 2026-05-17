@@ -530,6 +530,16 @@ fn walk_backwards(
     }
 }
 
+/// Unmodeled mnemonics that are architecturally side-effect-free with
+/// respect to a data-flow slice: they define no register, no flag, and
+/// access no memory the slicer tracks. Stepping over them is sound; every
+/// other [`InstructionKind::Other`] instruction has unknown effects and
+/// must truncate a still-pending slice rather than be silently skipped.
+const SIDE_EFFECT_FREE_OTHER: &[&str] = &[
+    "nop", "endbr64", "endbr32", "fnop", "pause", "yield", "lfence", "sfence", "mfence", "dmb",
+    "dsb", "isb",
+];
+
 fn walk_block(
     state: &mut WalkState,
     block: &BasicBlock,
@@ -570,9 +580,14 @@ fn walk_block(
             .collect();
 
         if effect.kind == InstructionKind::Other {
-            if touches_flags || !touches_live.is_empty() || !touches_live_stack.is_empty() {
+            if SIDE_EFFECT_FREE_OTHER.contains(&insn.mnemonic.as_str()) {
+                continue;
+            }
+            let slice_pending =
+                state.needs_flags || !state.live.is_empty() || !state.live_stack.is_empty();
+            if slice_pending {
                 return BlockWalkOutcome::Truncated(format!(
-                    "unsupported '{mnem}' at {addr} touches slice",
+                    "unsupported '{mnem}' at {addr} may redefine slice state",
                     mnem = insn.mnemonic,
                     addr = insn.address
                 ));

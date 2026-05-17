@@ -163,13 +163,25 @@ pub fn lift_branch_condition(candidate: &BranchCandidate, arch: Arch) -> Expr {
         BranchCondition::BitZero | BranchCondition::BitNotZero => {
             // `tbz Rn, #bit` / `tbnz Rn, #bit` — extract a single bit
             // and compare against zero.
-            let (var, _vbits) = aarch64_branch_var(candidate, arch);
-            let bit = candidate.bit_index.unwrap_or(0);
-            let slice = Expr::extract(var, bit, bit);
-            let cmp = Expr::eq(slice, Expr::konst(0, 1));
-            match candidate.condition {
-                BranchCondition::BitZero => cmp,
-                _ => Expr::bool_not(cmp),
+            let (var, vbits) = aarch64_branch_var(candidate, arch);
+            match candidate.bit_index {
+                Some(bit) if bit < vbits => {
+                    let slice = Expr::extract(var, bit, bit);
+                    let cmp = Expr::eq(slice, Expr::konst(0, 1));
+                    match candidate.condition {
+                        BranchCondition::BitZero => cmp,
+                        _ => Expr::bool_not(cmp),
+                    }
+                }
+                // Unparsed or out-of-range bit index: substituting a
+                // concrete bit would fabricate a different predicate
+                // (an unsound `AlwaysX`). Surface as a free symbolic
+                // value instead — the solver can only widen it to
+                // `BothPossible`, never fabricate a verdict.
+                _ => Expr::Unknown(format!(
+                    "tbz/tbnz bit-index unresolved for `{reg}`",
+                    reg = candidate.compare_register.as_deref().unwrap_or("")
+                )),
             }
         }
     }
@@ -182,6 +194,12 @@ pub fn lift_branch_condition(candidate: &BranchCandidate, arch: Arch) -> Expr {
 fn aarch64_branch_var(candidate: &BranchCandidate, arch: Arch) -> (Expr, u8) {
     let raw = candidate.compare_register.as_deref().unwrap_or("");
     if let Some(layout) = register_layout(raw, arch) {
+        // `xzr`/`wzr` always read 0. Mirrors `read_register` so
+        // `cbz xzr` / `tbz xzr, #n` resolve precisely instead of
+        // getting stuck on a free input named `xzr`.
+        if layout.parent == "xzr" {
+            return (Expr::konst(0, layout.width()), layout.width());
+        }
         let parent_bits = arch.pointer_bits();
         if u16::from(layout.hi) < u16::from(parent_bits) {
             let parent = Expr::var(layout.parent, parent_bits);
@@ -462,11 +480,23 @@ impl LiftCtx {
     }
 
     fn binop_width(&self, lhs: &Operand, rhs: &Operand) -> u8 {
-        // Use the wider of the two operand widths so immediates
-        // alongside sub-register reads keep enough room.
-        let lw = self.operand_width(lhs);
-        let rw = self.operand_width(rhs);
-        if lw >= rw { lw } else { rw }
+        // For the compare/test family the operation width is the width
+        // of the register/memory operand; `read_operand_at` then masks
+        // the immediate down to it. An immediate's `operand_width` is
+        // the pointer-width pseudo-size (`self.bits`), so taking the
+        // max here would inflate `cmp al, 1` to 64 bits and corrupt the
+        // sign-dependent flags (SF) for every sub-register compare.
+        let lhs_imm = matches!(lhs.kind, OperandKind::Immediate);
+        let rhs_imm = matches!(rhs.kind, OperandKind::Immediate);
+        match (lhs_imm, rhs_imm) {
+            (false, true) => self.operand_width(lhs),
+            (true, false) => self.operand_width(rhs),
+            _ => {
+                let lw = self.operand_width(lhs);
+                let rw = self.operand_width(rhs);
+                if lw >= rw { lw } else { rw }
+            }
+        }
     }
 
     // ---------- AArch64 handlers ------------------------------------

@@ -104,6 +104,42 @@ fn cmp_emits_tmp_and_flag_assignments() {
 }
 
 #[test]
+fn subregister_cmp_uses_register_width_not_immediate_pseudo_width() {
+    // `cmp al, 1` is an 8-bit subtraction. The compare width must be
+    // `al`'s 8 bits, not the immediate's pointer-width pseudo-size:
+    // widening corrupts SF (e.g. al=0xFF → 8-bit 0xFF-1=0xFE is
+    // negative, but 32-bit 254 is not), flipping `js`/`jns`.
+    let program = one_block_program(vec![
+        insn(
+            0x40_1000,
+            2,
+            "cmp",
+            vec![
+                op("al", OperandKind::Register),
+                op("1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1002,
+            6,
+            "jne",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let lifted = lift_first(&program, Arch::X86);
+    let sf = find_assign(&lifted.statements, "SF").expect("SF set");
+    if let IrStmt::Assign {
+        src: Expr::Slt(_, rhs),
+        ..
+    } = sf
+    {
+        assert_eq!(**rhs, Expr::konst(0, 8));
+    } else {
+        panic!("SF should be `slt(tmp, 0)`, got {sf:?}");
+    }
+}
+
+#[test]
 fn xor_same_reg_emits_zero_assignment_and_zf_one() {
     let program = one_block_program(vec![
         insn(
@@ -248,6 +284,66 @@ fn branch_condition_above_combines_cf_and_zf() {
             Expr::eq(Expr::flag("CF"), Expr::konst(0, 1)),
             Expr::eq(Expr::flag("ZF"), Expr::konst(0, 1)),
         )
+    );
+}
+
+fn aarch64_branch_cand(
+    condition: BranchCondition,
+    reg: &str,
+    bit_index: Option<u8>,
+) -> BranchCandidate {
+    BranchCandidate {
+        address: Address(0),
+        function: Address(0),
+        block: Address(0),
+        kind: BranchKind::Jcc,
+        mnemonic: "cbz".into(),
+        condition,
+        formula: String::new(),
+        taken_target: None,
+        fallthrough_target: None,
+        compare_register: Some(reg.into()),
+        bit_index,
+        upstream_resolved: None,
+        operand_raws: Vec::new(),
+        is_thumb: false,
+    }
+}
+
+#[test]
+fn cbz_xzr_resolves_to_constant_zero_not_free_var() {
+    // `xzr` always reads 0; modelling it as a free `Expr::var("xzr")`
+    // loses the precise `cbz xzr` → always-taken verdict.
+    let cand = aarch64_branch_cand(BranchCondition::RegisterZero, "xzr", None);
+    let expr = lift_branch_condition(&cand, Arch::Aarch64);
+    assert_eq!(expr, Expr::eq(Expr::konst(0, 64), Expr::konst(0, 64)));
+}
+
+#[test]
+fn tbz_unparsed_bit_index_is_free_not_silently_bit_zero() {
+    // `bit_index == None` must NOT substitute bit 0 — that fabricates a
+    // different concrete predicate. A free symbolic value is sound.
+    let cand = aarch64_branch_cand(BranchCondition::BitZero, "x0", None);
+    let expr = lift_branch_condition(&cand, Arch::Aarch64);
+    assert!(matches!(expr, Expr::Unknown(_)), "got {expr:?}");
+}
+
+#[test]
+fn tbz_out_of_range_bit_index_is_free() {
+    // `w0` is 32-bit; bit 40 cannot be extracted. Surface as free
+    // rather than emit an invalid `Extract`.
+    let cand = aarch64_branch_cand(BranchCondition::BitZero, "w0", Some(40));
+    let expr = lift_branch_condition(&cand, Arch::Aarch64);
+    assert!(matches!(expr, Expr::Unknown(_)), "got {expr:?}");
+}
+
+#[test]
+fn tbz_valid_bit_index_extracts_that_bit() {
+    let cand = aarch64_branch_cand(BranchCondition::BitZero, "x0", Some(5));
+    let expr = lift_branch_condition(&cand, Arch::Aarch64);
+    assert_eq!(
+        expr,
+        Expr::eq(Expr::extract(Expr::var("x0", 64), 5, 5), Expr::konst(0, 1))
     );
 }
 

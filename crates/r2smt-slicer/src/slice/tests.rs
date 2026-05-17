@@ -114,6 +114,84 @@ fn canonical_opaque_predicate_yields_complete_slice() {
 }
 
 #[test]
+fn unmodeled_register_writer_truncates_instead_of_being_skipped() {
+    // `not eax` is unmodeled (effect kind Other). It rewrites the live `eax`
+    // that `cmp eax, 0` reads, so the slice must truncate — silently walking
+    // past it would resolve `eax` to the stale `xor` value (0) and fabricate
+    // an AlwaysTrue verdict for the `je`.
+    let program = one_block_program(vec![
+        insn(
+            0x40_1000,
+            2,
+            "xor",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(0x40_1002, 2, "not", vec![op("eax", OperandKind::Register)]),
+        insn(
+            0x40_1004,
+            3,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op("0", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1007,
+            6,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let slice = slice_first(&program);
+    let SliceStatus::Truncated { reason } = &slice.status else {
+        panic!("expected Truncated, got {:?}", slice.status);
+    };
+    assert!(
+        reason.contains("not"),
+        "reason should name the mnemonic: {reason}"
+    );
+}
+
+#[test]
+fn benign_nop_does_not_over_truncate_the_slice() {
+    // `nop` is unmodeled (Other) but architecturally side-effect-free, so the
+    // walker must step over it and still complete the slice.
+    let program = one_block_program(vec![
+        insn(
+            0x40_1000,
+            2,
+            "xor",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(0x40_1002, 1, "nop", vec![]),
+        insn(
+            0x40_1003,
+            3,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op("0", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1006,
+            6,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let slice = slice_first(&program);
+    assert_eq!(slice.status, SliceStatus::Complete);
+}
+
+#[test]
 fn constant_propagation_has_no_roots() {
     // mov eax, 1; cmp eax, 1; jne junk → always false (constant).
     let program = one_block_program(vec![
