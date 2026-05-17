@@ -1673,3 +1673,28 @@ fn diamond_path_sensitive_predicate_stays_both_possible() {
         "path-sensitive predicate must not be fabricated into AlwaysX"
     );
 }
+
+#[test]
+fn combine_table_contract_is_exhaustive_and_sound() {
+    // The (cond-SAT, not-cond-SAT) → verdict table is a hard soundness
+    // contract. Weakening any cell — especially `(Unsat,Unsat)→Unsound`
+    // (never a confident verdict from a contradictory encoding) and
+    // `Unknown→Timeout` (never a definitive verdict from an undecided
+    // solver) — would let the engine fabricate or hide a verdict. This
+    // test fails closed if anyone changes the mapping.
+    use z3::SatResult::{Sat, Unknown, Unsat};
+    let cases: [(z3::SatResult, z3::SatResult, SmtResult); 9] = [
+        (Sat, Unsat, SmtResult::AlwaysTrue),
+        (Unsat, Sat, SmtResult::AlwaysFalse),
+        (Sat, Sat, SmtResult::BothPossible),
+        (Unsat, Unsat, SmtResult::Unsound),
+        (Unknown, Sat, SmtResult::Timeout),
+        (Unknown, Unsat, SmtResult::Timeout),
+        (Unknown, Unknown, SmtResult::Timeout),
+        (Sat, Unknown, SmtResult::Timeout),
+        (Unsat, Unknown, SmtResult::Timeout),
+    ];
+    for (i, (t, f, want)) in cases.into_iter().enumerate() {
+        assert_eq!(combine(t, f), want, "z3 combine table case {i} violated");
+    }
+}

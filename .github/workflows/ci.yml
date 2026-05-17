@@ -54,3 +54,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y radare2
       - run: cargo test --workspace --all-features
+
+  solver-contracts:
+    name: solver-contracts gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verdict-ladder soundness invariants (fail-closed)
+        run: ./scripts/quality-gates.sh solver-contracts
+
+  supply-chain:
+    name: supply-chain (cargo audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # `cargo deny` is intentionally NOT run: deny.toml is kept
+      # local-only by maintainer decision (see quality-gates.sh).
+      - run: ./scripts/quality-gates.sh supply-chain

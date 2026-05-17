@@ -301,4 +301,26 @@ mod tests {
             Ok(SmtResult::Unsound)
         );
     }
+
+    #[test]
+    fn combine_table_contract_is_exhaustive_and_sound() {
+        // Must stay byte-identical to the Z3 backend's combine table
+        // (`solver.rs`): the verdict ladder is solver-agnostic. A
+        // divergence here is a CVC5-vs-Z3 soundness split.
+        use SatOutcome::{Sat, Unknown, Unsat};
+        let cases: [(SatOutcome, SatOutcome, SmtResult); 9] = [
+            (Sat, Unsat, SmtResult::AlwaysTrue),
+            (Unsat, Sat, SmtResult::AlwaysFalse),
+            (Sat, Sat, SmtResult::BothPossible),
+            (Unsat, Unsat, SmtResult::Unsound),
+            (Unknown, Sat, SmtResult::Timeout),
+            (Unknown, Unsat, SmtResult::Timeout),
+            (Unknown, Unknown, SmtResult::Timeout),
+            (Sat, Unknown, SmtResult::Timeout),
+            (Unsat, Unknown, SmtResult::Timeout),
+        ];
+        for (i, (t, f, want)) in cases.into_iter().enumerate() {
+            assert_eq!(combine(t, f), want, "cvc5 combine table case {i} violated");
+        }
+    }
 }
