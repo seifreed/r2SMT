@@ -1,8 +1,0 @@
-[default]
-engine       = "Llvm"
-workspace    = true
-all-features = true
-out          = ["Html", "Xml"]
-timeout      = "120s"
-output-dir   = "target/tarpaulin"
-exclude-files = ["crates/*/tests/*", "target/*"]
