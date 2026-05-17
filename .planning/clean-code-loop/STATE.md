@@ -92,3 +92,11 @@ CLAUDE.md decomposition watchlist, not mandated by the hard rule
   plan.rs 819 — all need *genuine* code splits now (per-ISA / per-cmd /
   per-subcommand seams; watchlist prescribes the seams). slice/parse/plan
   only modestly over — apply DRY-with-a-brake; split only on a real seam.
+- 2026-05-17 POLICY (user decision): force-split EVERY prod file <800,
+  **safest-first**. For risky/interleaved files (registers.rs has
+  `const fn` + per-ISA name tables interleaved with handlers; load-bearing
+  for SMT) use a 2-phase per file: (1) reorder items contiguous by
+  ISA/domain → verified commit; (2) extract contiguous blocks to
+  submodules → verified commit. Clean-seam files split directly.
+  Order: main.rs (commands/*.rs) → effect.rs (per-ISA) → lift.rs
+  (merge-trio+per-ISA) → registers.rs (2-phase) → parse.rs/plan.rs/slice.rs.
