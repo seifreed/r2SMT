@@ -39,6 +39,7 @@ fn finding(
             inputs: vec![],
             unknown_count: 0,
             upstream_resolved_to: None,
+            oracle_agreement: None,
         },
         pseudocode: None,
     }

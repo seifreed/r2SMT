@@ -137,6 +137,26 @@ pub enum Confidence {
     Unknown,
 }
 
+/// Outcome of cross-checking the sound verdict against an independent
+/// differential oracle (P25 plumbing; the oracle itself lands in a
+/// later phase). It is *only ever* corroboration metadata or a
+/// downgrade signal — by construction it can neither flip a verdict's
+/// polarity nor raise its confidence (see
+/// [`crate::consensus::reconcile_with_oracle`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OracleAgreement {
+    /// The oracle independently reached the *same* definitive verdict.
+    /// Pure corroboration — the finding's confidence is unchanged.
+    Corroborated,
+    /// The oracle reached a *different* definitive verdict. The sound
+    /// verdict and kind are kept verbatim (polarity never flips); only
+    /// the confidence is capped at [`Confidence::Low`] and this flag
+    /// recorded so a human re-checks it.
+    Disagreed,
+}
+
 /// Structural data extracted from the slice / SSA.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FindingEvidence {
@@ -158,6 +178,12 @@ pub struct FindingEvidence {
     /// recorded target is the only successor the block exits to.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub upstream_resolved_to: Option<Address>,
+    /// Set when an independent differential oracle was consulted for
+    /// this finding (P25). `None` — the default and the no-oracle
+    /// case — is skipped during serialization, so output stays
+    /// byte-identical to pre-P25 when no oracle runs.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub oracle_agreement: Option<OracleAgreement>,
 }
 
 impl Finding {
@@ -210,6 +236,7 @@ pub fn lifter_disagreement_finding(
             inputs: Vec::new(),
             unknown_count: 0,
             upstream_resolved_to: None,
+            oracle_agreement: None,
         },
         pseudocode: None,
     }
@@ -253,6 +280,7 @@ pub fn classify_lowered_upstream(branch: &BranchCandidate) -> Option<Finding> {
         inputs: Vec::new(),
         unknown_count: 0,
         upstream_resolved_to: Some(resolved_to),
+        oracle_agreement: None,
     };
     Some(Finding {
         address: branch.address,
@@ -349,6 +377,7 @@ pub fn classify_finding_with_hints(
         inputs,
         unknown_count,
         upstream_resolved_to: None,
+        oracle_agreement: None,
     };
     let is_complete = matches!(slice.status, SliceStatus::Complete);
     let kind = kind_for(verdict, slice);

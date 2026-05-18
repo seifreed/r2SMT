@@ -7,14 +7,16 @@
 //! layer.
 
 pub mod analyzer;
+pub mod consensus;
 pub mod dump;
 pub mod finding;
 pub mod prepare;
 
 pub use analyzer::{Analyzer, AnalyzerConfig};
+pub use consensus::{OracleReconciliation, reconcile_finding_with_oracle, reconcile_with_oracle};
 pub use dump::dump_program;
 pub use finding::{
-    Confidence, Finding, FindingEvidence, FindingKind, classify_finding,
+    Confidence, Finding, FindingEvidence, FindingKind, OracleAgreement, classify_finding,
     classify_finding_with_hints, classify_finding_with_pretty, classify_lowered_upstream,
     lifter_disagreement_finding, reconcile_folded,
 };
