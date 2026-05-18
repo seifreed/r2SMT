@@ -53,10 +53,15 @@ gate_solver_contracts() {
   # Multiple positional filters are OR-matched by libtest
   # (Rust >= 1.70; workspace MSRV is 1.85).
   echo "==> solver-contracts: combine table + sound-decline guards"
+  # `combine_table_contract_is_exhaustive_and_sound` is defined
+  # identically in solver.rs (Z3), cvc5.rs and bitwuzla.rs, so this
+  # single filter asserts the verdict ladder byte-equal across all
+  # three backends.
   cargo test -p r2smt-smt --lib -- \
     combine_table_contract_is_exhaustive_and_sound \
     truncated_slice_is_reported_unsound \
-    slice_with_unknown_is_declined_without_spawning_cvc5
+    slice_with_unknown_is_declined_without_spawning_cvc5 \
+    slice_with_unknown_is_declined_without_spawning_bitwuzla
 }
 
 gate_supply_chain() {

@@ -16,13 +16,15 @@
 //!   conclude within the budget.
 
 pub mod adapter;
+pub mod bitwuzla;
 pub mod cvc5;
 pub mod encoder;
 pub mod pretty;
 pub mod smtlib;
 pub mod solver;
 
-pub use adapter::{Cvc5Solver, Z3Solver};
+pub use adapter::{BitwuzlaSolver, Cvc5Solver, Z3Solver};
+pub use bitwuzla::{BitwuzlaError, solve_branch_bitwuzla};
 pub use cvc5::{Cvc5Error, solve_branch_cvc5};
 pub use pretty::z3_bool_to_infix;
 pub use r2smt_common::smt::{SmtResult, SolveOptions};

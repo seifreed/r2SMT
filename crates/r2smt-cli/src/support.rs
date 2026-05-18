@@ -248,6 +248,7 @@ fn build_solver(solver: SolverArg) -> Box<dyn r2smt_solver_port::Solver> {
     match solver {
         SolverArg::Z3 => Box::new(r2smt_smt::Z3Solver),
         SolverArg::Cvc5 => Box::new(r2smt_smt::Cvc5Solver),
+        SolverArg::Bitwuzla => Box::new(r2smt_smt::BitwuzlaSolver),
     }
 }
 

@@ -135,8 +135,9 @@ pub(crate) enum Command {
         unknowns_on_truncation: bool,
 
         /// SMT backend to consult. `z3` (default) uses the in-process
-        /// Z3 binding; `cvc5` shells out to a system `cvc5` binary
-        /// via SMT-LIB2. Useful as an independent cross-check.
+        /// Z3 binding; `cvc5` / `bitwuzla` shell out to a system
+        /// `cvc5` / `bitwuzla` binary via SMT-LIB2. Useful as an
+        /// independent cross-check.
         #[arg(long, value_enum, default_value_t = SolverArg::Z3)]
         solver: SolverArg,
 
@@ -203,8 +204,9 @@ pub(crate) enum Command {
         unknowns_on_truncation: bool,
 
         /// SMT backend to consult. `z3` (default) uses the in-process
-        /// Z3 binding; `cvc5` shells out to a system `cvc5` binary
-        /// via SMT-LIB2. Useful as an independent cross-check.
+        /// Z3 binding; `cvc5` / `bitwuzla` shell out to a system
+        /// `cvc5` / `bitwuzla` binary via SMT-LIB2. Useful as an
+        /// independent cross-check.
         #[arg(long, value_enum, default_value_t = SolverArg::Z3)]
         solver: SolverArg,
 
@@ -281,8 +283,9 @@ pub(crate) enum Command {
         unknowns_on_truncation: bool,
 
         /// SMT backend to consult. `z3` (default) uses the in-process
-        /// Z3 binding; `cvc5` shells out to a system `cvc5` binary
-        /// via SMT-LIB2. Useful as an independent cross-check.
+        /// Z3 binding; `cvc5` / `bitwuzla` shell out to a system
+        /// `cvc5` / `bitwuzla` binary via SMT-LIB2. Useful as an
+        /// independent cross-check.
         #[arg(long, value_enum, default_value_t = SolverArg::Z3)]
         solver: SolverArg,
 
@@ -495,8 +498,9 @@ pub(crate) enum Command {
         unknowns_on_truncation: bool,
 
         /// SMT backend to consult. `z3` (default) uses the in-process
-        /// Z3 binding; `cvc5` shells out to a system `cvc5` binary
-        /// via SMT-LIB2. Useful as an independent cross-check.
+        /// Z3 binding; `cvc5` / `bitwuzla` shell out to a system
+        /// `cvc5` / `bitwuzla` binary via SMT-LIB2. Useful as an
+        /// independent cross-check.
         #[arg(long, value_enum, default_value_t = SolverArg::Z3)]
         solver: SolverArg,
 
@@ -548,8 +552,9 @@ pub(crate) enum Command {
         unknowns_on_truncation: bool,
 
         /// SMT backend to consult. `z3` (default) uses the in-process
-        /// Z3 binding; `cvc5` shells out to a system `cvc5` binary
-        /// via SMT-LIB2. Useful as an independent cross-check.
+        /// Z3 binding; `cvc5` / `bitwuzla` shell out to a system
+        /// `cvc5` / `bitwuzla` binary via SMT-LIB2. Useful as an
+        /// independent cross-check.
         #[arg(long, value_enum, default_value_t = SolverArg::Z3)]
         solver: SolverArg,
 
@@ -602,8 +607,9 @@ pub(crate) enum Command {
         unknowns_on_truncation: bool,
 
         /// SMT backend to consult. `z3` (default) uses the in-process
-        /// Z3 binding; `cvc5` shells out to a system `cvc5` binary
-        /// via SMT-LIB2. Useful as an independent cross-check.
+        /// Z3 binding; `cvc5` / `bitwuzla` shell out to a system
+        /// `cvc5` / `bitwuzla` binary via SMT-LIB2. Useful as an
+        /// independent cross-check.
         #[arg(long, value_enum, default_value_t = SolverArg::Z3)]
         solver: SolverArg,
 
@@ -643,6 +649,10 @@ pub(crate) enum SolverArg {
     /// CVC5 via the `cvc5` subprocess. Requires `cvc5` to be
     /// available on `$PATH`.
     Cvc5,
+    /// Bitwuzla via the `bitwuzla` subprocess. Requires `bitwuzla`
+    /// to be available on `$PATH`. A third independent `QF_BV`
+    /// cross-check.
+    Bitwuzla,
 }
 
 impl ConfidenceArg {
