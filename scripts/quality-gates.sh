@@ -21,12 +21,18 @@ Available gates:
                        table byte-equal across the Z3/CVC5 backends plus
                        the sound-decline guards. Fails closed if the
                        contract is weakened.
+  determinism          Z3 (FFI) verdict determinism: the same query
+                       under a pinned seed yields a stable, seed-
+                       invariant verdict. Run single-threaded
+                       (`--test-threads=1`) so a contended host cannot
+                       mask a determinism regression.
   supply-chain         `cargo audit` against the RustSec advisory DB.
                        NOTE: `cargo deny` is intentionally NOT run here —
                        deny.toml is kept local-only by maintainer
                        decision, so the license/bans/sources policy is a
                        manual local check, not a CI gate.
-  all                  Run check + solver-contracts + supply-chain.
+  all                  Run check + solver-contracts + determinism +
+                       supply-chain.
 
 Planned gates (not yet implemented):
   r2pipe-contracts     Verify r2pipe extraction JSON shape.
@@ -64,6 +70,15 @@ gate_solver_contracts() {
     slice_with_unknown_is_declined_without_spawning_bitwuzla
 }
 
+gate_determinism() {
+  echo "==> determinism: pinned-seed verdict stability (Z3 FFI, serial)"
+  # `--test-threads=1` serialises the Z3 FFI tests so a contended
+  # host cannot turn a real determinism regression into a flaky
+  # pass. The filter matches both `determinism_*` contracts in
+  # solver/tests.rs.
+  cargo test -p r2smt-smt --lib -- --test-threads=1 determinism
+}
+
 gate_supply_chain() {
   echo "==> cargo audit"
   if ! command -v cargo-audit >/dev/null 2>&1; then
@@ -86,12 +101,16 @@ main() {
     solver-contracts)
       gate_solver_contracts
       ;;
+    determinism)
+      gate_determinism
+      ;;
     supply-chain)
       gate_supply_chain
       ;;
     all)
       gate_check
       gate_solver_contracts
+      gate_determinism
       gate_supply_chain
       ;;
     help|-h|--help)

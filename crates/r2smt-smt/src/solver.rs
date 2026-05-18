@@ -57,6 +57,16 @@ pub fn solve_branch_with_pretty(slice: &SsaLiftedSlice, options: SolveOptions) -
     let solver = Solver::new();
     let mut params = Params::new();
     params.set_u32("timeout", options.timeout_ms);
+    // Pin Z3's PRNG so a given query's verdict is reproducible
+    // run-to-run rather than varying with internal randomisation.
+    params.set_u32("random_seed", options.random_seed);
+    // A non-zero deterministic resource budget makes the
+    // `Unknown → Timeout` outcome load-independent. Left unset when
+    // zero so the wall-clock `timeout` path is byte-identical to
+    // before unless a caller opts in.
+    if options.rlimit > 0 {
+        params.set_u32("rlimit", options.rlimit);
+    }
     solver.set_params(&params);
 
     let mut encoder = Encoder::new();

@@ -65,6 +65,16 @@ jobs:
       - name: Verdict-ladder soundness invariants (fail-closed)
         run: ./scripts/quality-gates.sh solver-contracts
 
+  determinism:
+    name: determinism gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Pinned-seed verdict stability (Z3 FFI, single-threaded)
+        run: ./scripts/quality-gates.sh determinism
+
   supply-chain:
     name: supply-chain (cargo audit)
     runs-on: ubuntu-latest

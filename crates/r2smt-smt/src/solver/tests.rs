@@ -69,6 +69,16 @@ fn solve_first(program: &Program) -> SmtResult {
 }
 
 fn solve_first_with_timeout(program: &Program, timeout_ms: u32) -> SmtResult {
+    solve_first_with_options(
+        program,
+        SolveOptions {
+            timeout_ms,
+            ..SolveOptions::default()
+        },
+    )
+}
+
+fn solve_first_with_options(program: &Program, options: SolveOptions) -> SmtResult {
     let candidates = collect_branches(program);
     let cand = candidates.first().expect("at least one branch");
     let slice = slice_branch(
@@ -79,7 +89,60 @@ fn solve_first_with_timeout(program: &Program, timeout_ms: u32) -> SmtResult {
     );
     let lifted = lift_slice(&slice, program.arch);
     let ssa = ssa_convert(&lifted);
-    solve_branch(&ssa, SolveOptions { timeout_ms })
+    solve_branch(&ssa, options)
+}
+
+/// `mov eax, ecx ; imul eax, eax ; and eax, 1 ; cmp eax, 2 ; jne junk`.
+/// `(ecx * ecx) & 1` is in `{0, 1}`, never `2`, so `cmp eax, 2` sets
+/// `ZF = 0` always and `jne` fires every time → `AlwaysTrue`. A
+/// multiplication-bearing predicate is exactly the shape Z3's
+/// randomised search explores non-deterministically, so it doubles as
+/// the determinism fixture.
+fn canonical_opaque_predicate_program() -> Program {
+    one_block(vec![
+        insn(
+            0x40_1000,
+            2,
+            "mov",
+            vec![
+                op("eax", OperandKind::Register),
+                op("ecx", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1002,
+            3,
+            "imul",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1005,
+            3,
+            "and",
+            vec![
+                op("eax", OperandKind::Register),
+                op("1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            3,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op("2", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_100b,
+            6,
+            "jne",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ])
 }
 
 #[test]
@@ -318,54 +381,7 @@ fn constant_propagation_jne_is_always_false() {
 
 #[test]
 fn canonical_opaque_predicate_is_always_false() {
-    // mov eax, ecx ; imul eax, eax ; and eax, 1 ; cmp eax, 2 ; jne junk
-    // `(ecx * ecx) & 1` is in {0, 1}, never equal to 2, so `cmp eax, 2`
-    // sets ZF = 0 always, and `jne` fires every time → AlwaysTrue.
-    let program = one_block(vec![
-        insn(
-            0x40_1000,
-            2,
-            "mov",
-            vec![
-                op("eax", OperandKind::Register),
-                op("ecx", OperandKind::Register),
-            ],
-        ),
-        insn(
-            0x40_1002,
-            3,
-            "imul",
-            vec![
-                op("eax", OperandKind::Register),
-                op("eax", OperandKind::Register),
-            ],
-        ),
-        insn(
-            0x40_1005,
-            3,
-            "and",
-            vec![
-                op("eax", OperandKind::Register),
-                op("1", OperandKind::Immediate),
-            ],
-        ),
-        insn(
-            0x40_1008,
-            3,
-            "cmp",
-            vec![
-                op("eax", OperandKind::Register),
-                op("2", OperandKind::Immediate),
-            ],
-        ),
-        insn(
-            0x40_100b,
-            6,
-            "jne",
-            vec![op("0x401080", OperandKind::Immediate)],
-        ),
-    ]);
-    let verdict = solve_first(&program);
+    let verdict = solve_first(&canonical_opaque_predicate_program());
     assert_eq!(verdict, SmtResult::AlwaysTrue);
 }
 
@@ -1696,5 +1712,49 @@ fn combine_table_contract_is_exhaustive_and_sound() {
     ];
     for (i, (t, f, want)) in cases.into_iter().enumerate() {
         assert_eq!(combine(t, f), want, "z3 combine table case {i} violated");
+    }
+}
+
+#[test]
+fn determinism_verdict_is_stable_across_repeated_solves() {
+    // Same query, same pinned seed, solved N times: a deterministic
+    // solver must return the *identical* verdict every time. This is
+    // the regression guard for the P24 `random_seed` pinning — a
+    // flaky `AlwaysTrue`/`Timeout` split here means the pin regressed.
+    let program = canonical_opaque_predicate_program();
+    let options = SolveOptions {
+        timeout_ms: TEST_SOLVE_TIMEOUT_MS,
+        random_seed: 0x00C0_FFEE,
+        rlimit: 0,
+    };
+    let verdicts: Vec<SmtResult> = (0..8)
+        .map(|_| solve_first_with_options(&program, options))
+        .collect();
+    assert!(
+        verdicts.iter().all(|v| *v == SmtResult::AlwaysTrue),
+        "verdict not stable across repeats: {verdicts:?}"
+    );
+}
+
+#[test]
+fn determinism_verdict_is_invariant_across_random_seeds() {
+    // The PRNG seed steers the solver's search path, never the
+    // SAT/UNSAT result of a sound query. A seed that changes the
+    // verdict would be an encoding/soundness bug, not mere flakiness.
+    let program = canonical_opaque_predicate_program();
+    for seed in [0u32, 1, 7, 99_991, u32::MAX] {
+        let verdict = solve_first_with_options(
+            &program,
+            SolveOptions {
+                timeout_ms: TEST_SOLVE_TIMEOUT_MS,
+                random_seed: seed,
+                rlimit: 0,
+            },
+        );
+        assert_eq!(
+            verdict,
+            SmtResult::AlwaysTrue,
+            "seed {seed} changed the verdict"
+        );
     }
 }

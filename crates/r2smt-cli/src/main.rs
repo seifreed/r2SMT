@@ -183,6 +183,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             let options = SolveOptions {
                 timeout_ms: timeout_ms.unwrap_or(SolveOptions::default().timeout_ms),
+                ..SolveOptions::default()
             };
             let plan = AnnotatePlan {
                 min_confidence: min_confidence.to_confidence(),
@@ -229,6 +230,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             let options = SolveOptions {
                 timeout_ms: timeout_ms.unwrap_or(SolveOptions::default().timeout_ms),
+                ..SolveOptions::default()
             };
             let cfg = PatchCli {
                 min_confidence: min_confidence.to_confidence(),
@@ -283,6 +285,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             let options = SolveOptions {
                 timeout_ms: timeout_ms.unwrap_or(SolveOptions::default().timeout_ms),
+                ..SolveOptions::default()
             };
             let filters = SolveFilters {
                 min_confidence: min_confidence.to_confidence(),
@@ -337,6 +340,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             let options = SolveOptions {
                 timeout_ms: timeout_ms.unwrap_or(SolveOptions::default().timeout_ms),
+                ..SolveOptions::default()
             };
             batch(
                 &dir,
@@ -374,6 +378,7 @@ fn run(cli: Cli) -> Result<()> {
             limits.allow_join_merge = allow_join_merge;
             let options = SolveOptions {
                 timeout_ms: timeout_ms.unwrap_or(SolveOptions::default().timeout_ms),
+                ..SolveOptions::default()
             };
             let verbosity = if quiet {
                 AtVerbosity::Quiet

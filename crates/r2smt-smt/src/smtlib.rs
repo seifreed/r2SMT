@@ -31,6 +31,14 @@ pub fn emit_preamble(slice: &SsaLiftedSlice, options: &SolveOptions) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "(set-logic QF_BV)");
     let _ = writeln!(out, "(set-option :produce-models false)");
+    // Pin the subprocess backends' PRNG (standard SMT-LIB option,
+    // honoured by Z3 / CVC5 / Bitwuzla) so a query's verdict is
+    // reproducible run-to-run, mirroring the Z3 FFI `random_seed`.
+    let _ = writeln!(
+        out,
+        "(set-option :random-seed {seed})",
+        seed = options.random_seed
+    );
     let _ = writeln!(out, "(set-info :status unknown)");
     let _ = writeln!(out, "; r2smt slice @ {addr}", addr = slice.branch.address);
     let _ = writeln!(out, "; timeout-ms: {ms}", ms = options.timeout_ms);

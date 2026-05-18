@@ -44,6 +44,7 @@ fn diff(a: &[IrStmt], b: &[IrStmt]) -> DiffVerdict {
             &query,
             SolveOptions {
                 timeout_ms: TEST_SOLVE_TIMEOUT_MS,
+                ..SolveOptions::default()
             },
         )),
     }

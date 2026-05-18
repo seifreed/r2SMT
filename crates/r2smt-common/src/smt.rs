@@ -30,15 +30,40 @@ pub enum SmtResult {
 }
 
 /// Options controlling a single solve.
+///
+/// Extended fields are purely additive: every existing call site that
+/// only set `timeout_ms` keeps its behaviour by spreading
+/// `..SolveOptions::default()`, and the defaults are chosen so the
+/// observable verdict is unchanged unless a caller opts in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SolveOptions {
-    /// Per-branch solver budget in milliseconds.
+    /// Per-branch solver budget in milliseconds (wall-clock).
     pub timeout_ms: u32,
+    /// Pinned PRNG seed handed to every backend — the Z3 `random_seed`
+    /// parameter and the SMT-LIB `(set-option :random-seed …)` line
+    /// the subprocess backends (CVC5 / Bitwuzla) consume. Pinning it
+    /// makes a given query's verdict reproducible run-to-run instead
+    /// of varying with the solver's internal randomisation. Default
+    /// `0` (also Z3's own default — pinning it explicitly documents
+    /// the determinism intent and guards against upstream drift).
+    pub random_seed: u32,
+    /// Z3 deterministic resource limit (the `rlimit` parameter): a
+    /// load-independent unit-of-work bound. `0` (default) leaves it
+    /// unset, so the wall-clock `timeout_ms` path is byte-identical to
+    /// before unless a caller opts in. When `> 0` the budget no longer
+    /// depends on host load, so the `Unknown → Timeout` classification
+    /// stops flickering between runs under contention.
+    pub rlimit: u32,
 }
 
 impl Default for SolveOptions {
     fn default() -> Self {
-        // Matches SPEC.md §5.6 default budget.
-        Self { timeout_ms: 500 }
+        // `timeout_ms` matches SPEC.md §5.6; `random_seed` / `rlimit`
+        // defaults preserve the pre-P24 observable behaviour.
+        Self {
+            timeout_ms: 500,
+            random_seed: 0,
+            rlimit: 0,
+        }
     }
 }
