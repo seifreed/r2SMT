@@ -596,7 +596,18 @@ fn walk_block(
         }
 
         if !touches_flags && touches_live.is_empty() && touches_live_stack.is_empty() {
-            continue;
+            // P26: keep instructions that touch memory even when they
+            // don't define a currently-live register/flag. A `str`
+            // doesn't satisfy any pending live name, but its byte-
+            // granular effect on memory state IS observed by any
+            // downstream `ldr` that the encoder will lower through
+            // its `Ite`-chain memory model. Skipping it here would
+            // silently drop the write, unsoundly making the later
+            // load free. Gated on `allow_memory` so the default
+            // (no `--allow-memory`) path is byte-identical to pre-P26.
+            if !(limits.allow_memory && effect.has_memory_access) {
+                continue;
+            }
         }
 
         state.kept.push(insn.clone());

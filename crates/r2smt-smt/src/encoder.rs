@@ -17,11 +17,45 @@ enum Encoded {
     Bool(Bool),
 }
 
+/// One byte recorded by an [`IrStmt::StoreMem`]: byte address (at the
+/// slice's pointer width) and its 8-bit value. A `LoadMem` walks the
+/// store list in reverse, building an [`Ite`] chain over the
+/// `byte_addr == store.addr` predicate and falling back to a fresh
+/// free byte — aliasing is resolved by the solver, no oracle decides.
+#[derive(Debug, Clone)]
+struct ByteStore {
+    addr: BV,
+    byte: BV,
+}
+
+/// Soft cap on the number of bytes the byte-granular memory model
+/// tracks before it havocs the store list and starts answering every
+/// subsequent `LoadMem` with a fresh free value. Generous — one full
+/// stack frame is well under this — but bounded so a pathological
+/// slice cannot blow up Z3's `Ite`-chain depth (Host-Side Safety:
+/// solver-bound resources must maintain explicit budgets).
+const MEM_BYTE_STORE_CAP: usize = 4096;
+
 /// Encodes IR expressions into Z3 ASTs and feeds the resulting
 /// assertions into a [`Solver`].
 pub struct Encoder {
     vars: HashMap<String, BV>,
     unknown_counter: u32,
+    /// P26 memory model. Byte-granular store list consulted by every
+    /// [`IrStmt::LoadMem`]; an empty list and a `false` `mem_havoced`
+    /// reproduces the pre-P26 "every load is fresh" behaviour exactly.
+    byte_stores: Vec<ByteStore>,
+    /// `true` once the byte-store cap fired — all subsequent loads
+    /// see a fresh free value (sound widen-only).
+    mem_havoced: bool,
+    /// Pointer width for the slice currently being encoded. Set at
+    /// the top of [`Encoder::encode`]; defaults to 64 for the rare
+    /// caller that drives `encode_*` directly without going through
+    /// `encode` (no slice → no memory state).
+    ptr_bits: u8,
+    /// Disambiguates the fresh per-byte free variables minted by
+    /// repeated `LoadMem` operations.
+    load_counter: u32,
 }
 
 impl Default for Encoder {
@@ -37,6 +71,10 @@ impl Encoder {
         Self {
             vars: HashMap::new(),
             unknown_counter: 0,
+            byte_stores: Vec::new(),
+            mem_havoced: false,
+            ptr_bits: 64,
+            load_counter: 0,
         }
     }
 
@@ -45,6 +83,7 @@ impl Encoder {
     /// Returns the Z3 boolean expression representing the branch
     /// condition's *truth value*.
     pub fn encode(&mut self, slice: &SsaLiftedSlice, solver: &Solver) -> Bool {
+        self.ptr_bits = slice.arch.pointer_bits();
         for stmt in &slice.statements {
             self.encode_stmt(stmt, solver);
         }
@@ -59,13 +98,96 @@ impl Encoder {
                 let assertion = dst_bv.eq(&rhs);
                 solver.assert(&assertion);
             }
-            IrStmt::LoadMem { dst, bits, .. } => {
-                // Phase 6 has no memory model; declare the destination
-                // as a fresh free symbolic value.
-                let _ = self.declare(&dst.name, *bits);
+            IrStmt::LoadMem { dst, address, bits } => {
+                self.encode_load_mem(dst, address, *bits, solver);
             }
-            IrStmt::StoreMem { .. } | IrStmt::Unsupported { .. } | IrStmt::Nop => {}
+            IrStmt::StoreMem {
+                address,
+                value,
+                bits,
+            } => {
+                self.encode_store_mem(address, value, *bits);
+            }
+            IrStmt::Unsupported { .. } | IrStmt::Nop => {}
         }
+    }
+
+    /// Lower an [`IrStmt::LoadMem`] into a byte-granular value built
+    /// by walking the store list in reverse. Each output byte is an
+    /// [`Ite`] chain `byte_addr == store.addr ? store.byte : older`
+    /// folded from the most recent store backward, with a fresh free
+    /// byte as the base case. Aliasing is decided by the solver:
+    /// equal addresses pick the stored byte, unequal addresses fall
+    /// through to older stores or the fresh free value.
+    fn encode_load_mem(&mut self, dst: &Var, address: &Expr, bits: u8, solver: &Solver) {
+        let dst_bv = self.declare(&dst.name, bits);
+        if bits == 0 {
+            return;
+        }
+        let addr_bv = self.encode_address(address);
+        let nbytes = bits.div_ceil(8);
+        let load_id = self.load_counter;
+        self.load_counter = self.load_counter.wrapping_add(1);
+        let mut acc: Option<BV> = None;
+        for i in 0..nbytes {
+            let byte_addr = bv_add_offset(&addr_bv, i, self.ptr_bits);
+            let mut byte_val = mint_free_byte(load_id, i);
+            if !self.mem_havoced {
+                // Walk stores OLDEST → LATEST so the latest write
+                // ends up as the *outermost* `Ite`: the resulting
+                // value reads `latest.alias ? latest.byte : (…older
+                // chain…)`. With the order reversed, the *oldest*
+                // matching write would shadow every subsequent
+                // overwrite — silently unsound.
+                for store in &self.byte_stores {
+                    let alias = byte_addr.eq(&store.addr);
+                    byte_val = alias.ite(&store.byte, &byte_val);
+                }
+            }
+            acc = Some(match acc.take() {
+                None => byte_val,
+                Some(prev) => byte_val.concat(&prev),
+            });
+        }
+        let Some(loaded) = acc else { return };
+        let value = coerce_bv(loaded, u32::from(bits));
+        let assertion = dst_bv.eq(&value);
+        solver.assert(&assertion);
+    }
+
+    /// Record an [`IrStmt::StoreMem`] in the byte-granular store
+    /// list. Each byte is enqueued at `address + i`, little-endian.
+    /// Overflowing [`MEM_BYTE_STORE_CAP`] triggers a sound havoc:
+    /// the list is cleared and every subsequent load reads a fresh
+    /// free value (precision lost, soundness preserved).
+    fn encode_store_mem(&mut self, address: &Expr, value: &Expr, bits: u8) {
+        if bits == 0 {
+            return;
+        }
+        let nbytes = usize::from(bits.div_ceil(8));
+        if self.byte_stores.len().saturating_add(nbytes) > MEM_BYTE_STORE_CAP {
+            self.byte_stores.clear();
+            self.mem_havoced = true;
+            return;
+        }
+        let addr_bv = self.encode_address(address);
+        let value_bv = self.encode_as_bv_with_width(value, bits);
+        for i in 0..u8::try_from(nbytes).unwrap_or(u8::MAX) {
+            let byte_addr = bv_add_offset(&addr_bv, i, self.ptr_bits);
+            let lo = u32::from(i) * 8;
+            let hi = lo + 7;
+            let byte = value_bv.extract(hi, lo);
+            self.byte_stores.push(ByteStore {
+                addr: byte_addr,
+                byte,
+            });
+        }
+    }
+
+    /// Encode a memory address expression at the slice's pointer
+    /// width, the canonical type for both store and load indices.
+    fn encode_address(&mut self, address: &Expr) -> BV {
+        self.encode_as_bv_with_width(address, self.ptr_bits)
     }
 
     fn declare(&mut self, name: &str, bits: u8) -> BV {
@@ -278,5 +400,35 @@ fn widen(bv: &BV, extra: u32, sign: Signedness) -> BV {
     match sign {
         Signedness::Signed => bv.sign_ext(extra),
         Signedness::Unsigned => bv.zero_ext(extra),
+    }
+}
+
+/// Build `base + offset` at `ptr_bits` width. `offset` is small
+/// enough to fit in a `u64`, so no truncation risk: it's the byte
+/// index inside a single memory access (≤ 16 for an `ldp` / `stp`).
+fn bv_add_offset(base: &BV, offset: u8, ptr_bits: u8) -> BV {
+    if offset == 0 {
+        return base.clone();
+    }
+    let off = BV::from_u64(u64::from(offset), u32::from(ptr_bits));
+    base.bvadd(&off)
+}
+
+/// Mint a fresh, anonymous 8-bit value for byte `i` of load `id` —
+/// the base case of a `LoadMem`'s `Ite` chain when no prior store
+/// aliases the byte's address.
+fn mint_free_byte(id: u32, i: u8) -> BV {
+    BV::new_const(format!("__load_{id}_b{i}").as_str(), 8)
+}
+
+/// Truncate or zero-extend `bv` to exactly `target` bits. Used by
+/// the memory-load reconstruction to coerce the byte-concat (a
+/// multiple of 8 bits) to the load's exact width.
+fn coerce_bv(bv: BV, target: u32) -> BV {
+    let cur = bv.get_size();
+    match cur.cmp(&target) {
+        std::cmp::Ordering::Equal => bv,
+        std::cmp::Ordering::Greater => bv.extract(target - 1, 0),
+        std::cmp::Ordering::Less => bv.zero_ext(target - cur),
     }
 }

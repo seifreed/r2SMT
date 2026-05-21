@@ -1,9 +1,11 @@
 //! `AArch64` per-mnemonic lifter handlers, extracted from `lift.rs`.
 //! Methods on [`LiftCtx`]; shared infrastructure stays in the parent.
 
-use r2smt_ir::expr::Expr;
-use r2smt_ir::program::{Instruction, OperandKind};
+use r2smt_ir::expr::{Expr, Var};
+use r2smt_ir::program::{Instruction, Operand, OperandKind};
 use r2smt_ir::stmt::IrStmt;
+
+use crate::registers::register_layout;
 
 use super::{
     BinOp, CsArithOp, LiftCtx, aarch64_cond_suffix_to_predicate, nonzero_width, width_mask,
@@ -58,6 +60,14 @@ impl LiftCtx {
             "cinc" => self.lift_aarch64_cs_arith(insn, CsArithOp::Inc, true),
             "cinv" => self.lift_aarch64_cs_arith(insn, CsArithOp::Inv, true),
             "cneg" => self.lift_aarch64_cs_arith(insn, CsArithOp::Neg, true),
+            // P26 — memory loads / stores in offset form `[Xn]` /
+            // `[Xn, #imm]`. Pre / post-index writeback (`[Xn, #imm]!`
+            // / `[Xn], #imm`) and register-offset addressing
+            // (`[Xn, Xm]`) decline to `Unsupported` so the slice's
+            // confidence path picks them up — soundness in lowering,
+            // not detection.
+            "ldr" => self.lift_aarch64_ldr(insn),
+            "str" => self.lift_aarch64_str(insn),
             _ => self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("at {addr} (aarch64)", addr = insn.address),
@@ -396,4 +406,184 @@ impl LiftCtx {
         self.set_flag("OF", Expr::konst(0, 1));
         self.set_flag("PF", Expr::Unknown(String::new()));
     }
+
+    /// `ldr Rd, [Xn{, #imm}]` — read `Rd`-width bytes from memory and
+    /// write them to the destination register. W-form (`ldr Wd, …`)
+    /// zero-extends to the parent X per the `AArch64` ABI via
+    /// [`LiftCtx::write_register_to`]. Writeback (`[Xn, …]!`) and
+    /// register-offset addressing decline to `Unsupported` so the
+    /// confidence path picks them up rather than silently widening.
+    pub(super) fn lift_aarch64_ldr(&mut self, insn: &Instruction) {
+        let (Some(dst), Some(mem)) = (insn.operands.first(), insn.operands.get(1)) else {
+            return;
+        };
+        if dst.kind != OperandKind::Register || mem.kind != OperandKind::Memory {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "ldr operand shape (non-Register/non-Memory)".into(),
+            });
+            return;
+        }
+        let Some(load_width) = nonzero_width(self.operand_width(dst)) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "ldr zero-width destination".into(),
+            });
+            return;
+        };
+        let Some(address) = aarch64_address_expr(mem, self.bits) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: format!("ldr addressing mode not yet modelled: {}", mem.raw),
+            });
+            return;
+        };
+        // Two-statement lower: load into a fresh temp at the load
+        // width, then write that temp into the destination register
+        // so `write_register_to` zero-extends to the parent X for
+        // the W-form (mirrors the `add` / `sub` flag-ordering
+        // precedent: stash-then-write).
+        let tmp = self.new_temp(insn.address, load_width);
+        self.stmts.push(IrStmt::LoadMem {
+            dst: tmp.clone(),
+            address,
+            bits: load_width,
+        });
+        if !self.write_register_to(dst, Expr::Var(tmp)) {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "ldr destination not a supported register".into(),
+            });
+        }
+    }
+
+    /// `str Rs, [Xn{, #imm}]` — write the source register's natural
+    /// width to memory. See [`Self::lift_aarch64_ldr`] for the
+    /// addressing-mode restrictions.
+    pub(super) fn lift_aarch64_str(&mut self, insn: &Instruction) {
+        let (Some(src), Some(mem)) = (insn.operands.first(), insn.operands.get(1)) else {
+            return;
+        };
+        if src.kind != OperandKind::Register || mem.kind != OperandKind::Memory {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "str operand shape (non-Register/non-Memory)".into(),
+            });
+            return;
+        }
+        let Some(store_width) = nonzero_width(self.operand_width(src)) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "str zero-width source".into(),
+            });
+            return;
+        };
+        let Some(address) = aarch64_address_expr(mem, self.bits) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: format!("str addressing mode not yet modelled: {}", mem.raw),
+            });
+            return;
+        };
+        let value = self.read_operand_at(src, store_width);
+        self.stmts.push(IrStmt::StoreMem {
+            address,
+            value,
+            bits: store_width,
+        });
+    }
+}
+
+/// Parse an `AArch64` memory operand in the supported offset forms
+/// (`[Xn]` / `[Xn, #imm]` / `[Xn, imm]`) into a symbolic address
+/// expression `base ± offset` at the pointer width.
+///
+/// Returns `None` for writeback (`[Xn, …]!` / `[Xn], …`) and
+/// register-offset (`[Xn, Xm{, lsl #k}]`) forms — those addressing
+/// modes also mutate the base register and need an extra ordered
+/// `Assign`, which a later P26 follow-up will add. Rejecting cleanly
+/// here keeps the lifter sound (the caller emits `Unsupported` and
+/// the confidence path widens) rather than silently dropping the
+/// writeback effect.
+fn aarch64_address_expr(mem: &Operand, ptr_bits: u8) -> Option<Expr> {
+    let (base, offset) = parse_aarch64_memory(&mem.raw)?;
+    let parent =
+        register_layout(&base, r2smt_common::Arch::Aarch64).map_or(base.as_str(), |l| l.parent);
+    let base_var = Expr::Var(Var::new(parent, ptr_bits));
+    if offset == 0 {
+        return Some(base_var);
+    }
+    // Bit-pattern reinterpretation of `offset` as `u64`: negative
+    // offsets carry their two's-complement representation, which
+    // `bvadd` then folds correctly at `ptr_bits` (the encoder reads
+    // the constant as the unsigned representation of a negative
+    // integer at that width). Going through `to_le_bytes` keeps the
+    // conversion explicit (no `as` sign loss) and platform-stable.
+    let masked = u64::from_le_bytes(offset.to_le_bytes()) & width_mask(ptr_bits);
+    let off_const = Expr::konst(masked, ptr_bits);
+    Some(Expr::add(base_var, off_const))
+}
+
+/// Parse `[base{, #?offset}]` into `(base, offset)`. Returns `None`
+/// for any shape outside the supported subset (writeback, register
+/// offset, shift modifiers, malformed input).
+fn parse_aarch64_memory(raw: &str) -> Option<(String, i64)> {
+    let trimmed = raw.trim();
+    let body = trimmed.strip_prefix('[')?.strip_suffix(']')?;
+    // Writeback suffix `]!` was stripped by `strip_suffix(']')`, so a
+    // remaining `!` (e.g. inside the brackets — unusual) is still
+    // rejected via the comma-split below; the post-index form
+    // `[base], #imm` keeps the `, #imm` *outside* the brackets and
+    // therefore fails the `strip_suffix(']')` check above.
+    let parts: Vec<&str> = body.split(',').map(str::trim).collect();
+    match parts.as_slice() {
+        [base] => {
+            if !is_valid_aarch64_base(base) {
+                return None;
+            }
+            Some((base.to_ascii_lowercase(), 0))
+        }
+        [base, offset] => {
+            if !is_valid_aarch64_base(base) {
+                return None;
+            }
+            let off_str = offset.strip_prefix('#').unwrap_or(offset).trim();
+            let value = parse_signed_immediate(off_str)?;
+            Some((base.to_ascii_lowercase(), value))
+        }
+        // Three+ comma-separated parts implies a register-offset
+        // with shift (`[x0, x1, lsl #3]`) or some other unsupported
+        // shape — decline.
+        _ => None,
+    }
+}
+
+fn is_valid_aarch64_base(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    // Only the architectural addressing registers — `x0..x30`, `sp`,
+    // and analyst aliases (`lr`, `fp`) that resolve through
+    // `register_layout`. `wN` reads are rejected: AArch64 addressing
+    // is 64-bit, a `Wn` base would be a malformed disassembly.
+    register_layout(&lower, r2smt_common::Arch::Aarch64)
+        .map(|l| l.parent != "xzr")
+        .filter(|valid| *valid)
+        .is_some()
+        && !lower.starts_with('w')
+}
+
+fn parse_signed_immediate(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    let (negative, body) = if let Some(rest) = s.strip_prefix('-') {
+        (true, rest.trim())
+    } else if let Some(rest) = s.strip_prefix('+') {
+        (false, rest.trim())
+    } else {
+        (false, s)
+    };
+    let magnitude = if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).ok()?
+    } else {
+        body.parse::<i64>().ok()?
+    };
+    Some(if negative { -magnitude } else { magnitude })
 }

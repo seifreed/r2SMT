@@ -113,7 +113,76 @@ pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
             aarch64_csel_effect(insn)
         }
         "cset" | "csetm" => aarch64_cset_effect(insn),
+        // P26 — memory loads / stores. `ldr` defines its destination
+        // register; `str` does not define a register but mutates
+        // memory state which downstream `ldr`s consume, so the
+        // slicer's memory-aware pass keeps it (gated on
+        // `allow_memory`). Flag-setting is `false` for both — these
+        // are the plain `ldr` / `str` family, not the comparison
+        // forms (`tst` / `cmp` handled above).
+        "ldr" => aarch64_ldr_effect(insn),
+        "str" => aarch64_str_effect(insn),
         _ => other_effect(insn),
+    }
+}
+
+fn aarch64_ldr_effect(insn: &Instruction) -> InstructionEffect {
+    let mut defs = Vec::new();
+    let mut uses = Vec::new();
+    if let Some(dst) = insn.operands.first()
+        && let Some(reg) = canonical_register(&dst.raw, Arch::Aarch64)
+    {
+        defs.push(reg);
+    }
+    if let Some(mem) = insn.operands.get(1) {
+        for r in registers_in_operand(mem, Arch::Aarch64) {
+            if !uses.contains(&r) {
+                uses.push(r);
+            }
+        }
+    }
+    InstructionEffect {
+        kind: InstructionKind::Mov,
+        defs,
+        uses,
+        defines_flags: false,
+        has_memory_access: true,
+        is_call: false,
+        stack_defs: Vec::new(),
+        stack_uses: Vec::new(),
+        reads_flags: false,
+    }
+}
+
+fn aarch64_str_effect(insn: &Instruction) -> InstructionEffect {
+    let mut uses = Vec::new();
+    if let Some(src) = insn.operands.first()
+        && let Some(reg) = canonical_register(&src.raw, Arch::Aarch64)
+    {
+        uses.push(reg);
+    }
+    if let Some(mem) = insn.operands.get(1) {
+        for r in registers_in_operand(mem, Arch::Aarch64) {
+            if !uses.contains(&r) {
+                uses.push(r);
+            }
+        }
+    }
+    InstructionEffect {
+        // `Mov` keeps the slicer out of the `Other`-truncation path
+        // even though `str` has no register destination — it is
+        // semantically "data movement", and the memory side-effect is
+        // surfaced through `has_memory_access`. The memory-aware
+        // slice walker keeps it for any kept downstream `ldr`.
+        kind: InstructionKind::Mov,
+        defs: Vec::new(),
+        uses,
+        defines_flags: false,
+        has_memory_access: true,
+        is_call: false,
+        stack_defs: Vec::new(),
+        stack_uses: Vec::new(),
+        reads_flags: false,
     }
 }
 

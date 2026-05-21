@@ -504,6 +504,7 @@ dependencies = [
  "r2smt-common",
  "r2smt-ir",
  "r2smt-slicer",
+ "r2smt-smt",
  "r2smt-ssa",
  "serde",
  "serde_json",
