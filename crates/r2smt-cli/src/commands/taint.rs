@@ -1,6 +1,6 @@
 //! `taint` subcommand — E2b.
 //!
-//! Runs the sound may-taint pass ([`r2smt_taint::propagate`]) over the
+//! Runs the sound may-taint pass ([`r2smt_taint::propagate()`]) over the
 //! slice at a target address and reports which values derive from the
 //! seeded source(s). When the taint outcome is *opaque* (a flow hidden
 //! behind an `Unknown` / `Unsupported` node) and `--concretise` is set,

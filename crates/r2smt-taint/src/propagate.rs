@@ -11,7 +11,7 @@
 //! negatives — if a sink is untainted here, no modelled flow taints it.
 //!
 //! When an `Unknown` or `Unsupported` node is present the pass sets
-//! [`TaintOutcome::opaque`]. An opaque outcome is best-effort: flows
+//! `TaintOutcome::opaque`. An opaque outcome is best-effort: flows
 //! hidden inside the unmodelled node are invisible, so the taint map is
 //! no longer a guaranteed lower or upper bound. Callers that need
 //! soundness must treat an opaque outcome as "taint status unknown"

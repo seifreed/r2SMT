@@ -21,7 +21,7 @@
 //!    the query is `None` and the caller reports `Inconclusive`. An
 //!    [`Expr::Unknown`] is *not* disqualifying on its own: it
 //!    forward-taints only the outputs whose value depends on it (see
-//!    [`tainted_defs`]), and a tainted output is excluded from the
+//!    `tainted_defs`), and a tainted output is excluded from the
 //!    comparison set so it can never become an independently-free
 //!    value that fabricates a difference.
 //! 2. Free inputs are tied to one shared machine state through the

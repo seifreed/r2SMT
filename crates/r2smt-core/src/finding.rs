@@ -111,7 +111,7 @@ pub enum FindingKind {
     /// the differential harness. This is an engine-integrity defect —
     /// one of r2SMT's own lifters is unsound for that instruction —
     /// not a property of the analysed sample. Produced solely by the
-    /// opt-in `--differential-lift` path, never by [`kind_for`].
+    /// opt-in `--differential-lift` path, never by `kind_for`.
     LifterDisagreement,
 }
 

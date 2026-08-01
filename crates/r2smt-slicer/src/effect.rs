@@ -173,7 +173,7 @@ fn any_memory_operand(operands: &[Operand]) -> bool {
 /// address the byte-granular model **cannot** build, so the slicer
 /// must gate it behind `--allow-memory` (and truncate otherwise).
 ///
-/// x86 memory is unmodellable only when [`crate::lift::x86_memory_modellable`]
+/// x86 memory is unmodellable only when `x86_memory_modellable`
 /// rejects it (rip-relative segments, subtracted registers, …); a
 /// resolvable address — stack slot, global, or register-indirect — is
 /// modellable and resolves without the flag. For every other ISA the

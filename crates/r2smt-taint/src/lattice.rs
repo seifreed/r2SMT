@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-/// An opaque identifier for a taint source (e.g. "argv[1]", "stdin",
+/// An opaque identifier for a taint source (e.g. `argv[1]`, "stdin",
 /// "the RC4 key"). The caller assigns meaning; the lattice only unions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SourceId(pub u32);

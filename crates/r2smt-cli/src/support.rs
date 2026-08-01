@@ -216,7 +216,7 @@ pub(crate) fn compute_findings(
 
 /// Build the SSA slices for the targeted branches without solving them.
 /// Shares the open → dump → resolve → `prepare_ssa` path with
-/// [`compute_findings`], but returns the raw [`SsaLiftedSlice`]s for
+/// [`compute_findings`], but returns the raw `SsaLiftedSlice`s for
 /// consumers (like the taint pass) that run their own analysis.
 ///
 /// # Errors

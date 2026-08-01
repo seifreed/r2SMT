@@ -7,7 +7,7 @@
 //! to a multi-source join-semilattice ([`TaintSet`]), so several sources
 //! can be tracked at once (e.g. `argv[1]` and `stdin` independently).
 //!
-//! The propagation ([`propagate`]) is the *sound subset* of the taint
+//! The propagation ([`propagate()`]) is the *sound subset* of the taint
 //! story: exact for register data flow and a sound over-approximation
 //! for memory, with an [`TaintOutcome::is_opaque`] flag when an
 //! unmodelled node (`Unknown` / `Unsupported` / truncation) makes the

@@ -40,7 +40,7 @@ impl From<ParseError> for PcodeError {
     }
 }
 
-/// Lifter output — mirrors [`r2smt_esil::EsilLift`] so callers can
+/// Lifter output — mirrors `r2smt_esil::EsilLift` so callers can
 /// splice it into their statement list directly.
 #[derive(Debug, Clone)]
 pub struct PcodeLift {

@@ -630,7 +630,7 @@ fn classify_operand(raw: &str) -> OperandKind {
 /// `text` is the instruction's `0x…:` header line plus its indented
 /// P-code op lines. Lets the r2ghidra adapter attach per-instruction
 /// P-code to [`r2smt_ir::program::Instruction::pcode`] so the pure
-/// [`r2smt_pcode`] lifter never touches a live r2 process.
+/// `r2smt_pcode` lifter never touches a live r2 process.
 ///
 /// Pure and fixture-testable; non-header, non-indented noise (stray r2
 /// log lines) is ignored.
