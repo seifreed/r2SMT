@@ -2,9 +2,12 @@
 //! Methods on [`LiftCtx`]; reuses the `AArch64` 3-operand family and
 //! shared infrastructure from the parent module.
 
-use r2smt_ir::expr::Expr;
-use r2smt_ir::program::{Instruction, OperandKind};
+use r2smt_common::Arch;
+use r2smt_ir::expr::{Expr, Var};
+use r2smt_ir::program::{Instruction, Operand, OperandKind};
 use r2smt_ir::stmt::IrStmt;
+
+use crate::registers::register_layout;
 
 use super::{
     BinOp, LiftCtx, aarch64_cond_suffix_to_predicate, is_aarch32_base_supported, nonzero_width,
@@ -71,6 +74,12 @@ impl LiftCtx {
             "tst" => self.lift_aarch64_tst(insn),
             // `teq Rn, Op` = test-equivalence, sets flags from Rn ^ Op.
             "teq" => self.lift_aarch32_teq(insn),
+            // Memory in offset form `[Rn]` / `[Rn, #imm]`. Register-
+            // offset, writeback, and predicated forms (`ldreq`) are not
+            // in this match and decline to `Unsupported` — sound, the
+            // slice's confidence path widens rather than mis-lifting.
+            "ldr" => self.lift_aarch32_ldr(insn),
+            "str" => self.lift_aarch32_str(insn),
             _ => self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("at {addr} (aarch32)", addr = insn.address),
@@ -250,4 +259,122 @@ impl LiftCtx {
             });
         }
     }
+
+    fn lift_aarch32_ldr(&mut self, insn: &Instruction) {
+        let (Some(dst), Some(mem)) = (insn.operands.first(), insn.operands.get(1)) else {
+            return;
+        };
+        if dst.kind != OperandKind::Register || mem.kind != OperandKind::Memory {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "ldr operand shape (non-Register/non-Memory)".into(),
+            });
+            return;
+        }
+        let Some(load_width) = nonzero_width(self.operand_width(dst)) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "ldr zero-width destination".into(),
+            });
+            return;
+        };
+        let Some(address) = aarch32_address_expr(mem, self.bits) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: format!("ldr addressing mode not yet modelled: {}", mem.raw),
+            });
+            return;
+        };
+        let tmp = self.new_temp(insn.address, load_width);
+        self.stmts.push(IrStmt::LoadMem {
+            dst: tmp.clone(),
+            address,
+            bits: load_width,
+        });
+        if !self.write_register_to(dst, Expr::Var(tmp)) {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "ldr destination not a supported register".into(),
+            });
+        }
+    }
+
+    fn lift_aarch32_str(&mut self, insn: &Instruction) {
+        let (Some(src), Some(mem)) = (insn.operands.first(), insn.operands.get(1)) else {
+            return;
+        };
+        if src.kind != OperandKind::Register || mem.kind != OperandKind::Memory {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "str operand shape (non-Register/non-Memory)".into(),
+            });
+            return;
+        }
+        let Some(store_width) = nonzero_width(self.operand_width(src)) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "str zero-width source".into(),
+            });
+            return;
+        };
+        let Some(address) = aarch32_address_expr(mem, self.bits) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: format!("str addressing mode not yet modelled: {}", mem.raw),
+            });
+            return;
+        };
+        let value = self.read_operand_at(src, store_width);
+        self.stmts.push(IrStmt::StoreMem {
+            address,
+            value,
+            bits: store_width,
+        });
+    }
+}
+
+/// Parse an `AArch32` memory operand in the supported offset forms
+/// (`[Rn]` / `[Rn, #imm]`) into a symbolic address `base ± offset` at
+/// the pointer width. Returns `None` for register-offset, writeback,
+/// shifted, or otherwise unrecognised shapes so the caller declines
+/// soundly (the ARM `r0..r15` base is resolved through
+/// [`register_layout`] under [`Arch::Arm`]).
+fn aarch32_address_expr(mem: &Operand, ptr_bits: u8) -> Option<Expr> {
+    let (base, offset) = parse_aarch32_memory(&mem.raw)?;
+    let parent = register_layout(&base, Arch::Arm).map(|l| l.parent)?;
+    let base_var = Expr::Var(Var::new(parent, ptr_bits));
+    if offset == 0 {
+        return Some(base_var);
+    }
+    let masked = u64::from_le_bytes(offset.to_le_bytes()) & width_mask(ptr_bits);
+    Some(Expr::add(base_var, Expr::konst(masked, ptr_bits)))
+}
+
+/// Split `[base{, #?imm}]` into `(base, offset)`; `None` for any shape
+/// outside the supported offset subset (writeback keeps the `!` or a
+/// post-index `, #imm` outside the brackets; register-offset yields a
+/// non-numeric second part).
+fn parse_aarch32_memory(raw: &str) -> Option<(String, i64)> {
+    let body = raw.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let parts: Vec<&str> = body.split(',').map(str::trim).collect();
+    match parts.as_slice() {
+        [base] => Some((base.to_ascii_lowercase(), 0)),
+        [base, offset] => {
+            let off = offset.strip_prefix('#').unwrap_or(offset).trim();
+            Some((base.to_ascii_lowercase(), parse_aarch32_immediate(off)?))
+        }
+        _ => None,
+    }
+}
+
+/// Parse a signed immediate in decimal or `0x` hex (with optional `-`).
+fn parse_aarch32_immediate(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        return i64::from_str_radix(hex, 16).ok();
+    }
+    if let Some(hex) = s.strip_prefix("-0x").or_else(|| s.strip_prefix("-0X")) {
+        return i64::from_str_radix(hex, 16).ok().map(|v| -v);
+    }
+    s.parse::<i64>().ok()
 }

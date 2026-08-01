@@ -383,3 +383,85 @@ fn test_aarch64_stp_emits_two_storemem_for_the_pair() {
     assert!(format!("{:?}", stores[0].1).contains("\"x0\""));
     assert!(format!("{:?}", stores[1].1).contains("\"x1\""));
 }
+
+// --- AArch32 lifter goldens for `ldr` / `str` (P28) -------------------
+
+#[test]
+fn test_aarch32_ldr_emits_loadmem_with_base_plus_offset_address() {
+    // `ldr r0, [r1, #8]` → load 32 bits at `r1 + 8`.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "ldr",
+            vec![
+                op("r0", OperandKind::Register),
+                op("[r1, 8]", OperandKind::Memory),
+            ],
+        ),
+        Arch::Arm,
+    );
+    let load = stmts
+        .iter()
+        .find_map(|s| match s {
+            IrStmt::LoadMem { address, bits, .. } => Some((address.clone(), *bits)),
+            _ => None,
+        })
+        .expect("aarch32 ldr must produce a LoadMem");
+    assert_eq!(load.1, 32, "aarch32 ldr must load 32 bits");
+    assert!(
+        format!("{:?}", load.0).contains("\"r1\""),
+        "expected r1 in lifted address, got: {:?}",
+        load.0
+    );
+}
+
+#[test]
+fn test_aarch32_str_emits_storemem_with_value_and_address() {
+    // `str r2, [r3, #16]` → store r2 at `r3 + 16`.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "str",
+            vec![
+                op("r2", OperandKind::Register),
+                op("[r3, 16]", OperandKind::Memory),
+            ],
+        ),
+        Arch::Arm,
+    );
+    let store = stmts
+        .iter()
+        .find_map(|s| match s {
+            IrStmt::StoreMem {
+                address,
+                value,
+                bits,
+            } => Some((address.clone(), value.clone(), *bits)),
+            _ => None,
+        })
+        .expect("aarch32 str must produce a StoreMem");
+    assert_eq!(store.2, 32, "aarch32 str must store 32 bits");
+    assert!(format!("{:?}", store.0).contains("\"r3\""));
+    assert!(format!("{:?}", store.1).contains("\"r2\""));
+}
+
+#[test]
+fn test_aarch32_ldr_register_offset_declines_soundly() {
+    // `ldr r0, [r1, r2]` (register offset) is not modelled — the
+    // lifter must decline to `Unsupported`, never emit a LoadMem.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "ldr",
+            vec![
+                op("r0", OperandKind::Register),
+                op("[r1, r2]", OperandKind::Memory),
+            ],
+        ),
+        Arch::Arm,
+    );
+    assert!(
+        !stmts.iter().any(|s| matches!(s, IrStmt::LoadMem { .. })),
+        "register-offset ldr must not fabricate a LoadMem: {stmts:?}"
+    );
+}
