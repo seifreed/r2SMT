@@ -197,20 +197,29 @@ pub fn has_unmodellable_memory(operands: &[Operand], arch: Arch) -> bool {
 /// can fall back to their own natural pointer width. Applies to any
 /// memory operand, not just recognised stack slots — `dword ptr [rax]`
 /// is a 32-bit access regardless of the base register.
+///
+/// The size specifier is the *leading* token of an Intel-syntax memory
+/// operand (`dword ptr [rax]`, `xmmword [rsi]`), so the width is matched
+/// on the prefix rather than by substring. Anchoring is load-bearing:
+/// `xmmword`/`ymmword`/`zmmword` all contain `"word"` (they are 128 /
+/// 256 / 512-bit, not 16), and a symbol name that merely contains a
+/// size keyword (e.g. `[obj.dword_table]`) must not be read as sized.
 #[must_use]
 pub fn memory_operand_width(raw: &str) -> Option<u16> {
-    let lower = raw.to_ascii_lowercase();
-    if lower.contains("qword") {
-        Some(64)
-    } else if lower.contains("dword") {
-        Some(32)
-    } else if lower.contains("word") {
-        Some(16)
-    } else if lower.contains("byte") {
-        Some(8)
-    } else {
-        None
-    }
+    const WIDTHS: [(&str, u16); 7] = [
+        ("zmmword", 512),
+        ("ymmword", 256),
+        ("xmmword", 128),
+        ("qword", 64),
+        ("dword", 32),
+        ("word", 16),
+        ("byte", 8),
+    ];
+    let lower = raw.trim().to_ascii_lowercase();
+    WIDTHS
+        .iter()
+        .find(|(kw, _)| lower.starts_with(kw))
+        .map(|&(_, bits)| bits)
 }
 
 /// Pointer width of a recognised stack slot, in bits. Uses the

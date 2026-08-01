@@ -492,3 +492,22 @@ fn shifts_define_dest_and_flags() {
     assert_eq!(e.uses, vec!["rax"]);
     assert!(e.defines_flags);
 }
+
+#[test]
+fn memory_operand_width_reads_simd_size_prefixes() {
+    assert_eq!(memory_operand_width("xmmword ptr [rsi]"), Some(128));
+    assert_eq!(memory_operand_width("ymmword [rsi]"), Some(256));
+    assert_eq!(memory_operand_width("zmmword ptr [rsi]"), Some(512));
+    assert_eq!(memory_operand_width("qword ptr [rbp - 8]"), Some(64));
+    assert_eq!(memory_operand_width("dword [rax]"), Some(32));
+    assert_eq!(memory_operand_width("byte ptr [rdi]"), Some(8));
+}
+
+#[test]
+fn memory_operand_width_ignores_size_keywords_inside_symbols() {
+    // A symbol whose name merely contains a size keyword is not a sized
+    // access — the specifier must be the leading token.
+    assert_eq!(memory_operand_width("[obj.dword_table]"), None);
+    assert_eq!(memory_operand_width("[byte_count]"), None);
+    assert_eq!(memory_operand_width("[rax]"), None);
+}

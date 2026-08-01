@@ -216,13 +216,21 @@ fn fold_or(a: Expr, b: Expr) -> Expr {
     // at least as wide as the other operand: otherwise the result's
     // high bits come from `x`, not from the constant, and absorbing
     // would fabricate a definitive value (and a confident verdict).
+    // The `bits <= 128` guard is load-bearing above 128-bit widths:
+    // `width_mask` saturates to `u128::MAX` there, so without it a
+    // low-128-ones constant at (say) 256 bits would be misread as
+    // all-ones@256. A genuine all-ones constant wider than 128 bits is
+    // unrepresentable as a single `Const` (`value: u128`), so the rule
+    // simply cannot apply and the guard loses nothing.
     if let Some((va, bits)) = as_const(&a)
+        && bits <= 128
         && va == width_mask(bits)
         && expr_bits(&b).is_some_and(|other| bits >= other)
     {
         return Expr::konst(va, bits);
     }
     if let Some((vb, bits)) = as_const(&b)
+        && bits <= 128
         && vb == width_mask(bits)
         && expr_bits(&a).is_some_and(|other| bits >= other)
     {
@@ -503,6 +511,22 @@ mod tests {
         assert!(
             !matches!(simplify_expr(&e), Expr::Const { .. }),
             "narrow all-ones must not absorb a wider operand"
+        );
+    }
+
+    #[test]
+    fn or_absorb_does_not_fire_above_128_bits() {
+        // `u128::MAX:256 | zmm0:256` — at 256 bits `u128::MAX` is only
+        // the low 128 ones, NOT all-ones@256, so absorbing would zero
+        // out `zmm0`'s real high 128 bits. `width_mask` saturates above
+        // 128, so the rule must be gated off there.
+        let e = Expr::bv_or(
+            Expr::konst(u128::MAX, 256),
+            Expr::Var(Var::new("zmm0", 256)),
+        );
+        assert!(
+            !matches!(simplify_expr(&e), Expr::Const { .. }),
+            "all-ones absorbing must not fire for >128-bit widths"
         );
     }
 
