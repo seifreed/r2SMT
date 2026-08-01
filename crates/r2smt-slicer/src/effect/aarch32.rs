@@ -128,8 +128,8 @@ fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> Instruct
         // base; `str` reads its source plus the base. Both flag
         // `has_memory_access` so the memory-aware slice walker keeps
         // them under `--allow-memory`.
-        "ldr" => aarch32_ldr_effect(insn),
-        "str" => aarch32_str_effect(insn),
+        "ldr" | "ldrb" | "ldrh" => aarch32_ldr_effect(insn),
+        "str" | "strb" | "strh" => aarch32_str_effect(insn),
         _ => other_effect(insn),
     }
 }

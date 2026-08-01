@@ -74,12 +74,19 @@ impl LiftCtx {
             "tst" => self.lift_aarch64_tst(insn),
             // `teq Rn, Op` = test-equivalence, sets flags from Rn ^ Op.
             "teq" => self.lift_aarch32_teq(insn),
-            // Memory in offset form `[Rn]` / `[Rn, #imm]`. Register-
-            // offset, writeback, and predicated forms (`ldreq`) are not
-            // in this match and decline to `Unsupported` — sound, the
-            // slice's confidence path widens rather than mis-lifting.
-            "ldr" => self.lift_aarch32_ldr(insn),
-            "str" => self.lift_aarch32_str(insn),
+            // Memory in offset form `[Rn]` / `[Rn, #imm]`. Word (`ldr`/
+            // `str`), byte (`ldrb`/`strb`), and halfword (`ldrh`/`strh`)
+            // widths — byte/halfword loads zero-extend to the 32-bit
+            // register. Register-offset, writeback, predicated
+            // (`ldreq`), and the sign-extending `ldrsb`/`ldrsh` forms
+            // are not in this match and decline to `Unsupported` —
+            // sound, the confidence path widens rather than mis-lifting.
+            "ldr" => self.lift_aarch32_load(insn, None),
+            "ldrb" => self.lift_aarch32_load(insn, Some(8)),
+            "ldrh" => self.lift_aarch32_load(insn, Some(16)),
+            "str" => self.lift_aarch32_store(insn, None),
+            "strb" => self.lift_aarch32_store(insn, Some(8)),
+            "strh" => self.lift_aarch32_store(insn, Some(16)),
             _ => self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("at {addr} (aarch32)", addr = insn.address),
@@ -260,7 +267,10 @@ impl LiftCtx {
         }
     }
 
-    fn lift_aarch32_ldr(&mut self, insn: &Instruction) {
+    /// Lift an `AArch32` load. `width_override` is `Some(8)` for `ldrb`
+    /// and `Some(16)` for `ldrh` (zero-extended into the 32-bit
+    /// register); `None` for the word-sized `ldr`.
+    fn lift_aarch32_load(&mut self, insn: &Instruction, width_override: Option<u8>) {
         let (Some(dst), Some(mem)) = (insn.operands.first(), insn.operands.get(1)) else {
             return;
         };
@@ -271,13 +281,14 @@ impl LiftCtx {
             });
             return;
         }
-        let Some(load_width) = nonzero_width(self.operand_width(dst)) else {
+        let Some(dst_width) = nonzero_width(self.operand_width(dst)) else {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: "ldr zero-width destination".into(),
             });
             return;
         };
+        let load_width = width_override.unwrap_or(dst_width);
         let Some(address) = aarch32_address_expr(mem, self.bits) else {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
@@ -291,7 +302,12 @@ impl LiftCtx {
             address,
             bits: load_width,
         });
-        if !self.write_register_to(dst, Expr::Var(tmp)) {
+        let value = if load_width < dst_width {
+            Expr::zero_ext(Expr::Var(tmp), dst_width)
+        } else {
+            Expr::Var(tmp)
+        };
+        if !self.write_register_to(dst, value) {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: "ldr destination not a supported register".into(),
@@ -299,7 +315,10 @@ impl LiftCtx {
         }
     }
 
-    fn lift_aarch32_str(&mut self, insn: &Instruction) {
+    /// Lift an `AArch32` store. `width_override` is `Some(8)` for `strb`
+    /// and `Some(16)` for `strh` (the low bits of the source register);
+    /// `None` for the word-sized `str`.
+    fn lift_aarch32_store(&mut self, insn: &Instruction, width_override: Option<u8>) {
         let (Some(src), Some(mem)) = (insn.operands.first(), insn.operands.get(1)) else {
             return;
         };
@@ -310,13 +329,14 @@ impl LiftCtx {
             });
             return;
         }
-        let Some(store_width) = nonzero_width(self.operand_width(src)) else {
+        let Some(src_width) = nonzero_width(self.operand_width(src)) else {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: "str zero-width source".into(),
             });
             return;
         };
+        let store_width = width_override.unwrap_or(src_width);
         let Some(address) = aarch32_address_expr(mem, self.bits) else {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),

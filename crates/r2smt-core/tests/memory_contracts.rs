@@ -465,3 +465,51 @@ fn test_aarch32_ldr_register_offset_declines_soundly() {
         "register-offset ldr must not fabricate a LoadMem: {stmts:?}"
     );
 }
+
+#[test]
+fn test_aarch32_ldrb_loads_one_byte() {
+    // `ldrb r0, [r1]` → 8-bit LoadMem, zero-extended into r0.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "ldrb",
+            vec![
+                op("r0", OperandKind::Register),
+                op("[r1]", OperandKind::Memory),
+            ],
+        ),
+        Arch::Arm,
+    );
+    let bits = stmts
+        .iter()
+        .find_map(|s| match s {
+            IrStmt::LoadMem { bits, .. } => Some(*bits),
+            _ => None,
+        })
+        .expect("ldrb must produce a LoadMem");
+    assert_eq!(bits, 8, "ldrb must load a single byte");
+}
+
+#[test]
+fn test_aarch32_strh_stores_two_bytes() {
+    // `strh r2, [r3, #4]` → 16-bit StoreMem of the low halfword.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "strh",
+            vec![
+                op("r2", OperandKind::Register),
+                op("[r3, 4]", OperandKind::Memory),
+            ],
+        ),
+        Arch::Arm,
+    );
+    let bits = stmts
+        .iter()
+        .find_map(|s| match s {
+            IrStmt::StoreMem { bits, .. } => Some(*bits),
+            _ => None,
+        })
+        .expect("strh must produce a StoreMem");
+    assert_eq!(bits, 16, "strh must store a halfword");
+}
