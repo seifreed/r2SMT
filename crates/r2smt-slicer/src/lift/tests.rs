@@ -1137,6 +1137,36 @@ fn pandn_distinct_registers_lifts_to_andnot_preserving_upper() {
 }
 
 #[test]
+fn addss_lifts_to_scalar_fp_add_on_low_lane() {
+    use r2smt_ir::expr::RoundingMode;
+    // `addss xmm0, xmm1` — the low 32-bit lane of each register is
+    // reinterpreted as an IEEE single, added (round-nearest-even), and
+    // written back to the low lane with the upper parent bits preserved.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "addss",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    let lane = |p: &str| Expr::bv_to_fp(Expr::extract(Expr::var(p, 512), 31, 0), 8, 24);
+    let result = Expr::fp_to_ieee_bv(Expr::fadd(
+        lane("zmm0"),
+        lane("zmm1"),
+        RoundingMode::NearestTiesEven,
+    ));
+    assert_eq!(
+        *simd_dst_src(&stmts, "zmm0"),
+        Expr::concat(Expr::extract(Expr::var("zmm0", 512), 511, 32), result)
+    );
+}
+
+#[test]
 fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
     // Parity guard: the effect table keeps an instruction iff the lifter
     // models it. A mnemonic classified `Simd` by `analyze` but absent
@@ -1146,7 +1176,8 @@ fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
     let mnemonics = [
         "movaps", "movups", "movapd", "movupd", "movdqa", "movdqu", "vmovaps", "vmovups",
         "vmovapd", "vmovupd", "vmovdqa", "vmovdqu", "pxor", "vpxor", "pand", "vpand", "por",
-        "vpor", "pandn", "vpandn",
+        "vpor", "pandn", "vpandn", "addss", "subss", "mulss", "divss", "addsd", "subsd", "mulsd",
+        "divsd",
     ];
     for m in mnemonics {
         assert!(

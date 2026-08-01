@@ -108,7 +108,21 @@ fn is_x86_simd_mnemonic(mnemonic: &str) -> bool {
             | "vpor"
             | "pandn"
             | "vpandn"
+            | "addss"
+            | "subss"
+            | "mulss"
+            | "divss"
+            | "addsd"
+            | "subsd"
+            | "mulsd"
+            | "divsd"
     )
+}
+
+/// IEEE `(ebits, sbits)` sort for a scalar FP lane width: 32→single
+/// `(8, 24)`, anything else→double `(11, 53)`.
+fn fp_sort_bits(lane_bits: u16) -> (u16, u16) {
+    if lane_bits == 32 { (8, 24) } else { (11, 53) }
 }
 
 /// Lift `slice` under `arch`. The lifter still only handles x86
@@ -640,6 +654,51 @@ impl LiftCtx {
         } else {
             Expr::extract(parent, width - 1, 0)
         })
+    }
+
+    /// Read the low `lane_bits`-wide lane of an x86 SIMD register
+    /// operand and reinterpret it as an IEEE float of the matching sort
+    /// (32→single, 64→double). Used by the scalar SSE FP handlers.
+    fn read_simd_lane_fp(&self, op: &Operand, lane_bits: u16) -> Option<Expr> {
+        if op.kind != OperandKind::Register {
+            return None;
+        }
+        let layout = register_layout(&op.raw, self.arch)?;
+        if !layout.parent.starts_with("zmm") {
+            return None;
+        }
+        let lane = Expr::extract(
+            Expr::var(layout.parent, SIMD_PARENT_BITS),
+            lane_bits - 1,
+            0,
+        );
+        let (ebits, sbits) = fp_sort_bits(lane_bits);
+        Some(Expr::bv_to_fp(lane, ebits, sbits))
+    }
+
+    /// Write `lane_value` (an IEEE bit-vector of `lane_bits`) to the low
+    /// lane of an x86 SIMD register destination, preserving the parent
+    /// bits above the lane (legacy SSE scalar semantics).
+    fn write_simd_lane(&mut self, op: &Operand, lane_value: Expr, lane_bits: u16) -> bool {
+        if op.kind != OperandKind::Register {
+            return false;
+        }
+        let Some(layout) = register_layout(&op.raw, self.arch) else {
+            return false;
+        };
+        if !layout.parent.starts_with("zmm") {
+            return false;
+        }
+        let preserved = Expr::extract(
+            Expr::var(layout.parent, SIMD_PARENT_BITS),
+            SIMD_PARENT_BITS - 1,
+            lane_bits,
+        );
+        self.assign(
+            Var::new(layout.parent, SIMD_PARENT_BITS),
+            Expr::concat(preserved, lane_value),
+        );
+        true
     }
 
     /// Width of an x86 SIMD **register** view (128 / 256 / 512), or

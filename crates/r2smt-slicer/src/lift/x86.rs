@@ -3,7 +3,7 @@
 //! the parent module.
 
 use r2smt_common::Arch;
-use r2smt_ir::expr::Expr;
+use r2smt_ir::expr::{Expr, RoundingMode};
 use r2smt_ir::program::{Instruction, Operand, OperandKind};
 use r2smt_ir::stmt::IrStmt;
 
@@ -48,6 +48,14 @@ impl LiftCtx {
             "pand" | "vpand" => self.lift_simd_bitwise(insn, SimdBitOp::And),
             "por" | "vpor" => self.lift_simd_bitwise(insn, SimdBitOp::Or),
             "pandn" | "vpandn" => self.lift_simd_bitwise(insn, SimdBitOp::AndNot),
+            "addss" => self.lift_simd_scalar_fp(insn, FpArithOp::Add, 32),
+            "subss" => self.lift_simd_scalar_fp(insn, FpArithOp::Sub, 32),
+            "mulss" => self.lift_simd_scalar_fp(insn, FpArithOp::Mul, 32),
+            "divss" => self.lift_simd_scalar_fp(insn, FpArithOp::Div, 32),
+            "addsd" => self.lift_simd_scalar_fp(insn, FpArithOp::Add, 64),
+            "subsd" => self.lift_simd_scalar_fp(insn, FpArithOp::Sub, 64),
+            "mulsd" => self.lift_simd_scalar_fp(insn, FpArithOp::Mul, 64),
+            "divsd" => self.lift_simd_scalar_fp(insn, FpArithOp::Div, 64),
             _ => self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("at {addr}", addr = insn.address),
@@ -488,6 +496,33 @@ impl LiftCtx {
         }
     }
 
+    /// `addss`/`subss`/`mulss`/`divss` (32-bit lane) and their `sd`
+    /// double-precision (64-bit lane) forms — a scalar FP op on the low
+    /// lane of `dst`, with the upper parent bits preserved (legacy SSE
+    /// scalar semantics). `dst := fp_op(lane(dst), lane(src))`.
+    fn lift_simd_scalar_fp(&mut self, insn: &Instruction, op: FpArithOp, lane: u16) {
+        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
+            return;
+        };
+        let (Some(a), Some(b)) = (
+            self.read_simd_lane_fp(dst, lane),
+            self.read_simd_lane_fp(src, lane),
+        ) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let rm = RoundingMode::NearestTiesEven;
+        let result = match op {
+            FpArithOp::Add => Expr::fadd(a, b, rm),
+            FpArithOp::Sub => Expr::fsub(a, b, rm),
+            FpArithOp::Mul => Expr::fmul(a, b, rm),
+            FpArithOp::Div => Expr::fdiv(a, b, rm),
+        };
+        if !self.write_simd_lane(dst, Expr::fp_to_ieee_bv(result), lane) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
     fn push_simd_unsupported(&mut self, insn: &Instruction) {
         self.stmts.push(IrStmt::Unsupported {
             mnemonic: insn.mnemonic.clone(),
@@ -504,6 +539,16 @@ enum SimdBitOp {
     Or,
     /// `pandn`/`vpandn`: `(~a) & b`.
     AndNot,
+}
+
+/// Scalar floating-point arithmetic operation of an SSE `add/sub/mul/div
+/// ss/sd` instruction.
+#[derive(Clone, Copy)]
+enum FpArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
 }
 
 /// Whether two operands name the same SIMD register view (same vector

@@ -353,7 +353,8 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
         },
         "movaps" | "movups" | "movapd" | "movupd" | "movdqa" | "movdqu" | "vmovaps" | "vmovups"
         | "vmovapd" | "vmovupd" | "vmovdqa" | "vmovdqu" => simd_effect(insn, SimdShape::Move),
-        "pxor" | "vpxor" | "pand" | "vpand" | "por" | "vpor" | "pandn" | "vpandn" => {
+        "pxor" | "vpxor" | "pand" | "vpand" | "por" | "vpor" | "pandn" | "vpandn" | "addss"
+        | "subss" | "mulss" | "divss" | "addsd" | "subsd" | "mulsd" | "divsd" => {
             simd_effect(insn, SimdShape::Bitwise)
         }
         m if m.starts_with('j') => jcc_effect(insn),
