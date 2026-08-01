@@ -28,5 +28,5 @@ pub use bitwuzla::{BitwuzlaError, solve_branch_bitwuzla};
 pub use cvc5::{Cvc5Error, solve_branch_cvc5};
 pub use pretty::z3_bool_to_infix;
 pub use r2smt_common::smt::{SmtResult, SolveOptions};
-pub use smtlib::{emit_preamble, emit_query};
+pub use smtlib::{RenderError, emit_preamble, emit_query, emit_query_strict};
 pub use solver::{SolveOutcome, solve_branch, solve_branch_with_pretty};

@@ -2,7 +2,7 @@
 //!
 //! Spawns `cvc5` for each branch query (twice — once for the taken
 //! polarity, once for the not-taken). The SMT-LIB2 script comes
-//! straight from [`crate::smtlib::emit_query`] so the verdict ladder
+//! straight from [`crate::smtlib::emit_query_strict`] so the verdict ladder
 //! matches the Z3 backend's combine table.
 //!
 //! Requires `cvc5` to be available on `$PATH`. Distribution
@@ -19,7 +19,7 @@ use r2smt_slicer::SliceStatus;
 use r2smt_ssa::SsaLiftedSlice;
 use tracing::debug;
 
-use crate::smtlib::emit_query;
+use crate::smtlib::emit_query_strict;
 
 /// Failure modes specific to the CVC5 subprocess backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,14 +62,15 @@ pub fn solve_branch_cvc5(
     if slice_contains_unknown(slice) {
         return Ok(SmtResult::Unsound);
     }
-    // The QF_BV text renderer cannot encode floating-point theory — it
-    // emits a constant placeholder for FP nodes, which is unsound.
-    // Decline FP slices; precise QF_BVFP rendering lands in P40-f-4.
-    if slice_contains_float(slice) {
+    // The renderer refuses floating-point shapes it cannot encode
+    // portably, substituting a placeholder that would under-approximate
+    // the value set. Take its refusal rather than solve the placeholder.
+    let (Ok(script_taken), Ok(script_not_taken)) = (
+        emit_query_strict(slice, &options, true),
+        emit_query_strict(slice, &options, false),
+    ) else {
         return Ok(SmtResult::Unsound);
-    }
-    let script_taken = emit_query(slice, &options, true);
-    let script_not_taken = emit_query(slice, &options, false);
+    };
     let taken = run_cvc5(&script_taken, options.timeout_ms)?;
     let not_taken = run_cvc5(&script_not_taken, options.timeout_ms)?;
     let verdict = combine(taken, not_taken);
@@ -99,75 +100,6 @@ fn slice_contains_unknown(slice: &SsaLiftedSlice) -> bool {
         IrStmt::LoadMem { address, .. } => expr_has_unknown(address),
         IrStmt::Unsupported { .. } | IrStmt::Nop => false,
     })
-}
-
-/// Whether any expression rendered into the SMT-LIB query carries a
-/// floating-point node. The `QF_BV` text backend cannot encode FP theory,
-/// so such slices are declined (see [`solve_branch_cvc5`]).
-fn slice_contains_float(slice: &SsaLiftedSlice) -> bool {
-    if expr_has_float(&slice.condition) {
-        return true;
-    }
-    slice.statements.iter().any(|stmt| match stmt {
-        IrStmt::Assign { src, .. } => expr_has_float(src),
-        IrStmt::StoreMem { address, value, .. } => expr_has_float(address) || expr_has_float(value),
-        IrStmt::LoadMem { address, .. } => expr_has_float(address),
-        IrStmt::Unsupported { .. } | IrStmt::Nop => false,
-    })
-}
-
-/// Whether `expr` contains any floating-point node. Written without a
-/// wildcard arm so a new `Expr` variant forces this to be revisited.
-// Exhaustive `Expr` dispatch: FP arms mirror the BV arms' shape but stay separate for legibility (CLAUDE.md exhaustive-dispatch exception).
-#[allow(clippy::match_same_arms, clippy::too_many_lines)]
-fn expr_has_float(expr: &Expr) -> bool {
-    match expr {
-        Expr::FAdd(..)
-        | Expr::FSub(..)
-        | Expr::FMul(..)
-        | Expr::FDiv(..)
-        | Expr::FEq(..)
-        | Expr::FLt(..)
-        | Expr::FLe(..)
-        | Expr::FIsNaN(_)
-        | Expr::FpConst { .. }
-        | Expr::BvToFp { .. }
-        | Expr::FpToIeeeBv(_)
-        | Expr::FpToSbv { .. }
-        | Expr::SbvToFp { .. } => true,
-        Expr::Var(_) | Expr::Const { .. } | Expr::Unknown(_) => false,
-        Expr::BoolNot(a)
-        | Expr::Extract { src: a, .. }
-        | Expr::ZeroExtend { src: a, .. }
-        | Expr::SignExtend { src: a, .. } => expr_has_float(a),
-        Expr::Add(a, b)
-        | Expr::Sub(a, b)
-        | Expr::Mul(a, b)
-        | Expr::UDiv(a, b)
-        | Expr::URem(a, b)
-        | Expr::SDiv(a, b)
-        | Expr::SRem(a, b)
-        | Expr::And(a, b)
-        | Expr::Or(a, b)
-        | Expr::Xor(a, b)
-        | Expr::Shl(a, b)
-        | Expr::LShr(a, b)
-        | Expr::AShr(a, b)
-        | Expr::Eq(a, b)
-        | Expr::Ne(a, b)
-        | Expr::Ult(a, b)
-        | Expr::Ule(a, b)
-        | Expr::Slt(a, b)
-        | Expr::Sle(a, b)
-        | Expr::BoolAnd(a, b)
-        | Expr::BoolOr(a, b)
-        | Expr::Concat { high: a, low: b } => expr_has_float(a) || expr_has_float(b),
-        Expr::Ite {
-            cond,
-            then_expr,
-            else_expr,
-        } => expr_has_float(cond) || expr_has_float(then_expr) || expr_has_float(else_expr),
-    }
 }
 
 /// Exhaustive recursive check for an [`Expr::Unknown`] anywhere in the
@@ -388,6 +320,52 @@ mod tests {
         );
         assert_eq!(
             solve_branch_cvc5(&ssa, SolveOptions::default()),
+            Ok(SmtResult::Unsound)
+        );
+    }
+
+    #[test]
+    fn slice_with_unrenderable_float_is_declined_without_spawning_cvc5() {
+        // A bit-pattern reinterpret whose source is not float-sorted has
+        // no portable SMT-LIB encoding, so the renderer refuses it and
+        // the verdict path must decline *before* spawning — which also
+        // keeps this test deterministic on a host without `cvc5`.
+        use r2smt_common::{Address, Arch};
+        use r2smt_ir::expr::Var;
+        use r2smt_slicer::{BranchCandidate, BranchCondition, BranchKind, SliceStatus};
+
+        let at = Address::new(0x40_1000);
+        let slice = SsaLiftedSlice {
+            branch: BranchCandidate {
+                address: at,
+                function: at,
+                block: at,
+                kind: BranchKind::Jcc,
+                mnemonic: "jne".into(),
+                condition: BranchCondition::NotEqual,
+                formula: "fptest".into(),
+                taken_target: None,
+                fallthrough_target: None,
+                compare_register: None,
+                bit_index: None,
+                upstream_resolved: None,
+                operand_raws: Vec::new(),
+                is_thumb: false,
+            },
+            statements: vec![IrStmt::Assign {
+                dst: Var::new("t0", 1),
+                // `FEq` over a plain bit vector: no float sort to read.
+                src: Expr::feq(Expr::var("x", 32), Expr::var("y", 32)),
+            }],
+            condition: Expr::var("t0", 1),
+            status: SliceStatus::Complete,
+            treat_truncation_as_inputs: false,
+            inputs: vec![Var::new("x", 32), Var::new("y", 32)],
+            defs: Vec::new(),
+            arch: Arch::X86_64,
+        };
+        assert_eq!(
+            solve_branch_cvc5(&slice, SolveOptions::default()),
             Ok(SmtResult::Unsound)
         );
     }

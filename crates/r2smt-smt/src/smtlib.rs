@@ -12,7 +12,14 @@
 //! ([`crate::SmtResult`]).
 //!
 //! Output uses the `QF_BV` logic — no quantifiers, only the
-//! fixed-width bit-vector theory the slicer's IR maps onto.
+//! fixed-width bit-vector theory the slicer's IR maps onto — widening
+//! to `QF_BVFP` only for a slice that carries floating point, so
+//! float-free scripts are unaffected.
+//!
+//! [`emit_query`] is lossy: where the renderer cannot encode a shape it
+//! substitutes a placeholder to keep the script parseable for
+//! render-only consumers. Verdict paths must use [`emit_query_strict`],
+//! which fails instead.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -184,9 +191,39 @@ fn ptr_bits_for(arch: r2smt_common::Arch) -> u16 {
 /// run "taken" first, then "not-taken").
 #[must_use]
 pub fn emit_query(slice: &SsaLiftedSlice, options: &SolveOptions, polarity: bool) -> String {
+    build_query(slice, options, polarity, &mut RenderCtx::new())
+}
+
+/// [`emit_query`], failing instead of emitting a script the renderer
+/// could not encode faithfully.
+///
+/// Verdict paths must use this: [`emit_query`] keeps a lossy contract
+/// for render-only consumers, substituting a placeholder where it had
+/// to refuse, and a verdict derived from a placeholder would be
+/// unsound.
+///
+/// # Errors
+///
+/// Returns [`RenderError`] when the slice carries a floating-point
+/// shape with no portable SMT-LIB encoding.
+pub fn emit_query_strict(
+    slice: &SsaLiftedSlice,
+    options: &SolveOptions,
+    polarity: bool,
+) -> Result<String, RenderError> {
     let mut ctx = RenderCtx::new();
-    let mut script = emit_preamble_with(slice, options, &mut ctx);
-    let cond = render_expr_with_width(&slice.condition, 1, &mut ctx);
+    let script = build_query(slice, options, polarity, &mut ctx);
+    ctx.unsupported.map_or(Ok(script), Err)
+}
+
+fn build_query(
+    slice: &SsaLiftedSlice,
+    options: &SolveOptions,
+    polarity: bool,
+    ctx: &mut RenderCtx,
+) -> String {
+    let mut script = emit_preamble_with(slice, options, ctx);
+    let cond = render_expr_with_width(&slice.condition, 1, ctx);
     let assertion = if polarity {
         format!("(= {cond} #b1)")
     } else {

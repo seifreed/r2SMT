@@ -63,11 +63,19 @@ gate_solver_contracts() {
   # identically in solver.rs (Z3), cvc5.rs and bitwuzla.rs, so this
   # single filter asserts the verdict ladder byte-equal across all
   # three backends.
+  # The float filters guard the QF_BVFP renderer: the two decline
+  # contracts (a shape with no portable encoding must never reach a
+  # solver) and the inversion's anti-fabrication contract (a NaN
+  # reinterpret must leave both polarities satisfiable — the constant
+  # placeholder it replaced fabricated an always-false verdict there).
   cargo test -p r2smt-smt --lib -- \
     combine_table_contract_is_exhaustive_and_sound \
     truncated_slice_is_reported_unsound \
     slice_with_unknown_is_declined_without_spawning_cvc5 \
-    slice_with_unknown_is_declined_without_spawning_bitwuzla
+    slice_with_unknown_is_declined_without_spawning_bitwuzla \
+    slice_with_unrenderable_float_is_declined_without_spawning_cvc5 \
+    slice_with_unrenderable_float_is_declined_without_spawning_bitwuzla \
+    smtlib_fp_inversion_on_nan_keeps_both_polarities_satisfiable
 }
 
 gate_determinism() {
