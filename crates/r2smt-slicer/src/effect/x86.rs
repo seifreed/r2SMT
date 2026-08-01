@@ -351,9 +351,8 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
             is_call: false,
             reads_flags: false,
         },
-        "movaps" | "movups" | "movapd" | "movupd" | "movdqa" | "movdqu" => {
-            simd_effect(insn, SimdShape::Move)
-        }
+        "movaps" | "movups" | "movapd" | "movupd" | "movdqa" | "movdqu" | "vmovaps" | "vmovups"
+        | "vmovapd" | "vmovupd" | "vmovdqa" | "vmovdqu" => simd_effect(insn, SimdShape::Move),
         "pxor" | "vpxor" | "pand" | "vpand" | "por" | "vpor" | "pandn" | "vpandn" => {
             simd_effect(insn, SimdShape::Bitwise)
         }

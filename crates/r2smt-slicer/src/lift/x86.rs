@@ -40,7 +40,8 @@ impl LiftCtx {
             "shl" | "sal" => self.lift_shift(insn, ShiftOp::Shl),
             "shr" => self.lift_shift(insn, ShiftOp::Shr),
             "sar" => self.lift_shift(insn, ShiftOp::Sar),
-            "movaps" | "movups" | "movapd" | "movupd" | "movdqa" | "movdqu" => {
+            "movaps" | "movups" | "movapd" | "movupd" | "movdqa" | "movdqu" | "vmovaps"
+            | "vmovups" | "vmovapd" | "vmovupd" | "vmovdqa" | "vmovdqu" => {
                 self.lift_simd_move(insn);
             }
             "pxor" | "vpxor" => self.lift_simd_bitwise(insn, SimdBitOp::Xor),

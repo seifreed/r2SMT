@@ -1137,6 +1137,53 @@ fn pandn_distinct_registers_lifts_to_andnot_preserving_upper() {
 }
 
 #[test]
+fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
+    // Parity guard: the effect table keeps an instruction iff the lifter
+    // models it. A mnemonic classified `Simd` by `analyze` but absent
+    // from the lifter (the historical `pandn` bug) leaves the vector
+    // parent undefined — a stale-def fabrication. Assert both directions
+    // stay in lockstep for every SIMD mnemonic.
+    let mnemonics = [
+        "movaps", "movups", "movapd", "movupd", "movdqa", "movdqu", "vmovaps", "vmovups",
+        "vmovapd", "vmovupd", "vmovdqa", "vmovdqu", "pxor", "vpxor", "pand", "vpand", "por",
+        "vpor", "pandn", "vpandn",
+    ];
+    for m in mnemonics {
+        assert!(
+            is_x86_simd_mnemonic(m),
+            "{m}: not recognised by is_x86_simd_mnemonic"
+        );
+        let i = insn(
+            0x1000,
+            4,
+            m,
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        );
+        assert_eq!(
+            crate::effect::analyze(&i, Arch::X86_64).kind,
+            crate::effect::InstructionKind::Simd,
+            "{m}: effect table does not classify it as Simd"
+        );
+        let stmts = lift_per_mnemonic(&i, Arch::X86_64);
+        assert!(
+            stmts
+                .iter()
+                .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name.starts_with("zmm"))),
+            "{m}: lifter did not define the vector parent"
+        );
+        assert!(
+            !stmts
+                .iter()
+                .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+            "{m}: lifter emitted Unsupported"
+        );
+    }
+}
+
+#[test]
 fn vpxor_ymm_lifts_to_256bit_xor_with_upper_bits_zeroed() {
     // `vpxor ymm0, ymm1, ymm2` (3-operand VEX at 256-bit view) —
     // `ymm0 := ymm1 ^ ymm2`, parent bits above 256 zeroed.
