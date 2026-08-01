@@ -120,8 +120,8 @@ pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
         // `allow_memory`). Flag-setting is `false` for both — these
         // are the plain `ldr` / `str` family, not the comparison
         // forms (`tst` / `cmp` handled above).
-        "ldr" => aarch64_ldr_effect(insn),
-        "str" => aarch64_str_effect(insn),
+        "ldr" | "ldrb" | "ldrh" | "ldrsb" | "ldrsh" | "ldrsw" => aarch64_ldr_effect(insn),
+        "str" | "strb" | "strh" => aarch64_str_effect(insn),
         // Paired forms: `ldp` defines both `Rt`/`Rt2`, `stp` uses them;
         // both read the base register in the memory operand (index 2).
         "ldp" => aarch64_ldp_effect(insn),

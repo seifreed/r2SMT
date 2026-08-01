@@ -513,3 +513,82 @@ fn test_aarch32_strh_stores_two_bytes() {
         .expect("strh must produce a StoreMem");
     assert_eq!(bits, 16, "strh must store a halfword");
 }
+
+// --- AArch64 sub-word lifter goldens (P30) ---------------------------
+
+#[test]
+fn test_aarch64_ldrb_loads_one_byte_zero_extended() {
+    // `ldrb w0, [x1]` → 8-bit LoadMem, zero-extended into the register.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "ldrb",
+            vec![
+                op("w0", OperandKind::Register),
+                op("[x1]", OperandKind::Memory),
+            ],
+        ),
+        Arch::Aarch64,
+    );
+    let bits = stmts
+        .iter()
+        .find_map(|s| match s {
+            IrStmt::LoadMem { bits, .. } => Some(*bits),
+            _ => None,
+        })
+        .expect("ldrb must produce a LoadMem");
+    assert_eq!(bits, 8, "ldrb must load a single byte");
+}
+
+#[test]
+fn test_aarch64_ldrsw_sign_extends_the_loaded_word() {
+    // `ldrsw x0, [x1]` → load 32 bits, sign-extend into the 64-bit X0.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "ldrsw",
+            vec![
+                op("x0", OperandKind::Register),
+                op("[x1]", OperandKind::Memory),
+            ],
+        ),
+        Arch::Aarch64,
+    );
+    let load_bits = stmts
+        .iter()
+        .find_map(|s| match s {
+            IrStmt::LoadMem { bits, .. } => Some(*bits),
+            _ => None,
+        })
+        .expect("ldrsw must produce a LoadMem");
+    assert_eq!(load_bits, 32, "ldrsw loads a 32-bit word");
+    let has_sign_ext = stmts.iter().any(|s| match s {
+        IrStmt::Assign { src, .. } => format!("{src:?}").contains("SignExtend"),
+        _ => false,
+    });
+    assert!(has_sign_ext, "ldrsw must sign-extend: {stmts:?}");
+}
+
+#[test]
+fn test_aarch64_strb_stores_one_byte() {
+    // `strb w2, [x3]` → 8-bit StoreMem of the low byte.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "strb",
+            vec![
+                op("w2", OperandKind::Register),
+                op("[x3]", OperandKind::Memory),
+            ],
+        ),
+        Arch::Aarch64,
+    );
+    let bits = stmts
+        .iter()
+        .find_map(|s| match s {
+            IrStmt::StoreMem { bits, .. } => Some(*bits),
+            _ => None,
+        })
+        .expect("strb must produce a StoreMem");
+    assert_eq!(bits, 8, "strb must store a single byte");
+}
