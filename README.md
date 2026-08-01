@@ -148,6 +148,26 @@ r2smt solve ./sample --allow-memory --allow-calls --max-blocks 4 \
   --unknowns-on-truncation --allow-join-merge --solver cvc5
 ```
 
+**Search for an input that reaches an address (`why`) — explicitly UNSOUND:**
+
+Everything above is a *verifier*: it never claims more than it proved. `why`
+is the opposite tool — a best-effort *search* that drives a symbolic executor
+(radius2) to synthesise a concrete input reaching a target address, and reports
+the witness (stdin / argv / registers). A negative answer only means "not found
+within the budget", never "unreachable", so its output carries a
+non-suppressible `UNSOUND` banner and must never feed a verify or patch
+decision.
+
+```bash
+r2smt why ./sample 0x401234 --timeout-ms 30000 --max-paths 10000
+```
+
+The engine is fenced off from the verifier three ways: it can never produce a
+solver verdict (type fence), the verify/patch crates cannot depend on it
+(dependency fence), and it always runs in a budgeted subprocess (process
+fence). It is compiled in only with the off-by-default `oracle-radius2`
+feature; without it, `why` reports that the engine is not built.
+
 ---
 
 ## Verdicts & findings
