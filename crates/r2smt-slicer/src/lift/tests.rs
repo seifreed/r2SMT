@@ -1166,6 +1166,98 @@ fn addss_lifts_to_scalar_fp_add_on_low_lane() {
     );
 }
 
+/// Lift a register-to-register form of `mnemonic` on `xmm0, xmm1`.
+fn lift_xmm_pair(mnemonic: &str) -> Vec<IrStmt> {
+    lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            mnemonic,
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        Arch::X86_64,
+    )
+}
+
+/// The source assigned to flag `name`, or `None` if it is not defined.
+fn flag_src<'a>(stmts: &'a [IrStmt], name: &str) -> Option<&'a Expr> {
+    stmts.iter().find_map(|s| match s {
+        IrStmt::Assign { dst, src } if dst.name == name => Some(src),
+        _ => None,
+    })
+}
+
+#[test]
+fn ucomiss_lifts_parity_flag_to_the_exact_unordered_predicate() {
+    // PF after a scalar FP compare *is* the unordered predicate, so it
+    // lifts exactly — unlike the integer path, where PF degrades to
+    // `Unknown`. This is what makes the `ucomiss` + `jp` NaN check that
+    // compilers emit resolvable.
+    let stmts = lift_xmm_pair("ucomiss");
+    let lane = |p: &str| Expr::bv_to_fp(Expr::extract(Expr::var(p, 512), 31, 0), 8, 24);
+    assert_eq!(
+        flag_src(&stmts, "PF"),
+        Some(&Expr::bool_or(
+            Expr::fisnan(lane("zmm0")),
+            Expr::fisnan(lane("zmm1"))
+        ))
+    );
+}
+
+#[test]
+fn ucomiss_lifts_carry_flag_to_less_than_or_unordered() {
+    let stmts = lift_xmm_pair("ucomiss");
+    let lane = |p: &str| Expr::bv_to_fp(Expr::extract(Expr::var(p, 512), 31, 0), 8, 24);
+    assert_eq!(
+        flag_src(&stmts, "CF"),
+        Some(&Expr::bool_or(
+            Expr::bool_or(Expr::fisnan(lane("zmm0")), Expr::fisnan(lane("zmm1"))),
+            Expr::flt(lane("zmm0"), lane("zmm1"))
+        ))
+    );
+}
+
+#[test]
+fn scalar_fp_compare_defines_flags_without_touching_its_destination() {
+    // `comiss` writes EFLAGS only. Claiming its destination register as
+    // a def would fabricate a value for a register the instruction
+    // never writes.
+    for m in ["comiss", "ucomiss", "comisd", "ucomisd"] {
+        let stmts = lift_xmm_pair(m);
+        assert!(
+            !stmts
+                .iter()
+                .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name.starts_with("zmm"))),
+            "{m}: defined a vector register"
+        );
+        for flag in ["ZF", "CF", "PF"] {
+            assert!(flag_src(&stmts, flag).is_some(), "{m}: {flag} undefined");
+        }
+    }
+}
+
+#[test]
+fn scalar_fp_compare_effect_reads_both_operands_and_writes_flags() {
+    for m in ["comiss", "ucomiss", "comisd", "ucomisd"] {
+        let i = insn(
+            0x1000,
+            4,
+            m,
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        );
+        let e = crate::effect::analyze(&i, Arch::X86_64);
+        assert!(e.defines_flags, "{m}: does not define flags");
+        assert!(e.defs.is_empty(), "{m}: claims a register def");
+        assert_eq!(e.uses.len(), 2, "{m}: does not read both operands");
+    }
+}
+
 #[test]
 fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
     // Parity guard: the effect table keeps an instruction iff the lifter

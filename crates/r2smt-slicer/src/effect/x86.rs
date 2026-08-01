@@ -357,6 +357,11 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
         | "subss" | "mulss" | "divss" | "addsd" | "subsd" | "mulsd" | "divsd" => {
             simd_effect(insn, SimdShape::Bitwise)
         }
+        // The scalar FP compares share `cmp`'s shape, not the SIMD one:
+        // they read both operands, define no register, and write flags.
+        "comiss" | "ucomiss" | "comisd" | "ucomisd" => {
+            cmp_or_test_effect(insn, InstructionKind::Cmp)
+        }
         m if m.starts_with('j') => jcc_effect(insn),
         m if m.starts_with("set") => setcc_effect(insn),
         m if m.starts_with("cmov") => cmovcc_effect(insn),

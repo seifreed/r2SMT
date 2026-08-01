@@ -56,6 +56,8 @@ impl LiftCtx {
             "subsd" => self.lift_simd_scalar_fp(insn, FpArithOp::Sub, 64),
             "mulsd" => self.lift_simd_scalar_fp(insn, FpArithOp::Mul, 64),
             "divsd" => self.lift_simd_scalar_fp(insn, FpArithOp::Div, 64),
+            "comiss" | "ucomiss" => self.lift_simd_fp_compare(insn, 32),
+            "comisd" | "ucomisd" => self.lift_simd_fp_compare(insn, 64),
             _ => self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("at {addr}", addr = insn.address),
@@ -521,6 +523,41 @@ impl LiftCtx {
         if !self.write_simd_lane(dst, Expr::fp_to_ieee_bv(result), lane) {
             self.push_simd_unsupported(insn);
         }
+    }
+
+    /// `comiss`/`ucomiss` (32-bit lane) and `comisd`/`ucomisd` (64-bit)
+    /// — compare the low lanes and write the result into EFLAGS.
+    ///
+    /// Per the SDM: unordered sets ZF, PF and CF; greater-than clears
+    /// all three; less-than sets CF alone; equal sets ZF alone. OF, SF
+    /// and AF are always cleared. The ordered and unordered forms differ
+    /// only in which NaN raises the invalid-operation exception, which
+    /// the value model does not track, so both lift identically.
+    ///
+    /// PF is exact here, unlike the integer path where it degrades to
+    /// `Unknown`: it *is* the unordered predicate, which makes the
+    /// `ucomiss` + `jp`/`jnp` NaN check compilers emit resolve
+    /// precisely.
+    fn lift_simd_fp_compare(&mut self, insn: &Instruction, lane: u16) {
+        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
+            return;
+        };
+        let (Some(a), Some(b)) = (
+            self.read_simd_lane_fp(dst, lane),
+            self.read_simd_lane_fp(src, lane),
+        ) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let unordered = Expr::bool_or(Expr::fisnan(a.clone()), Expr::fisnan(b.clone()));
+        self.set_flag("PF", unordered.clone());
+        self.set_flag(
+            "ZF",
+            Expr::bool_or(unordered.clone(), Expr::feq(a.clone(), b.clone())),
+        );
+        self.set_flag("CF", Expr::bool_or(unordered, Expr::flt(a, b)));
+        self.set_flag("OF", Expr::konst(0, 1));
+        self.set_flag("SF", Expr::konst(0, 1));
     }
 
     fn push_simd_unsupported(&mut self, insn: &Instruction) {

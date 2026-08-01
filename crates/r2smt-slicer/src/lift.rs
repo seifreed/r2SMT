@@ -82,9 +82,14 @@ const FLAGS: &[&str] = &["ZF", "CF", "SF", "OF", "PF"];
 /// colliding as two different-width vars of the same name.
 const SIMD_PARENT_BITS: u16 = 512;
 
-/// SSE integer-SIMD mnemonics the per-mnemonic lifter models precisely
-/// at vector width. Kept in sync with the `simd_effect` dispatch in
-/// `effect/x86.rs`.
+/// SSE / AVX mnemonics whose per-mnemonic handler must win over the
+/// ESIL and P-code ladders, which model an `xmm` operand at pointer
+/// width instead of canonicalising it to its vector parent.
+///
+/// Most of these define the vector register; the scalar compares
+/// (`comiss` and friends) define only flags, but need the same override
+/// for the same reason — their operands are vector-register lanes.
+/// Kept in sync with the dispatch in `effect/x86.rs`.
 fn is_x86_simd_mnemonic(mnemonic: &str) -> bool {
     matches!(
         mnemonic.trim().to_ascii_lowercase().as_str(),
@@ -116,6 +121,10 @@ fn is_x86_simd_mnemonic(mnemonic: &str) -> bool {
             | "subsd"
             | "mulsd"
             | "divsd"
+            | "comiss"
+            | "ucomiss"
+            | "comisd"
+            | "ucomisd"
     )
 }
 

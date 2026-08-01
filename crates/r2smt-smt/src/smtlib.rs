@@ -1098,14 +1098,50 @@ mod tests {
         //     smtlib_writes_fp_script_for_external_solver_replay
         //   cvc5 --lang smt2 < target/fp-replay-taken.smt2
         //   bitwuzla < target/fp-replay-not-taken.smt2
-        let slice = fp_slice(
-            Expr::fp_to_ieee_bv(Expr::fadd(
-                f32_const(F32_ONE),
-                f32_const(F32_ONE),
-                RoundingMode::NearestTiesEven,
-            )),
-            Expr::eq(Expr::var("t0", 32), Expr::konst(F32_TWO, 32)),
-        );
+        // Built by the real pipeline rather than by hand, so the script
+        // exercises what the lifter actually emits — the scalar compare
+        // pulls in fp.eq, fp.lt and fp.isNaN alongside the reinterpret.
+        let program = Program {
+            arch: Arch::X86_64,
+            bits: 64,
+            entry: Some(Address(0x40_1000)),
+            functions: vec![Function {
+                address: Address(0x40_1000),
+                name: Some("sym.main".into()),
+                blocks: vec![BasicBlock {
+                    address: Address(0x40_1000),
+                    instructions: vec![
+                        insn(
+                            0x40_1000,
+                            4,
+                            "pxor",
+                            vec![
+                                op("xmm0", OperandKind::Register),
+                                op("xmm0", OperandKind::Register),
+                            ],
+                        ),
+                        insn(
+                            0x40_1004,
+                            4,
+                            "ucomiss",
+                            vec![
+                                op("xmm0", OperandKind::Register),
+                                op("xmm0", OperandKind::Register),
+                            ],
+                        ),
+                        insn(
+                            0x40_1008,
+                            6,
+                            "jp",
+                            vec![op("0x401080", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![],
+                }],
+                is_thumb: false,
+            }],
+        };
+        let slice = build_ssa(&program);
         // A unit test runs with the crate directory as its working
         // directory, so reach the workspace target dir explicitly.
         let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");

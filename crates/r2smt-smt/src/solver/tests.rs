@@ -1673,6 +1673,83 @@ fn solve_fp_condition(cond: r2smt_ir::expr::Expr, inputs: Vec<r2smt_ir::expr::Va
     solve_branch(&ssa, SolveOptions::default())
 }
 
+/// `pxor xmm0, xmm0` (the zero idiom) followed by a self-compare, then
+/// `branch`. Comparing 0.0 with itself is ordered and equal, so the
+/// flags are fully determined without needing a memory operand to
+/// materialise a constant.
+fn zeroed_self_compare_then(branch: &str) -> Program {
+    one_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "pxor",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm0", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "ucomiss",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm0", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            6,
+            branch,
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ])
+}
+
+#[test]
+fn zeroed_scalar_fp_self_compare_makes_parity_branch_always_false() {
+    // End-to-end from instructions: 0.0 compared with itself is
+    // ordered, so PF is 0 and `jp` can never be taken. This is the
+    // whole point of lifting `ucomiss` — the NaN-check branch compilers
+    // emit becomes decidable.
+    assert_eq!(
+        solve_first(&zeroed_self_compare_then("jp")),
+        SmtResult::AlwaysFalse
+    );
+}
+
+#[test]
+fn zeroed_scalar_fp_self_compare_makes_equality_branch_always_true() {
+    assert_eq!(
+        solve_first(&zeroed_self_compare_then("je")),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn scalar_fp_compare_of_free_inputs_stays_both_possible() {
+    // The anti-fabrication direction: with nothing pinning the lanes,
+    // an ordered-compare branch must stay undecided.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "ucomiss",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            6,
+            "ja",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::BothPossible);
+}
+
 #[test]
 fn fp_precise_encoding_folds_constant_predicate_to_always_true() {
     use r2smt_ir::expr::{Expr, RoundingMode};
