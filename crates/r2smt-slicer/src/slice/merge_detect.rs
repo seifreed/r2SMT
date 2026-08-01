@@ -168,7 +168,7 @@ pub(super) fn try_build_diamond_merge(
     state: &WalkState,
     arch: Arch,
 ) -> Option<SliceMerge> {
-    if state.needs_flags || !state.live_stack.is_empty() || state.live.is_empty() {
+    if state.needs_flags || state.live.is_empty() {
         return None;
     }
     if preds.len() != 2 {

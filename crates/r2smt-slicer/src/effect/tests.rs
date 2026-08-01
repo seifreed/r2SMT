@@ -215,24 +215,29 @@ fn lea_does_not_access_memory() {
 }
 
 #[test]
-fn mov_load_from_unresolved_memory_flags_has_memory_access() {
-    // `[rax]` is an indirect deref — not a recognised stack slot,
-    // so the slicer still truncates on it.
+fn mov_load_from_register_indirect_is_modellable_memory() {
+    // `[rax]` is register-indirect — a memory access the byte model
+    // can build, so it flags `has_memory_access` but is NOT
+    // unmodellable (resolves without `--allow-memory`). The address
+    // register is a data-flow input.
+    let mem = op("[rax]", OperandKind::Memory);
     let e = ax86(&insn(
         "mov",
-        vec![
-            op("eax", OperandKind::Register),
-            op("[rax]", OperandKind::Memory),
-        ],
+        vec![op("eax", OperandKind::Register), mem.clone()],
     ));
     assert!(e.has_memory_access);
-    assert!(e.stack_uses.is_empty());
+    assert!(!has_unmodellable_memory(
+        std::slice::from_ref(&mem),
+        Arch::X86_64
+    ));
+    assert!(e.uses.contains(&"rax"));
 }
 
 #[test]
-fn mov_load_from_stack_slot_uses_virtual_slot() {
-    // `[rbp - 4]` is a Phase C stack slot — surfaced via
-    // `stack_uses`, not `has_memory_access`.
+fn mov_load_from_stack_slot_is_modellable_memory() {
+    // `[rbp - 4]` now lifts through the byte model like any other
+    // memory operand: `has_memory_access` is set and the base register
+    // `rbp` is a data-flow input, not a virtual stack slot.
     let e = ax86(&insn(
         "mov",
         vec![
@@ -240,13 +245,15 @@ fn mov_load_from_stack_slot_uses_virtual_slot() {
             op("[rbp - 4]", OperandKind::Memory),
         ],
     ));
-    assert!(!e.has_memory_access);
-    assert_eq!(e.stack_uses, vec!["stk_rbp_-4".to_string()]);
+    assert!(e.has_memory_access);
+    assert!(e.uses.contains(&"rbp"));
     assert!(e.defs.contains(&"rax"));
 }
 
 #[test]
-fn mov_store_to_stack_slot_is_a_virtual_def() {
+fn mov_store_to_stack_slot_uses_address_register_no_reg_def() {
+    // `mov [rbp - 8], 5` — a byte-model store: no register def, the
+    // address register `rbp` is a use.
     let e = ax86(&insn(
         "mov",
         vec![
@@ -254,12 +261,24 @@ fn mov_store_to_stack_slot_is_a_virtual_def() {
             op("5", OperandKind::Immediate),
         ],
     ));
-    assert!(!e.has_memory_access);
-    assert_eq!(e.stack_defs, vec!["stk_rbp_-8".to_string()]);
+    assert!(e.has_memory_access);
+    assert!(e.uses.contains(&"rbp"));
     assert!(
         e.defs.is_empty(),
-        "stack-slot stores must not define a register"
+        "memory stores must not define a register"
     );
+}
+
+#[test]
+fn segment_prefixed_memory_is_unmodellable() {
+    // `fs:[0x30]` addresses `fs_base + 0x30`; the byte model declines
+    // it, so it must be gated (unmodellable) rather than resolved as
+    // an absolute `[0x30]`.
+    let seg = op("qword fs:[0x30]", OperandKind::Memory);
+    assert!(has_unmodellable_memory(
+        std::slice::from_ref(&seg),
+        Arch::X86_64
+    ));
 }
 
 #[test]

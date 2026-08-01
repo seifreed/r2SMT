@@ -41,8 +41,6 @@ pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
             defines_flags: false,
             has_memory_access: false,
             is_call: false,
-            stack_defs: Vec::new(),
-            stack_uses: Vec::new(),
             reads_flags: false,
         },
         "bl" | "blr" => InstructionEffect {
@@ -52,8 +50,6 @@ pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
             defines_flags: false,
             has_memory_access: false,
             is_call: true,
-            stack_defs: Vec::new(),
-            stack_uses: Vec::new(),
             reads_flags: false,
         },
         "ret" => InstructionEffect {
@@ -63,8 +59,6 @@ pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
             defines_flags: false,
             has_memory_access: false,
             is_call: false,
-            stack_defs: Vec::new(),
-            stack_uses: Vec::new(),
             reads_flags: false,
         },
         // Conditional branches read NZCV without writing any
@@ -76,8 +70,6 @@ pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
             defines_flags: false,
             has_memory_access: false,
             is_call: false,
-            stack_defs: Vec::new(),
-            stack_uses: Vec::new(),
             reads_flags: false,
         },
         // Compare-and-branch (`cbz`/`cbnz`/`tbz`/`tbnz`) — does not
@@ -97,8 +89,6 @@ pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
                 defines_flags: false,
                 has_memory_access: false,
                 is_call: false,
-                stack_defs: Vec::new(),
-                stack_uses: Vec::new(),
                 reads_flags: false,
             }
         }
@@ -152,8 +142,6 @@ fn aarch64_ldr_effect(insn: &Instruction) -> InstructionEffect {
         defines_flags: false,
         has_memory_access: true,
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }
@@ -184,8 +172,6 @@ fn aarch64_str_effect(insn: &Instruction) -> InstructionEffect {
         defines_flags: false,
         has_memory_access: true,
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }
@@ -214,8 +200,6 @@ fn aarch64_ldp_effect(insn: &Instruction) -> InstructionEffect {
         defines_flags: false,
         has_memory_access: true,
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }
@@ -243,8 +227,6 @@ fn aarch64_stp_effect(insn: &Instruction) -> InstructionEffect {
         defines_flags: false,
         has_memory_access: true,
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }
@@ -271,8 +253,6 @@ fn aarch64_csel_effect(insn: &Instruction) -> InstructionEffect {
         defines_flags: false,
         has_memory_access: false,
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         // csel / csinc / csinv / csneg (and the cinc / cinv / cneg
         // aliases that route through here) all consume NZCV.
         reads_flags: true,
@@ -293,8 +273,6 @@ fn aarch64_cset_effect(insn: &Instruction) -> InstructionEffect {
         defines_flags: false,
         has_memory_access: false,
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         // `cset` / `csetm` only read NZCV — the predicate decides
         // whether to write 1 / -1 or 0.
         reads_flags: true,
@@ -319,8 +297,6 @@ fn aarch64_mov_effect(insn: &Instruction) -> InstructionEffect {
         defines_flags: false,
         has_memory_access: any_memory_operand(&insn.operands),
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }
@@ -355,8 +331,6 @@ fn aarch64_arith3_effect(
         defines_flags: sets_flags,
         has_memory_access: any_memory_operand(&insn.operands),
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }
@@ -380,8 +354,6 @@ fn aarch64_cmp_test_effect(insn: &Instruction, kind: InstructionKind) -> Instruc
         defines_flags: true,
         has_memory_access: any_memory_operand(&insn.operands),
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }

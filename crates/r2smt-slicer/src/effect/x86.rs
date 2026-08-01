@@ -2,10 +2,10 @@
 
 use super::{
     InstructionEffect, InstructionKind, any_memory_operand, canonical_register, first_register,
-    has_unresolved_memory, other_effect, registers_in_operand, stack_slot,
+    other_effect, registers_in_operand,
 };
 use r2smt_common::Arch;
-use r2smt_ir::program::{Instruction, OperandKind};
+use r2smt_ir::program::Instruction;
 
 fn arith_effect(insn: &Instruction, kind: InstructionKind) -> InstructionEffect {
     // Two-operand RMW arithmetic / logical: `op dst, src` —
@@ -34,8 +34,6 @@ fn arith_effect(insn: &Instruction, kind: InstructionKind) -> InstructionEffect 
         defines_flags: true,
         has_memory_access: any_memory_operand(&insn.operands),
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }
@@ -44,39 +42,24 @@ fn mov_effect(insn: &Instruction) -> InstructionEffect {
     // `mov dst, src` — defines dst, uses src registers, no flag effect.
     let mut defs = Vec::new();
     let mut uses = Vec::new();
-    let mut stack_defs: Vec<String> = Vec::new();
-    let mut stack_uses: Vec<String> = Vec::new();
 
     if let Some(dst) = insn.operands.first() {
         if let Some(reg) = canonical_register(&dst.raw, Arch::X86_64) {
             defs.push(reg);
-        } else if let Some((slot, _bits)) = stack_slot(dst) {
-            // `mov [rbp - K], src` — the stack slot becomes a def, like
-            // a virtual register. The base register (rbp/rsp) is not a
-            // data input.
-            stack_defs.push(slot);
         } else {
-            // Memory destination we cannot resolve: the registers in
-            // the expression are address inputs, not data inputs.
+            // Memory destination (stack or otherwise): the registers in
+            // the address expression are inputs (the store address),
+            // not defs — the byte-granular memory model resolves the
+            // stored value.
             uses.extend(registers_in_operand(dst, Arch::X86_64));
         }
     }
     if let Some(src) = insn.operands.get(1) {
-        if src.kind == OperandKind::Memory {
-            if let Some((slot, _bits)) = stack_slot(src) {
-                stack_uses.push(slot);
-            } else {
-                for r in registers_in_operand(src, Arch::X86_64) {
-                    if !uses.contains(&r) {
-                        uses.push(r);
-                    }
-                }
-            }
-        } else {
-            for r in registers_in_operand(src, Arch::X86_64) {
-                if !uses.contains(&r) {
-                    uses.push(r);
-                }
+        // `registers_in_operand` covers both a register source and the
+        // address registers of a memory source (`[rbp - 4]` → rbp).
+        for r in registers_in_operand(src, Arch::X86_64) {
+            if !uses.contains(&r) {
+                uses.push(r);
             }
         }
     }
@@ -86,10 +69,8 @@ fn mov_effect(insn: &Instruction) -> InstructionEffect {
         defs,
         uses,
         defines_flags: false,
-        has_memory_access: has_unresolved_memory(&insn.operands),
+        has_memory_access: any_memory_operand(&insn.operands),
         is_call: false,
-        stack_defs,
-        stack_uses,
         reads_flags: false,
     }
 }
@@ -114,8 +95,6 @@ fn lea_effect(insn: &Instruction) -> InstructionEffect {
         defines_flags: false,
         has_memory_access: false,
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }
@@ -147,8 +126,6 @@ fn xor_effect(insn: &Instruction) -> InstructionEffect {
             defines_flags: true,
             has_memory_access: false,
             is_call: false,
-            stack_defs: Vec::new(),
-            stack_uses: Vec::new(),
             reads_flags: false,
         };
     }
@@ -156,19 +133,11 @@ fn xor_effect(insn: &Instruction) -> InstructionEffect {
 }
 
 fn cmp_or_test_effect(insn: &Instruction, kind: InstructionKind) -> InstructionEffect {
-    // `cmp lhs, rhs` and `test lhs, rhs`: read both, define no register,
-    // write flags.
+    // `cmp lhs, rhs` and `test lhs, rhs`: read both operands (including
+    // any memory-address registers), define no register, write flags.
+    // Memory operands are resolved by the byte-granular model.
     let mut uses = Vec::new();
-    let mut stack_uses: Vec<String> = Vec::new();
     for op in &insn.operands {
-        if op.kind == OperandKind::Memory {
-            if let Some((slot, _bits)) = stack_slot(op) {
-                if !stack_uses.contains(&slot) {
-                    stack_uses.push(slot);
-                }
-                continue;
-            }
-        }
         for r in registers_in_operand(op, Arch::X86_64) {
             if !uses.contains(&r) {
                 uses.push(r);
@@ -180,10 +149,8 @@ fn cmp_or_test_effect(insn: &Instruction, kind: InstructionKind) -> InstructionE
         defs: Vec::new(),
         uses,
         defines_flags: true,
-        has_memory_access: has_unresolved_memory(&insn.operands),
+        has_memory_access: any_memory_operand(&insn.operands),
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses,
         reads_flags: false,
     }
 }
@@ -210,8 +177,6 @@ fn jcc_effect(insn: &Instruction) -> InstructionEffect {
         defines_flags: false,
         has_memory_access: false,
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }
@@ -228,8 +193,6 @@ fn setcc_effect(insn: &Instruction) -> InstructionEffect {
         defines_flags: false,
         has_memory_access: any_memory_operand(&insn.operands),
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }
@@ -260,8 +223,6 @@ fn cmovcc_effect(insn: &Instruction) -> InstructionEffect {
         defines_flags: false,
         has_memory_access: any_memory_operand(&insn.operands),
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }
@@ -293,8 +254,6 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
             defines_flags: false,
             has_memory_access: false,
             is_call: false,
-            stack_defs: Vec::new(),
-            stack_uses: Vec::new(),
             reads_flags: false,
         },
         "call" => InstructionEffect {
@@ -304,8 +263,6 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
             defines_flags: false,
             has_memory_access: false,
             is_call: true,
-            stack_defs: Vec::new(),
-            stack_uses: Vec::new(),
             reads_flags: false,
         },
         "ret" | "retn" | "retf" => InstructionEffect {
@@ -315,8 +272,6 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
             defines_flags: false,
             has_memory_access: false,
             is_call: false,
-            stack_defs: Vec::new(),
-            stack_uses: Vec::new(),
             reads_flags: false,
         },
         m if m.starts_with('j') => jcc_effect(insn),
@@ -358,8 +313,6 @@ fn imul_effect(insn: &Instruction) -> InstructionEffect {
         defines_flags: true,
         has_memory_access: any_memory_operand(&insn.operands),
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }

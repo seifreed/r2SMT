@@ -302,9 +302,11 @@ fn call_before_flag_producer_truncates() {
 }
 
 #[test]
-fn memory_load_truncates_when_not_allowed() {
-    // mov eax, [rax]; cmp eax, 5; je — `[rax]` is unresolved memory
-    // (not a stack slot) so the slicer must still truncate.
+fn modellable_memory_load_resolves_by_default() {
+    // mov eax, [rax]; cmp eax, 5; je — `[rax]` is register-indirect,
+    // an address the byte model can build, so it resolves without
+    // `--allow-memory`: the slice completes (rax is a root) rather
+    // than truncating.
     let program = one_block_program(vec![
         insn(
             0x40_1000,
@@ -313,6 +315,41 @@ fn memory_load_truncates_when_not_allowed() {
             vec![
                 op("eax", OperandKind::Register),
                 op("[rax]", OperandKind::Memory),
+            ],
+        ),
+        insn(
+            0x40_1003,
+            3,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op("5", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1006,
+            6,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let slice = slice_first(&program);
+    assert!(matches!(slice.status, SliceStatus::Complete));
+}
+
+#[test]
+fn unmodellable_memory_load_truncates_when_not_allowed() {
+    // mov eax, fs:[0x30]; cmp eax, 5; je — a segment-relative access
+    // the byte model cannot build, so the slicer still truncates
+    // without `--allow-memory`.
+    let program = one_block_program(vec![
+        insn(
+            0x40_1000,
+            3,
+            "mov",
+            vec![
+                op("eax", OperandKind::Register),
+                op("qword fs:[0x30]", OperandKind::Memory),
             ],
         ),
         insn(

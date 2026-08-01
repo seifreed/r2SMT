@@ -96,19 +96,16 @@ pub struct InstructionEffect {
     /// instruction in the slice even when the live register set is
     /// already satisfied.
     pub reads_flags: bool,
-    /// `true` if the instruction touches memory through a load or store
-    /// the slicer cannot model. Stack-slot accesses recognised by
-    /// [`stack_slot`] (e.g. `[rbp - 4]`) do **not** set this flag —
-    /// they are surfaced via [`Self::stack_defs`] / [`Self::stack_uses`]
-    /// so the slicer can resolve them like a virtual register.
-    /// `lea` is **not** a memory access for this purpose.
+    /// `true` if the instruction touches memory through a load or
+    /// store the slicer should keep in the data-flow chain (any memory
+    /// operand — stack, global, or register-indirect; the byte-granular
+    /// memory model resolves them). `lea` is **not** a memory access
+    /// for this purpose. Whether that access is *modellable* (and so
+    /// resolvable without `--allow-memory`) is a separate question the
+    /// slicer answers on demand via [`has_unmodellable_memory`].
     pub has_memory_access: bool,
     /// `true` if the instruction is a call.
     pub is_call: bool,
-    /// Stack slots written by the instruction (e.g. `"stk_rbp_-4"`).
-    pub stack_defs: Vec<String>,
-    /// Stack slots read by the instruction.
-    pub stack_uses: Vec<String>,
 }
 
 /// Canonicalise a register operand name to its parent register family
@@ -168,14 +165,25 @@ fn any_memory_operand(operands: &[Operand]) -> bool {
     operands.iter().any(|o| o.kind == OperandKind::Memory)
 }
 
-/// Reports whether the operand list contains a memory access that
-/// is *not* a recognised stack slot. Used by the slicer to decide
-/// whether to truncate.
-fn has_unresolved_memory(operands: &[Operand]) -> bool {
+/// Reports whether the operand list contains a memory access whose
+/// address the byte-granular model **cannot** build, so the slicer
+/// must gate it behind `--allow-memory` (and truncate otherwise).
+///
+/// x86 memory is unmodellable only when [`crate::lift::x86_memory_modellable`]
+/// rejects it (rip-relative segments, subtracted registers, …); a
+/// resolvable address — stack slot, global, or register-indirect — is
+/// modellable and resolves without the flag. For every other ISA the
+/// answer is "any memory operand": ARM memory keeps its existing
+/// `--allow-memory` gating until an ARM address model lands.
+#[must_use]
+pub fn has_unmodellable_memory(operands: &[Operand], arch: Arch) -> bool {
     operands
         .iter()
         .filter(|o| o.kind == OperandKind::Memory)
-        .any(|o| stack_slot(o).is_none())
+        .any(|o| match arch {
+            Arch::X86 | Arch::X86_64 => !crate::lift::x86_memory_modellable(o),
+            _ => true,
+        })
 }
 
 /// Explicit pointer width of a memory operand, in bits, from its
@@ -312,8 +320,6 @@ fn other_effect(insn: &Instruction) -> InstructionEffect {
         defines_flags: false,
         has_memory_access: any_memory_operand(&insn.operands),
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }

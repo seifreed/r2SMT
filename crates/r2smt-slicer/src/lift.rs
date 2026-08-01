@@ -864,6 +864,16 @@ fn x86_address_expr(op: &Operand, ptr_bits: u8) -> Option<Expr> {
     Some(Expr::add(base, Expr::konst(masked, ptr_bits)))
 }
 
+/// Whether an x86 memory operand's address can be built by the
+/// byte-granular model — i.e. [`x86_address_expr`] would return `Some`.
+/// The pointer width is irrelevant to the yes/no answer, so a fixed
+/// 64-bit probe suffices. Used by the slicer's memory gate
+/// ([`crate::effect::has_unmodellable_memory`]) so modellable memory
+/// resolves without `--allow-memory` while opaque memory stays gated.
+pub(crate) fn x86_memory_modellable(op: &Operand) -> bool {
+    x86_address_expr(op, 64).is_some()
+}
+
 /// x86 segment-override prefixes. A memory operand carrying one
 /// (`fs:[0x30]`, `gs:[0x60]`, …) addresses `segment_base + offset`,
 /// not `offset`, so the byte-model address parser must decline it.

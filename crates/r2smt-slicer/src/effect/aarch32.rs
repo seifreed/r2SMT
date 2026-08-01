@@ -84,8 +84,6 @@ fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> Instruct
             defines_flags: false,
             has_memory_access: false,
             is_call: false,
-            stack_defs: Vec::new(),
-            stack_uses: Vec::new(),
             reads_flags: false,
         },
         "bl" | "blx" => InstructionEffect {
@@ -95,8 +93,6 @@ fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> Instruct
             defines_flags: false,
             has_memory_access: false,
             is_call: true,
-            stack_defs: Vec::new(),
-            stack_uses: Vec::new(),
             reads_flags: false,
         },
         "bx" => InstructionEffect {
@@ -107,8 +103,6 @@ fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> Instruct
             defines_flags: false,
             has_memory_access: false,
             is_call: false,
-            stack_defs: Vec::new(),
-            stack_uses: Vec::new(),
             reads_flags: false,
         },
         m if m.starts_with('b') && m.len() == 3 => InstructionEffect {
@@ -120,8 +114,6 @@ fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> Instruct
             defines_flags: false,
             has_memory_access: false,
             is_call: false,
-            stack_defs: Vec::new(),
-            stack_uses: Vec::new(),
             reads_flags: false,
         },
         // Memory: `ldr` defines its destination register and reads the
@@ -178,8 +170,6 @@ fn aarch32_push_pop_effect(insn: &Instruction, is_pop: bool) -> InstructionEffec
         defines_flags: false,
         has_memory_access: true,
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }
@@ -214,8 +204,6 @@ fn aarch32_ldm_stm_effect(insn: &Instruction, is_load: bool) -> InstructionEffec
         defines_flags: false,
         has_memory_access: true,
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }
@@ -242,8 +230,6 @@ fn aarch32_ldr_effect(insn: &Instruction) -> InstructionEffect {
         defines_flags: false,
         has_memory_access: true,
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }
@@ -269,8 +255,6 @@ fn aarch32_str_effect(insn: &Instruction) -> InstructionEffect {
         defines_flags: false,
         has_memory_access: true,
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }
@@ -293,8 +277,6 @@ fn aarch32_mov_effect(insn: &Instruction) -> InstructionEffect {
         defines_flags: false,
         has_memory_access: any_memory_operand(&insn.operands),
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }
@@ -325,8 +307,6 @@ fn aarch32_arith_effect(
         defines_flags: sets_flags,
         has_memory_access: any_memory_operand(&insn.operands),
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }
@@ -347,8 +327,6 @@ fn aarch32_cmp_test_effect(insn: &Instruction, kind: InstructionKind) -> Instruc
         defines_flags: true,
         has_memory_access: any_memory_operand(&insn.operands),
         is_call: false,
-        stack_defs: Vec::new(),
-        stack_uses: Vec::new(),
         reads_flags: false,
     }
 }

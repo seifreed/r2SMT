@@ -43,7 +43,7 @@ use tracing::debug;
 
 use crate::collector::BranchCandidate;
 use crate::condition::BranchCondition;
-use crate::effect::{InstructionKind, analyze};
+use crate::effect::{InstructionKind, analyze, has_unmodellable_memory};
 
 mod merge_detect;
 use merge_detect::try_build_diamond_merge;
@@ -286,8 +286,6 @@ struct WalkState {
     /// Canonical register names still needed by the slice (their
     /// definition site has not yet been found).
     live: BTreeSet<&'static str>,
-    /// Stack slots still needed by the slice.
-    live_stack: BTreeSet<String>,
     /// `true` while the slice still needs a flag-defining instruction
     /// (`cmp`, `test`, flag-setting arithmetic, …). Always `false`
     /// for compare-and-branch families that bypass NZCV.
@@ -331,7 +329,6 @@ impl WalkState {
         Self {
             kept: Vec::new(),
             live,
-            live_stack: BTreeSet::new(),
             needs_flags,
             blocks_visited: 0,
             visited: BTreeSet::new(),
@@ -343,8 +340,7 @@ impl WalkState {
     fn into_complete_slice(self, candidate: &BranchCandidate) -> Slice {
         let mut instructions = self.kept;
         instructions.reverse();
-        let mut roots: Vec<String> = self.live.iter().map(|r| (*r).to_string()).collect();
-        roots.extend(self.live_stack.iter().cloned());
+        let roots: Vec<String> = self.live.iter().map(|r| (*r).to_string()).collect();
         Slice {
             branch: candidate.clone(),
             instructions,
@@ -358,8 +354,7 @@ impl WalkState {
     fn into_truncated_slice(self, candidate: &BranchCandidate, reason: String) -> Slice {
         let mut instructions = self.kept;
         instructions.reverse();
-        let mut roots: Vec<String> = self.live.iter().map(|r| (*r).to_string()).collect();
-        roots.extend(self.live_stack.iter().cloned());
+        let roots: Vec<String> = self.live.iter().map(|r| (*r).to_string()).collect();
         let treat_truncation_as_inputs = self.unknowns_on_truncation;
         Slice {
             branch: candidate.clone(),
@@ -378,9 +373,9 @@ impl WalkState {
     /// A flag-dependent branch (`jcc`/`b.<cond>`) needs a definite
     /// flag-defining instruction; if `needs_flags` is still true at
     /// this point, the slice is unsound and gets truncated. Otherwise
-    /// the remaining `live` and `live_stack` entries are treated as
-    /// external inputs (roots) and the slice is complete — same
-    /// semantic the single-block walker had since Phase 3.
+    /// the remaining `live` entries are treated as external inputs
+    /// (roots) and the slice is complete — same semantic the
+    /// single-block walker had since Phase 3.
     fn finalize_at_block_entry(self, candidate: &BranchCandidate, structural: &str) -> Slice {
         if self.needs_flags {
             let pending = pending_summary(&self);
@@ -558,9 +553,17 @@ fn walk_block(
         if !limits.allow_calls && effect.is_call {
             return BlockWalkOutcome::Truncated(format!("call at {addr}", addr = insn.address));
         }
-        if !limits.allow_memory && effect.has_memory_access {
+        // Truncate only on memory the byte-granular model cannot build
+        // (rip / segment / subtracted-register on x86; any memory on
+        // ARM). Modellable memory — stack slots, globals, register-
+        // indirect — resolves through the byte model and needs no
+        // `--allow-memory`.
+        if !limits.allow_memory
+            && effect.has_memory_access
+            && has_unmodellable_memory(&insn.operands, arch)
+        {
             return BlockWalkOutcome::Truncated(format!(
-                "memory access at {addr}",
+                "unmodellable memory access at {addr}",
                 addr = insn.address
             ));
         }
@@ -572,19 +575,12 @@ fn walk_block(
             .filter(|d| state.live.contains(*d))
             .copied()
             .collect();
-        let touches_live_stack: Vec<String> = effect
-            .stack_defs
-            .iter()
-            .filter(|d| state.live_stack.contains(*d))
-            .cloned()
-            .collect();
 
         if effect.kind == InstructionKind::Other {
             if SIDE_EFFECT_FREE_OTHER.contains(&insn.mnemonic.as_str()) {
                 continue;
             }
-            let slice_pending =
-                state.needs_flags || !state.live.is_empty() || !state.live_stack.is_empty();
+            let slice_pending = state.needs_flags || !state.live.is_empty();
             if slice_pending {
                 return BlockWalkOutcome::Truncated(format!(
                     "unsupported '{mnem}' at {addr} may redefine slice state",
@@ -595,17 +591,18 @@ fn walk_block(
             continue;
         }
 
-        if !touches_flags && touches_live.is_empty() && touches_live_stack.is_empty() {
-            // P26: keep instructions that touch memory even when they
-            // don't define a currently-live register/flag. A `str`
-            // doesn't satisfy any pending live name, but its byte-
-            // granular effect on memory state IS observed by any
-            // downstream `ldr` that the encoder will lower through
-            // its `Ite`-chain memory model. Skipping it here would
-            // silently drop the write, unsoundly making the later
-            // load free. Gated on `allow_memory` so the default
-            // (no `--allow-memory`) path is byte-identical to pre-P26.
-            if !(limits.allow_memory && effect.has_memory_access) {
+        if !touches_flags && touches_live.is_empty() {
+            // Keep instructions that touch memory even when they don't
+            // define a currently-live register/flag. A store doesn't
+            // satisfy any pending live name, but its byte-granular
+            // effect on memory state IS observed by any downstream load
+            // that the encoder lowers through its `Ite`-chain memory
+            // model. Skipping it would silently drop the write,
+            // unsoundly making the later load free. Kept regardless of
+            // `--allow-memory`: unmodellable memory already truncated
+            // above, so anything reaching here is modellable and its
+            // store/load must stay in the slice.
+            if !effect.has_memory_access {
                 continue;
             }
         }
@@ -617,14 +614,8 @@ fn walk_block(
         for def in &touches_live {
             state.live.remove(def);
         }
-        for def in &touches_live_stack {
-            state.live_stack.remove(def);
-        }
         for u in &effect.uses {
             state.live.insert(*u);
-        }
-        for u in &effect.stack_uses {
-            state.live_stack.insert(u.clone());
         }
         // If the kept instruction reads NZCV (AArch64 conditional-
         // select family, AArch32 predicated execution, …) we must
@@ -637,7 +628,7 @@ fn walk_block(
             state.needs_flags = true;
         }
 
-        if !state.needs_flags && state.live.is_empty() && state.live_stack.is_empty() {
+        if !state.needs_flags && state.live.is_empty() {
             return BlockWalkOutcome::Done;
         }
     }
@@ -683,10 +674,6 @@ fn pending_summary(state: &WalkState) -> String {
     if !state.live.is_empty() {
         let regs: Vec<&'static str> = state.live.iter().copied().collect();
         parts.push(format!("registers {regs:?}"));
-    }
-    if !state.live_stack.is_empty() {
-        let slots: Vec<&str> = state.live_stack.iter().map(String::as_str).collect();
-        parts.push(format!("stack slots {slots:?}"));
     }
     if parts.is_empty() {
         // Should not happen — `BlockEntry` only fires while something
