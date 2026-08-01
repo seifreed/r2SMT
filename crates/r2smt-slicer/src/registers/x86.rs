@@ -99,18 +99,23 @@ pub(super) fn x86_layout(lower: &str) -> Option<RegisterLayout> {
     Some(layout)
 }
 
-/// x86 SIMD register layout. `xmm<n>` maps to bits `[127:0]` of a
-/// synthetic `zmm<n>` parent — the widest architectural view — so a
-/// future `ymm`/`zmm` slice (bits `[255:0]` / `[511:0]`, gated on the
-/// `u16` width migration) lands on the same data-flow node without
-/// renaming the parent. `mm<n>` (MMX) and `st<n>` (x87) stay `None`
-/// until their own lifters land.
+/// x86 SIMD register layout. `xmm<n>` / `ymm<n>` / `zmm<n>` map to bits
+/// `[127:0]` / `[255:0]` / `[511:0]` of a synthetic `zmm<n>` parent —
+/// the widest architectural view — so every view lands on the same
+/// data-flow node without renaming the parent. `mm<n>` (MMX) and
+/// `st<n>` (x87) stay `None` until their own lifters land.
 fn x86_simd_layout(lower: &str) -> Option<RegisterLayout> {
-    let n: u8 = lower.strip_prefix("xmm")?.parse().ok()?;
+    let hi: u16 = match lower.get(..3)? {
+        "xmm" => 127,
+        "ymm" => 255,
+        "zmm" => 511,
+        _ => return None,
+    };
+    let n: u8 = lower[3..].parse().ok()?;
     if n > 31 {
         return None;
     }
-    Some(simd_slice(x86_zmm_name(n), 0, 127))
+    Some(simd_slice(x86_zmm_name(n), 0, hi))
 }
 
 const fn x86_zmm_name(n: u8) -> &'static str {
@@ -189,12 +194,61 @@ fn x86_xmm_alias(parent: &str) -> Option<&'static str> {
     })
 }
 
+fn x86_zmm_alias(parent: &str) -> Option<&'static str> {
+    let n: u8 = parent.strip_prefix("zmm")?.parse().ok()?;
+    (n <= 31).then(|| x86_zmm_name(n))
+}
+
+fn x86_ymm_alias(parent: &str) -> Option<&'static str> {
+    let n: u8 = parent.strip_prefix("zmm")?.parse().ok()?;
+    Some(match n {
+        0 => "ymm0",
+        1 => "ymm1",
+        2 => "ymm2",
+        3 => "ymm3",
+        4 => "ymm4",
+        5 => "ymm5",
+        6 => "ymm6",
+        7 => "ymm7",
+        8 => "ymm8",
+        9 => "ymm9",
+        10 => "ymm10",
+        11 => "ymm11",
+        12 => "ymm12",
+        13 => "ymm13",
+        14 => "ymm14",
+        15 => "ymm15",
+        16 => "ymm16",
+        17 => "ymm17",
+        18 => "ymm18",
+        19 => "ymm19",
+        20 => "ymm20",
+        21 => "ymm21",
+        22 => "ymm22",
+        23 => "ymm23",
+        24 => "ymm24",
+        25 => "ymm25",
+        26 => "ymm26",
+        27 => "ymm27",
+        28 => "ymm28",
+        29 => "ymm29",
+        30 => "ymm30",
+        31 => "ymm31",
+        _ => return None,
+    })
+}
+
 pub(super) fn x86_alias(parent: &str, hi: u16, lo: u16) -> Option<&'static str> {
-    // SIMD parents (`zmm<n>`) never collide with GPR parents; dispatch
-    // the `[127:0]` xmm view first. Wider (ymm/zmm) views land here
-    // once the `u16` migration allows `hi > 255`.
-    if lo == 0 && hi == 127 && parent.starts_with("zmm") {
-        return x86_xmm_alias(parent);
+    // SIMD parents (`zmm<n>`) never collide with GPR parents; the low
+    // slice width selects the disassembler-visible view: `[127:0]` →
+    // `xmm`, `[255:0]` → `ymm`, `[511:0]` → the `zmm` parent itself.
+    if lo == 0 && parent.starts_with("zmm") {
+        return match hi {
+            127 => x86_xmm_alias(parent),
+            255 => x86_ymm_alias(parent),
+            511 => x86_zmm_alias(parent),
+            _ => None,
+        };
     }
     match (parent, hi, lo) {
         ("rax", 63, 0) => Some("rax"),

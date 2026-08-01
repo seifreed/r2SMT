@@ -55,10 +55,11 @@
 //!   above. The internal `vN` parent identifier is therefore only
 //!   surfaced by [`alias_for`] reverse lookups, never by
 //!   [`register_layout`] forward queries.
-//! - **`x86_64`**: SIMD / FPU stacks (`xmm0`, `ymm0`, `zmm0`,
-//!   `st0`…`st7`, MMX `mm0`…) are out of scope and still resolve to
-//!   `None`. Adding them is a separate exercise gated on an x86
-//!   SIMD lifter.
+//! - **`x86_64`**: SIMD vector registers (`xmm<n>` / `ymm<n>` /
+//!   `zmm<n>`, n=0..31) resolve to bits `[127:0]` / `[255:0]` /
+//!   `[511:0]` of a synthetic `zmm<n>` parent, so the three views
+//!   alias on one data-flow node. The x87 stack (`st0`…`st7`) and MMX
+//!   (`mm0`…) stay `None`, gated on their own lifters.
 //!
 //! Name disambiguation across ISAs is critical: `AArch64` `sp` is
 //! the 64-bit stack pointer; x86 `sp` is the 16-bit alias of `rsp`;

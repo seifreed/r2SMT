@@ -74,10 +74,13 @@ fn default_arch() -> Arch {
 
 const FLAGS: &[&str] = &["ZF", "CF", "SF", "OF", "PF"];
 
-/// Width of an x86 SSE `xmm` register. Modelled at 128 bits (fits the
-/// current `u8` width field); the wider `ymm`/`zmm` views are gated on
-/// the `u16` migration.
-const XMM_BITS: u16 = 128;
+/// Full architectural width of an x86 SIMD vector parent (`zmm<n>`).
+/// Every `xmm`/`ymm`/`zmm` view is a low slice of this one parent, so
+/// the parent variable is always declared at the widest width and reads
+/// / writes extract or reconstruct the accessed slice — a 128-bit and a
+/// 256-bit view of `zmm0` therefore share one data-flow node instead of
+/// colliding as two different-width vars of the same name.
+const SIMD_PARENT_BITS: u16 = 512;
 
 /// SSE integer-SIMD mnemonics the per-mnemonic lifter models precisely
 /// at vector width. Kept in sync with the `simd_effect` dispatch in
@@ -594,8 +597,9 @@ impl LiftCtx {
         false
     }
 
-    /// Read a 128-bit x86 SIMD **register** operand as its canonical
-    /// vector parent (`zmm<n>`). Returns `None` for anything else,
+    /// Read an x86 SIMD **register** operand as a low slice of its
+    /// canonical vector parent (`zmm<n>`), sized to the operand's view
+    /// width (128 / 256 / 512). Returns `None` for anything else,
     /// including memory operands: SIMD memory loads/stores are deferred
     /// (a follow-up) so this step introduces no byte-store-list
     /// interaction, keeping it a strict widening. The caller marks the
@@ -606,22 +610,57 @@ impl LiftCtx {
             return None;
         }
         let layout = register_layout(&op.raw, self.arch)?;
-        (layout.width() == XMM_BITS).then(|| Expr::var(layout.parent, XMM_BITS))
+        if !layout.parent.starts_with("zmm") {
+            return None;
+        }
+        let width = layout.width();
+        let parent = Expr::var(layout.parent, SIMD_PARENT_BITS);
+        Some(if width == SIMD_PARENT_BITS {
+            parent
+        } else {
+            Expr::extract(parent, width - 1, 0)
+        })
     }
 
-    /// Write a 128-bit value to an x86 SIMD **register** destination.
-    /// Returns `false` for non-register destinations (memory deferred).
-    fn write_xmm_dst(&mut self, op: &Operand, value: Expr) -> bool {
+    /// Width of an x86 SIMD **register** view (128 / 256 / 512), or
+    /// `None` if `op` is not a SIMD register.
+    fn simd_view_bits(&self, op: &Operand) -> Option<u16> {
+        let layout = register_layout(&op.raw, self.arch)?;
+        layout.parent.starts_with("zmm").then(|| layout.width())
+    }
+
+    /// Write a `value` (already sized to the operand's view width) to an
+    /// x86 SIMD **register** destination, reconstructing the full-width
+    /// parent per the write's upper-bits rule: `zero_upper` (VEX-encoded
+    /// `v*` forms) zeroes bits above the view; otherwise (legacy SSE)
+    /// the bits above the view are preserved from the parent's prior
+    /// value. Returns `false` for non-register destinations (memory
+    /// deferred).
+    fn write_xmm_dst(&mut self, op: &Operand, value: Expr, zero_upper: bool) -> bool {
         if op.kind != OperandKind::Register {
             return false;
         }
-        match register_layout(&op.raw, self.arch) {
-            Some(layout) if layout.width() == XMM_BITS => {
-                self.assign(Var::new(layout.parent, XMM_BITS), value);
-                true
-            }
-            _ => false,
+        let Some(layout) = register_layout(&op.raw, self.arch) else {
+            return false;
+        };
+        if !layout.parent.starts_with("zmm") {
+            return false;
         }
+        let width = layout.width();
+        let full = if width == SIMD_PARENT_BITS {
+            value
+        } else if zero_upper {
+            Expr::zero_ext(value, SIMD_PARENT_BITS)
+        } else {
+            let preserved = Expr::extract(
+                Expr::var(layout.parent, SIMD_PARENT_BITS),
+                SIMD_PARENT_BITS - 1,
+                width,
+            );
+            Expr::concat(preserved, value)
+        };
+        self.assign(Var::new(layout.parent, SIMD_PARENT_BITS), full);
+        true
     }
 
     fn binop_width(&self, lhs: &Operand, rhs: &Operand) -> u16 {

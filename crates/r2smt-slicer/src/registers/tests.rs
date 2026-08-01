@@ -73,10 +73,28 @@ fn xmm_resolves_to_128bit_zmm_parent() {
     assert_eq!(layout.width(), 128);
     // Reverse lookup rounds back to the disassembler spelling.
     assert_eq!(alias_for("zmm0", 127, 0, Arch::X86_64), Some("xmm0"));
-    // ymm / zmm views need the u16 migration (hi > 255) — still None.
-    assert!(register_layout("ymm0", Arch::X86_64).is_none());
-    assert!(register_layout("zmm0", Arch::X86_64).is_none());
     assert!(register_layout("xmm32", Arch::X86_64).is_none());
+}
+
+#[test]
+fn ymm_and_zmm_resolve_to_wider_slices_of_the_zmm_parent() {
+    let ymm = register_layout("ymm3", Arch::X86_64).unwrap();
+    assert_eq!(ymm.parent, "zmm3");
+    assert_eq!((ymm.lo, ymm.hi), (0, 255));
+    assert_eq!(ymm.width(), 256);
+
+    let zmm = register_layout("zmm3", Arch::X86_64).unwrap();
+    assert_eq!(zmm.parent, "zmm3");
+    assert_eq!((zmm.lo, zmm.hi), (0, 511));
+    assert_eq!(zmm.width(), 512);
+
+    // Each view rounds back to its own disassembler spelling.
+    assert_eq!(alias_for("zmm3", 127, 0, Arch::X86_64), Some("xmm3"));
+    assert_eq!(alias_for("zmm3", 255, 0, Arch::X86_64), Some("ymm3"));
+    assert_eq!(alias_for("zmm3", 511, 0, Arch::X86_64), Some("zmm3"));
+
+    assert!(register_layout("ymm32", Arch::X86_64).is_none());
+    assert!(register_layout("zmm32", Arch::X86_64).is_none());
 }
 
 #[test]

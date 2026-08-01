@@ -1016,16 +1016,28 @@ fn simd_dst_src<'a>(stmts: &'a [IrStmt], dst: &str) -> &'a Expr {
     stmts
         .iter()
         .find_map(|s| match s {
-            IrStmt::Assign { dst: d, src } if d.name == dst && d.bits == 128 => Some(src),
+            IrStmt::Assign { dst: d, src } if d.name == dst && d.bits == 512 => Some(src),
             _ => None,
         })
-        .expect("expected a 128-bit SIMD assignment")
+        .expect("expected a 512-bit SIMD parent assignment")
+}
+
+/// Read a SIMD register view: the low `bits` slice of the 512-bit parent.
+fn simd_read(parent: &str, bits: u16) -> Expr {
+    Expr::extract(Expr::var(parent, 512), bits - 1, 0)
+}
+
+/// Legacy-SSE write reconstruction: the value in the low `bits`, the
+/// parent's prior contents preserved above.
+fn preserve_upper(parent: &str, bits: u16, low: Expr) -> Expr {
+    Expr::concat(Expr::extract(Expr::var(parent, 512), 511, bits), low)
 }
 
 #[test]
-fn vpxor_same_register_lifts_to_128bit_zero() {
-    // `vpxor xmm0, xmm0, xmm0` — the SIMD zero idiom. The result is
-    // the 128-bit constant 0, independent of xmm0's prior contents.
+fn vpxor_same_register_lifts_to_zero_with_upper_bits_zeroed() {
+    // `vpxor xmm0, xmm0, xmm0` — the SIMD zero idiom. The low 128 bits
+    // are 0 independent of inputs; being VEX-encoded, the parent bits
+    // above the view are zeroed.
     let stmts = lift_per_mnemonic(
         &insn(
             0x1000,
@@ -1039,13 +1051,16 @@ fn vpxor_same_register_lifts_to_128bit_zero() {
         ),
         Arch::X86_64,
     );
-    assert_eq!(*simd_dst_src(&stmts, "zmm0"), Expr::konst(0, 128));
+    assert_eq!(
+        *simd_dst_src(&stmts, "zmm0"),
+        Expr::zero_ext(Expr::konst(0, 128), 512)
+    );
 }
 
 #[test]
-fn movaps_copies_xmm_register_at_128_bits() {
-    // `movaps xmm0, xmm1` — a full 128-bit copy; both registers read
-    // through their canonical `zmm` vector parent.
+fn movaps_copies_xmm_view_preserving_upper_parent_bits() {
+    // `movaps xmm0, xmm1` — a 128-bit copy; legacy SSE preserves the
+    // parent bits above the view.
     let stmts = lift_per_mnemonic(
         &insn(
             0x1000,
@@ -1058,12 +1073,16 @@ fn movaps_copies_xmm_register_at_128_bits() {
         ),
         Arch::X86_64,
     );
-    assert_eq!(*simd_dst_src(&stmts, "zmm0"), Expr::var("zmm1", 128));
+    assert_eq!(
+        *simd_dst_src(&stmts, "zmm0"),
+        preserve_upper("zmm0", 128, simd_read("zmm1", 128))
+    );
 }
 
 #[test]
-fn pxor_distinct_registers_lifts_to_128bit_xor() {
-    // `pxor xmm0, xmm1` (2-operand RMW) — `zmm0 := zmm0 ^ zmm1`.
+fn pxor_distinct_registers_lifts_to_xor_preserving_upper() {
+    // `pxor xmm0, xmm1` (2-operand RMW) — low 128 = `xmm0 ^ xmm1`,
+    // upper parent bits preserved (legacy SSE).
     let stmts = lift_per_mnemonic(
         &insn(
             0x1000,
@@ -1078,13 +1097,17 @@ fn pxor_distinct_registers_lifts_to_128bit_xor() {
     );
     assert_eq!(
         *simd_dst_src(&stmts, "zmm0"),
-        Expr::bv_xor(Expr::var("zmm0", 128), Expr::var("zmm1", 128))
+        preserve_upper(
+            "zmm0",
+            128,
+            Expr::bv_xor(simd_read("zmm0", 128), simd_read("zmm1", 128))
+        )
     );
 }
 
 #[test]
-fn pandn_distinct_registers_lifts_to_128bit_andnot() {
-    // `pandn xmm0, xmm1` (2-operand RMW) — `zmm0 := (~zmm0) & zmm1`.
+fn pandn_distinct_registers_lifts_to_andnot_preserving_upper() {
+    // `pandn xmm0, xmm1` (2-operand RMW) — low 128 = `(~xmm0) & xmm1`.
     // Regression: `pandn`/`vpandn` was classified `Simd` by the effect
     // table but had no lifter arm, so it emitted a silent `Unsupported`
     // no-op — a stale-def fabrication once an xmm→GPR bridge exists.
@@ -1102,9 +1125,39 @@ fn pandn_distinct_registers_lifts_to_128bit_andnot() {
     );
     assert_eq!(
         *simd_dst_src(&stmts, "zmm0"),
-        Expr::bv_and(
-            Expr::bv_xor(Expr::var("zmm0", 128), Expr::konst(u128::MAX, 128)),
-            Expr::var("zmm1", 128)
+        preserve_upper(
+            "zmm0",
+            128,
+            Expr::bv_and(
+                Expr::bv_xor(simd_read("zmm0", 128), Expr::konst(u128::MAX, 128)),
+                simd_read("zmm1", 128)
+            )
+        )
+    );
+}
+
+#[test]
+fn vpxor_ymm_lifts_to_256bit_xor_with_upper_bits_zeroed() {
+    // `vpxor ymm0, ymm1, ymm2` (3-operand VEX at 256-bit view) —
+    // `ymm0 := ymm1 ^ ymm2`, parent bits above 256 zeroed.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "vpxor",
+            vec![
+                op("ymm0", OperandKind::Register),
+                op("ymm1", OperandKind::Register),
+                op("ymm2", OperandKind::Register),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    assert_eq!(
+        *simd_dst_src(&stmts, "zmm0"),
+        Expr::zero_ext(
+            Expr::bv_xor(simd_read("zmm1", 256), simd_read("zmm2", 256)),
+            512
         )
     );
 }

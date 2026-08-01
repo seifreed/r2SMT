@@ -9,7 +9,7 @@ use r2smt_ir::stmt::IrStmt;
 
 use crate::registers::register_layout;
 
-use super::{BitwiseOp, ExtendKind, LiftCtx, ShiftOp, XMM_BITS, nonzero_width};
+use super::{BitwiseOp, ExtendKind, LiftCtx, ShiftOp, nonzero_width};
 
 /// x86 SHL/SHR/SAR/SAL mask the shift count before shifting: 5 bits
 /// for 8/16/32-bit operands, 6 bits for 64-bit operands (Intel SDM
@@ -421,17 +421,20 @@ impl LiftCtx {
         self.set_flag("PF", Expr::Unknown(String::new()));
     }
 
-    /// `movaps`/`movups`/`movdqa`/`movdqu dst, src` — a 128-bit copy of
-    /// `src` into `dst`, both `xmm` registers or modellable memory.
+    /// `movaps`/`movups`/`movdqa`/`movdqu dst, src` (and their VEX
+    /// `v*` forms) — a full-view copy of `src` into `dst`. The view
+    /// width (128 / 256 / 512) comes from the operands; a legacy move
+    /// preserves the parent bits above the view, a VEX move zeroes them.
     fn lift_simd_move(&mut self, insn: &Instruction) {
         let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
             return;
         };
+        let zero_upper = is_vex(insn);
         let Some(value) = self.read_xmm_operand(src) else {
             self.push_simd_unsupported(insn);
             return;
         };
-        if !self.write_xmm_dst(dst, value) {
+        if !self.write_xmm_dst(dst, value, zero_upper) {
             self.push_simd_unsupported(insn);
         }
     }
@@ -443,6 +446,11 @@ impl LiftCtx {
     fn lift_simd_bitwise(&mut self, insn: &Instruction, op: SimdBitOp) {
         let ops = &insn.operands;
         let Some(dst) = ops.first() else {
+            return;
+        };
+        let zero_upper = is_vex(insn);
+        let Some(width) = self.simd_view_bits(dst) else {
+            self.push_simd_unsupported(insn);
             return;
         };
         // Operand roles: 2-operand `OP dst, src` is RMW (a = dst,
@@ -457,7 +465,7 @@ impl LiftCtx {
             }
         };
         if matches!(op, SimdBitOp::Xor) && same_xmm_register(a_op, b_op) {
-            if !self.write_xmm_dst(dst, Expr::konst(0, XMM_BITS)) {
+            if !self.write_xmm_dst(dst, Expr::konst(0, width), zero_upper) {
                 self.push_simd_unsupported(insn);
             }
             return;
@@ -472,9 +480,9 @@ impl LiftCtx {
             SimdBitOp::Or => Expr::bv_or(a, b),
             // `pandn`/`vpandn` compute `(~a) & b`. The IR has no bitwise
             // NOT, so `~a` is `a XOR all-ones` at the vector width.
-            SimdBitOp::AndNot => Expr::bv_and(Expr::bv_xor(a, Expr::konst(u128::MAX, XMM_BITS)), b),
+            SimdBitOp::AndNot => Expr::bv_and(Expr::bv_xor(a, simd_all_ones(width)), b),
         };
-        if !self.write_xmm_dst(dst, result) {
+        if !self.write_xmm_dst(dst, result, zero_upper) {
             self.push_simd_unsupported(insn);
         }
     }
@@ -497,14 +505,41 @@ enum SimdBitOp {
     AndNot,
 }
 
-/// Whether two operands name the same `xmm` register (by canonical
-/// vector parent) — the condition for a `pxor`/`vpxor` zero idiom.
+/// Whether two operands name the same SIMD register view (same vector
+/// parent and same width) — the condition for a `pxor`/`vpxor` zero
+/// idiom.
 fn same_xmm_register(a: &Operand, b: &Operand) -> bool {
     match (
         register_layout(&a.raw, Arch::X86_64),
         register_layout(&b.raw, Arch::X86_64),
     ) {
-        (Some(la), Some(lb)) => la.parent == lb.parent && la.width() == 128,
+        (Some(la), Some(lb)) => {
+            la.parent.starts_with("zmm") && la.parent == lb.parent && la.width() == lb.width()
+        }
         _ => false,
+    }
+}
+
+/// Whether `insn` is a VEX/EVEX-encoded (`v`-prefixed) SIMD form, whose
+/// destination write zeroes the vector-register bits above the view.
+/// Legacy SSE forms preserve those bits.
+fn is_vex(insn: &Instruction) -> bool {
+    insn.mnemonic.trim().to_ascii_lowercase().starts_with('v')
+}
+
+/// All-ones bit-vector at `bits` width. Constants wider than 128 bits
+/// cannot be a single `Const` (`value: u128`), so they are built by
+/// concatenating 128-bit all-ones chunks (`bits` is always a multiple
+/// of 128 for SIMD views).
+fn simd_all_ones(bits: u16) -> Expr {
+    if bits <= 128 {
+        let mask = if bits == 128 {
+            u128::MAX
+        } else {
+            (1u128 << bits) - 1
+        };
+        Expr::konst(mask, bits)
+    } else {
+        Expr::concat(simd_all_ones(bits - 128), Expr::konst(u128::MAX, 128))
     }
 }
