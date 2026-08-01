@@ -43,27 +43,43 @@ pub fn emit_preamble(slice: &SsaLiftedSlice, options: &SolveOptions) -> String {
     let _ = writeln!(out, "; r2smt slice @ {addr}", addr = slice.branch.address);
     let _ = writeln!(out, "; timeout-ms: {ms}", ms = options.timeout_ms);
     let mut declared: Vec<String> = Vec::new();
+    let mut mem = TextMemory::new(ptr_bits_for(slice.arch));
     for var in &slice.inputs {
         declare_bv(&mut out, &var.name, var.bits, &mut declared);
     }
     for stmt in &slice.statements {
-        if let IrStmt::Assign { dst, src } = stmt {
-            declare_bv(&mut out, &dst.name, dst.bits, &mut declared);
-            let rhs = render_expr_with_width(src, dst.bits);
-            let _ = writeln!(out, "(assert (= {lhs} {rhs}))", lhs = dst.name);
-            let _ = rhs;
-        } else if let IrStmt::LoadMem { dst, .. } = stmt {
-            // No memory model — declare the destination as a free
-            // bit-vector so downstream assertions can reference it.
-            declare_bv(&mut out, &dst.name, dst.bits, &mut declared);
+        match stmt {
+            IrStmt::Assign { dst, src } => {
+                declare_bv(&mut out, &dst.name, dst.bits, &mut declared);
+                let rhs = render_expr_with_width(src, dst.bits);
+                let _ = writeln!(out, "(assert (= {lhs} {rhs}))", lhs = dst.name);
+            }
+            IrStmt::StoreMem {
+                address,
+                value,
+                bits,
+            } => mem.record_store(address, value, *bits),
+            IrStmt::LoadMem { dst, address, bits } => {
+                declare_bv(&mut out, &dst.name, dst.bits, &mut declared);
+                mem.emit_load(&mut out, &mut declared, dst, address, *bits);
+            }
+            // Unsupported / Nop emit nothing; the SMT side stays an
+            // over-approximation for those (extra freedom can only widen
+            // `AlwaysX` to `BothPossible`, never fabricate one).
+            IrStmt::Unsupported { .. } | IrStmt::Nop => {}
         }
-        // StoreMem / Unsupported / Nop emit nothing; the SMT side is
-        // an over-approximation that ignores stores and unsupported
-        // mnemonics. The verdict is sound: extra freedom can only
-        // widen `AlwaysX` to `BothPossible`, never fabricate one.
     }
     let _ = writeln!(out);
     out
+}
+
+/// Pointer width in bits for the target architecture, matching the Z3
+/// encoder's `ptr_bits`.
+fn ptr_bits_for(arch: r2smt_common::Arch) -> u8 {
+    match arch {
+        r2smt_common::Arch::X86_64 | r2smt_common::Arch::Aarch64 => 64,
+        _ => 32,
+    }
 }
 
 /// Convenience helper combining [`emit_preamble`] with the
@@ -82,6 +98,104 @@ pub fn emit_query(slice: &SsaLiftedSlice, options: &SolveOptions, polarity: bool
     let _ = writeln!(&mut script, "(assert {assertion})");
     let _ = writeln!(&mut script, "(check-sat)");
     script
+}
+
+/// Byte-store cap for the textual backend, matching the Z3 encoder's
+/// `MEM_BYTE_STORE_CAP`. Overflow havocs the store list.
+const MEM_BYTE_STORE_CAP: usize = 4096;
+
+/// Byte-granular memory model for the textual SMT-LIB backend, mirroring
+/// the Z3 encoder's `Ite`-chain (`encoder.rs`). Each `StoreMem` enqueues
+/// its bytes little-endian; each `LoadMem` reads latest-write-wins by
+/// folding one `ite` per byte over the store list **oldest → latest**,
+/// so the latest write is the outermost `ite`. Bounded by
+/// [`MEM_BYTE_STORE_CAP`]: overflow havocs the list and subsequent loads
+/// read fresh free bytes — precision lost, soundness preserved.
+struct TextMemory {
+    stores: Vec<(String, String)>,
+    havoced: bool,
+    load_counter: u32,
+    ptr_bits: u8,
+}
+
+impl TextMemory {
+    fn new(ptr_bits: u8) -> Self {
+        Self {
+            stores: Vec::new(),
+            havoced: false,
+            load_counter: 0,
+            ptr_bits,
+        }
+    }
+
+    fn byte_addr(&self, addr: &str, i: u8) -> String {
+        if i == 0 {
+            addr.to_string()
+        } else {
+            format!("(bvadd {addr} (_ bv{i} {bits}))", bits = self.ptr_bits)
+        }
+    }
+
+    fn record_store(&mut self, address: &Expr, value: &Expr, bits: u8) {
+        if bits == 0 {
+            return;
+        }
+        let nbytes = usize::from(bits.div_ceil(8));
+        if self.stores.len().saturating_add(nbytes) > MEM_BYTE_STORE_CAP {
+            self.stores.clear();
+            self.havoced = true;
+            return;
+        }
+        let addr = render_expr_with_width(address, self.ptr_bits);
+        let value_s = render_expr_with_width(value, bits);
+        for i in 0..u8::try_from(nbytes).unwrap_or(u8::MAX) {
+            let byte_addr = self.byte_addr(&addr, i);
+            let lo = u32::from(i) * 8;
+            let hi = lo + 7;
+            let byte = format!("((_ extract {hi} {lo}) {value_s})");
+            self.stores.push((byte_addr, byte));
+        }
+    }
+
+    fn emit_load(
+        &mut self,
+        out: &mut String,
+        declared: &mut Vec<String>,
+        dst: &r2smt_ir::expr::Var,
+        address: &Expr,
+        bits: u8,
+    ) {
+        if bits == 0 {
+            return;
+        }
+        let nbytes = bits.div_ceil(8);
+        let addr = render_expr_with_width(address, self.ptr_bits);
+        let load_id = self.load_counter;
+        self.load_counter = self.load_counter.wrapping_add(1);
+        let mut acc: Option<String> = None;
+        for i in 0..nbytes {
+            let byte_addr = self.byte_addr(&addr, i);
+            let fresh = format!("load_{load_id}_{i}");
+            declare_bv(out, &fresh, 8, declared);
+            let mut byte_val = fresh;
+            if !self.havoced {
+                for (store_addr, store_byte) in &self.stores {
+                    byte_val =
+                        format!("(ite (= {byte_addr} {store_addr}) {store_byte} {byte_val})");
+                }
+            }
+            acc = Some(match acc.take() {
+                None => byte_val,
+                Some(prev) => format!("(concat {byte_val} {prev})"),
+            });
+        }
+        let Some(loaded) = acc else {
+            return;
+        };
+        let total_bits = nbytes.saturating_mul(8);
+        let coerced = coerce(&loaded, total_bits, bits);
+        let _ = writeln!(out, "(assert (= {lhs} {coerced}))", lhs = dst.name);
+    }
 }
 
 fn declare_bv(out: &mut String, name: &str, bits: u8, declared: &mut Vec<String>) {
@@ -351,5 +465,81 @@ mod tests {
         assert!(script.contains("(check-sat)"));
         assert!(script.contains("(declare-fun "));
         assert!(script.contains("(assert ("));
+    }
+
+    fn mem_slice(statements: Vec<IrStmt>) -> SsaLiftedSlice {
+        use r2smt_slicer::{BranchCandidate, BranchCondition, BranchKind, SliceStatus};
+        let z = Address::new(0x1000);
+        SsaLiftedSlice {
+            branch: BranchCandidate {
+                address: z,
+                function: z,
+                block: z,
+                kind: BranchKind::Jcc,
+                mnemonic: "memtest".into(),
+                condition: BranchCondition::NotEqual,
+                formula: "memtest".into(),
+                taken_target: None,
+                fallthrough_target: None,
+                compare_register: None,
+                bit_index: None,
+                upstream_resolved: None,
+                operand_raws: Vec::new(),
+                is_thumb: false,
+            },
+            statements,
+            condition: Expr::konst(0, 1),
+            status: SliceStatus::Complete,
+            treat_truncation_as_inputs: false,
+            inputs: Vec::new(),
+            defs: Vec::new(),
+            arch: Arch::Aarch64,
+        }
+    }
+
+    #[test]
+    fn smtlib_store_then_load_emits_byte_granular_ite_chain() {
+        // A store to `sp` followed by a load from `sp` must constrain
+        // the loaded value via the alias `ite` chain — the same
+        // precision the Z3 backend has, not a free variable.
+        use r2smt_ir::expr::Var;
+        let sp = Expr::Var(Var::new("sp", 64));
+        let ssa = mem_slice(vec![
+            IrStmt::StoreMem {
+                address: sp.clone(),
+                value: Expr::konst(5, 64),
+                bits: 64,
+            },
+            IrStmt::LoadMem {
+                dst: Var::new("t0", 64),
+                address: sp,
+                bits: 64,
+            },
+        ]);
+        let script = emit_preamble(&ssa, &SolveOptions::default());
+        assert!(
+            script.contains("(ite "),
+            "expected alias ite chain: {script}"
+        );
+        assert!(
+            script.contains("(concat "),
+            "expected byte concat: {script}"
+        );
+    }
+
+    #[test]
+    fn smtlib_load_without_prior_store_stays_a_free_value() {
+        // No store → the load reads a fresh free byte (no ite chain).
+        use r2smt_ir::expr::Var;
+        let ssa = mem_slice(vec![IrStmt::LoadMem {
+            dst: Var::new("t0", 64),
+            address: Expr::Var(Var::new("sp", 64)),
+            bits: 64,
+        }]);
+        let script = emit_preamble(&ssa, &SolveOptions::default());
+        assert!(
+            !script.contains("(ite "),
+            "a load with no prior store must not build an ite chain: {script}"
+        );
     }
 }
