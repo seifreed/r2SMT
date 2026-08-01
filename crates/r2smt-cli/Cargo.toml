@@ -28,6 +28,7 @@ r2smt-report       = { workspace = true }
 r2smt-patch        = { workspace = true }
 r2smt-difflift     = { workspace = true }
 r2smt-explore      = { workspace = true }
+r2smt-taint        = { workspace = true }
 clap               = { workspace = true }
 anyhow             = { workspace = true }
 rayon              = { workspace = true }

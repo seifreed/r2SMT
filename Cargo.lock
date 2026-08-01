@@ -611,6 +611,7 @@ dependencies = [
  "r2smt-smt",
  "r2smt-solver-port",
  "r2smt-ssa",
+ "r2smt-taint",
  "rayon",
  "serde",
  "serde_json",

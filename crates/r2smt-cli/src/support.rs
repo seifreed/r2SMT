@@ -214,6 +214,37 @@ pub(crate) fn compute_findings(
     Ok((arch, findings))
 }
 
+/// Build the SSA slices for the targeted branches without solving them.
+/// Shares the open → dump → resolve → `prepare_ssa` path with
+/// [`compute_findings`], but returns the raw [`SsaLiftedSlice`]s for
+/// consumers (like the taint pass) that run their own analysis.
+///
+/// # Errors
+///
+/// Propagates provider / program-load failures.
+pub(crate) fn compute_slices(
+    file: &Path,
+    deep: bool,
+    at: Option<&str>,
+    function_filter: Option<&str>,
+    limits: &SliceLimits,
+    ir_pcode: bool,
+) -> Result<(Arch, Vec<r2smt_ssa::SsaLiftedSlice>)> {
+    let mut provider = open_provider(file, deep)?;
+    provider.set_attach_pcode(ir_pcode);
+    let program = dump_program(&mut provider)
+        .with_context(|| format!("loading program from {}", file.display()))?;
+    let arch = program.arch;
+    let (ctx, filtered) = resolve_targets(&mut provider, file, program, at, function_filter)?;
+    let mut slices = Vec::with_capacity(filtered.len());
+    for cand in &filtered {
+        if let Some(function) = ctx.find_function(cand.function) {
+            slices.push(prepare_ssa(function, cand, limits, ctx.program.arch));
+        }
+    }
+    Ok((arch, slices))
+}
+
 /// Dispatch a single solve request to the selected backend. CVC5
 /// failures (subprocess missing, garbled output) are surfaced as
 /// `Err(anyhow::Error)` so the CLI can return a clear message to the

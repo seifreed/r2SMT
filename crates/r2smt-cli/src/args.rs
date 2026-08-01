@@ -626,6 +626,49 @@ pub(crate) enum Command {
         json: Option<PathBuf>,
     },
 
+    /// Sound may-taint analysis: report which values at `addr` derive
+    /// from a seeded source. With `--concretise`, an opaque outcome
+    /// (flow hidden behind an unmodelled node) falls through to the
+    /// fenced UNSOUND exploration engine to search for a witness.
+    Taint {
+        /// Path to the binary to analyze.
+        file: PathBuf,
+
+        /// Address of the branch / instruction to analyze.
+        addr: String,
+
+        /// Source register to seed (repeatable; each a distinct taint
+        /// source). If omitted, every free input is seeded as one
+        /// source.
+        #[arg(long = "source", value_name = "REG")]
+        sources: Vec<String>,
+
+        /// On an opaque outcome, search for a concrete witness via the
+        /// exploration engine (UNSOUND, banner-stamped).
+        #[arg(long)]
+        concretise: bool,
+
+        /// Maximum number of instructions per slice. Default: 32.
+        #[arg(long, value_name = "N")]
+        max_instructions: Option<usize>,
+
+        /// Allow memory load / store instructions in slices.
+        #[arg(long)]
+        allow_memory: bool,
+
+        /// Allow `call` instructions in slices.
+        #[arg(long)]
+        allow_calls: bool,
+
+        /// Host-side wall-clock budget in ms for concretisation. Default: 30000.
+        #[arg(long, value_name = "MS")]
+        timeout_ms: Option<u64>,
+
+        /// Path-explosion budget for concretisation. Default: 10000.
+        #[arg(long, value_name = "N")]
+        max_paths: Option<u64>,
+    },
+
     /// Search for a concrete input that reaches an address (UNSOUND
     /// exploration). Drives the fenced radius2 engine to synthesise a
     /// witness — stdin / argv / registers — that would steer execution

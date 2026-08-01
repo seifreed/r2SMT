@@ -4,11 +4,62 @@
 //! orchestration state — extracted from `main.rs` so the binary entry
 //! point stays a thin composition root.
 
+use std::fmt::Write as _;
+
+use r2smt_common::Address;
 use r2smt_core::{Confidence, Finding, FindingKind};
+use r2smt_explore::ExploreResult;
 use r2smt_ir::program::{Function, Program};
-use r2smt_report::Annotation;
+use r2smt_report::{Annotation, wrap_unsound};
 use r2smt_slicer::{BranchCandidate, LiftedSlice, Slice, SliceStatus};
 use r2smt_ssa::SsaLiftedSlice;
+
+/// Render an exploration result for a target, wrapped in the
+/// non-suppressible UNSOUND banner. Shared by the `why` and `taint
+/// --concretise` commands.
+pub(crate) fn render_explore_result(target: Address, result: &ExploreResult) -> String {
+    wrap_unsound(&render_explore_body(target, result))
+}
+
+fn render_explore_body(target: Address, result: &ExploreResult) -> String {
+    match result {
+        ExploreResult::ReachedWith(model) => {
+            let mut out = format!(
+                "reached {target} with:\n  stdin = {}",
+                render_bytes(&model.stdin)
+            );
+            if !model.argv.is_empty() {
+                let _ = write!(out, "\n  argv  = {:?}", model.argv);
+            }
+            for (reg, val) in &model.regs_init {
+                let _ = write!(out, "\n  {reg} = {val:#x}");
+            }
+            out
+        }
+        ExploreResult::NotFoundWithinBudget { reason } => {
+            format!("no input reaches {target} within budget: {reason}")
+        }
+        ExploreResult::Inconclusive { reason } => {
+            format!("inconclusive for {target}: {reason}")
+        }
+        _ => format!("unrecognised explore result for {target}"),
+    }
+}
+
+fn render_bytes(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "(empty)".to_string();
+    }
+    if bytes.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+        format!("{:?}", String::from_utf8_lossy(bytes))
+    } else {
+        let mut hex = String::from("0x");
+        for b in bytes {
+            let _ = write!(hex, "{b:02x}");
+        }
+        hex
+    }
+}
 
 pub(crate) fn print_branch_summary(candidates: &[BranchCandidate]) {
     println!("candidates: {}", candidates.len());
@@ -492,4 +543,53 @@ pub(crate) fn print_summary(program: &Program) {
         .sum();
     println!("blocks:    {total_blocks}");
     println!("insns:     {total_insns}");
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+
+    use super::{render_bytes, render_explore_result};
+    use r2smt_common::Address;
+    use r2smt_explore::{ExploreResult, Model};
+    use r2smt_report::UNSOUND_BANNER;
+
+    #[test]
+    fn test_render_bytes_printable_yields_quoted_string() {
+        assert_eq!(render_bytes(b"PASS"), "\"PASS\"");
+    }
+
+    #[test]
+    fn test_render_bytes_nonprintable_yields_hex() {
+        assert_eq!(render_bytes(&[0x00, 0xff]), "0x00ff");
+    }
+
+    #[test]
+    fn test_render_bytes_empty_is_marked() {
+        assert_eq!(render_bytes(&[]), "(empty)");
+    }
+
+    #[test]
+    fn test_render_explore_result_reached_shows_target_stdin_and_banner() {
+        let model = Model {
+            stdin: b"PASS".to_vec(),
+            argv: Vec::new(),
+            regs_init: std::collections::BTreeMap::new(),
+        };
+        let rendered = render_explore_result(
+            Address::new(0x0040_1000),
+            &ExploreResult::ReachedWith(model),
+        );
+        assert!(rendered.starts_with(UNSOUND_BANNER));
+        assert!(rendered.contains("reached 0x401000") && rendered.contains("\"PASS\""));
+    }
+
+    #[test]
+    fn test_render_explore_result_inconclusive_is_labelled() {
+        let rendered = render_explore_result(
+            Address::new(0x1000),
+            &ExploreResult::inconclusive("no engine"),
+        );
+        assert!(rendered.contains("inconclusive for 0x1000"));
+    }
 }
