@@ -56,11 +56,27 @@ fn case_and_whitespace_insensitive() {
 
 #[test]
 fn non_gpr_returns_none() {
-    assert!(register_layout("xmm0", Arch::X86_64).is_none());
+    // MMX / x87 stay unmodelled; only SSE `xmm` is wired (P40-b).
     assert!(register_layout("st0", Arch::X86_64).is_none());
+    assert!(register_layout("mm0", Arch::X86_64).is_none());
     assert!(register_layout("ptr", Arch::X86_64).is_none());
     assert!(register_layout("0x10", Arch::X86_64).is_none());
     assert!(register_layout("", Arch::X86_64).is_none());
+}
+
+#[test]
+fn xmm_resolves_to_128bit_zmm_parent() {
+    let layout = register_layout("xmm0", Arch::X86_64).unwrap();
+    assert_eq!(layout.parent, "zmm0");
+    assert_eq!(layout.lo, 0);
+    assert_eq!(layout.hi, 127);
+    assert_eq!(layout.width(), 128);
+    // Reverse lookup rounds back to the disassembler spelling.
+    assert_eq!(alias_for("zmm0", 127, 0, Arch::X86_64), Some("xmm0"));
+    // ymm / zmm views need the u16 migration (hi > 255) — still None.
+    assert!(register_layout("ymm0", Arch::X86_64).is_none());
+    assert!(register_layout("zmm0", Arch::X86_64).is_none());
+    assert!(register_layout("xmm32", Arch::X86_64).is_none());
 }
 
 #[test]

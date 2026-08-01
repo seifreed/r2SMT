@@ -37,7 +37,8 @@ fn canonical_register_covers_aliases() {
         assert_eq!(canonical_register(alias, Arch::X86_64), Some("rax"));
     }
     assert_eq!(canonical_register("r8d", Arch::X86_64), Some("r8"));
-    assert_eq!(canonical_register("xmm0", Arch::X86_64), None);
+    // `xmm` now resolves (P40-b); MMX/x87 stay unmodelled.
+    assert_eq!(canonical_register("st0", Arch::X86_64), None);
     assert_eq!(canonical_register("ptr", Arch::X86_64), None);
     assert_eq!(canonical_register("0x10", Arch::X86_64), None);
 }
@@ -119,9 +120,10 @@ fn canonical_register_recognises_aarch64_simd_aliases() {
         assert_eq!(canonical_register(alias, Arch::Aarch64), Some("v0"));
     }
     assert_eq!(canonical_register("d31", Arch::Aarch64), Some("v31"));
-    // x86 SIMD still resolves to None — adding ARM SIMD does not
-    // accidentally widen the x86 table.
-    assert_eq!(canonical_register("xmm0", Arch::X86_64), None);
+    // Adding ARM SIMD does not accidentally widen the x86 table:
+    // x86 MMX / x87 stay None (only SSE `xmm` is wired, under X86_64).
+    assert_eq!(canonical_register("mm0", Arch::X86_64), None);
+    assert_eq!(canonical_register("st0", Arch::X86_64), None);
 }
 
 #[test]

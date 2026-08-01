@@ -211,6 +211,19 @@ const fn aarch64_vector(parent: &'static str, lo: u8, hi: u8) -> RegisterLayout 
     }
 }
 
+/// SIMD register slice, ISA-neutral. `zero_extends_parent_64` is a
+/// GPR concept (32→64 dword zero-extension) and does not describe SIMD
+/// write semantics, so it stays `false`; the lifter models the
+/// zero-extension-to-vector-width behaviour explicitly.
+const fn simd_slice(parent: &'static str, lo: u8, hi: u8) -> RegisterLayout {
+    RegisterLayout {
+        parent,
+        lo,
+        hi,
+        zero_extends_parent_64: false,
+    }
+}
+
 const fn arm32_full(parent: &'static str) -> RegisterLayout {
     RegisterLayout {
         parent,
