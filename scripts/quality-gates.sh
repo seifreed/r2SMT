@@ -75,7 +75,8 @@ gate_solver_contracts() {
     slice_with_unknown_is_declined_without_spawning_bitwuzla \
     slice_with_unrenderable_float_is_declined_without_spawning_cvc5 \
     slice_with_unrenderable_float_is_declined_without_spawning_bitwuzla \
-    smtlib_fp_inversion_on_nan_keeps_both_polarities_satisfiable
+    smtlib_fp_inversion_on_nan_keeps_both_polarities_satisfiable \
+    smtlib_ssa_renamed_slice_solves_to_the_same_verdict_as_the_z3_backend
 }
 
 gate_determinism() {

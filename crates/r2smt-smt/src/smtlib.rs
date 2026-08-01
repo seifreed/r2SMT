@@ -21,6 +21,7 @@
 //! render-only consumers. Verdict paths must use [`emit_query_strict`],
 //! which fails instead.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
@@ -152,7 +153,7 @@ fn emit_preamble_with(
                 declare_bv(&mut out, &dst.name, dst.bits, &mut declared);
                 let rhs = render_expr_with_width(src, dst.bits, ctx);
                 ctx.flush_into(&mut out);
-                let _ = writeln!(out, "(assert (= {lhs} {rhs}))", lhs = dst.name);
+                let _ = writeln!(out, "(assert (= {lhs} {rhs}))", lhs = smt_symbol(&dst.name));
             }
             IrStmt::StoreMem {
                 address,
@@ -317,7 +318,11 @@ impl TextMemory {
         let memo_key = (render_expr_with_width(address, self.ptr_bits, ctx), bits);
         if let Some(cached) = self.load_memo.get(&memo_key) {
             ctx.flush_into(out);
-            let _ = writeln!(out, "(assert (= {lhs} {cached}))", lhs = dst.name);
+            let _ = writeln!(
+                out,
+                "(assert (= {lhs} {cached}))",
+                lhs = smt_symbol(&dst.name)
+            );
             return;
         }
         let nbytes = bits.div_ceil(8);
@@ -347,8 +352,13 @@ impl TextMemory {
         let total_bits = nbytes.saturating_mul(8);
         let coerced = coerce(&loaded, total_bits, bits);
         ctx.flush_into(out);
-        let _ = writeln!(out, "(assert (= {lhs} {coerced}))", lhs = dst.name);
-        self.load_memo.insert(memo_key, dst.name.clone());
+        let _ = writeln!(
+            out,
+            "(assert (= {lhs} {coerced}))",
+            lhs = smt_symbol(&dst.name)
+        );
+        self.load_memo
+            .insert(memo_key, smt_symbol(&dst.name).into_owned());
     }
 }
 
@@ -651,11 +661,41 @@ fn fp_predicate(name: &str, operands: [&Expr; 2], ctx: &mut RenderCtx) -> (Strin
 /// the context, and the verdict paths decline before solving.
 const UNRENDERABLE_PLACEHOLDER: &str = "(_ bv0 1)";
 
+/// Characters an SMT-LIB *simple* symbol may contain besides letters
+/// and digits (SMT-LIB 2.6 §3.1).
+const SYMBOL_EXTRA_CHARS: [char; 17] = [
+    '~', '!', '@', '$', '%', '^', '&', '*', '_', '-', '+', '=', '<', '>', '.', '?', '/',
+];
+
+/// Render `name` as an SMT-LIB symbol, quoting it when it is not a
+/// legal simple symbol.
+///
+/// Load-bearing for SSA names: the rename pass suffixes every
+/// definition with `#N`, and `#` is not a simple-symbol character — it
+/// opens a bit-vector literal, so an unquoted `zmm0#0` is a parse error
+/// in every solver.
+fn smt_symbol(name: &str) -> Cow<'_, str> {
+    let simple = !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || SYMBOL_EXTRA_CHARS.contains(&c));
+    if simple {
+        Cow::Borrowed(name)
+    } else {
+        Cow::Owned(format!("|{name}|"))
+    }
+}
+
 fn declare_bv(out: &mut String, name: &str, bits: u16, declared: &mut Vec<String>) {
     if declared.iter().any(|n| n == name) {
         return;
     }
-    let _ = writeln!(out, "(declare-fun {name} () (_ BitVec {bits}))");
+    let _ = writeln!(
+        out,
+        "(declare-fun {name} () (_ BitVec {bits}))",
+        name = smt_symbol(name)
+    );
     declared.push(name.to_string());
 }
 
@@ -675,7 +715,7 @@ fn render_expr_with_width(expr: &Expr, target_bits: u16, ctx: &mut RenderCtx) ->
 #[allow(clippy::too_many_lines, clippy::match_same_arms)]
 fn render_expr(expr: &Expr, ctx: &mut RenderCtx) -> (String, u16) {
     match expr {
-        Expr::Var(v) => (v.name.clone(), v.bits),
+        Expr::Var(v) => (smt_symbol(&v.name).into_owned(), v.bits),
         Expr::Const { value, bits } => (format!("(_ bv{value} {bits})"), *bits),
         Expr::Add(a, b) => bin_op("bvadd", a, b, Signedness::Unsigned, ctx),
         Expr::Sub(a, b) => bin_op("bvsub", a, b, Signedness::Unsigned, ctx),
@@ -1088,20 +1128,11 @@ mod tests {
         );
     }
 
-    #[test]
-    #[ignore = "writes a script for manual replay against cvc5 / bitwuzla"]
-    fn smtlib_writes_fp_script_for_external_solver_replay() {
-        // Opt-in: the default suite must not depend on a solver binary
-        // being installed, but the emitted text is what CVC5 and
-        // Bitwuzla actually parse, so keep a way to hand it to them:
-        //   cargo test -p r2smt-smt --lib -- --ignored \
-        //     smtlib_writes_fp_script_for_external_solver_replay
-        //   cvc5 --lang smt2 < target/fp-replay-taken.smt2
-        //   bitwuzla < target/fp-replay-not-taken.smt2
-        // Built by the real pipeline rather than by hand, so the script
-        // exercises what the lifter actually emits — the scalar compare
-        // pulls in fp.eq, fp.lt and fp.isNaN alongside the reinterpret.
-        let program = Program {
+    /// `pxor xmm0, xmm0` then a self-compare then `branch`: every
+    /// variable in the resulting slice carries an SSA `#N` suffix, and
+    /// the flags are fully determined without a memory operand.
+    fn zeroed_self_compare_program(branch: &str) -> Program {
+        Program {
             arch: Arch::X86_64,
             bits: 64,
             entry: Some(Address(0x40_1000)),
@@ -1132,7 +1163,7 @@ mod tests {
                         insn(
                             0x40_1008,
                             6,
-                            "jp",
+                            branch,
                             vec![op("0x401080", OperandKind::Immediate)],
                         ),
                     ],
@@ -1140,8 +1171,51 @@ mod tests {
                 }],
                 is_thumb: false,
             }],
-        };
-        let slice = build_ssa(&program);
+        }
+    }
+
+    #[test]
+    fn smtlib_quotes_ssa_symbols_carrying_a_version_suffix() {
+        // The SSA rename suffixes definitions with `#N`, and `#` opens a
+        // bit-vector literal in SMT-LIB rather than continuing a symbol.
+        // Unquoted, every solver rejects the script at parse time.
+        let script = emit_query(
+            &build_ssa(&zeroed_self_compare_program("jp")),
+            &SolveOptions::default(),
+            true,
+        );
+        assert!(script.contains("(declare-fun |zmm0#0| ()"), "{script}");
+    }
+
+    #[test]
+    fn smtlib_ssa_renamed_slice_solves_to_the_same_verdict_as_the_z3_backend() {
+        // Parses *and* decides: a script whose symbols were rejected
+        // would leave the solver with no assertions, making both
+        // polarities satisfiable instead of proving the branch dead.
+        let slice = build_ssa(&zeroed_self_compare_program("jp"));
+        let taken = z3_check(&emit_query(&slice, &SolveOptions::default(), true));
+        let not_taken = z3_check(&emit_query(&slice, &SolveOptions::default(), false));
+        assert_eq!(
+            (taken, not_taken),
+            (z3::SatResult::Unsat, z3::SatResult::Sat)
+        );
+    }
+
+    #[test]
+    #[ignore = "writes a script for manual replay against cvc5 / bitwuzla"]
+    fn smtlib_writes_fp_script_for_external_solver_replay() {
+        // Opt-in: the default suite must not depend on a solver binary
+        // being installed, but the emitted text is what CVC5 and
+        // Bitwuzla actually parse, so keep a way to hand it to them:
+        //   cargo test -p r2smt-smt --lib -- --ignored \
+        //     smtlib_writes_fp_script_for_external_solver_replay
+        //   cvc5 --lang smt2 < target/fp-replay-taken.smt2
+        //   bitwuzla < target/fp-replay-not-taken.smt2
+        // Built by the real pipeline rather than by hand, so the script
+        // exercises what the lifter actually emits — the scalar compare
+        // pulls in fp.eq, fp.lt and fp.isNaN alongside the reinterpret,
+        // over SSA-renamed symbols.
+        let slice = build_ssa(&zeroed_self_compare_program("jp"));
         // A unit test runs with the crate directory as its working
         // directory, so reach the workspace target dir explicitly.
         let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
