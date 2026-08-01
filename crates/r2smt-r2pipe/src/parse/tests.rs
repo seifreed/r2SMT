@@ -624,3 +624,47 @@ fn split_pdgsd_ignores_stray_log_lines() {
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].0, 0x100);
 }
+
+#[test]
+fn test_split_disasm_keeps_aarch64_offset_memory_operand_whole() {
+    // The real-path regression the P26–P30 goldens missed: a naive
+    // comma split fragmented `[x1, 8]` into `[x1` + `8]`, so the memory
+    // lifter declined. The bracket-aware split must keep it as one
+    // Memory operand.
+    let (mnem, ops) = split_disasm("ldr x0, [x1, 8]");
+    assert_eq!(mnem, "ldr");
+    assert_eq!(ops.len(), 2, "expected two operands, got {ops:?}");
+    assert_eq!(ops[0].raw, "x0");
+    assert_eq!(ops[0].kind, OperandKind::Register);
+    assert_eq!(ops[1].raw, "[x1, 8]");
+    assert_eq!(ops[1].kind, OperandKind::Memory);
+}
+
+#[test]
+fn test_split_disasm_keeps_preindex_writeback_operand_whole() {
+    let (_mnem, ops) = split_disasm("ldr x0, [x1, 8]!");
+    assert_eq!(ops.len(), 2, "expected two operands, got {ops:?}");
+    assert_eq!(ops[1].raw, "[x1, 8]!");
+    assert_eq!(ops[1].kind, OperandKind::Memory);
+}
+
+#[test]
+fn test_split_disasm_keeps_register_list_operand_whole() {
+    let (mnem, ops) = split_disasm("push {r4, r5, lr}");
+    assert_eq!(mnem, "push");
+    assert_eq!(
+        ops.len(),
+        1,
+        "register list must stay one operand, got {ops:?}"
+    );
+    assert_eq!(ops[0].raw, "{r4, r5, lr}");
+}
+
+#[test]
+fn test_split_disasm_splits_plain_operands_at_top_level() {
+    // Non-bracketed operands still split normally.
+    let (_mnem, ops) = split_disasm("add x0, x1, x2");
+    assert_eq!(ops.len(), 3);
+    assert_eq!(ops[0].raw, "x0");
+    assert_eq!(ops[2].raw, "x2");
+}

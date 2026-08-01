@@ -202,8 +202,8 @@ fn split_disasm(text: &str) -> (String, Vec<Operand>) {
     if operand_str.is_empty() {
         return (mnemonic, Vec::new());
     }
-    let operands = operand_str
-        .split(',')
+    let operands = split_top_level_commas(operand_str)
+        .into_iter()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|raw| Operand {
@@ -212,6 +212,31 @@ fn split_disasm(text: &str) -> (String, Vec<Operand>) {
         })
         .collect();
     (mnemonic, operands)
+}
+
+/// Split an operand string on commas that sit at bracket/brace/paren
+/// depth zero. radare2 writes a memory operand `[x1, 8]`, a
+/// pre-index `[x1, 8]!`, and a register list `{r4, r5, lr}` as single
+/// operands that contain internal commas; a naive `split(',')` would
+/// fragment them (and the lifter would then decline a well-formed
+/// memory access). Depth tracking keeps each such operand whole.
+fn split_top_level_commas(operand_str: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0;
+    for (i, ch) in operand_str.char_indices() {
+        match ch {
+            '[' | '{' | '(' => depth += 1,
+            ']' | '}' | ')' => depth = (depth - 1).max(0),
+            ',' if depth == 0 => {
+                parts.push(&operand_str[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&operand_str[start..]);
+    parts
 }
 
 /// Coarse control-flow classification of a single instruction, as
