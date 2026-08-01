@@ -16,7 +16,7 @@ default = []
 # Off by default: keeps the radius2 / radare2 subprocess engine out of
 # the default dependency graph so the verify/patch closure can never
 # transitively reach it. Turn on to compile the actual explorer.
-oracle-radius2 = []
+oracle-radius2 = ["dep:radius2"]
 
 [[bin]]
 name = "r2smt-explore-worker"
@@ -28,6 +28,7 @@ serde        = { workspace = true }
 serde_json   = { workspace = true }
 thiserror    = { workspace = true }
 tempfile     = { workspace = true }
+radius2      = { version = "1.0.28", optional = true }
 
 [dev-dependencies]
 trybuild = "1"

@@ -32,6 +32,8 @@
 //! non-suppressible `r2smt_report::UNSOUND_BANNER`.
 
 pub mod driver;
+#[cfg(feature = "oracle-radius2")]
+pub mod engine;
 pub mod model;
 
 pub use driver::{WaitOutcome, WorkerSpec, explore, run_worker, spawn_and_wait};

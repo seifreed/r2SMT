@@ -66,13 +66,7 @@ fn run(request: &ExploreRequest, max_paths: u64) -> ExploreResult {
     }
     #[cfg(feature = "oracle-radius2")]
     {
-        // ponytail: radius2 driver lands in the E1b increment; the
-        // fenced infrastructure (subprocess, watchdog, budget, banner,
-        // fences) is complete and tested without it. Until then the
-        // compiled-in engine soundly declines rather than fabricating a
-        // witness.
-        let _ = (request, max_paths);
-        ExploreResult::inconclusive("radius2 engine not yet wired (E1b)")
+        r2smt_explore::engine::explore_engine(request, max_paths)
     }
 }
 
