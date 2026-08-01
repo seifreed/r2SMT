@@ -30,9 +30,15 @@
 //! memory / unsupported still hard-truncate. Both behaviours are
 //! sound: a path-insensitive predicate keeps its high-confidence
 //! verdict, a path-sensitive one only ever widens an `AlwaysX` to
-//! `BothPossible` — never a fabricated verdict. The *general* DAG
-//! Φ-merge (nested / chained diamonds, merges inside loops) remains
-//! future work — see CLAUDE.md "Still outside scope".
+//! `BothPossible` — never a fabricated verdict.
+//!
+//! The merge is now a general DAG recovery, always fail-closing to the
+//! sound free-input boundary: multi-block straight-line arms, flag
+//! merging across arms, chained / nested diamonds (the walk resumes
+//! after each merge), and merged memory state (per-arm conditional
+//! stores). Concrete counted self-loops are resolved by a bounded
+//! forward unroll to the counter's exit constant (see [`loop_unroll`]);
+//! non-concrete or non-convergent loops decline and stay free.
 
 use std::collections::BTreeSet;
 
@@ -47,6 +53,9 @@ use crate::effect::{InstructionKind, analyze, has_unmodellable_memory};
 
 mod merge_detect;
 use merge_detect::{head_condition_roots, try_build_diamond_merge};
+
+mod loop_unroll;
+use loop_unroll::try_unroll_counted_loop;
 
 /// Limits applied while slicing.
 ///
@@ -450,6 +459,32 @@ fn walk_backwards(
                     }
                     1 => {
                         let pred_addr = preds[0];
+                        // Bounded counted-loop unroll: if the unique
+                        // predecessor is a concrete counted self-loop,
+                        // resolve the counter to its exit constant rather
+                        // than walking (and truncating on) the loop. A
+                        // non-concrete or non-convergent loop declines and
+                        // falls through to the sound cycle/free-input path.
+                        if limits.allow_join_merge
+                            && let Some(pred_block) =
+                                function.blocks.iter().find(|b| b.address == pred_addr)
+                            && let Some(synth) = try_unroll_counted_loop(
+                                function,
+                                pred_block,
+                                &state.live,
+                                state.needs_flags,
+                                arch,
+                            )
+                        {
+                            state.kept.push(synth);
+                            // The synthetic `mov counter, const` resolves
+                            // the sole live counter; nothing else pends.
+                            state.live.clear();
+                            return state.finalize_at_block_entry(
+                                candidate,
+                                "counted loop unrolled to constant",
+                            );
+                        }
                         if state.visited.contains(&pred_addr) {
                             let structural = format!("cycle back to {pred_addr}");
                             return state.finalize_at_block_entry(candidate, &structural);

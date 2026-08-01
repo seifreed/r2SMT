@@ -1730,6 +1730,140 @@ fn solve_flag_diamond(program: &Program) -> SmtResult {
     solve_branch(&ssa, SolveOptions::default())
 }
 
+/// Counted self-loop: `eax` starts at `init`, the body increments it and
+/// loops while `eax < trip`; after the loop the branch tests `eax ==
+/// cmp_imm`. `init` is an operand spelling (immediate → concrete loop;
+/// register → non-concrete, declines the unroll).
+fn counted_loop(init: &str, init_kind: OperandKind, trip: &str, cmp_imm: &str) -> Program {
+    Program {
+        arch: Arch::X86_64,
+        bits: 64,
+        entry: Some(Address(0x40_1000)),
+        functions: vec![Function {
+            address: Address(0x40_1000),
+            name: Some("sym.main".into()),
+            blocks: vec![
+                BasicBlock {
+                    address: Address(0x40_1000),
+                    instructions: vec![insn(
+                        0x40_1000,
+                        5,
+                        "mov",
+                        vec![op("eax", OperandKind::Register), op(init, init_kind)],
+                    )],
+                    successors: vec![Address(0x40_1100)],
+                },
+                BasicBlock {
+                    address: Address(0x40_1100),
+                    instructions: vec![
+                        insn(
+                            0x40_1100,
+                            3,
+                            "add",
+                            vec![
+                                op("eax", OperandKind::Register),
+                                op("1", OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1103,
+                            3,
+                            "cmp",
+                            vec![
+                                op("eax", OperandKind::Register),
+                                op(trip, OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1106,
+                            2,
+                            "jl",
+                            vec![op("0x401100", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![Address(0x40_1100), Address(0x40_1200)],
+                },
+                BasicBlock {
+                    address: Address(0x40_1200),
+                    instructions: vec![
+                        insn(
+                            0x40_1200,
+                            3,
+                            "cmp",
+                            vec![
+                                op("eax", OperandKind::Register),
+                                op(cmp_imm, OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1203,
+                            6,
+                            "je",
+                            vec![op("0x401300", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![],
+                },
+            ],
+            is_thumb: false,
+        }],
+    }
+}
+
+fn solve_counted_loop(program: &Program, allow_join_merge: bool) -> SmtResult {
+    let cands = collect_branches(program);
+    let branch = cands
+        .iter()
+        .find(|c| c.address == Address(0x40_1203))
+        .expect("post-loop branch present");
+    let limits = SliceLimits {
+        max_basic_blocks: 8,
+        allow_join_merge,
+        ..SliceLimits::default()
+    };
+    let slice = slice_branch(branch, &program.functions[0], &limits, program.arch);
+    let lifted = lift_slice(&slice, program.arch);
+    let ssa = ssa_convert(&lifted);
+    solve_branch(&ssa, SolveOptions::default())
+}
+
+#[test]
+fn counted_loop_unrolls_to_exit_constant() {
+    // `for (eax = 0; eax < 3; eax++)` exits with `eax == 3`. The bounded
+    // unroll computes that constant, so `eax == 3` is provably always
+    // taken — precise only because the loop is concrete.
+    let program = counted_loop("0", OperandKind::Immediate, "3", "3");
+    assert_eq!(
+        solve_counted_loop(&program, true),
+        SmtResult::AlwaysTrue,
+        "concrete counted loop resolves the counter to its exit constant"
+    );
+}
+
+#[test]
+fn counted_loop_without_merge_is_sound_but_imprecise() {
+    // Merge off: no unroll, `eax` is a free input, verdict widens.
+    let program = counted_loop("0", OperandKind::Immediate, "3", "3");
+    assert_eq!(
+        solve_counted_loop(&program, false),
+        SmtResult::BothPossible,
+        "un-unrolled loop counter is free: sound, imprecise"
+    );
+}
+
+#[test]
+fn non_concrete_counted_loop_declines_unroll_soundly() {
+    // The counter is initialised from a register (`mov eax, ecx`), so
+    // the exit value is not a constant. The unroll must decline and the
+    // counter stays free — BothPossible, never a fabricated verdict.
+    let program = counted_loop("ecx", OperandKind::Register, "3", "3");
+    assert_eq!(
+        solve_counted_loop(&program, true),
+        SmtResult::BothPossible,
+        "non-concrete loop init must decline the unroll soundly"
+    );
+}
+
 /// Memory diamond: each arm stores an immediate to the stack slot
 /// `[rbp-8]`, the join loads it back into `eax` and branches on
 /// `eax == cmp_imm`. Resolving the branch needs the conditional store.
