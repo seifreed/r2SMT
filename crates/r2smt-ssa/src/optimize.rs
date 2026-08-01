@@ -188,6 +188,26 @@ fn substitute(expr: &Expr, map: &HashMap<String, Expr>, depth: usize) -> Expr {
         }
         Expr::ZeroExtend { src, to_bits } => Expr::zero_ext(substitute(src, map, d), *to_bits),
         Expr::SignExtend { src, to_bits } => Expr::sign_ext(substitute(src, map, d), *to_bits),
+        Expr::FAdd(a, b, rm) => Expr::fadd(substitute(a, map, d), substitute(b, map, d), *rm),
+        Expr::FSub(a, b, rm) => Expr::fsub(substitute(a, map, d), substitute(b, map, d), *rm),
+        Expr::FMul(a, b, rm) => Expr::fmul(substitute(a, map, d), substitute(b, map, d), *rm),
+        Expr::FDiv(a, b, rm) => Expr::fdiv(substitute(a, map, d), substitute(b, map, d), *rm),
+        Expr::FEq(a, b) => Expr::feq(substitute(a, map, d), substitute(b, map, d)),
+        Expr::FLt(a, b) => Expr::flt(substitute(a, map, d), substitute(b, map, d)),
+        Expr::FLe(a, b) => Expr::fle(substitute(a, map, d), substitute(b, map, d)),
+        Expr::FIsNaN(a) => Expr::fisnan(substitute(a, map, d)),
+        Expr::FpConst { .. } => expr.clone(),
+        Expr::BvToFp { src, ebits, sbits } => {
+            Expr::bv_to_fp(substitute(src, map, d), *ebits, *sbits)
+        }
+        Expr::FpToIeeeBv(src) => Expr::fp_to_ieee_bv(substitute(src, map, d)),
+        Expr::FpToSbv { src, rm, bits } => Expr::fp_to_sbv(substitute(src, map, d), *rm, *bits),
+        Expr::SbvToFp {
+            src,
+            rm,
+            ebits,
+            sbits,
+        } => Expr::sbv_to_fp(substitute(src, map, d), *rm, *ebits, *sbits),
     }
 }
 
@@ -293,6 +313,22 @@ fn collect_var_names(expr: &Expr, out: &mut HashSet<String>) {
             collect_var_names(high, out);
             collect_var_names(low, out);
         }
+        Expr::FAdd(a, b, _)
+        | Expr::FSub(a, b, _)
+        | Expr::FMul(a, b, _)
+        | Expr::FDiv(a, b, _)
+        | Expr::FEq(a, b)
+        | Expr::FLt(a, b)
+        | Expr::FLe(a, b) => {
+            collect_var_names(a, out);
+            collect_var_names(b, out);
+        }
+        Expr::FIsNaN(s)
+        | Expr::FpToIeeeBv(s)
+        | Expr::BvToFp { src: s, .. }
+        | Expr::FpToSbv { src: s, .. }
+        | Expr::SbvToFp { src: s, .. } => collect_var_names(s, out),
+        Expr::FpConst { .. } => {}
     }
 }
 
@@ -378,6 +414,22 @@ fn collect_vars(expr: &Expr, out: &mut Vec<Var>) {
             collect_vars(high, out);
             collect_vars(low, out);
         }
+        Expr::FAdd(a, b, _)
+        | Expr::FSub(a, b, _)
+        | Expr::FMul(a, b, _)
+        | Expr::FDiv(a, b, _)
+        | Expr::FEq(a, b)
+        | Expr::FLt(a, b)
+        | Expr::FLe(a, b) => {
+            collect_vars(a, out);
+            collect_vars(b, out);
+        }
+        Expr::FIsNaN(s)
+        | Expr::FpToIeeeBv(s)
+        | Expr::BvToFp { src: s, .. }
+        | Expr::FpToSbv { src: s, .. }
+        | Expr::SbvToFp { src: s, .. } => collect_vars(s, out),
+        Expr::FpConst { .. } => {}
     }
 }
 

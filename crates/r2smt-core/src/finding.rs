@@ -515,6 +515,19 @@ fn count_unknowns(expr: &Expr) -> usize {
             count_unknowns(src)
         }
         Expr::Concat { high, low } => count_unknowns(high) + count_unknowns(low),
+        Expr::FAdd(a, b, _)
+        | Expr::FSub(a, b, _)
+        | Expr::FMul(a, b, _)
+        | Expr::FDiv(a, b, _)
+        | Expr::FEq(a, b)
+        | Expr::FLt(a, b)
+        | Expr::FLe(a, b) => count_unknowns(a) + count_unknowns(b),
+        Expr::FIsNaN(s)
+        | Expr::FpToIeeeBv(s)
+        | Expr::BvToFp { src: s, .. }
+        | Expr::FpToSbv { src: s, .. }
+        | Expr::SbvToFp { src: s, .. } => count_unknowns(s),
+        Expr::FpConst { .. } => 0,
     }
 }
 

@@ -347,6 +347,28 @@ impl Encoder {
             // weaken, never fabricate" invariant. A 64-bit free var is
             // only ever *truncated* downstream, which stays sound.
             Expr::Unknown(_) => Encoded::Bv(self.fresh_unknown(64)),
+            // Floating point: modelled as fresh free values — a sound
+            // over-approximation (any value possible → widens `AlwaysX`
+            // to `BothPossible`, never fabricates a verdict). Each FP
+            // node is independently free, so no two need consistent
+            // widths. Precise FP encoding lands in P40-f-3. FP-typed
+            // results are declared at their `ebits + sbits` width so a
+            // downstream `Extract` / `FpToIeeeBv` consumer sees enough
+            // bits; predicates yield a fresh free boolean.
+            Expr::FAdd(a, ..) | Expr::FSub(a, ..) | Expr::FMul(a, ..) | Expr::FDiv(a, ..) => {
+                Encoded::Bv(self.fresh_unknown(fp_total_bits(a)))
+            }
+            Expr::FpConst { ebits, sbits, .. }
+            | Expr::BvToFp { ebits, sbits, .. }
+            | Expr::SbvToFp { ebits, sbits, .. } => {
+                Encoded::Bv(self.fresh_unknown(u32::from(*ebits) + u32::from(*sbits)))
+            }
+            Expr::FpToIeeeBv(src) => Encoded::Bv(self.fresh_unknown(fp_total_bits(src))),
+            Expr::FpToSbv { bits, .. } => Encoded::Bv(self.fresh_unknown(u32::from(*bits))),
+            Expr::FEq(..) | Expr::FLt(..) | Expr::FLe(..) | Expr::FIsNaN(_) => {
+                let free = self.fresh_unknown(1);
+                Encoded::Bool(Self::bv_is_true(&free))
+            }
         }
     }
 
@@ -389,6 +411,21 @@ impl Encoder {
         let name = format!("__unk_{}", self.unknown_counter);
         self.unknown_counter += 1;
         BV::new_const(name.as_str(), bits)
+    }
+}
+
+/// Total IEEE bit width (`ebits + sbits`) of a floating-point-typed
+/// expression, recovered from the sort it carries or the sort of its
+/// first operand. Falls back to 64 for shapes that carry no sort.
+fn fp_total_bits(expr: &Expr) -> u32 {
+    match expr {
+        Expr::FpConst { ebits, sbits, .. }
+        | Expr::BvToFp { ebits, sbits, .. }
+        | Expr::SbvToFp { ebits, sbits, .. } => u32::from(*ebits) + u32::from(*sbits),
+        Expr::FAdd(a, ..) | Expr::FSub(a, ..) | Expr::FMul(a, ..) | Expr::FDiv(a, ..) => {
+            fp_total_bits(a)
+        }
+        _ => 64,
     }
 }
 

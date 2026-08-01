@@ -231,6 +231,17 @@ fn expr_has_unknown(expr: &Expr) -> bool {
             then_expr,
             else_expr,
         } => expr_has_unknown(cond) || expr_has_unknown(then_expr) || expr_has_unknown(else_expr),
+        Expr::FAdd(a, b, _) | Expr::FSub(a, b, _) | Expr::FMul(a, b, _) | Expr::FDiv(a, b, _) => {
+            expr_has_unknown(a) || expr_has_unknown(b)
+        }
+        Expr::FEq(a, b) | Expr::FLt(a, b) | Expr::FLe(a, b) => {
+            expr_has_unknown(a) || expr_has_unknown(b)
+        }
+        Expr::FIsNaN(a) | Expr::FpToIeeeBv(a) => expr_has_unknown(a),
+        Expr::FpConst { .. } => false,
+        Expr::BvToFp { src, .. } | Expr::FpToSbv { src, .. } | Expr::SbvToFp { src, .. } => {
+            expr_has_unknown(src)
+        }
     }
 }
 
@@ -286,5 +297,44 @@ fn subst_expr(expr: &Expr, env: &HashMap<String, Expr>) -> Expr {
         Expr::ZeroExtend { src, to_bits } => Expr::zero_ext(subst_expr(src, env), *to_bits),
         Expr::SignExtend { src, to_bits } => Expr::sign_ext(subst_expr(src, env), *to_bits),
         Expr::Unknown(hint) => Expr::Unknown(hint.clone()),
+        Expr::FAdd(a, b, rm) => {
+            Expr::FAdd(Box::new(subst_expr(a, env)), Box::new(subst_expr(b, env)), *rm)
+        }
+        Expr::FSub(a, b, rm) => {
+            Expr::FSub(Box::new(subst_expr(a, env)), Box::new(subst_expr(b, env)), *rm)
+        }
+        Expr::FMul(a, b, rm) => {
+            Expr::FMul(Box::new(subst_expr(a, env)), Box::new(subst_expr(b, env)), *rm)
+        }
+        Expr::FDiv(a, b, rm) => {
+            Expr::FDiv(Box::new(subst_expr(a, env)), Box::new(subst_expr(b, env)), *rm)
+        }
+        Expr::FEq(a, b) => Expr::FEq(Box::new(subst_expr(a, env)), Box::new(subst_expr(b, env))),
+        Expr::FLt(a, b) => Expr::FLt(Box::new(subst_expr(a, env)), Box::new(subst_expr(b, env))),
+        Expr::FLe(a, b) => Expr::FLe(Box::new(subst_expr(a, env)), Box::new(subst_expr(b, env))),
+        Expr::FIsNaN(a) => Expr::FIsNaN(Box::new(subst_expr(a, env))),
+        Expr::FpConst { .. } => expr.clone(),
+        Expr::BvToFp { src, ebits, sbits } => Expr::BvToFp {
+            src: Box::new(subst_expr(src, env)),
+            ebits: *ebits,
+            sbits: *sbits,
+        },
+        Expr::FpToIeeeBv(src) => Expr::FpToIeeeBv(Box::new(subst_expr(src, env))),
+        Expr::FpToSbv { src, rm, bits } => Expr::FpToSbv {
+            src: Box::new(subst_expr(src, env)),
+            rm: *rm,
+            bits: *bits,
+        },
+        Expr::SbvToFp {
+            src,
+            rm,
+            ebits,
+            sbits,
+        } => Expr::SbvToFp {
+            src: Box::new(subst_expr(src, env)),
+            rm: *rm,
+            ebits: *ebits,
+            sbits: *sbits,
+        },
     }
 }

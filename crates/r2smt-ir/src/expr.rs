@@ -160,6 +160,86 @@ pub enum Expr {
     /// parse, instruction with side effects we have not modelled, …).
     /// The string is a short, human-readable hint.
     Unknown(String),
+
+    // --- Floating-point (IEEE-754) theory ---
+    // FP values carry a `(ebits, sbits)` sort: `ebits` exponent bits and
+    // `sbits` significand bits including the implicit leading bit. IEEE
+    // single is `(8, 24)`, double `(11, 53)`. An FP expression's total
+    // bit width (for coercion) is `ebits + sbits`.
+    /// Floating-point addition under a rounding mode.
+    FAdd(Box<Expr>, Box<Expr>, RoundingMode),
+    /// Floating-point subtraction under a rounding mode.
+    FSub(Box<Expr>, Box<Expr>, RoundingMode),
+    /// Floating-point multiplication under a rounding mode.
+    FMul(Box<Expr>, Box<Expr>, RoundingMode),
+    /// Floating-point division under a rounding mode.
+    FDiv(Box<Expr>, Box<Expr>, RoundingMode),
+    /// IEEE floating-point equality (`NaN` ≠ `NaN`), yields a 1-bit value.
+    FEq(Box<Expr>, Box<Expr>),
+    /// IEEE floating-point less-than, yields a 1-bit value.
+    FLt(Box<Expr>, Box<Expr>),
+    /// IEEE floating-point less-than-or-equal, yields a 1-bit value.
+    FLe(Box<Expr>, Box<Expr>),
+    /// `true` (1-bit) when the operand is a `NaN`.
+    FIsNaN(Box<Expr>),
+    /// Floating-point constant, as its IEEE bit pattern under the sort.
+    FpConst {
+        /// IEEE bit pattern (width `ebits + sbits`).
+        bits: u128,
+        /// Exponent bit width.
+        ebits: u16,
+        /// Significand bit width (incl. implicit bit).
+        sbits: u16,
+    },
+    /// Reinterpret a raw bit-vector as a float of the given sort
+    /// (SMT-LIB `(_ to_fp e s)` applied to a bit-vector — a bit-pattern
+    /// reinterpret, no rounding).
+    BvToFp {
+        /// Source bit-vector (width must equal `ebits + sbits`).
+        src: Box<Expr>,
+        /// Exponent bit width.
+        ebits: u16,
+        /// Significand bit width.
+        sbits: u16,
+    },
+    /// Reinterpret a float as its IEEE bit-vector (width `ebits + sbits`).
+    FpToIeeeBv(Box<Expr>),
+    /// Convert a float to a signed integer bit-vector of `bits` width.
+    FpToSbv {
+        /// Source float.
+        src: Box<Expr>,
+        /// Rounding mode for the conversion.
+        rm: RoundingMode,
+        /// Result bit width.
+        bits: u16,
+    },
+    /// Convert a signed integer bit-vector to a float of the given sort.
+    SbvToFp {
+        /// Source signed integer bit-vector.
+        src: Box<Expr>,
+        /// Rounding mode for the conversion.
+        rm: RoundingMode,
+        /// Exponent bit width.
+        ebits: u16,
+        /// Significand bit width.
+        sbits: u16,
+    },
+}
+
+/// IEEE-754 rounding mode for floating-point operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundingMode {
+    /// Round to nearest, ties to even — the IEEE default (`RNE`).
+    NearestTiesEven,
+    /// Round to nearest, ties away from zero (`RNA`).
+    NearestTiesAway,
+    /// Round toward positive infinity (`RTP`).
+    TowardPositive,
+    /// Round toward negative infinity (`RTN`).
+    TowardNegative,
+    /// Round toward zero (`RTZ`).
+    TowardZero,
 }
 
 impl Expr {
@@ -339,6 +419,80 @@ impl Expr {
             to_bits,
         }
     }
+
+    /// Floating-point addition under `rm`.
+    #[must_use]
+    pub fn fadd(a: Self, b: Self, rm: RoundingMode) -> Self {
+        Self::FAdd(Box::new(a), Box::new(b), rm)
+    }
+    /// Floating-point subtraction under `rm`.
+    #[must_use]
+    pub fn fsub(a: Self, b: Self, rm: RoundingMode) -> Self {
+        Self::FSub(Box::new(a), Box::new(b), rm)
+    }
+    /// Floating-point multiplication under `rm`.
+    #[must_use]
+    pub fn fmul(a: Self, b: Self, rm: RoundingMode) -> Self {
+        Self::FMul(Box::new(a), Box::new(b), rm)
+    }
+    /// Floating-point division under `rm`.
+    #[must_use]
+    pub fn fdiv(a: Self, b: Self, rm: RoundingMode) -> Self {
+        Self::FDiv(Box::new(a), Box::new(b), rm)
+    }
+    /// IEEE floating-point equality (1-bit result).
+    #[must_use]
+    pub fn feq(a: Self, b: Self) -> Self {
+        Self::FEq(Box::new(a), Box::new(b))
+    }
+    /// IEEE floating-point less-than (1-bit result).
+    #[must_use]
+    pub fn flt(a: Self, b: Self) -> Self {
+        Self::FLt(Box::new(a), Box::new(b))
+    }
+    /// IEEE floating-point less-than-or-equal (1-bit result).
+    #[must_use]
+    pub fn fle(a: Self, b: Self) -> Self {
+        Self::FLe(Box::new(a), Box::new(b))
+    }
+    /// Floating-point is-NaN predicate (1-bit result).
+    #[must_use]
+    pub fn fisnan(a: Self) -> Self {
+        Self::FIsNaN(Box::new(a))
+    }
+    /// Reinterpret a bit-vector as a float of sort `(ebits, sbits)`.
+    #[must_use]
+    pub fn bv_to_fp(src: Self, ebits: u16, sbits: u16) -> Self {
+        Self::BvToFp {
+            src: Box::new(src),
+            ebits,
+            sbits,
+        }
+    }
+    /// Reinterpret a float as its IEEE bit-vector.
+    #[must_use]
+    pub fn fp_to_ieee_bv(src: Self) -> Self {
+        Self::FpToIeeeBv(Box::new(src))
+    }
+    /// Convert a float to a signed `bits`-wide integer under `rm`.
+    #[must_use]
+    pub fn fp_to_sbv(src: Self, rm: RoundingMode, bits: u16) -> Self {
+        Self::FpToSbv {
+            src: Box::new(src),
+            rm,
+            bits,
+        }
+    }
+    /// Convert a signed integer to a float of sort `(ebits, sbits)`.
+    #[must_use]
+    pub fn sbv_to_fp(src: Self, rm: RoundingMode, ebits: u16, sbits: u16) -> Self {
+        Self::SbvToFp {
+            src: Box::new(src),
+            rm,
+            ebits,
+            sbits,
+        }
+    }
 }
 
 impl fmt::Display for Expr {
@@ -381,6 +535,24 @@ impl fmt::Display for Expr {
             Self::SignExtend { src, to_bits } => write!(f, "sext({src}, {to_bits})"),
             Self::Unknown(reason) if reason.is_empty() => write!(f, "?"),
             Self::Unknown(reason) => write!(f, "?({reason})"),
+            Self::FAdd(a, b, rm) => write!(f, "fadd({a}, {b}, {rm:?})"),
+            Self::FSub(a, b, rm) => write!(f, "fsub({a}, {b}, {rm:?})"),
+            Self::FMul(a, b, rm) => write!(f, "fmul({a}, {b}, {rm:?})"),
+            Self::FDiv(a, b, rm) => write!(f, "fdiv({a}, {b}, {rm:?})"),
+            Self::FEq(a, b) => write!(f, "feq({a}, {b})"),
+            Self::FLt(a, b) => write!(f, "flt({a}, {b})"),
+            Self::FLe(a, b) => write!(f, "fle({a}, {b})"),
+            Self::FIsNaN(a) => write!(f, "fisnan({a})"),
+            Self::FpConst { bits, ebits, sbits } => write!(f, "fp{ebits}_{sbits}({bits:#x})"),
+            Self::BvToFp { src, ebits, sbits } => write!(f, "bv_to_fp({src}, {ebits}, {sbits})"),
+            Self::FpToIeeeBv(src) => write!(f, "fp_to_bv({src})"),
+            Self::FpToSbv { src, rm, bits } => write!(f, "fp_to_sbv({src}, {rm:?}, {bits})"),
+            Self::SbvToFp {
+                src,
+                rm,
+                ebits,
+                sbits,
+            } => write!(f, "sbv_to_fp({src}, {rm:?}, {ebits}, {sbits})"),
         }
     }
 }
@@ -441,6 +613,31 @@ mod tests {
             }),
             low: Box::new(Expr::konst(u128::MAX >> 1, 128)),
         };
+        let json = serde_json::to_string(&expr).unwrap();
+        let back: Expr = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, expr);
+    }
+
+    #[test]
+    fn floating_point_nodes_round_trip_through_json() {
+        // A single-precision `(x + 1.0) == 2.0` predicate over a
+        // bit-vector reinterpreted as float, exercising the FP sorts,
+        // a rounding mode, an FP constant and the BV↔FP reinterprets.
+        let x = Expr::bv_to_fp(Expr::var("xmm0_lo", 32), 8, 24);
+        let one = Expr::FpConst {
+            bits: 0x3f80_0000,
+            ebits: 8,
+            sbits: 24,
+        };
+        let two = Expr::FpConst {
+            bits: 0x4000_0000,
+            ebits: 8,
+            sbits: 24,
+        };
+        let expr = Expr::feq(
+            Expr::fadd(x, one, RoundingMode::NearestTiesEven),
+            two,
+        );
         let json = serde_json::to_string(&expr).unwrap();
         let back: Expr = serde_json::from_str(&json).unwrap();
         assert_eq!(back, expr);

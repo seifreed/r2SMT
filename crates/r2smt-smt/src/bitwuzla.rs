@@ -66,6 +66,11 @@ pub fn solve_branch_bitwuzla(
     if slice_contains_unknown(slice) {
         return Ok(SmtResult::Unsound);
     }
+    // The QF_BV text renderer cannot encode floating-point theory —
+    // decline FP slices; precise QF_BVFP rendering lands in P40-f-4.
+    if slice_contains_float(slice) {
+        return Ok(SmtResult::Unsound);
+    }
     let script_taken = emit_query(slice, &options, true);
     let script_not_taken = emit_query(slice, &options, false);
     let taken = run_bitwuzla(&script_taken, options.timeout_ms)?;
@@ -97,6 +102,75 @@ fn slice_contains_unknown(slice: &SsaLiftedSlice) -> bool {
         IrStmt::LoadMem { address, .. } => expr_has_unknown(address),
         IrStmt::Unsupported { .. } | IrStmt::Nop => false,
     })
+}
+
+/// Whether any expression rendered into the SMT-LIB query carries a
+/// floating-point node. The QF_BV text backend cannot encode FP theory,
+/// so such slices are declined (see [`solve_branch_bitwuzla`]).
+fn slice_contains_float(slice: &SsaLiftedSlice) -> bool {
+    if expr_has_float(&slice.condition) {
+        return true;
+    }
+    slice.statements.iter().any(|stmt| match stmt {
+        IrStmt::Assign { src, .. } => expr_has_float(src),
+        IrStmt::StoreMem { address, value, .. } => {
+            expr_has_float(address) || expr_has_float(value)
+        }
+        IrStmt::LoadMem { address, .. } => expr_has_float(address),
+        IrStmt::Unsupported { .. } | IrStmt::Nop => false,
+    })
+}
+
+/// Whether `expr` contains any floating-point node. Written without a
+/// wildcard arm so a new `Expr` variant forces this to be revisited.
+fn expr_has_float(expr: &Expr) -> bool {
+    match expr {
+        Expr::FAdd(..)
+        | Expr::FSub(..)
+        | Expr::FMul(..)
+        | Expr::FDiv(..)
+        | Expr::FEq(..)
+        | Expr::FLt(..)
+        | Expr::FLe(..)
+        | Expr::FIsNaN(_)
+        | Expr::FpConst { .. }
+        | Expr::BvToFp { .. }
+        | Expr::FpToIeeeBv(_)
+        | Expr::FpToSbv { .. }
+        | Expr::SbvToFp { .. } => true,
+        Expr::Var(_) | Expr::Const { .. } | Expr::Unknown(_) => false,
+        Expr::BoolNot(a)
+        | Expr::Extract { src: a, .. }
+        | Expr::ZeroExtend { src: a, .. }
+        | Expr::SignExtend { src: a, .. } => expr_has_float(a),
+        Expr::Add(a, b)
+        | Expr::Sub(a, b)
+        | Expr::Mul(a, b)
+        | Expr::UDiv(a, b)
+        | Expr::URem(a, b)
+        | Expr::SDiv(a, b)
+        | Expr::SRem(a, b)
+        | Expr::And(a, b)
+        | Expr::Or(a, b)
+        | Expr::Xor(a, b)
+        | Expr::Shl(a, b)
+        | Expr::LShr(a, b)
+        | Expr::AShr(a, b)
+        | Expr::Eq(a, b)
+        | Expr::Ne(a, b)
+        | Expr::Ult(a, b)
+        | Expr::Ule(a, b)
+        | Expr::Slt(a, b)
+        | Expr::Sle(a, b)
+        | Expr::BoolAnd(a, b)
+        | Expr::BoolOr(a, b)
+        | Expr::Concat { high: a, low: b } => expr_has_float(a) || expr_has_float(b),
+        Expr::Ite {
+            cond,
+            then_expr,
+            else_expr,
+        } => expr_has_float(cond) || expr_has_float(then_expr) || expr_has_float(else_expr),
+    }
 }
 
 /// Exhaustive recursive check for an [`Expr::Unknown`] anywhere in the
@@ -137,6 +211,16 @@ fn expr_has_unknown(expr: &Expr) -> bool {
             then_expr,
             else_expr,
         } => expr_has_unknown(cond) || expr_has_unknown(then_expr) || expr_has_unknown(else_expr),
+        Expr::FAdd(a, b, _) | Expr::FSub(a, b, _) | Expr::FMul(a, b, _) | Expr::FDiv(a, b, _)
+        | Expr::FEq(a, b) | Expr::FLt(a, b) | Expr::FLe(a, b) => {
+            expr_has_unknown(a) || expr_has_unknown(b)
+        }
+        Expr::FIsNaN(s)
+        | Expr::FpToIeeeBv(s)
+        | Expr::BvToFp { src: s, .. }
+        | Expr::FpToSbv { src: s, .. }
+        | Expr::SbvToFp { src: s, .. } => expr_has_unknown(s),
+        Expr::FpConst { .. } => false,
     }
 }
 

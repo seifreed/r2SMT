@@ -167,6 +167,25 @@ fn taint_of_expr(
             t.join_from(&taint_of_expr(else_expr, taint, opaque, next)?);
             t
         }
+        // Floating-point ops propagate taint from their operands exactly
+        // like the bit-vector ops above.
+        Expr::FAdd(a, b, _)
+        | Expr::FSub(a, b, _)
+        | Expr::FMul(a, b, _)
+        | Expr::FDiv(a, b, _)
+        | Expr::FEq(a, b)
+        | Expr::FLt(a, b)
+        | Expr::FLe(a, b) => {
+            let mut t = taint_of_expr(a, taint, opaque, next)?;
+            t.join_from(&taint_of_expr(b, taint, opaque, next)?);
+            t
+        }
+        Expr::FIsNaN(s)
+        | Expr::FpToIeeeBv(s)
+        | Expr::BvToFp { src: s, .. }
+        | Expr::FpToSbv { src: s, .. }
+        | Expr::SbvToFp { src: s, .. } => taint_of_expr(s, taint, opaque, next)?,
+        Expr::FpConst { .. } => TaintSet::untainted(),
     };
     Some(out)
 }

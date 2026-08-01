@@ -317,6 +317,20 @@ fn render_expr(expr: &Expr) -> (String, u16) {
         // contains an `Unknown` before this is ever solved, so no
         // verdict is derived from this placeholder.
         Expr::Unknown(_) => ("(_ bv0 1)".to_string(), 1),
+        // Floating point has no sound QF_BV text encoding. Like
+        // `Unknown`, these placeholders only keep the script parseable
+        // for render-only consumers; the CVC5 / Bitwuzla verdict paths
+        // decline any slice containing a float (`slice_contains_float`)
+        // before this is ever solved, so no verdict is derived from a
+        // placeholder. Precise `QF_BVFP` rendering lands in P40-f-4.
+        Expr::FAdd(..) | Expr::FSub(..) | Expr::FMul(..) | Expr::FDiv(..) | Expr::FpConst { .. }
+        | Expr::BvToFp { .. } | Expr::FpToIeeeBv(_) | Expr::SbvToFp { .. } => {
+            ("(_ bv0 1)".to_string(), 1)
+        }
+        Expr::FpToSbv { bits, .. } => (format!("(_ bv0 {bits})"), *bits),
+        Expr::FEq(..) | Expr::FLt(..) | Expr::FLe(..) | Expr::FIsNaN(_) => {
+            ("(_ bv0 1)".to_string(), 1)
+        }
     }
 }
 

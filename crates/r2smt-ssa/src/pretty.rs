@@ -159,6 +159,43 @@ fn write_expr(out: &mut String, expr: &Expr, ctx: &FmtCtx<'_>, depth: usize) {
                 let _ = write!(out, "?({reason})");
             }
         }
+        Expr::FAdd(a, b, _) => write_binary(out, ctx, depth, a, "f+", b),
+        Expr::FSub(a, b, _) => write_binary(out, ctx, depth, a, "f-", b),
+        Expr::FMul(a, b, _) => write_binary(out, ctx, depth, a, "f*", b),
+        Expr::FDiv(a, b, _) => write_binary(out, ctx, depth, a, "f/", b),
+        Expr::FEq(a, b) => write_binary(out, ctx, depth, a, "f==", b),
+        Expr::FLt(a, b) => write_binary(out, ctx, depth, a, "f<", b),
+        Expr::FLe(a, b) => write_binary(out, ctx, depth, a, "f<=", b),
+        Expr::FIsNaN(a) => {
+            let _ = write!(out, "isnan(");
+            write_expr(out, a, ctx, depth + 1);
+            let _ = write!(out, ")");
+        }
+        Expr::FpConst { bits, ebits, sbits } => {
+            let _ = write!(out, "fp{ebits}_{sbits}({bits:#x})");
+        }
+        Expr::BvToFp { src, ebits, sbits } => {
+            let _ = write!(out, "bv_to_fp{ebits}_{sbits}(");
+            write_expr(out, src, ctx, depth + 1);
+            let _ = write!(out, ")");
+        }
+        Expr::FpToIeeeBv(src) => {
+            let _ = write!(out, "fp_to_bv(");
+            write_expr(out, src, ctx, depth + 1);
+            let _ = write!(out, ")");
+        }
+        Expr::FpToSbv { src, bits, .. } => {
+            let _ = write!(out, "fp_to_sbv{bits}(");
+            write_expr(out, src, ctx, depth + 1);
+            let _ = write!(out, ")");
+        }
+        Expr::SbvToFp {
+            src, ebits, sbits, ..
+        } => {
+            let _ = write!(out, "sbv_to_fp{ebits}_{sbits}(");
+            write_expr(out, src, ctx, depth + 1);
+            let _ = write!(out, ")");
+        }
     }
 }
 

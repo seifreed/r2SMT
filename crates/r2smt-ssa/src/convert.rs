@@ -278,6 +278,53 @@ fn rename_reads(
             Expr::sign_ext(rename_reads(src, latest, inputs), *to_bits)
         }
         Expr::Unknown(reason) => Expr::Unknown(reason.clone()),
+        Expr::FAdd(a, b, rm) => Expr::fadd(
+            rename_reads(a, latest, inputs),
+            rename_reads(b, latest, inputs),
+            *rm,
+        ),
+        Expr::FSub(a, b, rm) => Expr::fsub(
+            rename_reads(a, latest, inputs),
+            rename_reads(b, latest, inputs),
+            *rm,
+        ),
+        Expr::FMul(a, b, rm) => Expr::fmul(
+            rename_reads(a, latest, inputs),
+            rename_reads(b, latest, inputs),
+            *rm,
+        ),
+        Expr::FDiv(a, b, rm) => Expr::fdiv(
+            rename_reads(a, latest, inputs),
+            rename_reads(b, latest, inputs),
+            *rm,
+        ),
+        Expr::FEq(a, b) => Expr::feq(
+            rename_reads(a, latest, inputs),
+            rename_reads(b, latest, inputs),
+        ),
+        Expr::FLt(a, b) => Expr::flt(
+            rename_reads(a, latest, inputs),
+            rename_reads(b, latest, inputs),
+        ),
+        Expr::FLe(a, b) => Expr::fle(
+            rename_reads(a, latest, inputs),
+            rename_reads(b, latest, inputs),
+        ),
+        Expr::FIsNaN(a) => Expr::fisnan(rename_reads(a, latest, inputs)),
+        Expr::FpConst { .. } => expr.clone(),
+        Expr::BvToFp { src, ebits, sbits } => {
+            Expr::bv_to_fp(rename_reads(src, latest, inputs), *ebits, *sbits)
+        }
+        Expr::FpToIeeeBv(src) => Expr::fp_to_ieee_bv(rename_reads(src, latest, inputs)),
+        Expr::FpToSbv { src, rm, bits } => {
+            Expr::fp_to_sbv(rename_reads(src, latest, inputs), *rm, *bits)
+        }
+        Expr::SbvToFp {
+            src,
+            rm,
+            ebits,
+            sbits,
+        } => Expr::sbv_to_fp(rename_reads(src, latest, inputs), *rm, *ebits, *sbits),
     }
 }
 

@@ -269,6 +269,19 @@ fn expr_is_tainted(expr: &Expr, tainted: &BTreeSet<String>, depth: u32) -> Optio
         Expr::Extract { src, .. } | Expr::ZeroExtend { src, .. } | Expr::SignExtend { src, .. } => {
             expr_is_tainted(src, tainted, next)?
         }
+        Expr::FAdd(a, b, _)
+        | Expr::FSub(a, b, _)
+        | Expr::FMul(a, b, _)
+        | Expr::FDiv(a, b, _)
+        | Expr::FEq(a, b)
+        | Expr::FLt(a, b)
+        | Expr::FLe(a, b) => expr_is_tainted(a, tainted, next)? || expr_is_tainted(b, tainted, next)?,
+        Expr::FIsNaN(s)
+        | Expr::FpToIeeeBv(s)
+        | Expr::BvToFp { src: s, .. }
+        | Expr::FpToSbv { src: s, .. }
+        | Expr::SbvToFp { src: s, .. } => expr_is_tainted(s, tainted, next)?,
+        Expr::FpConst { .. } => false,
     };
     Some(any)
 }
@@ -390,6 +403,44 @@ fn namespace_expr(expr: &Expr, pfx: &str, depth: u32) -> Option<Expr> {
             src: Box::new(namespace_expr(src, pfx, next)?),
             to_bits: *to_bits,
         },
+        Expr::FAdd(a, b, rm) => Expr::fadd(
+            namespace_expr(a, pfx, next)?,
+            namespace_expr(b, pfx, next)?,
+            *rm,
+        ),
+        Expr::FSub(a, b, rm) => Expr::fsub(
+            namespace_expr(a, pfx, next)?,
+            namespace_expr(b, pfx, next)?,
+            *rm,
+        ),
+        Expr::FMul(a, b, rm) => Expr::fmul(
+            namespace_expr(a, pfx, next)?,
+            namespace_expr(b, pfx, next)?,
+            *rm,
+        ),
+        Expr::FDiv(a, b, rm) => Expr::fdiv(
+            namespace_expr(a, pfx, next)?,
+            namespace_expr(b, pfx, next)?,
+            *rm,
+        ),
+        Expr::FEq(a, b) => Expr::feq(namespace_expr(a, pfx, next)?, namespace_expr(b, pfx, next)?),
+        Expr::FLt(a, b) => Expr::flt(namespace_expr(a, pfx, next)?, namespace_expr(b, pfx, next)?),
+        Expr::FLe(a, b) => Expr::fle(namespace_expr(a, pfx, next)?, namespace_expr(b, pfx, next)?),
+        Expr::FIsNaN(a) => Expr::fisnan(namespace_expr(a, pfx, next)?),
+        Expr::FpConst { .. } => expr.clone(),
+        Expr::BvToFp { src, ebits, sbits } => {
+            Expr::bv_to_fp(namespace_expr(src, pfx, next)?, *ebits, *sbits)
+        }
+        Expr::FpToIeeeBv(src) => Expr::fp_to_ieee_bv(namespace_expr(src, pfx, next)?),
+        Expr::FpToSbv { src, rm, bits } => {
+            Expr::fp_to_sbv(namespace_expr(src, pfx, next)?, *rm, *bits)
+        }
+        Expr::SbvToFp {
+            src,
+            rm,
+            ebits,
+            sbits,
+        } => Expr::sbv_to_fp(namespace_expr(src, pfx, next)?, *rm, *ebits, *sbits),
     };
     Some(out)
 }
