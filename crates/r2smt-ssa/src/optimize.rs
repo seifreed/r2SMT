@@ -210,6 +210,12 @@ fn substitute(expr: &Expr, map: &HashMap<String, Expr>, depth: usize) -> Expr {
             ebits,
             sbits,
         } => Expr::sbv_to_fp(substitute(src, map, d), *rm, *ebits, *sbits),
+        Expr::FpToFp {
+            src,
+            rm,
+            ebits,
+            sbits,
+        } => Expr::fp_to_fp(substitute(src, map, d), *rm, *ebits, *sbits),
     }
 }
 
@@ -331,7 +337,8 @@ fn collect_var_names(expr: &Expr, out: &mut HashSet<String>) {
         | Expr::FpToIeeeBv(s)
         | Expr::BvToFp { src: s, .. }
         | Expr::FpToSbv { src: s, .. }
-        | Expr::SbvToFp { src: s, .. } => collect_var_names(s, out),
+        | Expr::SbvToFp { src: s, .. }
+        | Expr::FpToFp { src: s, .. } => collect_var_names(s, out),
         Expr::FpConst { .. } => {}
     }
 }
@@ -434,7 +441,8 @@ fn collect_vars(expr: &Expr, out: &mut Vec<Var>) {
         | Expr::FpToIeeeBv(s)
         | Expr::BvToFp { src: s, .. }
         | Expr::FpToSbv { src: s, .. }
-        | Expr::SbvToFp { src: s, .. } => collect_vars(s, out),
+        | Expr::SbvToFp { src: s, .. }
+        | Expr::FpToFp { src: s, .. } => collect_vars(s, out),
         Expr::FpConst { .. } => {}
     }
 }

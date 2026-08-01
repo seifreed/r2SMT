@@ -284,7 +284,8 @@ fn expr_is_tainted(expr: &Expr, tainted: &BTreeSet<String>, depth: u32) -> Optio
         | Expr::FpToIeeeBv(s)
         | Expr::BvToFp { src: s, .. }
         | Expr::FpToSbv { src: s, .. }
-        | Expr::SbvToFp { src: s, .. } => expr_is_tainted(s, tainted, next)?,
+        | Expr::SbvToFp { src: s, .. }
+        | Expr::FpToFp { src: s, .. } => expr_is_tainted(s, tainted, next)?,
         Expr::FpConst { .. } => false,
     };
     Some(any)
@@ -447,6 +448,12 @@ fn namespace_expr(expr: &Expr, pfx: &str, depth: u32) -> Option<Expr> {
             ebits,
             sbits,
         } => Expr::sbv_to_fp(namespace_expr(src, pfx, next)?, *rm, *ebits, *sbits),
+        Expr::FpToFp {
+            src,
+            rm,
+            ebits,
+            sbits,
+        } => Expr::fp_to_fp(namespace_expr(src, pfx, next)?, *rm, *ebits, *sbits),
     };
     Some(out)
 }

@@ -528,7 +528,8 @@ fn count_unknowns(expr: &Expr) -> usize {
         | Expr::FpToIeeeBv(s)
         | Expr::BvToFp { src: s, .. }
         | Expr::FpToSbv { src: s, .. }
-        | Expr::SbvToFp { src: s, .. } => count_unknowns(s),
+        | Expr::SbvToFp { src: s, .. }
+        | Expr::FpToFp { src: s, .. } => count_unknowns(s),
         Expr::FpConst { .. } => 0,
     }
 }

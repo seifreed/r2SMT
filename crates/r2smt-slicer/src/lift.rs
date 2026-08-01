@@ -131,6 +131,8 @@ fn is_x86_simd_mnemonic(mnemonic: &str) -> bool {
             | "cvtsd2si"
             | "cvttss2si"
             | "cvttsd2si"
+            | "cvtss2sd"
+            | "cvtsd2ss"
     )
 }
 

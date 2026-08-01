@@ -325,6 +325,12 @@ fn rename_reads(
             ebits,
             sbits,
         } => Expr::sbv_to_fp(rename_reads(src, latest, inputs), *rm, *ebits, *sbits),
+        Expr::FpToFp {
+            src,
+            rm,
+            ebits,
+            sbits,
+        } => Expr::fp_to_fp(rename_reads(src, latest, inputs), *rm, *ebits, *sbits),
     }
 }
 

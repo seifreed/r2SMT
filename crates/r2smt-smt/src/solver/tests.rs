@@ -1751,6 +1751,52 @@ fn scalar_fp_compare_of_free_inputs_stays_both_possible() {
 }
 
 #[test]
+fn float_to_float_widening_is_encoded_exactly() {
+    // Widening single to double loses nothing, so `(float)1.0f` as a
+    // double must equal the double bit pattern of 1.0 exactly. An
+    // encoding that reinterpreted the bits instead of converting them
+    // would not satisfy this.
+    let single_one = r2smt_ir::expr::Expr::FpConst {
+        bits: 0x3f80_0000,
+        ebits: 8,
+        sbits: 24,
+    };
+    let widened = r2smt_ir::expr::Expr::fp_to_fp(
+        single_one,
+        r2smt_ir::expr::RoundingMode::NearestTiesEven,
+        11,
+        53,
+    );
+    let cond = r2smt_ir::expr::Expr::eq(
+        r2smt_ir::expr::Expr::fp_to_ieee_bv(widened),
+        r2smt_ir::expr::Expr::konst(0x3ff0_0000_0000_0000, 64),
+    );
+    assert_eq!(solve_fp_condition(cond, Vec::new()), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn float_to_float_narrowing_rounds_rather_than_truncating_bits() {
+    // The smallest double above 1.0 rounds back to 1.0f in single
+    // precision. A bit-level reinterpret would not.
+    let nudged_double = r2smt_ir::expr::Expr::FpConst {
+        bits: 0x3ff0_0000_0000_0001,
+        ebits: 11,
+        sbits: 53,
+    };
+    let narrowed = r2smt_ir::expr::Expr::fp_to_fp(
+        nudged_double,
+        r2smt_ir::expr::RoundingMode::NearestTiesEven,
+        8,
+        24,
+    );
+    let cond = r2smt_ir::expr::Expr::eq(
+        r2smt_ir::expr::Expr::fp_to_ieee_bv(narrowed),
+        r2smt_ir::expr::Expr::konst(0x3f80_0000, 32),
+    );
+    assert_eq!(solve_fp_condition(cond, Vec::new()), SmtResult::AlwaysTrue);
+}
+
+#[test]
 fn fp_precise_encoding_folds_constant_predicate_to_always_true() {
     use r2smt_ir::expr::{Expr, RoundingMode};
     // IEEE single-precision `(1.0 + 1.0) == 2.0` — always true, proved

@@ -394,7 +394,8 @@ fn expr_uses_fp(expr: &Expr) -> bool {
         | Expr::BvToFp { .. }
         | Expr::FpToIeeeBv(_)
         | Expr::FpToSbv { .. }
-        | Expr::SbvToFp { .. } => true,
+        | Expr::SbvToFp { .. }
+        | Expr::FpToFp { .. } => true,
         Expr::Var(_) | Expr::Const { .. } | Expr::Unknown(_) => false,
         Expr::BoolNot(a)
         | Expr::Extract { src: a, .. }
@@ -525,6 +526,12 @@ fn render_fp(expr: &Expr, ctx: &mut RenderCtx) -> Option<FpTerm> {
                 sbits: *sbits,
             })
         }
+        Expr::FpToFp {
+            src,
+            rm,
+            ebits,
+            sbits,
+        } => render_fp_to_fp(src, *rm, (*ebits, *sbits), ctx),
         Expr::FAdd(a, b, rm) => fp_arith("fp.add", a, b, *rm, ctx),
         Expr::FSub(a, b, rm) => fp_arith("fp.sub", a, b, *rm, ctx),
         Expr::FMul(a, b, rm) => fp_arith("fp.mul", a, b, *rm, ctx),
@@ -569,6 +576,29 @@ fn render_fp(expr: &Expr, ctx: &mut RenderCtx) -> Option<FpTerm> {
         | Expr::FpToIeeeBv(_)
         | Expr::FpToSbv { .. } => None,
     }
+}
+
+/// Convert a float to another float sort. Shares SMT-LIB's `to_fp`
+/// spelling with the signed-integer conversion; the argument's sort
+/// disambiguates them.
+fn render_fp_to_fp(
+    src: &Expr,
+    rm: RoundingMode,
+    sort: (u16, u16),
+    ctx: &mut RenderCtx,
+) -> Option<FpTerm> {
+    let (ebits, sbits) = sort;
+    fp_sort_checked(ebits, sbits, ctx)?;
+    let inner = render_fp(src, ctx)?;
+    Some(FpTerm {
+        text: format!(
+            "((_ to_fp {ebits} {sbits}) {rm} {inner})",
+            rm = rm_smtlib(rm),
+            inner = inner.text
+        ),
+        ebits,
+        sbits,
+    })
 }
 
 /// Validate an FP sort, returning its IEEE bit-pattern width. Declines
@@ -804,7 +834,8 @@ fn render_expr(expr: &Expr, ctx: &mut RenderCtx) -> (String, u16) {
         | Expr::FDiv(..)
         | Expr::FpConst { .. }
         | Expr::BvToFp { .. }
-        | Expr::SbvToFp { .. } => fp_bridge_to_bv(expr, ctx),
+        | Expr::SbvToFp { .. }
+        | Expr::FpToFp { .. } => fp_bridge_to_bv(expr, ctx),
         Expr::FpToSbv { src, rm, bits } => {
             let Some(f) = render_fp(src, ctx) else {
                 ctx.note_unsupported("float-to-signed conversion of a term with no float sort");

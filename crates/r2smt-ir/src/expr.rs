@@ -224,6 +224,21 @@ pub enum Expr {
         /// Significand bit width.
         sbits: u16,
     },
+    /// Convert a float to a different float sort, rounding when the
+    /// target significand is narrower.
+    ///
+    /// Distinct from [`Expr::BvToFp`], which reinterprets a bit pattern
+    /// and never rounds.
+    FpToFp {
+        /// Source float.
+        src: Box<Expr>,
+        /// Rounding mode for the conversion.
+        rm: RoundingMode,
+        /// Target exponent bit width.
+        ebits: u16,
+        /// Target significand bit width.
+        sbits: u16,
+    },
 }
 
 /// IEEE-754 rounding mode for floating-point operations.
@@ -493,6 +508,17 @@ impl Expr {
             sbits,
         }
     }
+
+    /// Construct a [`Expr::FpToFp`].
+    #[must_use]
+    pub fn fp_to_fp(src: Self, rm: RoundingMode, ebits: u16, sbits: u16) -> Self {
+        Self::FpToFp {
+            src: Box::new(src),
+            rm,
+            ebits,
+            sbits,
+        }
+    }
 }
 
 impl fmt::Display for Expr {
@@ -553,6 +579,12 @@ impl fmt::Display for Expr {
                 ebits,
                 sbits,
             } => write!(f, "sbv_to_fp({src}, {rm:?}, {ebits}, {sbits})"),
+            Self::FpToFp {
+                src,
+                rm,
+                ebits,
+                sbits,
+            } => write!(f, "fp_to_fp({src}, {rm:?}, {ebits}, {sbits})"),
         }
     }
 }
@@ -635,6 +667,19 @@ mod tests {
             sbits: 24,
         };
         let expr = Expr::feq(Expr::fadd(x, one, RoundingMode::NearestTiesEven), two);
+        let json = serde_json::to_string(&expr).unwrap();
+        let back: Expr = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, expr);
+    }
+
+    #[test]
+    fn float_to_float_conversion_round_trips_through_json() {
+        let expr = Expr::fp_to_fp(
+            Expr::bv_to_fp(Expr::var("xmm0_lo", 32), 8, 24),
+            RoundingMode::NearestTiesEven,
+            11,
+            53,
+        );
         let json = serde_json::to_string(&expr).unwrap();
         let back: Expr = serde_json::from_str(&json).unwrap();
         assert_eq!(back, expr);

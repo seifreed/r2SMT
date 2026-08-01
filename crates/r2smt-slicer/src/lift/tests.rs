@@ -1372,6 +1372,54 @@ fn float_to_integer_conversion_does_not_read_its_destination_register() {
 }
 
 #[test]
+fn cvtss2sd_widens_the_low_lane_to_the_double_sort() {
+    use r2smt_ir::expr::RoundingMode;
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "cvtss2sd",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    let converted = Expr::fp_to_ieee_bv(Expr::fp_to_fp(
+        Expr::bv_to_fp(Expr::extract(Expr::var("zmm1", 512), 31, 0), 8, 24),
+        RoundingMode::NearestTiesEven,
+        11,
+        53,
+    ));
+    assert_eq!(
+        *simd_dst_src(&stmts, "zmm0"),
+        Expr::concat(Expr::extract(Expr::var("zmm0", 512), 511, 64), converted)
+    );
+}
+
+#[test]
+fn cvtsd2ss_narrows_the_low_lane_to_the_single_sort() {
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "cvtsd2ss",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    // Narrowing reads a double lane and produces a single: the source
+    // sort must come from the mnemonic, not the destination width.
+    let rendered = format!("{:?}", simd_dst_src(&stmts, "zmm0"));
+    assert!(rendered.contains("bits: 11"), "{rendered}");
+    assert!(rendered.contains("ebits: 8"), "{rendered}");
+}
+
+#[test]
 fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
     // Parity guard: the effect table keeps an instruction iff the lifter
     // models it. A mnemonic classified `Simd` by `analyze` but absent

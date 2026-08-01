@@ -64,6 +64,8 @@ impl LiftCtx {
             "cvtsd2si" => self.lift_fp_to_int(insn, 64, RoundingMode::NearestTiesEven),
             "cvttss2si" => self.lift_fp_to_int(insn, 32, RoundingMode::TowardZero),
             "cvttsd2si" => self.lift_fp_to_int(insn, 64, RoundingMode::TowardZero),
+            "cvtss2sd" => self.lift_fp_to_fp(insn, 32, 64),
+            "cvtsd2ss" => self.lift_fp_to_fp(insn, 64, 32),
             _ => self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("at {addr}", addr = insn.address),
@@ -602,6 +604,27 @@ impl LiftCtx {
         };
         let width = self.operand_width(dst);
         if !self.write_register_to(dst, Expr::fp_to_sbv(f, rm, width)) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
+    /// `cvtss2sd`/`cvtsd2ss` — convert the low lane of `src` to the
+    /// other float sort and write it to the low lane of `dst`.
+    ///
+    /// `src_lane` is the source sort's width, `dst_lane` the target's.
+    /// Widening is exact; narrowing rounds under the MXCSR default,
+    /// pinned as in [`Self::lift_int_to_fp`].
+    fn lift_fp_to_fp(&mut self, insn: &Instruction, src_lane: u16, dst_lane: u16) {
+        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
+            return;
+        };
+        let Some(f) = self.read_simd_lane_fp(src, src_lane) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let (ebits, sbits) = fp_sort_bits(dst_lane);
+        let converted = Expr::fp_to_fp(f, RoundingMode::NearestTiesEven, ebits, sbits);
+        if !self.write_simd_lane(dst, Expr::fp_to_ieee_bv(converted), dst_lane) {
             self.push_simd_unsupported(insn);
         }
     }

@@ -186,7 +186,8 @@ fn taint_of_expr(
         | Expr::FpToIeeeBv(s)
         | Expr::BvToFp { src: s, .. }
         | Expr::FpToSbv { src: s, .. }
-        | Expr::SbvToFp { src: s, .. } => taint_of_expr(s, taint, opaque, next)?,
+        | Expr::SbvToFp { src: s, .. }
+        | Expr::FpToFp { src: s, .. } => taint_of_expr(s, taint, opaque, next)?,
         Expr::FpConst { .. } => TaintSet::untainted(),
     };
     Some(out)

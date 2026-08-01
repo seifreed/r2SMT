@@ -157,7 +157,8 @@ fn expr_has_unknown(expr: &Expr) -> bool {
         | Expr::FpToIeeeBv(s)
         | Expr::BvToFp { src: s, .. }
         | Expr::FpToSbv { src: s, .. }
-        | Expr::SbvToFp { src: s, .. } => expr_has_unknown(s),
+        | Expr::SbvToFp { src: s, .. }
+        | Expr::FpToFp { src: s, .. } => expr_has_unknown(s),
         Expr::FpConst { .. } => false,
     }
 }

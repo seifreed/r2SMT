@@ -198,6 +198,13 @@ fn write_expr(out: &mut String, expr: &Expr, ctx: &FmtCtx<'_>, depth: usize) {
             write_expr(out, src, ctx, depth + 1);
             let _ = write!(out, ")");
         }
+        Expr::FpToFp {
+            src, ebits, sbits, ..
+        } => {
+            let _ = write!(out, "fp_to_fp{ebits}_{sbits}(");
+            write_expr(out, src, ctx, depth + 1);
+            let _ = write!(out, ")");
+        }
     }
 }
 

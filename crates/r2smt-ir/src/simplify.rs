@@ -101,6 +101,17 @@ pub fn simplify_expr(expr: &Expr) -> Expr {
             ebits: *ebits,
             sbits: *sbits,
         },
+        Expr::FpToFp {
+            src,
+            rm,
+            ebits,
+            sbits,
+        } => Expr::FpToFp {
+            src: Box::new(simplify_expr(src)),
+            rm: *rm,
+            ebits: *ebits,
+            sbits: *sbits,
+        },
     }
 }
 
@@ -157,7 +168,8 @@ fn expr_bits(expr: &Expr) -> Option<u16> {
         Expr::Unknown(_) => None,
         Expr::FpConst { ebits, sbits, .. }
         | Expr::BvToFp { ebits, sbits, .. }
-        | Expr::SbvToFp { ebits, sbits, .. } => ebits.checked_add(*sbits),
+        | Expr::SbvToFp { ebits, sbits, .. }
+        | Expr::FpToFp { ebits, sbits, .. } => ebits.checked_add(*sbits),
         Expr::FpToIeeeBv(src) => expr_bits(src),
     }
 }

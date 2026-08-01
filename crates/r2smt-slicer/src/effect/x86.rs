@@ -366,9 +366,9 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
         "comiss" | "ucomiss" | "comisd" | "ucomisd" => {
             cmp_or_test_effect(insn, InstructionKind::Cmp)
         }
-        // Integer to float writes one lane and preserves the rest, so
-        // it reads its destination as well as defining it.
-        "cvtsi2ss" | "cvtsi2sd" => simd_effect(insn, SimdShape::Bitwise),
+        // These write one lane and preserve the rest, so they read
+        // their destination as well as defining it.
+        "cvtsi2ss" | "cvtsi2sd" | "cvtss2sd" | "cvtsd2ss" => simd_effect(insn, SimdShape::Bitwise),
         m if m.starts_with('j') => jcc_effect(insn),
         m if m.starts_with("set") => setcc_effect(insn),
         m if m.starts_with("cmov") => cmovcc_effect(insn),

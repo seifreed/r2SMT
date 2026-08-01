@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use r2smt_ir::expr::{Expr, RoundingMode, Var};
 use r2smt_ir::stmt::IrStmt;
 use r2smt_ssa::SsaLiftedSlice;
-use z3::Solver;
 use z3::ast::{BV, Bool, Float, RoundingMode as Z3RoundingMode};
+use z3::{Solver, Sort};
 
 /// A multi-bit bit-vector, a boolean, or a floating-point value produced
 /// by the encoder.
@@ -437,6 +437,18 @@ impl Encoder {
                     None => Encoded::Fp(self.fresh_unknown_fp(*ebits, *sbits)),
                 }
             }
+            // Unlike the reinterprets, this goes through the safe `z3`
+            // API — no shim needed.
+            Expr::FpToFp {
+                src,
+                rm,
+                ebits,
+                sbits,
+            } => {
+                let f = self.encode_as_fp(src);
+                let sort = Sort::float(u32::from(*ebits), u32::from(*sbits));
+                Encoded::Fp(f.to_fp_with_rounding_mode(&to_z3_rm(*rm), &sort))
+            }
         }
     }
 
@@ -504,7 +516,8 @@ fn fp_sort_of(expr: &Expr) -> Option<(u16, u16)> {
     match expr {
         Expr::FpConst { ebits, sbits, .. }
         | Expr::BvToFp { ebits, sbits, .. }
-        | Expr::SbvToFp { ebits, sbits, .. } => Some((*ebits, *sbits)),
+        | Expr::SbvToFp { ebits, sbits, .. }
+        | Expr::FpToFp { ebits, sbits, .. } => Some((*ebits, *sbits)),
         Expr::FAdd(a, ..) | Expr::FSub(a, ..) | Expr::FMul(a, ..) | Expr::FDiv(a, ..) => {
             fp_sort_of(a)
         }
