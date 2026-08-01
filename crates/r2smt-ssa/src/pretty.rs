@@ -465,6 +465,50 @@ mod tests {
     }
 
     #[test]
+    fn stack_slot_load_renders_analyst_alias() {
+        // Post-P41b a stack-slot load lowers to a `LoadMem` whose temp
+        // keeps the `stk_rbp_-4` canonical name. The pretty-printer must
+        // still surface the analyst alias (`var_4h`) via the `stk_`
+        // prefix even though the name now lives on a load temp instead
+        // of a named `Assign` var — the user-visible payoff of the
+        // P41b-3 temp-naming decision.
+        let program = one_block(vec![
+            insn(
+                0x40_1000,
+                3,
+                "mov",
+                vec![
+                    op("eax", OperandKind::Register),
+                    op("dword ptr [rbp - 4]", OperandKind::Memory),
+                ],
+            ),
+            insn(
+                0x40_1003,
+                3,
+                "cmp",
+                vec![
+                    op("eax", OperandKind::Register),
+                    op("5", OperandKind::Immediate),
+                ],
+            ),
+            insn(
+                0x40_1006,
+                6,
+                "je",
+                vec![op("0x401080", OperandKind::Immediate)],
+            ),
+        ]);
+        let ssa = ssa_first(&program);
+        let mut hints = NameHints::default();
+        hints.add_stack_slot("stk_rbp_-4", "var_4h");
+        let pretty = pretty_condition_with_hints(&ssa, &hints);
+        assert!(
+            pretty.contains("var_4h"),
+            "stack-slot analyst alias must appear in pretty output; got: {pretty}"
+        );
+    }
+
+    #[test]
     fn ssa_suffix_is_stripped_from_pretty_output() {
         let program = one_block(vec![
             insn(
