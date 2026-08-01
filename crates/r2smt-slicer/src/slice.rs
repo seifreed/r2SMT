@@ -46,7 +46,7 @@ use crate::condition::BranchCondition;
 use crate::effect::{InstructionKind, analyze, has_unmodellable_memory};
 
 mod merge_detect;
-use merge_detect::try_build_diamond_merge;
+use merge_detect::{head_condition_roots, try_build_diamond_merge};
 
 /// Limits applied while slicing.
 ///
@@ -189,6 +189,15 @@ pub struct SliceMerge {
     pub fallthrough_arm: Vec<Instruction>,
     /// Canonical registers merged at the join, with bit width.
     pub merged: Vec<MergedVar>,
+    /// Number of kept slice instructions that execute *after* this
+    /// merge (i.e. below the join in execution order). Set by the
+    /// walker from `WalkState::kept.len()` at the moment the merge is
+    /// recorded. The lifter uses it to interleave multiple merges with
+    /// the kept-instruction stream in execution order: a merge with a
+    /// larger tail executes earlier. A single merge captures the whole
+    /// tail, reproducing the historical "lower merges first" order.
+    #[serde(default)]
+    pub tail_instructions: usize,
 }
 
 /// A register merged across the two arms of a [`SliceMerge`].
@@ -464,7 +473,7 @@ fn walk_backwards(
                     }
                     n => {
                         if limits.allow_join_merge
-                            && let Some(merge) = try_build_diamond_merge(
+                            && let Some(mut merge) = try_build_diamond_merge(
                                 function,
                                 current_block,
                                 &preds,
@@ -497,7 +506,37 @@ fn walk_backwards(
                             // per-arm `Ite`s, so the outstanding flag
                             // obligation is discharged.
                             state.needs_flags = false;
+                            // Anchor the merge in execution order: every
+                            // instruction kept so far executes after it
+                            // (the walk is backward), so its `Ite`s must
+                            // precede them in the lowered stream.
+                            merge.tail_instructions = state.kept.len();
+                            // Chained diamonds: if the head condition's
+                            // selector reads registers defined upstream,
+                            // resume the walk from the head block to
+                            // resolve them — possibly through another
+                            // diamond. The head block's own body is
+                            // already captured in `head_instructions`, so
+                            // we re-enter at its predecessors (start_idx
+                            // 0) and never double-count it.
+                            let head_addr = merge.head.block;
+                            let continuation = head_condition_roots(function, &merge.head, arch);
                             state.merges.push(merge);
+                            if let Some(roots) = continuation
+                                && !roots.is_empty()
+                                && state.blocks_visited < limits.max_basic_blocks
+                                && !state.visited.contains(&head_addr)
+                                && let Some(head_block) =
+                                    function.blocks.iter().find(|b| b.address == head_addr)
+                            {
+                                state.live.clear();
+                                for r in roots {
+                                    state.live.insert(r);
+                                }
+                                current_block = head_block;
+                                start_idx = 0;
+                                continue;
+                            }
                             let structural = format!(
                                 "join at {addr} resolved by bounded Φ-merge",
                                 addr = current_block.address

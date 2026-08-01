@@ -199,6 +199,39 @@ fn head_condition_instructions(
 /// their pre-diamond value and are dead-flag-eliminated downstream.
 const MERGED_FLAGS: &[&str] = &["ZF", "CF", "SF", "OF", "PF"];
 
+/// External register dependencies of a merge's head condition: the
+/// canonical roots of the head-condition slice, taken within the head
+/// block only. Returns `None` when the head condition is *not* cleanly
+/// resolvable inside its own block (truncated, or a non-register root),
+/// in which case the caller must not chain into an upstream diamond and
+/// should finalize at the sound free-input boundary instead. When
+/// `Some`, chasing these roots into an upstream diamond is the
+/// chained-diamond continuation.
+pub(super) fn head_condition_roots(
+    function: &Function,
+    head: &BranchCandidate,
+    arch: Arch,
+) -> Option<Vec<&'static str>> {
+    let limits = SliceLimits {
+        max_basic_blocks: 1,
+        ..SliceLimits::default()
+    };
+    let slice = slice_branch(head, function, &limits, arch);
+    if !matches!(slice.status, crate::slice::SliceStatus::Complete) {
+        return None;
+    }
+    let mut roots: Vec<&'static str> = Vec::new();
+    for r in &slice.roots {
+        // A non-register root (e.g. a stack slot) cannot be canonicalised
+        // to a `'static` live-set entry — bail rather than guess.
+        let layout = crate::registers::register_layout(r, arch)?;
+        if !roots.contains(&layout.parent) {
+            roots.push(layout.parent);
+        }
+    }
+    Some(roots)
+}
+
 /// Attempt to recover a bounded simple-diamond Φ-merge at `join`.
 ///
 /// Returns `Some` only when the join is a fully-resolvable diamond:
@@ -295,5 +328,8 @@ pub(super) fn try_build_diamond_merge(
         taken_arm: taken.instructions,
         fallthrough_arm: fallthrough.instructions,
         merged,
+        // Filled in by the walker from `WalkState::kept.len()` when the
+        // merge is recorded (this detector has no view of that count).
+        tail_instructions: 0,
     })
 }

@@ -1410,6 +1410,117 @@ fn test_flag_merge_discharges_flag_obligation() {
     );
 }
 
+/// Two chained diamonds. The inner diamond (`0x1000` head) sets `esi`;
+/// the outer diamond's head (`0x1200`) branches on `esi`, sets `eax`;
+/// the sliced branch (`0x1400`) branches on `eax`. Resolving it needs
+/// both merges, recovered by resuming the walk after the first.
+fn chained_diamond_program() -> Program {
+    let mov = |addr: u64, reg: &str, imm: &str, succ: u64| BasicBlock {
+        address: Address(addr),
+        instructions: vec![insn(
+            addr,
+            5,
+            "mov",
+            vec![
+                op(reg, OperandKind::Register),
+                op(imm, OperandKind::Immediate),
+            ],
+        )],
+        successors: vec![Address(succ)],
+    };
+    let head = |addr: u64, cmp_reg: &str, cmp_imm: &str, jmp: &str, taken: u64, fallthrough: u64| {
+        BasicBlock {
+            address: Address(addr),
+            instructions: vec![
+                insn(
+                    addr,
+                    3,
+                    "cmp",
+                    vec![
+                        op(cmp_reg, OperandKind::Register),
+                        op(cmp_imm, OperandKind::Immediate),
+                    ],
+                ),
+                insn(
+                    addr + 3,
+                    6,
+                    jmp,
+                    vec![op(&format!("{taken:#x}"), OperandKind::Immediate)],
+                ),
+            ],
+            successors: vec![Address(taken), Address(fallthrough)],
+        }
+    };
+    Program {
+        arch: Arch::X86_64,
+        bits: 64,
+        entry: Some(Address(0x1000)),
+        functions: vec![Function {
+            address: Address(0x1000),
+            name: Some("sym.main".into()),
+            blocks: vec![
+                head(0x1000, "edx", "0", "jne", 0x1100, 0x1009),
+                mov(0x1009, "esi", "20", 0x1200),
+                mov(0x1100, "esi", "10", 0x1200),
+                head(0x1200, "esi", "15", "je", 0x1300, 0x1209),
+                mov(0x1209, "eax", "2", 0x1400),
+                mov(0x1300, "eax", "1", 0x1400),
+                BasicBlock {
+                    address: Address(0x1400),
+                    instructions: vec![
+                        insn(
+                            0x1400,
+                            3,
+                            "cmp",
+                            vec![
+                                op("eax", OperandKind::Register),
+                                op("1", OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x1403,
+                            6,
+                            "je",
+                            vec![op("0x1500", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![],
+                },
+            ],
+            is_thumb: false,
+        }],
+    }
+}
+
+#[test]
+fn test_chained_diamonds_recover_two_merges() {
+    // The walk resumes after the outer merge to resolve the head
+    // selector `esi`, recovering the inner diamond too — two merges,
+    // and neither `eax` nor `esi` left as an unresolved root.
+    let program = chained_diamond_program();
+    let cands = collect_branches(&program);
+    let branch = cands
+        .iter()
+        .find(|c| c.address == Address(0x1403))
+        .expect("sliced branch present");
+    let limits = SliceLimits {
+        max_basic_blocks: 8,
+        allow_join_merge: true,
+        ..SliceLimits::default()
+    };
+    let slice = slice_branch(branch, &program.functions[0], &limits, program.arch);
+    assert_eq!(slice.status, SliceStatus::Complete);
+    assert_eq!(slice.merges.len(), 2, "both chained diamonds recovered");
+    let merged: Vec<&str> = slice
+        .merges
+        .iter()
+        .flat_map(|m| m.merged.iter().map(|v| v.name.as_str()))
+        .collect();
+    assert!(merged.contains(&"rax") && merged.contains(&"rsi"));
+    assert!(!slice.roots.contains(&"rax".to_string()));
+    assert!(!slice.roots.contains(&"rsi".to_string()));
+}
+
 #[test]
 fn test_bounded_diamond_default_off_byte_identical() {
     // With `allow_join_merge` off the join handling is unchanged:

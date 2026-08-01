@@ -33,7 +33,7 @@ use crate::collector::BranchCandidate;
 use crate::condition::BranchCondition;
 use crate::effect::{memory_operand_width, stack_slot};
 use crate::registers::register_layout;
-use crate::slice::{Slice, SliceStatus};
+use crate::slice::{Slice, SliceMerge, SliceStatus};
 
 mod aarch32;
 mod aarch64;
@@ -119,19 +119,33 @@ fn is_x86_simd_mnemonic(mnemonic: &str) -> bool {
 #[must_use]
 pub fn lift_slice(slice: &Slice, arch: Arch) -> LiftedSlice {
     let mut ctx = LiftCtx::new(arch);
-    // Lower any bounded simple-diamond Φ-merges *first*: the head
-    // condition definitions and the resulting `Ite` assignments
-    // execute before the join-block body, so they must precede it in
-    // the statement stream. A merge that turns out not to be soundly
-    // foldable at lift time emits nothing — the merged register then
-    // surfaces as a free SSA input through its use in the join body,
-    // which is exactly the sound free-input boundary (widen-only,
-    // never a fabricated verdict).
+    // Lower Φ-merges interleaved with the kept-instruction stream in
+    // execution order. Each merge's `tail_instructions` is the number
+    // of kept instructions that execute *after* it, so its execution
+    // index is `total - tail`; a merge is lowered just before the
+    // instruction at that index. A single merge captures the whole tail
+    // (index 0) and is lowered first, reproducing the historical order.
+    // Chained/nested diamonds anchor at their true positions so an
+    // upstream merge's `Ite` precedes the instructions and merges that
+    // consume it. A merge that turns out not to be soundly foldable at
+    // lift time emits nothing — the merged register then surfaces as a
+    // free SSA input through its use, the sound free-input boundary
+    // (widen-only, never a fabricated verdict).
+    let total = slice.instructions.len();
+    let mut merges_by_pos: Vec<Vec<&SliceMerge>> = vec![Vec::new(); total + 1];
     for merge in &slice.merges {
-        lower_merge(&mut ctx, merge, arch);
+        let pos = total.saturating_sub(merge.tail_instructions);
+        merges_by_pos[pos].push(merge);
     }
-    for insn in &slice.instructions {
-        ctx.lift_instruction(insn);
+    for (pos, bucket) in merges_by_pos.iter().enumerate() {
+        // Later-recorded (upstream) merges at the same position lower
+        // first, so a nested inner diamond precedes the outer one.
+        for merge in bucket.iter().rev() {
+            lower_merge(&mut ctx, merge, arch);
+        }
+        if let Some(insn) = slice.instructions.get(pos) {
+            ctx.lift_instruction(insn);
+        }
     }
     let condition = lift_branch_condition(&slice.branch, arch);
     debug!(

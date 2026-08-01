@@ -1730,6 +1730,139 @@ fn solve_flag_diamond(program: &Program) -> SmtResult {
     solve_branch(&ssa, SolveOptions::default())
 }
 
+/// Two chained diamonds: inner sets `esi ∈ {then,else}`, outer branches
+/// on `esi==15` to set `eax ∈ {1,2}`, sliced branch tests `eax==1`.
+fn chained_diamond(inner_then: &str, inner_else: &str) -> Program {
+    let mov = |addr: u64, reg: &str, imm: &str, succ: u64| BasicBlock {
+        address: Address(addr),
+        instructions: vec![insn(
+            addr,
+            5,
+            "mov",
+            vec![
+                op(reg, OperandKind::Register),
+                op(imm, OperandKind::Immediate),
+            ],
+        )],
+        successors: vec![Address(succ)],
+    };
+    let head = |addr: u64, reg: &str, imm: &str, jmp: &str, taken: u64, ft: u64| BasicBlock {
+        address: Address(addr),
+        instructions: vec![
+            insn(
+                addr,
+                3,
+                "cmp",
+                vec![
+                    op(reg, OperandKind::Register),
+                    op(imm, OperandKind::Immediate),
+                ],
+            ),
+            insn(
+                addr + 3,
+                6,
+                jmp,
+                vec![op(&format!("{taken:#x}"), OperandKind::Immediate)],
+            ),
+        ],
+        successors: vec![Address(taken), Address(ft)],
+    };
+    Program {
+        arch: Arch::X86_64,
+        bits: 64,
+        entry: Some(Address(0x1000)),
+        functions: vec![Function {
+            address: Address(0x1000),
+            name: Some("sym.main".into()),
+            blocks: vec![
+                head(0x1000, "edx", "0", "jne", 0x1100, 0x1009),
+                mov(0x1009, "esi", inner_else, 0x1200),
+                mov(0x1100, "esi", inner_then, 0x1200),
+                head(0x1200, "esi", "15", "je", 0x1300, 0x1209),
+                mov(0x1209, "eax", "2", 0x1400),
+                mov(0x1300, "eax", "1", 0x1400),
+                BasicBlock {
+                    address: Address(0x1400),
+                    instructions: vec![
+                        insn(
+                            0x1400,
+                            3,
+                            "cmp",
+                            vec![
+                                op("eax", OperandKind::Register),
+                                op("1", OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x1403,
+                            6,
+                            "je",
+                            vec![op("0x1500", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![],
+                },
+            ],
+            is_thumb: false,
+        }],
+    }
+}
+
+fn solve_chained_diamond(program: &Program, allow_join_merge: bool) -> SmtResult {
+    let cands = collect_branches(program);
+    let branch = cands
+        .iter()
+        .find(|c| c.address == Address(0x1403))
+        .expect("sliced branch present");
+    let limits = SliceLimits {
+        max_basic_blocks: 8,
+        allow_join_merge,
+        ..SliceLimits::default()
+    };
+    let slice = slice_branch(branch, &program.functions[0], &limits, program.arch);
+    let lifted = lift_slice(&slice, program.arch);
+    let ssa = ssa_convert(&lifted);
+    solve_branch(&ssa, SolveOptions::default())
+}
+
+#[test]
+fn chained_diamonds_resolve_opaque_predicate_precisely() {
+    // `esi ∈ {10,20}` never equals 15, so `eax` is always 2 and the
+    // sliced `je` (`eax==1`) is never taken. Proving this needs BOTH
+    // merges — the outer to bind `eax`, the inner to bind `esi`.
+    let program = chained_diamond("10", "20");
+    assert_eq!(
+        solve_chained_diamond(&program, true),
+        SmtResult::AlwaysFalse,
+        "chained merge must resolve the two-level opaque predicate"
+    );
+}
+
+#[test]
+fn chained_diamonds_without_merge_are_sound_but_imprecise() {
+    // Same program, merge off: `esi` is a free input, so `esi==15` is
+    // possible and the verdict widens to BothPossible. Sound, imprecise.
+    let program = chained_diamond("10", "20");
+    assert_eq!(
+        solve_chained_diamond(&program, false),
+        SmtResult::BothPossible,
+        "without chaining esi is free: sound, imprecise"
+    );
+}
+
+#[test]
+fn chained_diamonds_path_sensitive_stays_both_possible() {
+    // Soundness guard: inner arm makes `esi==15` genuinely reachable,
+    // so `eax==1` depends on the free head input `edx`. The chained
+    // merge must NOT fabricate an AlwaysX here.
+    let program = chained_diamond("15", "20");
+    assert_eq!(
+        solve_chained_diamond(&program, true),
+        SmtResult::BothPossible,
+        "path-sensitive chained predicate must stay BothPossible"
+    );
+}
+
 #[test]
 fn flag_merge_path_sensitive_predicate_stays_both_possible() {
     // Soundness guard for the flag merge: arms set ZF differently
