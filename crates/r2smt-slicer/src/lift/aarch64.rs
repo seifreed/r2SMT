@@ -564,10 +564,7 @@ fn is_valid_aarch64_base(raw: &str) -> bool {
     // and analyst aliases (`lr`, `fp`) that resolve through
     // `register_layout`. `wN` reads are rejected: AArch64 addressing
     // is 64-bit, a `Wn` base would be a malformed disassembly.
-    register_layout(&lower, r2smt_common::Arch::Aarch64)
-        .map(|l| l.parent != "xzr")
-        .filter(|valid| *valid)
-        .is_some()
+    register_layout(&lower, r2smt_common::Arch::Aarch64).is_some_and(|l| l.parent != "xzr")
         && !lower.starts_with('w')
 }
 

@@ -13,9 +13,11 @@
 pub mod batch_report;
 mod patch_suggestion;
 pub mod report;
+pub mod unsound;
 
 pub use batch_report::{
     BatchOutcome, BatchReport, BatchSampleEntry, BatchSampleSummary, MAX_FINDINGS_PER_SAMPLE,
 };
 pub use patch_suggestion::{PatchStrategy, PatchSuggestion, suggest_patch};
 pub use report::{Annotation, KindCounts, Report};
+pub use unsound::{UNSOUND_BANNER, wrap_unsound};

@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+  --> tests/compile-fail/smtresult_from_explore.rs:10:41
+   |
+10 |     let _s: SmtResult = SmtResult::from(r);
+   |                         --------------- ^ expected `SmtResult`, found `ExploreResult`
+   |                         |
+   |                         arguments to this function are incorrect
+   |
+note: associated function defined here
+  --> $RUST/core/src/convert/mod.rs
+   |
+   |     fn from(value: T) -> Self;
+   |        ^^^^

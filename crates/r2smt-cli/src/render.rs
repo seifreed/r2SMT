@@ -157,7 +157,7 @@ pub(crate) fn print_lift_summary(lifts: &[LiftedSlice], explicit_at: bool, funct
         .flat_map(|l| &l.statements)
         .filter(|s| matches!(s, r2smt_ir::IrStmt::Unsupported { .. }))
         .count();
-    println!("  ir statements:  {stmt_total} ({unsupported} unsupported)",);
+    println!("  ir statements:  {stmt_total} ({unsupported} unsupported)");
 
     if explicit_at && total == 1 {
         println!();
