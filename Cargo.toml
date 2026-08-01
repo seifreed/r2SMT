@@ -39,6 +39,7 @@ r2smt-report  = { path = "crates/r2smt-report",  version = "0.1.0" }
 r2smt-patch   = { path = "crates/r2smt-patch",   version = "0.1.0" }
 r2smt-difflift = { path = "crates/r2smt-difflift", version = "0.1.0" }
 r2smt-explore = { path = "crates/r2smt-explore", version = "0.1.0" }
+r2smt-taint   = { path = "crates/r2smt-taint",   version = "0.1.0" }
 
 [workspace.lints.rust]
 missing_docs              = "deny"

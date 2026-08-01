@@ -1,0 +1,22 @@
+[package]
+name         = "r2smt-taint"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+description = "Sound may-taint lattice over the r2SMT IR: propagates {Untainted, Tainted(source)} through SSA data flow. Generalises the difflift Unknown-taint pass to a multi-source join-semilattice."
+
+[lints]
+workspace = true
+
+[dependencies]
+r2smt-common = { workspace = true }
+r2smt-ir     = { workspace = true }
+r2smt-slicer = { workspace = true }
+r2smt-ssa    = { workspace = true }
+serde        = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
