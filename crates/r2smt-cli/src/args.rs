@@ -625,6 +625,31 @@ pub(crate) enum Command {
         #[arg(long, value_name = "PATH")]
         json: Option<PathBuf>,
     },
+
+    /// Search for a concrete input that reaches an address (UNSOUND
+    /// exploration). Drives the fenced radius2 engine to synthesise a
+    /// witness — stdin / argv / registers — that would steer execution
+    /// to `addr`. A best-effort search, never a verdict: the output is
+    /// stamped with a non-suppressible UNSOUND banner and must not be
+    /// used for verify / patch decisions. Without the `oracle-radius2`
+    /// build feature the engine is not compiled in and the command
+    /// reports that it is inconclusive.
+    Why {
+        /// Path to the binary to explore.
+        file: PathBuf,
+
+        /// Target address to reach (decimal or `0x` hex).
+        addr: String,
+
+        /// Host-side wall-clock budget in milliseconds. Default: 30000.
+        #[arg(long, value_name = "MS")]
+        timeout_ms: Option<u64>,
+
+        /// Path-explosion budget: maximum symbolic states to fork
+        /// before giving up. Default: 10000.
+        #[arg(long, value_name = "N")]
+        max_paths: Option<u64>,
+    },
 }
 
 /// Minimum-confidence threshold exposed via `--min-confidence`.

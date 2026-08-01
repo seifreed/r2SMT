@@ -7,6 +7,7 @@
 
 //! `r2smt` command-line entrypoint.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
@@ -16,10 +17,11 @@ use clap::Parser;
 use r2smt_core::{
     Confidence, Finding, FindingKind, classify_finding_with_pretty, dump_program, prepare_ssa,
 };
+use r2smt_explore::{ExploreBudget, ExploreRequest, ExploreResult};
 use r2smt_ir::Annotator;
 use r2smt_ir::NameHints;
 use r2smt_ir::program::Function;
-use r2smt_report::Report;
+use r2smt_report::{Report, wrap_unsound};
 use r2smt_slicer::SliceLimits;
 use r2smt_smt::SolveOptions;
 use tracing::error;
@@ -84,6 +86,12 @@ fn run(cli: Cli) -> Result<()> {
             println!("r2smt {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        Command::Why {
+            file,
+            addr,
+            timeout_ms,
+            max_paths,
+        } => why_command(&file, deep, &addr, timeout_ms, max_paths),
         Command::Analyze {
             file,
             dump_program: dump_flag,
@@ -481,6 +489,76 @@ struct AtOptions {
 /// — delegates to the existing patch path (backup + manifest next to
 /// the binary). Analysis logic stays in the use-case crates; this is
 /// a thin combinator.
+fn why_command(
+    file: &Path,
+    deep: bool,
+    addr: &str,
+    timeout_ms: Option<u64>,
+    max_paths: Option<u64>,
+) -> Result<()> {
+    if !file.exists() {
+        anyhow::bail!("input file does not exist: {}", file.display());
+    }
+    let target: r2smt_common::Address = addr
+        .parse()
+        .with_context(|| format!("invalid target address: {addr}"))?;
+    let mut provider = open_provider(file, deep)?;
+    let program = dump_program(&mut provider)
+        .with_context(|| format!("loading program from {}", file.display()))?;
+    let request = ExploreRequest {
+        binary_path: file.to_path_buf(),
+        target,
+        arch: program.arch,
+    };
+    let budget = ExploreBudget {
+        wall_clock_ms: timeout_ms.unwrap_or(30_000),
+        max_paths: max_paths.unwrap_or(10_000),
+    };
+    let result = r2smt_explore::explore(&request, budget);
+    println!("{}", wrap_unsound(&render_explore(target, &result)));
+    Ok(())
+}
+
+fn render_explore(target: r2smt_common::Address, result: &ExploreResult) -> String {
+    match result {
+        ExploreResult::ReachedWith(model) => {
+            let mut out = format!(
+                "reached {target} with:\n  stdin = {}",
+                render_bytes(&model.stdin)
+            );
+            if !model.argv.is_empty() {
+                let _ = write!(out, "\n  argv  = {:?}", model.argv);
+            }
+            for (reg, val) in &model.regs_init {
+                let _ = write!(out, "\n  {reg} = {val:#x}");
+            }
+            out
+        }
+        ExploreResult::NotFoundWithinBudget { reason } => {
+            format!("no input reaches {target} within budget: {reason}")
+        }
+        ExploreResult::Inconclusive { reason } => {
+            format!("inconclusive for {target}: {reason}")
+        }
+        _ => format!("unrecognised explore result for {target}"),
+    }
+}
+
+fn render_bytes(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "(empty)".to_string();
+    }
+    if bytes.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+        format!("{:?}", String::from_utf8_lossy(bytes))
+    } else {
+        let mut hex = String::from("0x");
+        for b in bytes {
+            let _ = write!(hex, "{b:02x}");
+        }
+        hex
+    }
+}
+
 fn at_command(
     file: &Path,
     deep: bool,
@@ -918,5 +996,52 @@ fn keep_finding(finding: &Finding, filters: &SolveFilters) -> bool {
         // `FindingKind` is `#[non_exhaustive]`; SuspiciousButUnknown and
         // any future unknown variants gate on `--include-suspicious`.
         _ => filters.include_suspicious,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+
+    use super::{render_bytes, render_explore};
+    use r2smt_common::Address;
+    use r2smt_explore::{ExploreResult, Model};
+
+    #[test]
+    fn test_render_bytes_printable_yields_quoted_string() {
+        assert_eq!(render_bytes(b"PASS"), "\"PASS\"");
+    }
+
+    #[test]
+    fn test_render_bytes_nonprintable_yields_hex() {
+        assert_eq!(render_bytes(&[0x00, 0xff]), "0x00ff");
+    }
+
+    #[test]
+    fn test_render_bytes_empty_is_marked() {
+        assert_eq!(render_bytes(&[]), "(empty)");
+    }
+
+    #[test]
+    fn test_render_explore_reached_shows_target_and_stdin() {
+        let model = Model {
+            stdin: b"PASS".to_vec(),
+            argv: Vec::new(),
+            regs_init: std::collections::BTreeMap::new(),
+        };
+        let rendered = render_explore(
+            Address::new(0x0040_1000),
+            &ExploreResult::ReachedWith(model),
+        );
+        assert!(rendered.contains("reached 0x401000") && rendered.contains("\"PASS\""));
+    }
+
+    #[test]
+    fn test_render_explore_inconclusive_is_labelled() {
+        let rendered = render_explore(
+            Address::new(0x1000),
+            &ExploreResult::inconclusive("no engine"),
+        );
+        assert!(rendered.starts_with("inconclusive for 0x1000"));
     }
 }

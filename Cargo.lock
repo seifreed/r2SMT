@@ -602,6 +602,7 @@ dependencies = [
  "r2smt-common",
  "r2smt-core",
  "r2smt-difflift",
+ "r2smt-explore",
  "r2smt-ir",
  "r2smt-patch",
  "r2smt-r2pipe",
