@@ -420,7 +420,7 @@ mod tests {
         }
     }
 
-    fn assign(name: &str, bits: u8, src: Expr) -> IrStmt {
+    fn assign(name: &str, bits: u16, src: Expr) -> IrStmt {
         IrStmt::Assign {
             dst: Var::new(name, bits),
             src,

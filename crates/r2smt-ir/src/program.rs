@@ -9,7 +9,7 @@ pub struct Program {
     /// Target instruction set.
     pub arch: Arch,
     /// Pointer width in bits (32 for x86, 64 for `x86_64`).
-    pub bits: u8,
+    pub bits: u16,
     /// Entry point address, when known.
     pub entry: Option<Address>,
     /// Functions discovered by radare2.

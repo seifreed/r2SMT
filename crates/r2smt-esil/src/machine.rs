@@ -87,7 +87,7 @@ struct Machine {
     /// precise size. Set to the architecture pointer width — `Var`s
     /// for unknown registers default to this, matching the slicer's
     /// canonical register layout.
-    default_bits: u8,
+    default_bits: u16,
     stack: Vec<StackValue>,
     statements: Vec<IrStmt>,
     /// Last arithmetic / logical result. ESIL's `$z`, `$s`, `$cN`,
@@ -135,7 +135,7 @@ pub(crate) struct LastArith {
     pub(crate) lhs: Expr,
     pub(crate) rhs: Expr,
     pub(crate) result: Expr,
-    pub(crate) bits: u8,
+    pub(crate) bits: u16,
 }
 
 /// One active predicated `?{ ... }` block. Pushed on `?{`, popped on
@@ -160,11 +160,11 @@ enum StackValue {
     /// name without re-parsing the expression.
     Register(Var),
     /// A computed value.
-    Expression { expr: Expr, bits: u8 },
+    Expression { expr: Expr, bits: u16 },
 }
 
 impl StackValue {
-    fn bits(&self) -> u8 {
+    fn bits(&self) -> u16 {
         match self {
             StackValue::Register(var) => var.bits,
             StackValue::Expression { bits, .. } => *bits,
@@ -287,9 +287,9 @@ impl Machine {
         Ok(())
     }
 
-    fn push_const(&mut self, value: u64, bits: u8) {
+    fn push_const(&mut self, value: u64, bits: u16) {
         self.stack.push(StackValue::Expression {
-            expr: Expr::konst(value, bits),
+            expr: Expr::konst(u128::from(value), bits),
             bits,
         });
     }
@@ -439,7 +439,7 @@ impl Machine {
 
     fn apply_load(&mut self, size: u8) -> Result<(), EsilError> {
         let address = self.pop("load address")?;
-        let bits = u8::try_from(usize::from(size) * 8).unwrap_or(self.default_bits);
+        let bits = u16::try_from(usize::from(size) * 8).unwrap_or(self.default_bits);
         let dst = Var::new(self.fresh_tmp_name("ld"), bits);
         self.statements.push(IrStmt::LoadMem {
             dst: dst.clone(),
@@ -457,7 +457,7 @@ impl Machine {
         // value being stored.
         let address = self.pop("store address")?;
         let value = self.pop("store value")?;
-        let bits = u8::try_from(usize::from(size) * 8).unwrap_or(self.default_bits);
+        let bits = u16::try_from(usize::from(size) * 8).unwrap_or(self.default_bits);
         let value_expr = widen(value, bits);
         self.statements.push(IrStmt::StoreMem {
             address: address.into_expr(),
@@ -496,7 +496,7 @@ impl Machine {
 /// canonical-name resolution still owns the parent-register mapping;
 /// here we only care about width so the lifter does not zero-extend
 /// flag bits to the pointer width by accident.
-fn register_width(name: &str) -> Option<u8> {
+fn register_width(name: &str) -> Option<u16> {
     let lower = name.to_ascii_lowercase();
     match lower.as_str() {
         // x86 / x86_64 flags. Both `zf` (ESIL convention) and `ZF`
@@ -539,7 +539,7 @@ fn parse_arm_reg_index(s: &str) -> Option<u8> {
     s.parse::<u8>().ok()
 }
 
-fn widen(value: StackValue, target_bits: u8) -> Expr {
+fn widen(value: StackValue, target_bits: u16) -> Expr {
     let cur_bits = value.bits();
     let expr = value.into_expr();
     if cur_bits == target_bits {

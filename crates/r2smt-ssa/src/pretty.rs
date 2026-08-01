@@ -167,7 +167,7 @@ fn write_expr(out: &mut String, expr: &Expr, ctx: &FmtCtx<'_>, depth: usize) {
 /// register — e.g. `Extract(rcx_free, 31, 0)` → `ecx`) or as the
 /// substituted expression with a trailing `[hi:lo]` decoration so the
 /// analyst can follow the data-flow all the way back to its origin.
-fn write_extract(out: &mut String, src: &Expr, hi: u8, lo: u8, ctx: &FmtCtx<'_>, depth: usize) {
+fn write_extract(out: &mut String, src: &Expr, hi: u16, lo: u16, ctx: &FmtCtx<'_>, depth: usize) {
     if let Expr::Var(v) = src
         && !ctx.defs.contains_key(&v.name)
         && let Some(alias) =

@@ -63,19 +63,19 @@ fn arm32_simd_layout(lower: &str) -> Option<RegisterLayout> {
         'q' if n <= 15 => Some(arm32_vector(arm32_v_name(n), 0, 127)),
         'd' if n <= 31 => {
             let parent = arm32_v_name(n / 2);
-            let lo = (n % 2) * 64;
+            let lo = u16::from(n % 2) * 64;
             Some(arm32_vector(parent, lo, lo + 63))
         }
         's' if n <= 31 => {
             let parent = arm32_v_name(n / 4);
-            let lo = (n % 4) * 32;
+            let lo = u16::from(n % 4) * 32;
             Some(arm32_vector(parent, lo, lo + 31))
         }
         _ => None,
     }
 }
 
-pub(super) fn arm32_alias(parent: &str, hi: u8, lo: u8) -> Option<&'static str> {
+pub(super) fn arm32_alias(parent: &str, hi: u16, lo: u16) -> Option<&'static str> {
     if let Some(stripped) = parent.strip_prefix('v')
         && let Ok(k) = stripped.parse::<u8>()
         && k <= 15
@@ -93,7 +93,7 @@ pub(super) fn arm32_alias(parent: &str, hi: u8, lo: u8) -> Option<&'static str> 
     }
 }
 
-fn arm32_simd_alias(k: u8, hi: u8, lo: u8) -> Option<&'static str> {
+fn arm32_simd_alias(k: u8, hi: u16, lo: u16) -> Option<&'static str> {
     // `qN` is preferred over the synthetic `vN` since q-form is the
     // 128-bit name the AArch32 disassembler actually emits.
     match (hi, lo) {

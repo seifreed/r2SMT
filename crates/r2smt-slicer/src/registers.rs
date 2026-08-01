@@ -81,10 +81,10 @@ pub struct RegisterLayout {
     pub parent: &'static str,
     /// Inclusive low bit offset within the parent (0 for `al`, 8 for
     /// `ah`, 0 for `eax`).
-    pub lo: u8,
+    pub lo: u16,
     /// Inclusive high bit offset within the parent (7 for `al`, 15 for
-    /// `ah`, 31 for `eax`, 63 for `rax`).
-    pub hi: u8,
+    /// `ah`, 31 for `eax`, 63 for `rax`, 511 for `zmm`).
+    pub hi: u16,
     /// `true` if this alias is the 32-bit doubleword form whose write
     /// zero-extends into a 64-bit parent on `x86_64` / `AArch64`.
     /// False for 64/16/8-bit aliases.
@@ -94,7 +94,7 @@ pub struct RegisterLayout {
 impl RegisterLayout {
     /// Width of the register slice in bits (`hi - lo + 1`).
     #[must_use]
-    pub const fn width(&self) -> u8 {
+    pub const fn width(&self) -> u16 {
         self.hi - self.lo + 1
     }
 }
@@ -126,7 +126,7 @@ pub fn register_layout(name: &str, arch: Arch) -> Option<RegisterLayout> {
 /// or `Extract(x0, 31, 0)` as `w0`. Returns `None` for slices that
 /// do not correspond to a named sub-register.
 #[must_use]
-pub fn alias_for(parent: &str, hi: u8, lo: u8, arch: Arch) -> Option<&'static str> {
+pub fn alias_for(parent: &str, hi: u16, lo: u16, arch: Arch) -> Option<&'static str> {
     match arch {
         Arch::X86 | Arch::X86_64 => x86_alias(parent, hi, lo),
         Arch::Aarch64 => aarch64_alias(parent, hi, lo),
@@ -198,7 +198,7 @@ const fn aarch64_dword(parent: &'static str) -> RegisterLayout {
     }
 }
 
-const fn aarch64_vector(parent: &'static str, lo: u8, hi: u8) -> RegisterLayout {
+const fn aarch64_vector(parent: &'static str, lo: u16, hi: u16) -> RegisterLayout {
     // SIMD slice — `zero_extends_parent_64` is GPR-specific (32→64
     // dword zero-extension) and does not capture the SIMD write
     // semantic of zero-extending to 128. We leave it `false` here
@@ -215,7 +215,7 @@ const fn aarch64_vector(parent: &'static str, lo: u8, hi: u8) -> RegisterLayout 
 /// GPR concept (32→64 dword zero-extension) and does not describe SIMD
 /// write semantics, so it stays `false`; the lifter models the
 /// zero-extension-to-vector-width behaviour explicitly.
-const fn simd_slice(parent: &'static str, lo: u8, hi: u8) -> RegisterLayout {
+const fn simd_slice(parent: &'static str, lo: u16, hi: u16) -> RegisterLayout {
     RegisterLayout {
         parent,
         lo,
@@ -233,7 +233,7 @@ const fn arm32_full(parent: &'static str) -> RegisterLayout {
     }
 }
 
-const fn arm32_vector(parent: &'static str, lo: u8, hi: u8) -> RegisterLayout {
+const fn arm32_vector(parent: &'static str, lo: u16, hi: u16) -> RegisterLayout {
     RegisterLayout {
         parent,
         lo,

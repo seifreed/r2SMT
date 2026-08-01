@@ -27,14 +27,15 @@ use serde::{Deserialize, Serialize};
 pub struct Var {
     /// Variable name (e.g. `"rax"`, `"ZF"`, `"t0"`).
     pub name: String,
-    /// Width in bits (`1` for flags, `8/16/32/64` for register slices).
-    pub bits: u8,
+    /// Width in bits (`1` for flags, `8/16/32/64` for register slices,
+    /// up to `512` for `zmm` vector registers).
+    pub bits: u16,
 }
 
 impl Var {
     /// Construct a variable with a borrowed name.
     #[must_use]
-    pub fn new(name: impl Into<String>, bits: u8) -> Self {
+    pub fn new(name: impl Into<String>, bits: u16) -> Self {
         Self {
             name: name.into(),
             bits,
@@ -57,9 +58,9 @@ pub enum Expr {
     /// Constant bit-vector value.
     Const {
         /// Unsigned representation (two's-complement for negatives).
-        value: u64,
+        value: u128,
         /// Width in bits.
-        bits: u8,
+        bits: u16,
     },
     /// Bit-vector addition.
     Add(Box<Expr>, Box<Expr>),
@@ -128,9 +129,9 @@ pub enum Expr {
         /// Source bit-vector.
         src: Box<Expr>,
         /// Inclusive high bit.
-        hi: u8,
+        hi: u16,
         /// Inclusive low bit.
-        lo: u8,
+        lo: u16,
     },
     /// Bit-vector concatenation: `high` placed above `low`. Result
     /// width is the sum of the operand widths.
@@ -146,14 +147,14 @@ pub enum Expr {
         /// Source bit-vector.
         src: Box<Expr>,
         /// Target width.
-        to_bits: u8,
+        to_bits: u16,
     },
     /// Sign-extend `src` to `to_bits` total bits.
     SignExtend {
         /// Source bit-vector.
         src: Box<Expr>,
         /// Target width.
-        to_bits: u8,
+        to_bits: u16,
     },
     /// Something the lifter could not translate (operand we cannot
     /// parse, instruction with side effects we have not modelled, …).
@@ -164,7 +165,7 @@ pub enum Expr {
 impl Expr {
     /// Construct a [`Expr::Var`].
     #[must_use]
-    pub fn var(name: impl Into<String>, bits: u8) -> Self {
+    pub fn var(name: impl Into<String>, bits: u16) -> Self {
         Self::Var(Var::new(name, bits))
     }
 
@@ -176,7 +177,7 @@ impl Expr {
 
     /// Construct a typed constant.
     #[must_use]
-    pub const fn konst(value: u64, bits: u8) -> Self {
+    pub const fn konst(value: u128, bits: u16) -> Self {
         Self::Const { value, bits }
     }
 
@@ -307,7 +308,7 @@ impl Expr {
     }
     /// Extract bits `[hi:lo]` (inclusive) from `src`.
     #[must_use]
-    pub fn extract(src: Self, hi: u8, lo: u8) -> Self {
+    pub fn extract(src: Self, hi: u16, lo: u16) -> Self {
         Self::Extract {
             src: Box::new(src),
             hi,
@@ -324,7 +325,7 @@ impl Expr {
     }
     /// Zero-extend `src` to `to_bits` total bits.
     #[must_use]
-    pub fn zero_ext(src: Self, to_bits: u8) -> Self {
+    pub fn zero_ext(src: Self, to_bits: u16) -> Self {
         Self::ZeroExtend {
             src: Box::new(src),
             to_bits,
@@ -332,7 +333,7 @@ impl Expr {
     }
     /// Sign-extend `src` to `to_bits` total bits.
     #[must_use]
-    pub fn sign_ext(src: Self, to_bits: u8) -> Self {
+    pub fn sign_ext(src: Self, to_bits: u16) -> Self {
         Self::SignExtend {
             src: Box::new(src),
             to_bits,
@@ -425,5 +426,23 @@ mod tests {
         let e = Expr::Unknown("unmodeled flag".into());
         assert_eq!(e.to_string(), "?(unmodeled flag)");
         assert_eq!(Expr::unknown().to_string(), "?");
+    }
+
+    #[test]
+    fn wide_vector_widths_round_trip_through_json() {
+        // zmm-width var, a high-half extract, and a 128-bit all-ones
+        // constant exceeding u64 — all representable after the u16/u128
+        // width migration and byte-identical on the JSON wire.
+        let expr = Expr::Concat {
+            high: Box::new(Expr::Extract {
+                src: Box::new(Expr::var("zmm0", 512)),
+                hi: 511,
+                lo: 256,
+            }),
+            low: Box::new(Expr::konst(u128::MAX >> 1, 128)),
+        };
+        let json = serde_json::to_string(&expr).unwrap();
+        let back: Expr = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, expr);
     }
 }

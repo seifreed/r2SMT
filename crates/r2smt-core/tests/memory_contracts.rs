@@ -327,7 +327,7 @@ fn test_aarch64_ldp_emits_two_loadmem_at_consecutive_addresses() {
         ),
         Arch::Aarch64,
     );
-    let loads: Vec<(Expr, u8)> = stmts
+    let loads: Vec<(Expr, u16)> = stmts
         .iter()
         .filter_map(|s| match s {
             IrStmt::LoadMem { address, bits, .. } => Some((address.clone(), *bits)),
@@ -364,7 +364,7 @@ fn test_aarch64_stp_emits_two_storemem_for_the_pair() {
         ),
         Arch::Aarch64,
     );
-    let stores: Vec<(Expr, Expr, u8)> = stmts
+    let stores: Vec<(Expr, Expr, u16)> = stmts
         .iter()
         .filter_map(|s| match s {
             IrStmt::StoreMem {
@@ -918,4 +918,24 @@ fn test_store_between_loads_invalidates_read_read_memo() {
 
     let verdict = solve_branch(&slice, solve_opts());
     assert_eq!(verdict, SmtResult::BothPossible);
+}
+
+#[test]
+fn test_wide_const_high_bits_survive_encoding() {
+    // P40-d regression: a 128-bit all-ones constant carries bits above
+    // the low 64. `Extract(0xFF..FF:128, 127, 127)` must be 1, so the
+    // predicate `extracted == 1` is AlwaysTrue. If the encoder still
+    // built the constant with `BV::from_u64` (truncating to 64 bits),
+    // the top bit would be 0 and the verdict would flip to AlwaysFalse.
+    let all_ones_128 = Expr::konst(u128::MAX, 128);
+    let top_bit = Expr::extract(all_ones_128, 127, 127);
+    let slice = synthetic_slice(
+        Vec::new(),
+        Expr::eq(top_bit, Expr::konst(1, 1)),
+        Vec::new(),
+        Vec::new(),
+    );
+
+    let verdict = solve_branch(&slice, solve_opts());
+    assert_eq!(verdict, SmtResult::AlwaysTrue);
 }

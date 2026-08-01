@@ -71,7 +71,7 @@ struct Machine {
     arch: Arch,
     /// Defined width (in bits) per varnode key, so a later read uses
     /// the width its defining op assigned.
-    widths: BTreeMap<String, u8>,
+    widths: BTreeMap<String, u16>,
     statements: Vec<IrStmt>,
 }
 
@@ -142,7 +142,12 @@ impl Machine {
     }
 
     /// Build the value expression for a defining opcode.
-    fn eval(&mut self, opcode: &str, inputs: &[Varnode], out_bits: u8) -> Result<Expr, PcodeError> {
+    fn eval(
+        &mut self,
+        opcode: &str,
+        inputs: &[Varnode],
+        out_bits: u16,
+    ) -> Result<Expr, PcodeError> {
         let bin = |m: &mut Self| -> Result<(Expr, Expr), PcodeError> {
             let [a, b] = inputs else {
                 return Err(PcodeError::Arity(format!("{opcode} needs 2 inputs")));
@@ -154,6 +159,11 @@ impl Machine {
                 return Err(PcodeError::Arity(format!("{opcode} needs 1 input")));
             };
             m.read(a)
+        };
+        let all_ones: u128 = if out_bits >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << out_bits) - 1
         };
 
         match opcode {
@@ -167,7 +177,7 @@ impl Machine {
             "INT_LEFT" => bin(self).map(|(a, b)| Expr::shl(a, b)),
             "INT_RIGHT" => bin(self).map(|(a, b)| Expr::lshr(a, b)),
             "INT_SRIGHT" => bin(self).map(|(a, b)| Expr::ashr(a, b)),
-            "INT_NEGATE" => un(self).map(|a| Expr::bv_xor(a, Expr::konst(u64::MAX, out_bits))),
+            "INT_NEGATE" => un(self).map(|a| Expr::bv_xor(a, Expr::konst(all_ones, out_bits))),
             "INT_2COMP" => un(self).map(|a| Expr::sub(Expr::konst(0, out_bits), a)),
             "INT_ZEXT" => un(self).map(|a| Expr::zero_ext(a, out_bits)),
             "INT_SEXT" => un(self).map(|a| Expr::sign_ext(a, out_bits)),
@@ -198,7 +208,7 @@ impl Machine {
                     )));
                 };
                 let src = self.read(a)?;
-                let lo = u8::try_from(byte_off.saturating_mul(8))
+                let lo = u16::try_from(byte_off.saturating_mul(8))
                     .map_err(|_| PcodeError::BadVarnode("SUBPIECE offset too large".into()))?;
                 let hi = lo.saturating_add(out_bits.saturating_sub(1));
                 Ok(Expr::extract(src, hi, lo))
@@ -211,8 +221,8 @@ impl Machine {
     fn read(&mut self, vn: &Varnode) -> Result<Expr, PcodeError> {
         match vn {
             Varnode::Const { value, size } => {
-                let bits = size.map_or(self.ptr_bits(), |s| s.saturating_mul(8));
-                Ok(Expr::konst(*value, bits))
+                let bits = size.map_or(self.ptr_bits(), |s| u16::from(s).saturating_mul(8));
+                Ok(Expr::konst(u128::from(*value), bits))
             }
             Varnode::Register(_) | Varnode::Unique { .. } => {
                 let name = Self::var_name(vn);
@@ -234,13 +244,13 @@ impl Machine {
     }
 
     /// Register the defined width for `out` and return its IR `Var`.
-    fn define(&mut self, out: &Varnode, bits: u8) -> (Var, u8) {
+    fn define(&mut self, out: &Varnode, bits: u16) -> (Var, u16) {
         let name = Self::var_name(out);
         self.widths.insert(name.clone(), bits);
         (Var::new(name, bits), bits)
     }
 
-    fn var_width(&self, vn: &Varnode) -> u8 {
+    fn var_width(&self, vn: &Varnode) -> u16 {
         let name = Self::var_name(vn);
         if let Some(w) = self.widths.get(&name) {
             return *w;
@@ -259,7 +269,7 @@ impl Machine {
         }
     }
 
-    fn ptr_bits(&self) -> u8 {
+    fn ptr_bits(&self) -> u16 {
         match self.arch {
             Arch::X86 | Arch::Arm => 32,
             _ => 64,
@@ -288,16 +298,16 @@ fn map_register(r: &str) -> String {
 }
 
 /// Natural width (bits) of a varnode before any defining op overrides.
-fn varnode_bits(vn: &Varnode, arch: Arch) -> u8 {
+fn varnode_bits(vn: &Varnode, arch: Arch) -> u16 {
     match vn {
-        Varnode::Unique { size, .. } => size.saturating_mul(8).max(1),
-        Varnode::Const { size, .. } => size.map_or(64, |s| s.saturating_mul(8)).max(1),
+        Varnode::Unique { size, .. } => u16::from(*size).saturating_mul(8).max(1),
+        Varnode::Const { size, .. } => size.map_or(64, |s| u16::from(s).saturating_mul(8)).max(1),
         Varnode::Register(r) => register_bits(r, arch),
         Varnode::Ram(_) | Varnode::CodeAddr(_) => 64,
     }
 }
 
-fn register_bits(r: &str, arch: Arch) -> u8 {
+fn register_bits(r: &str, arch: Arch) -> u16 {
     match r {
         "ZR" | "tmpZR" | "NG" | "tmpNG" | "CY" | "tmpCY" | "OV" | "tmpOV" => 1,
         "sp" | "lr" | "fp" | "pc" => 64,
@@ -310,7 +320,7 @@ fn register_bits(r: &str, arch: Arch) -> u8 {
     }
 }
 
-fn expr_bits(expr: &Expr, fallback: u8) -> u8 {
+fn expr_bits(expr: &Expr, fallback: u16) -> u16 {
     match expr {
         Expr::Const { bits, .. } => *bits,
         Expr::Var(v) => v.bits,

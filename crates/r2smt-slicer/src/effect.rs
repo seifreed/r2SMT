@@ -198,7 +198,7 @@ pub fn has_unmodellable_memory(operands: &[Operand], arch: Arch) -> bool {
 /// memory operand, not just recognised stack slots — `dword ptr [rax]`
 /// is a 32-bit access regardless of the base register.
 #[must_use]
-pub fn memory_operand_width(raw: &str) -> Option<u8> {
+pub fn memory_operand_width(raw: &str) -> Option<u16> {
     let lower = raw.to_ascii_lowercase();
     if lower.contains("qword") {
         Some(64)
@@ -216,7 +216,7 @@ pub fn memory_operand_width(raw: &str) -> Option<u8> {
 /// Pointer width of a recognised stack slot, in bits. Uses the
 /// explicit prefix width when present, defaulting to 64-bit so the
 /// slot is interoperable with native pointer-sized accesses.
-fn stack_slot_width(raw: &str) -> u8 {
+fn stack_slot_width(raw: &str) -> u16 {
     memory_operand_width(raw).unwrap_or(64)
 }
 
@@ -245,7 +245,7 @@ fn parse_integer(raw: &str) -> Option<i64> {
 /// indexing (`[rbp + rax*4]`), non-stack-base registers (`[rax]`),
 /// or non-memory operands.
 #[must_use]
-pub fn stack_slot(operand: &Operand) -> Option<(String, u8)> {
+pub fn stack_slot(operand: &Operand) -> Option<(String, u16)> {
     if operand.kind != OperandKind::Memory {
         return None;
     }

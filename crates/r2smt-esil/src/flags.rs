@@ -98,18 +98,18 @@ pub(crate) fn flag_token_to_expr_in_ctx(
 /// Parse `cN` / `bN` (where `prefix` is the leading char) into the
 /// numeric bit index. Returns `None` for unmatched prefixes, empty
 /// digits, or numeric overflow.
-fn parse_parametric_suffix(suffix: &str, prefix: char) -> Option<u8> {
+fn parse_parametric_suffix(suffix: &str, prefix: char) -> Option<u16> {
     let rest = suffix.strip_prefix(prefix)?;
     if rest.is_empty() {
         return None;
     }
-    rest.parse::<u8>().ok()
+    rest.parse::<u16>().ok()
 }
 
 /// `$cN` — carry into bit `N+1` after the last `Add`. Returns `None`
 /// when the bit index would land outside the result width (cannot
 /// extract bit `N+1` from a `bits`-wide value).
-fn carry_bit_expr(arith: &LastArith, n: u8) -> Option<Expr> {
+fn carry_bit_expr(arith: &LastArith, n: u16) -> Option<Expr> {
     let bit = n.checked_add(1)?;
     if bit >= arith.bits {
         return None;
@@ -123,7 +123,7 @@ fn carry_bit_expr(arith: &LastArith, n: u8) -> Option<Expr> {
 /// `$bN` — borrow into bit `N+1` after the last `Sub`. Same XOR-of-
 /// carries derivation as `$cN`, but the "result" is the difference
 /// `lhs - rhs` rather than `lhs + rhs`.
-fn borrow_bit_expr(arith: &LastArith, n: u8) -> Option<Expr> {
+fn borrow_bit_expr(arith: &LastArith, n: u16) -> Option<Expr> {
     let bit = n.checked_add(1)?;
     if bit >= arith.bits {
         return None;
@@ -140,7 +140,7 @@ mod tests {
 
     use super::*;
 
-    fn dummy_add(bits: u8) -> LastArith {
+    fn dummy_add(bits: u16) -> LastArith {
         LastArith {
             kind: ArithKind::Add,
             lhs: Expr::Var(Var::new("a", bits)),
@@ -153,7 +153,7 @@ mod tests {
         }
     }
 
-    fn dummy_sub(bits: u8) -> LastArith {
+    fn dummy_sub(bits: u16) -> LastArith {
         LastArith {
             kind: ArithKind::Sub,
             lhs: Expr::Var(Var::new("a", bits)),

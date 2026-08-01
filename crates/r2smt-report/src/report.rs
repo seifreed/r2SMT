@@ -68,7 +68,7 @@ pub struct Report {
     /// Target architecture.
     pub arch: Arch,
     /// Pointer width in bits.
-    pub bits: u8,
+    pub bits: u16,
     /// Number of functions discovered by radare2.
     pub functions_analyzed: usize,
     /// Total number of conditional branches considered.
@@ -86,7 +86,7 @@ impl Report {
         version: impl Into<String>,
         binary: impl Into<String>,
         arch: Arch,
-        bits: u8,
+        bits: u16,
         functions_analyzed: usize,
         findings: Vec<Finding>,
     ) -> Self {

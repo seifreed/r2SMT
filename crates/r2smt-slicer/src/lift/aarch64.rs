@@ -189,7 +189,7 @@ impl LiftCtx {
         lhs: &Expr,
         rhs: &Expr,
         result: &Expr,
-        width: u8,
+        width: u16,
     ) {
         self.set_flag("ZF", Expr::eq(result.clone(), Expr::konst(0, width)));
         self.set_flag("SF", Expr::slt(result.clone(), Expr::konst(0, width)));
@@ -337,7 +337,10 @@ impl LiftCtx {
         let rm_value = self.read_operand_at(rm, dst_width);
         let else_value = match op {
             CsArithOp::Inc => Expr::add(rm_value, Expr::konst(1, dst_width)),
-            CsArithOp::Inv => Expr::bv_xor(rm_value, Expr::konst(width_mask(dst_width), dst_width)),
+            CsArithOp::Inv => Expr::bv_xor(
+                rm_value,
+                Expr::konst(u128::from(width_mask(dst_width)), dst_width),
+            ),
             CsArithOp::Neg => Expr::sub(Expr::konst(0, dst_width), rm_value),
         };
         let ite = Expr::Ite {
@@ -387,7 +390,7 @@ impl LiftCtx {
         let true_val = if all_ones {
             // `csetm` writes all-ones — represent as 0 - 1 of dst_width
             // (a single Const at the right width).
-            Expr::konst(width_mask(dst_width), dst_width)
+            Expr::konst(u128::from(width_mask(dst_width)), dst_width)
         } else {
             Expr::konst(1, dst_width)
         };
@@ -436,7 +439,7 @@ impl LiftCtx {
     pub(super) fn lift_aarch64_load(
         &mut self,
         insn: &Instruction,
-        width_override: Option<u8>,
+        width_override: Option<u16>,
         signed: bool,
     ) {
         let (Some(dst), Some(mem)) = (insn.operands.first(), insn.operands.get(1)) else {
@@ -499,7 +502,7 @@ impl LiftCtx {
     /// `str Rs, [Xn{, #imm}]` — write the source register (optionally
     /// truncated for `strb`/`strh`) to memory. See
     /// [`Self::lift_aarch64_load`] for the addressing-mode restrictions.
-    pub(super) fn lift_aarch64_store(&mut self, insn: &Instruction, width_override: Option<u8>) {
+    pub(super) fn lift_aarch64_store(&mut self, insn: &Instruction, width_override: Option<u16>) {
         let (Some(src), Some(mem)) = (insn.operands.first(), insn.operands.get(1)) else {
             return;
         };
@@ -545,7 +548,7 @@ impl LiftCtx {
         };
         let base_var = Expr::Var(Var::new(&base, self.bits));
         let masked = u64::from_le_bytes(delta.to_le_bytes()) & width_mask(self.bits);
-        let new_value = Expr::add(base_var, Expr::konst(masked, self.bits));
+        let new_value = Expr::add(base_var, Expr::konst(u128::from(masked), self.bits));
         self.assign(Var::new(&base, self.bits), new_value);
     }
 
@@ -640,7 +643,7 @@ impl LiftCtx {
     /// Two-statement load: into a fresh temp at `width`, then written to
     /// `dst` so `write_register_to` zero-extends the parent X for the
     /// W-form (the P26 `ldr` stash-then-write precedent).
-    fn load_into_register(&mut self, insn: &Instruction, dst: &Operand, address: Expr, width: u8) {
+    fn load_into_register(&mut self, insn: &Instruction, dst: &Operand, address: Expr, width: u16) {
         let tmp = self.new_temp(insn.address, width);
         self.stmts.push(IrStmt::LoadMem {
             dst: tmp.clone(),
@@ -658,13 +661,13 @@ impl LiftCtx {
     /// Address of the two paired elements: the base address and the base
     /// plus one element (`first_width / 8` bytes). Returns `None` for the
     /// same writeback / register-offset forms the single `ldr` declines.
-    fn aarch64_pair_addresses(&self, mem: &Operand, first_width: u8) -> Option<(Expr, Expr)> {
+    fn aarch64_pair_addresses(&self, mem: &Operand, first_width: u16) -> Option<(Expr, Expr)> {
         if mem.kind != OperandKind::Memory {
             return None;
         }
         let first = aarch64_address_expr(mem, self.bits)?;
         let stride = u64::from(first_width / 8) & width_mask(self.bits);
-        let second = Expr::add(first.clone(), Expr::konst(stride, self.bits));
+        let second = Expr::add(first.clone(), Expr::konst(u128::from(stride), self.bits));
         Some((first, second))
     }
 }
@@ -680,7 +683,7 @@ impl LiftCtx {
 /// here keeps the lifter sound (the caller emits `Unsupported` and
 /// the confidence path widens) rather than silently dropping the
 /// writeback effect.
-fn aarch64_address_expr(mem: &Operand, ptr_bits: u8) -> Option<Expr> {
+fn aarch64_address_expr(mem: &Operand, ptr_bits: u16) -> Option<Expr> {
     let (base, offset) = parse_aarch64_memory(&mem.raw)?;
     let parent =
         register_layout(&base, r2smt_common::Arch::Aarch64).map_or(base.as_str(), |l| l.parent);
@@ -695,7 +698,7 @@ fn aarch64_address_expr(mem: &Operand, ptr_bits: u8) -> Option<Expr> {
     // integer at that width). Going through `to_le_bytes` keeps the
     // conversion explicit (no `as` sign loss) and platform-stable.
     let masked = u64::from_le_bytes(offset.to_le_bytes()) & width_mask(ptr_bits);
-    let off_const = Expr::konst(masked, ptr_bits);
+    let off_const = Expr::konst(u128::from(masked), ptr_bits);
     Some(Expr::add(base_var, off_const))
 }
 
@@ -704,7 +707,7 @@ fn aarch64_address_expr(mem: &Operand, ptr_bits: u8) -> Option<Expr> {
 /// `post` is the instruction's trailing operand, which for a post-index
 /// access is the immediate offset. Register-offset and other
 /// unrecognised shapes still return `None` (sound decline).
-fn aarch64_mem_access(mem: &Operand, post: Option<&Operand>, ptr_bits: u8) -> Option<MemAccess> {
+fn aarch64_mem_access(mem: &Operand, post: Option<&Operand>, ptr_bits: u16) -> Option<MemAccess> {
     if mem.kind != OperandKind::Memory {
         return None;
     }
@@ -746,13 +749,13 @@ fn aarch64_base_parent(base: &str) -> &str {
 /// Build `base ± offset` at the pointer width (base alone if `offset`
 /// is zero). Shares the two's-complement offset handling with
 /// [`aarch64_address_expr`].
-fn aarch64_addr_from(parent: &str, offset: i64, ptr_bits: u8) -> Expr {
+fn aarch64_addr_from(parent: &str, offset: i64, ptr_bits: u16) -> Expr {
     let base_var = Expr::Var(Var::new(parent, ptr_bits));
     if offset == 0 {
         return base_var;
     }
     let masked = u64::from_le_bytes(offset.to_le_bytes()) & width_mask(ptr_bits);
-    Expr::add(base_var, Expr::konst(masked, ptr_bits))
+    Expr::add(base_var, Expr::konst(u128::from(masked), ptr_bits))
 }
 
 /// Parse `[base{, #?offset}]` into `(base, offset)`. Returns `None`

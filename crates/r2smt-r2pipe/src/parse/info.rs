@@ -10,7 +10,7 @@ pub struct BinaryInfo {
     /// Target instruction set.
     pub arch: Arch,
     /// Pointer width in bits.
-    pub bits: u8,
+    pub bits: u16,
     /// Entry point, when reported by r2.
     pub entry: Option<Address>,
 }
@@ -18,7 +18,7 @@ pub struct BinaryInfo {
 #[derive(Debug, Deserialize)]
 struct IjBin {
     arch: String,
-    bits: u8,
+    bits: u16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,7 +45,7 @@ pub fn parse_info(json: &str) -> Result<BinaryInfo> {
     })
 }
 
-fn arch_from_str(name: &str, bits: u8) -> Result<Arch> {
+fn arch_from_str(name: &str, bits: u16) -> Result<Arch> {
     match (name, bits) {
         ("x86", 32) => Ok(Arch::X86),
         ("x86", 64) => Ok(Arch::X86_64),

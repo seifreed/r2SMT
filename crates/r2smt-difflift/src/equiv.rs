@@ -455,8 +455,8 @@ fn tie_inputs(
 ) -> Option<(BTreeMap<String, Var>, Vec<Var>)> {
     let ptr = arch.pointer_bits();
     let mut parents: BTreeMap<String, Var> = BTreeMap::new();
-    let mut none_a: BTreeMap<String, u8> = BTreeMap::new();
-    let mut none_b: BTreeMap<String, u8> = BTreeMap::new();
+    let mut none_a: BTreeMap<String, u16> = BTreeMap::new();
+    let mut none_b: BTreeMap<String, u16> = BTreeMap::new();
 
     for (side, store) in [(&ssa_a.inputs, true), (&ssa_b.inputs, false)] {
         for input in side {
@@ -520,7 +520,7 @@ fn tie_statements(
     Some(ties)
 }
 
-fn coerce(expr: Expr, from_bits: u8, to_bits: u8) -> Expr {
+fn coerce(expr: Expr, from_bits: u16, to_bits: u16) -> Expr {
     use std::cmp::Ordering::{Equal, Greater, Less};
     match to_bits.cmp(&from_bits) {
         Equal => expr,

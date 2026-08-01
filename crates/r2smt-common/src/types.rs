@@ -99,7 +99,7 @@ pub enum Arch {
 impl Arch {
     /// Default register width in bits.
     #[must_use]
-    pub const fn pointer_bits(self) -> u8 {
+    pub const fn pointer_bits(self) -> u16 {
         match self {
             Self::X86 | Self::Arm => 32,
             Self::X86_64 | Self::Aarch64 => 64,

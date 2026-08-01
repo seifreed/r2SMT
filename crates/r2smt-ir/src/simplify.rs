@@ -68,7 +68,7 @@ pub fn simplify_expr(expr: &Expr) -> Expr {
 /// node's structure alone. Returns `None` for shapes whose width
 /// depends on data we cannot inspect (free `Unknown`, free `Var`s
 /// whose declared width does not match — never happens in practice).
-fn expr_bits(expr: &Expr) -> Option<u8> {
+fn expr_bits(expr: &Expr) -> Option<u16> {
     match expr {
         Expr::Var(v) => Some(v.bits),
         Expr::Const { bits, .. } => Some(*bits),
@@ -110,15 +110,15 @@ fn expr_bits(expr: &Expr) -> Option<u8> {
     }
 }
 
-fn width_mask(bits: u8) -> u64 {
-    if bits >= 64 {
-        u64::MAX
+fn width_mask(bits: u16) -> u128 {
+    if bits >= 128 {
+        u128::MAX
     } else {
-        (1u64 << bits) - 1
+        (1u128 << bits) - 1
     }
 }
 
-fn as_const(expr: &Expr) -> Option<(u64, u8)> {
+fn as_const(expr: &Expr) -> Option<(u128, u16)> {
     match expr {
         Expr::Const { value, bits } => Some((*value, *bits)),
         _ => None,
@@ -257,7 +257,7 @@ fn fold_xor(a: Expr, b: Expr) -> Expr {
 fn fold_eq(a: Expr, b: Expr) -> Expr {
     if let (Some((va, ba)), Some((vb, bb))) = (as_const(&a), as_const(&b)) {
         let eq = (va & width_mask(ba)) == (vb & width_mask(bb));
-        return Expr::konst(u64::from(eq), 1);
+        return Expr::konst(u128::from(eq), 1);
     }
     if structurally_equal(&a, &b) {
         return Expr::konst(1, 1);
@@ -268,7 +268,7 @@ fn fold_eq(a: Expr, b: Expr) -> Expr {
 fn fold_ne(a: Expr, b: Expr) -> Expr {
     if let (Some((va, ba)), Some((vb, bb))) = (as_const(&a), as_const(&b)) {
         let ne = (va & width_mask(ba)) != (vb & width_mask(bb));
-        return Expr::konst(u64::from(ne), 1);
+        return Expr::konst(u128::from(ne), 1);
     }
     if structurally_equal(&a, &b) {
         return Expr::konst(0, 1);
@@ -281,7 +281,7 @@ fn fold_bool_not(inner: Expr) -> Expr {
         return *inner_inner;
     }
     if let Some((value, _)) = as_const(&inner) {
-        return Expr::konst(u64::from(value == 0), 1);
+        return Expr::konst(u128::from(value == 0), 1);
     }
     Expr::bool_not(inner)
 }
@@ -297,7 +297,7 @@ fn fold_ite(cond: Expr, then_expr: Expr, else_expr: Expr) -> Expr {
     }
 }
 
-fn fold_extract(src: Expr, hi: u8, lo: u8) -> Expr {
+fn fold_extract(src: Expr, hi: u16, lo: u16) -> Expr {
     if let Some(bits) = expr_bits(&src)
         && lo == 0
         && hi.saturating_add(1) == bits
@@ -315,7 +315,7 @@ fn fold_extract(src: Expr, hi: u8, lo: u8) -> Expr {
     Expr::extract(src, hi, lo)
 }
 
-fn fold_zero_ext(src: Expr, to_bits: u8) -> Expr {
+fn fold_zero_ext(src: Expr, to_bits: u16) -> Expr {
     if let Some(bits) = expr_bits(&src)
         && bits == to_bits
     {
@@ -324,7 +324,7 @@ fn fold_zero_ext(src: Expr, to_bits: u8) -> Expr {
     Expr::zero_ext(src, to_bits)
 }
 
-fn fold_sign_ext(src: Expr, to_bits: u8) -> Expr {
+fn fold_sign_ext(src: Expr, to_bits: u16) -> Expr {
     if let Some(bits) = expr_bits(&src)
         && bits == to_bits
     {
@@ -340,7 +340,7 @@ mod tests {
     use super::*;
     use crate::expr::Var;
 
-    fn v(name: &str, bits: u8) -> Expr {
+    fn v(name: &str, bits: u16) -> Expr {
         Expr::Var(Var::new(name, bits))
     }
 

@@ -19,7 +19,7 @@ use super::{BitwiseOp, ExtendKind, LiftCtx, ShiftOp, XMM_BITS, nonzero_width};
 /// verdicts.
 const X86_SHIFT_COUNT_MASK_NARROW: u64 = 0x1F;
 const X86_SHIFT_COUNT_MASK_64: u64 = 0x3F;
-const X86_WIDTH_64: u8 = 64;
+const X86_WIDTH_64: u16 = 64;
 
 impl LiftCtx {
     pub(super) fn lift_instruction_x86(&mut self, insn: &Instruction) {
@@ -393,7 +393,7 @@ impl LiftCtx {
         } else {
             X86_SHIFT_COUNT_MASK_NARROW
         };
-        let shift = Expr::bv_and(raw_shift, Expr::konst(count_mask, dst_width));
+        let shift = Expr::bv_and(raw_shift, Expr::konst(u128::from(count_mask), dst_width));
         let computed = match op {
             ShiftOp::Shl => Expr::shl(lhs, shift),
             ShiftOp::Shr => Expr::lshr(lhs, shift),

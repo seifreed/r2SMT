@@ -60,7 +60,7 @@ pub struct BatchSampleSummary {
     /// Target architecture.
     pub arch: Arch,
     /// Pointer width in bits.
-    pub bits: u8,
+    pub bits: u16,
     /// Functions discovered by radare2.
     pub functions_analyzed: usize,
     /// Conditional branches considered.

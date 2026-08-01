@@ -154,7 +154,7 @@ impl LiftCtx {
         let lhs = self.read_operand_at(src1, dst_width);
         let rhs = self.read_operand_at(src2, dst_width);
         // ~Op = Op XOR all-ones.
-        let ones = Expr::konst(width_mask(dst_width), dst_width);
+        let ones = Expr::konst(u128::from(width_mask(dst_width)), dst_width);
         let not_rhs = Expr::bv_xor(rhs.clone(), ones);
         let computed = Expr::bv_and(lhs.clone(), not_rhs);
         let tmp = self.new_temp(insn.address, dst_width);
@@ -267,7 +267,10 @@ impl LiftCtx {
             return;
         };
         let value = self.read_operand_at(src, dst_width);
-        let result = Expr::bv_xor(value, Expr::konst(width_mask(dst_width), dst_width));
+        let result = Expr::bv_xor(
+            value,
+            Expr::konst(u128::from(width_mask(dst_width)), dst_width),
+        );
         if !self.write_register_to(dst, result) {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
@@ -279,7 +282,7 @@ impl LiftCtx {
     /// Lift an `AArch32` load. `width_override` is `Some(8)` for `ldrb`
     /// and `Some(16)` for `ldrh` (zero-extended into the 32-bit
     /// register); `None` for the word-sized `ldr`.
-    fn lift_aarch32_load(&mut self, insn: &Instruction, width_override: Option<u8>) {
+    fn lift_aarch32_load(&mut self, insn: &Instruction, width_override: Option<u16>) {
         let (Some(dst), Some(mem)) = (insn.operands.first(), insn.operands.get(1)) else {
             return;
         };
@@ -329,7 +332,7 @@ impl LiftCtx {
     /// Lift an `AArch32` store. `width_override` is `Some(8)` for `strb`
     /// and `Some(16)` for `strh` (the low bits of the source register);
     /// `None` for the word-sized `str`.
-    fn lift_aarch32_store(&mut self, insn: &Instruction, width_override: Option<u8>) {
+    fn lift_aarch32_store(&mut self, insn: &Instruction, width_override: Option<u16>) {
         let (Some(src), Some(mem)) = (insn.operands.first(), insn.operands.get(1)) else {
             return;
         };
@@ -469,7 +472,7 @@ impl LiftCtx {
         }
     }
 
-    fn read_named_register(&self, name: &str, width: u8) -> Expr {
+    fn read_named_register(&self, name: &str, width: u16) -> Expr {
         let op = Operand {
             raw: name.to_string(),
             kind: OperandKind::Register,
@@ -545,7 +548,7 @@ fn aarch32_base_writeback(raw: &str) -> Option<(String, bool)> {
 /// (`[Rn, #imm]!`) and post-index (`[Rn], #imm`) writeback forms.
 /// Mirrors the `AArch64` resolver but validates the base through the
 /// `Arch::Arm` register table. Unrecognised shapes still return `None`.
-fn aarch32_mem_access(mem: &Operand, post: Option<&Operand>, ptr_bits: u8) -> Option<MemAccess> {
+fn aarch32_mem_access(mem: &Operand, post: Option<&Operand>, ptr_bits: u16) -> Option<MemAccess> {
     if mem.kind != OperandKind::Memory {
         return None;
     }
@@ -577,13 +580,13 @@ fn aarch32_mem_access(mem: &Operand, post: Option<&Operand>, ptr_bits: u8) -> Op
 }
 
 /// Build `base ± offset` at the pointer width (base alone if zero).
-fn aarch32_addr_from(parent: &str, offset: i64, ptr_bits: u8) -> Expr {
+fn aarch32_addr_from(parent: &str, offset: i64, ptr_bits: u16) -> Expr {
     let base_var = Expr::Var(Var::new(parent, ptr_bits));
     if offset == 0 {
         return base_var;
     }
     let masked = u64::from_le_bytes(offset.to_le_bytes()) & width_mask(ptr_bits);
-    Expr::add(base_var, Expr::konst(masked, ptr_bits))
+    Expr::add(base_var, Expr::konst(u128::from(masked), ptr_bits))
 }
 
 /// Split `[base{, #?imm}]` into `(base, offset)`; `None` for any shape

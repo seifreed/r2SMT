@@ -197,7 +197,7 @@ pub struct MergedVar {
     /// Canonical (parent) register name, e.g. `"rax"`.
     pub name: String,
     /// Bit width of the merged value.
-    pub bits: u8,
+    pub bits: u16,
 }
 
 /// Whether the slice represents the full data-flow chain or was cut

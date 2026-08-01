@@ -77,7 +77,7 @@ const FLAGS: &[&str] = &["ZF", "CF", "SF", "OF", "PF"];
 /// Width of an x86 SSE `xmm` register. Modelled at 128 bits (fits the
 /// current `u8` width field); the wider `ymm`/`zmm` views are gated on
 /// the `u16` migration.
-const XMM_BITS: u8 = 128;
+const XMM_BITS: u16 = 128;
 
 /// SSE integer-SIMD mnemonics the per-mnemonic lifter models precisely
 /// at vector width. Kept in sync with the `simd_effect` dispatch in
@@ -191,7 +191,8 @@ pub fn lift_branch_condition(candidate: &BranchCandidate, arch: Arch) -> Expr {
             // and compare against zero.
             let (var, vbits) = aarch64_branch_var(candidate, arch);
             match candidate.bit_index {
-                Some(bit) if bit < vbits => {
+                Some(bit) if u16::from(bit) < vbits => {
+                    let bit = u16::from(bit);
                     let slice = Expr::extract(var, bit, bit);
                     let cmp = Expr::eq(slice, Expr::konst(0, 1));
                     match candidate.condition {
@@ -217,7 +218,7 @@ pub fn lift_branch_condition(candidate: &BranchCandidate, arch: Arch) -> Expr {
 /// against the arch's layout table. Falls back to a parent-width
 /// `Unknown(name)` for unrecognised tokens so the SMT backend
 /// produces a free input rather than silently dropping the operand.
-fn aarch64_branch_var(candidate: &BranchCandidate, arch: Arch) -> (Expr, u8) {
+fn aarch64_branch_var(candidate: &BranchCandidate, arch: Arch) -> (Expr, u16) {
     let raw = candidate.compare_register.as_deref().unwrap_or("");
     if let Some(layout) = register_layout(raw, arch) {
         // `xzr`/`wzr` always read 0. Mirrors `read_register` so
@@ -227,7 +228,7 @@ fn aarch64_branch_var(candidate: &BranchCandidate, arch: Arch) -> (Expr, u8) {
             return (Expr::konst(0, layout.width()), layout.width());
         }
         let parent_bits = arch.pointer_bits();
-        if u16::from(layout.hi) < u16::from(parent_bits) {
+        if layout.hi < parent_bits {
             let parent = Expr::var(layout.parent, parent_bits);
             let width = layout.width();
             let var = if layout.lo == 0 && layout.hi + 1 == parent_bits {
@@ -278,7 +279,7 @@ pub fn lift_per_mnemonic(insn: &Instruction, arch: Arch) -> Vec<IrStmt> {
 
 struct LiftCtx {
     stmts: Vec<IrStmt>,
-    bits: u8,
+    bits: u16,
     arch: Arch,
     temp_counter: u32,
     cur_addr: Address,
@@ -295,7 +296,7 @@ impl LiftCtx {
         }
     }
 
-    fn new_temp(&mut self, address: Address, width: u8) -> Var {
+    fn new_temp(&mut self, address: Address, width: u16) -> Var {
         let name = format!(
             "t_{addr:x}_{n}",
             addr = address.get(),
@@ -381,7 +382,7 @@ impl LiftCtx {
 
     /// Width of the operand at its natural granularity (sub-register
     /// width, stack-slot width, or pointer width for immediates).
-    fn operand_width(&self, op: &Operand) -> u8 {
+    fn operand_width(&self, op: &Operand) -> u16 {
         match op.kind {
             OperandKind::Register => {
                 register_layout(&op.raw, self.arch).map_or(self.bits, |layout| layout.width())
@@ -406,7 +407,7 @@ impl LiftCtx {
             return Some(Expr::konst(0, layout.width()));
         }
         let parent_bits = self.bits;
-        if u16::from(layout.hi) >= u16::from(parent_bits) {
+        if layout.hi >= parent_bits {
             // Caller is running at a pointer width that cannot fit the
             // register (`rax` in a 32-bit lift). Surface as Unsound at
             // the lifter level rather than fabricate a slice.
@@ -427,7 +428,7 @@ impl LiftCtx {
     /// read does not need to round-trip through a wider type.
     /// Sub-register and stack-slot reads are produced at their natural
     /// width and zero-extended / truncated to match `width`.
-    fn read_operand_at(&self, op: &Operand, width: u8) -> Expr {
+    fn read_operand_at(&self, op: &Operand, width: u16) -> Expr {
         match op.kind {
             OperandKind::Register => match self.read_register(op) {
                 Some(natural) => {
@@ -438,7 +439,7 @@ impl LiftCtx {
                 None => Expr::Unknown(op.raw.clone()),
             },
             OperandKind::Immediate => match parse_immediate(&op.raw) {
-                Some(value) => Expr::konst(value & width_mask(width), width),
+                Some(value) => Expr::konst(u128::from(value & width_mask(width)), width),
                 None => Expr::Unknown(op.raw.clone()),
             },
             // x86 memory is lowered to a `LoadMem` by
@@ -462,7 +463,7 @@ impl LiftCtx {
     /// immediates, and x86 memory whose address cannot be modelled
     /// (rip / segment / subtracted-register) fall back to
     /// [`Self::read_operand_at`].
-    fn read_operand_lowered(&mut self, op: &Operand, width: u8) -> Expr {
+    fn read_operand_lowered(&mut self, op: &Operand, width: u16) -> Expr {
         if matches!(self.arch, Arch::X86 | Arch::X86_64)
             && op.kind == OperandKind::Memory
             && let Some(address) = x86_address_expr(op, self.bits)
@@ -487,7 +488,7 @@ impl LiftCtx {
     fn build_parent_write(&self, op: &Operand, value: Expr) -> Option<(Var, Expr)> {
         let layout = register_layout(&op.raw, self.arch)?;
         let parent_bits = self.bits;
-        if u16::from(layout.hi) >= u16::from(parent_bits) {
+        if layout.hi >= parent_bits {
             return None;
         }
         let parent_var = Var::new(layout.parent, parent_bits);
@@ -520,7 +521,7 @@ impl LiftCtx {
     /// a register, so a non-register operand yields `None`.
     fn dst_var(&self, op: &Operand) -> Option<Var> {
         if let Some(layout) = register_layout(&op.raw, self.arch)
-            && u16::from(layout.hi) < u16::from(self.bits)
+            && layout.hi < self.bits
         {
             return Some(Var::new(layout.parent, self.bits));
         }
@@ -541,7 +542,7 @@ impl LiftCtx {
         }
     }
 
-    fn update_logic_flags(&mut self, result: &Expr, width: u8) {
+    fn update_logic_flags(&mut self, result: &Expr, width: u16) {
         // After `and / or / xor / test`:
         //   ZF = result == 0
         //   SF = msb(result)
@@ -573,7 +574,7 @@ impl LiftCtx {
     /// scheme no longer represents stack values, only the byte model
     /// does). Unmodellable memory (rip / segment / subtracted-register)
     /// returns `false` so the caller marks the instruction unsupported.
-    fn write_dst(&mut self, dst_op: &Operand, value: Expr, dst_width: u8) -> bool {
+    fn write_dst(&mut self, dst_op: &Operand, value: Expr, dst_width: u16) -> bool {
         if dst_op.kind == OperandKind::Register {
             return self.write_register_to(dst_op, value);
         }
@@ -621,7 +622,7 @@ impl LiftCtx {
         }
     }
 
-    fn binop_width(&self, lhs: &Operand, rhs: &Operand) -> u8 {
+    fn binop_width(&self, lhs: &Operand, rhs: &Operand) -> u16 {
         // For the compare/test family the operation width is the width
         // of the register/memory operand; `read_operand_at` then masks
         // the immediate down to it. An immediate's `operand_width` is
@@ -806,11 +807,11 @@ fn aarch64_cond_suffix_to_predicate(raw: &str) -> Option<Expr> {
     })
 }
 
-fn nonzero_width(width: u8) -> Option<u8> {
+fn nonzero_width(width: u16) -> Option<u16> {
     if width == 0 { None } else { Some(width) }
 }
 
-fn coerce_to_width(value: Expr, target: u8, source: u8) -> Expr {
+fn coerce_to_width(value: Expr, target: u16, source: u16) -> Expr {
     match source.cmp(&target) {
         std::cmp::Ordering::Equal => value,
         std::cmp::Ordering::Less => Expr::zero_ext(value, target),
@@ -820,7 +821,7 @@ fn coerce_to_width(value: Expr, target: u8, source: u8) -> Expr {
 
 /// Mask covering the low `width` bits of a `u64`. `width == 64` keeps
 /// every bit; smaller widths zero the upper bits.
-const fn width_mask(width: u8) -> u64 {
+const fn width_mask(width: u16) -> u64 {
     if width >= 64 {
         u64::MAX
     } else {
@@ -868,7 +869,7 @@ fn parse_immediate(raw: &str) -> Option<u64> {
 /// — modelling it as a bare `offset` would alias with an absolute
 /// access at that offset and could *fabricate* a verdict, so the
 /// caller declines and the operand stays opaque.
-fn x86_address_expr(op: &Operand, ptr_bits: u8) -> Option<Expr> {
+fn x86_address_expr(op: &Operand, ptr_bits: u16) -> Option<Expr> {
     if op.kind != OperandKind::Memory {
         return None;
     }
@@ -901,7 +902,7 @@ fn x86_address_expr(op: &Operand, ptr_bits: u8) -> Option<Expr> {
             let scale = parse_immediate(scale_s.trim())?;
             let scaled = Expr::mul(
                 Expr::var(parent, ptr_bits),
-                Expr::konst(scale & width_mask(ptr_bits), ptr_bits),
+                Expr::konst(u128::from(scale & width_mask(ptr_bits)), ptr_bits),
             );
             acc = Some(match acc.take() {
                 None => scaled,
@@ -927,7 +928,7 @@ fn x86_address_expr(op: &Operand, ptr_bits: u8) -> Option<Expr> {
         return Some(base);
     }
     let masked = u64::from_le_bytes(disp.to_le_bytes()) & width_mask(ptr_bits);
-    Some(Expr::add(base, Expr::konst(masked, ptr_bits)))
+    Some(Expr::add(base, Expr::konst(u128::from(masked), ptr_bits)))
 }
 
 /// Whether an x86 memory operand's address can be built by the

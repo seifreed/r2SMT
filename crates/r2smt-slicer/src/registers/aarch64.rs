@@ -44,7 +44,7 @@ pub(super) fn aarch64_layout(lower: &str) -> Option<RegisterLayout> {
 fn aarch64_simd_layout(lower: &str) -> Option<RegisterLayout> {
     let prefix = lower.chars().next()?;
     let hi = match prefix {
-        'v' | 'q' => 127u8,
+        'v' | 'q' => 127u16,
         'd' => 63,
         's' => 31,
         'h' => 15,
@@ -59,7 +59,7 @@ fn aarch64_simd_layout(lower: &str) -> Option<RegisterLayout> {
     Some(aarch64_vector(aarch64_v_name(n), 0, hi))
 }
 
-pub(super) fn aarch64_alias(parent: &str, hi: u8, lo: u8) -> Option<&'static str> {
+pub(super) fn aarch64_alias(parent: &str, hi: u16, lo: u16) -> Option<&'static str> {
     // SIMD parents start with 'v' and never collide with GPR parents,
     // so dispatching first keeps the GPR catch-all (`(p, 31, 0) => ...`)
     // from swallowing v0(31, 0) and returning None.
@@ -80,7 +80,7 @@ pub(super) fn aarch64_alias(parent: &str, hi: u8, lo: u8) -> Option<&'static str
     }
 }
 
-fn aarch64_simd_alias(parent: &str, hi: u8) -> Option<&'static str> {
+fn aarch64_simd_alias(parent: &str, hi: u16) -> Option<&'static str> {
     let stripped = parent.strip_prefix('v')?;
     let n: u8 = stripped.parse().ok()?;
     if n > 31 {

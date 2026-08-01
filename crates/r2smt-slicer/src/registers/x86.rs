@@ -189,7 +189,7 @@ fn x86_xmm_alias(parent: &str) -> Option<&'static str> {
     })
 }
 
-pub(super) fn x86_alias(parent: &str, hi: u8, lo: u8) -> Option<&'static str> {
+pub(super) fn x86_alias(parent: &str, hi: u16, lo: u16) -> Option<&'static str> {
     // SIMD parents (`zmm<n>`) never collide with GPR parents; dispatch
     // the `[127:0]` xmm view first. Wider (ymm/zmm) views land here
     // once the `u16` migration allows `hi > 255`.

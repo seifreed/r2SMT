@@ -52,7 +52,7 @@ pub struct Encoder {
     /// the top of [`Encoder::encode`]; defaults to 64 for the rare
     /// caller that drives `encode_*` directly without going through
     /// `encode` (no slice → no memory state).
-    ptr_bits: u8,
+    ptr_bits: u16,
     /// Disambiguates the fresh per-byte free variables minted by
     /// repeated `LoadMem` operations.
     load_counter: u32,
@@ -63,7 +63,7 @@ pub struct Encoder {
     /// free bytes). Keyed by (canonical address rendering, width);
     /// cleared on every store and on havoc so a stale value can never
     /// be reused across a write.
-    load_memo: HashMap<(String, u8), BV>,
+    load_memo: HashMap<(String, u16), BV>,
 }
 
 impl Default for Encoder {
@@ -128,7 +128,7 @@ impl Encoder {
     /// byte as the base case. Aliasing is decided by the solver:
     /// equal addresses pick the stored byte, unequal addresses fall
     /// through to older stores or the fresh free value.
-    fn encode_load_mem(&mut self, dst: &Var, address: &Expr, bits: u8, solver: &Solver) {
+    fn encode_load_mem(&mut self, dst: &Var, address: &Expr, bits: u16, solver: &Solver) {
         let dst_bv = self.declare(&dst.name, bits);
         if bits == 0 {
             return;
@@ -178,7 +178,7 @@ impl Encoder {
     /// Overflowing [`MEM_BYTE_STORE_CAP`] triggers a sound havoc:
     /// the list is cleared and every subsequent load reads a fresh
     /// free value (precision lost, soundness preserved).
-    fn encode_store_mem(&mut self, address: &Expr, value: &Expr, bits: u8) {
+    fn encode_store_mem(&mut self, address: &Expr, value: &Expr, bits: u16) {
         if bits == 0 {
             return;
         }
@@ -193,7 +193,7 @@ impl Encoder {
         }
         let addr_bv = self.encode_address(address);
         let value_bv = self.encode_as_bv_with_width(value, bits);
-        for i in 0..u8::try_from(nbytes).unwrap_or(u8::MAX) {
+        for i in 0..u16::try_from(nbytes).unwrap_or(u16::MAX) {
             let byte_addr = bv_add_offset(&addr_bv, i, self.ptr_bits);
             let lo = u32::from(i) * 8;
             let hi = lo + 7;
@@ -211,7 +211,7 @@ impl Encoder {
         self.encode_as_bv_with_width(address, self.ptr_bits)
     }
 
-    fn declare(&mut self, name: &str, bits: u8) -> BV {
+    fn declare(&mut self, name: &str, bits: u16) -> BV {
         if let Some(existing) = self.vars.get(name) {
             return existing.clone();
         }
@@ -227,7 +227,7 @@ impl Encoder {
         }
     }
 
-    fn encode_as_bv_with_width(&mut self, expr: &Expr, target_bits: u8) -> BV {
+    fn encode_as_bv_with_width(&mut self, expr: &Expr, target_bits: u16) -> BV {
         let bv = self.encode_as_bv(expr);
         let actual = bv.get_size();
         let target = u32::from(target_bits);
@@ -248,7 +248,7 @@ impl Encoder {
     fn encode_expr(&mut self, expr: &Expr) -> Encoded {
         match expr {
             Expr::Var(v) => Encoded::Bv(self.encode_var(v)),
-            Expr::Const { value, bits } => Encoded::Bv(BV::from_u64(*value, u32::from(*bits))),
+            Expr::Const { value, bits } => Encoded::Bv(bv_const(*value, *bits)),
             Expr::Add(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvadd(&y)),
             Expr::Sub(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvsub(&y)),
             Expr::Mul(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvmul(&y)),
@@ -427,7 +427,7 @@ fn widen(bv: &BV, extra: u32, sign: Signedness) -> BV {
 /// Build `base + offset` at `ptr_bits` width. `offset` is small
 /// enough to fit in a `u64`, so no truncation risk: it's the byte
 /// index inside a single memory access (≤ 16 for an `ldp` / `stp`).
-fn bv_add_offset(base: &BV, offset: u8, ptr_bits: u8) -> BV {
+fn bv_add_offset(base: &BV, offset: u16, ptr_bits: u16) -> BV {
     if offset == 0 {
         return base.clone();
     }
@@ -438,8 +438,22 @@ fn bv_add_offset(base: &BV, offset: u8, ptr_bits: u8) -> BV {
 /// Mint a fresh, anonymous 8-bit value for byte `i` of load `id` —
 /// the base case of a `LoadMem`'s `Ite` chain when no prior store
 /// aliases the byte's address.
-fn mint_free_byte(id: u32, i: u8) -> BV {
+fn mint_free_byte(id: u32, i: u16) -> BV {
     BV::new_const(format!("__load_{id}_b{i}").as_str(), 8)
+}
+
+/// Build a `bits`-wide Z3 bit-vector holding `value`. `BV::from_u64`
+/// only takes a `u64`, so a wider constant is assembled from its
+/// high/low 64-bit halves — the high half sits above the low half so
+/// the `Concat` reproduces the `u128` value bit-for-bit.
+fn bv_const(value: u128, bits: u16) -> BV {
+    let low = u64::try_from(value & u128::from(u64::MAX)).unwrap_or_default();
+    if bits <= 64 {
+        return BV::from_u64(low, u32::from(bits));
+    }
+    let high = u64::try_from(value >> 64).unwrap_or_default();
+    let low_bv = BV::from_u64(low, 64);
+    BV::from_u64(high, u32::from(bits) - 64).concat(&low_bv)
 }
 
 /// Truncate or zero-extend `bv` to exactly `target` bits. Used by

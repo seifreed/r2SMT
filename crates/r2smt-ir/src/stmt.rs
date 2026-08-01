@@ -25,7 +25,7 @@ pub enum IrStmt {
         /// Address expression.
         address: Expr,
         /// Width in bits being read.
-        bits: u8,
+        bits: u16,
     },
     /// `*address := value` writing `bits` bits.
     StoreMem {
@@ -34,7 +34,7 @@ pub enum IrStmt {
         /// Value being written.
         value: Expr,
         /// Width in bits being written.
-        bits: u8,
+        bits: u16,
     },
     /// Marker for an instruction the lifter could not translate; the
     /// payload carries the original mnemonic and a hint.

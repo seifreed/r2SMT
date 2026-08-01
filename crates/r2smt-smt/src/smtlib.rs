@@ -76,7 +76,7 @@ pub fn emit_preamble(slice: &SsaLiftedSlice, options: &SolveOptions) -> String {
 
 /// Pointer width in bits for the target architecture, matching the Z3
 /// encoder's `ptr_bits`.
-fn ptr_bits_for(arch: r2smt_common::Arch) -> u8 {
+fn ptr_bits_for(arch: r2smt_common::Arch) -> u16 {
     match arch {
         r2smt_common::Arch::X86_64 | r2smt_common::Arch::Aarch64 => 64,
         _ => 32,
@@ -116,16 +116,16 @@ struct TextMemory {
     stores: Vec<(String, String)>,
     havoced: bool,
     load_counter: u32,
-    ptr_bits: u8,
+    ptr_bits: u16,
     /// Load memo restoring read-read consistency, mirroring the Z3
     /// encoder's `load_memo`. Keyed by (canonical address rendering,
     /// width) → the destination name of the first identical load;
     /// cleared on every store and on havoc.
-    load_memo: HashMap<(String, u8), String>,
+    load_memo: HashMap<(String, u16), String>,
 }
 
 impl TextMemory {
-    fn new(ptr_bits: u8) -> Self {
+    fn new(ptr_bits: u16) -> Self {
         Self {
             stores: Vec::new(),
             havoced: false,
@@ -135,7 +135,7 @@ impl TextMemory {
         }
     }
 
-    fn byte_addr(&self, addr: &str, i: u8) -> String {
+    fn byte_addr(&self, addr: &str, i: u16) -> String {
         if i == 0 {
             addr.to_string()
         } else {
@@ -143,7 +143,7 @@ impl TextMemory {
         }
     }
 
-    fn record_store(&mut self, address: &Expr, value: &Expr, bits: u8) {
+    fn record_store(&mut self, address: &Expr, value: &Expr, bits: u16) {
         if bits == 0 {
             return;
         }
@@ -157,7 +157,7 @@ impl TextMemory {
         }
         let addr = render_expr_with_width(address, self.ptr_bits);
         let value_s = render_expr_with_width(value, bits);
-        for i in 0..u8::try_from(nbytes).unwrap_or(u8::MAX) {
+        for i in 0..u16::try_from(nbytes).unwrap_or(u16::MAX) {
             let byte_addr = self.byte_addr(&addr, i);
             let lo = u32::from(i) * 8;
             let hi = lo + 7;
@@ -172,7 +172,7 @@ impl TextMemory {
         declared: &mut Vec<String>,
         dst: &r2smt_ir::expr::Var,
         address: &Expr,
-        bits: u8,
+        bits: u16,
     ) {
         if bits == 0 {
             return;
@@ -215,7 +215,7 @@ impl TextMemory {
     }
 }
 
-fn declare_bv(out: &mut String, name: &str, bits: u8, declared: &mut Vec<String>) {
+fn declare_bv(out: &mut String, name: &str, bits: u16, declared: &mut Vec<String>) {
     if declared.iter().any(|n| n == name) {
         return;
     }
@@ -226,7 +226,7 @@ fn declare_bv(out: &mut String, name: &str, bits: u8, declared: &mut Vec<String>
 /// Render an expression to SMT-LIB2 text, widening / narrowing to
 /// the target bit width before returning. Used at every assertion
 /// boundary so the produced SMT-LIB stays well-typed.
-fn render_expr_with_width(expr: &Expr, target_bits: u8) -> String {
+fn render_expr_with_width(expr: &Expr, target_bits: u16) -> String {
     let (rendered, bits) = render_expr(expr);
     coerce(&rendered, bits, target_bits)
 }
@@ -236,7 +236,7 @@ fn render_expr_with_width(expr: &Expr, target_bits: u8) -> String {
 // between the variant set and the SMT-LIB renderer without removing any
 // logic.
 #[allow(clippy::too_many_lines)]
-fn render_expr(expr: &Expr) -> (String, u8) {
+fn render_expr(expr: &Expr) -> (String, u16) {
     match expr {
         Expr::Var(v) => (v.name.clone(), v.bits),
         Expr::Const { value, bits } => (format!("(_ bv{value} {bits})"), *bits),
@@ -320,7 +320,7 @@ fn render_expr(expr: &Expr) -> (String, u8) {
     }
 }
 
-fn bin_op(name: &str, a: &Expr, b: &Expr, sign: Signedness) -> (String, u8) {
+fn bin_op(name: &str, a: &Expr, b: &Expr, sign: Signedness) -> (String, u16) {
     let (a_str, a_bits) = render_expr(a);
     let (b_str, b_bits) = render_expr(b);
     let target = a_bits.max(b_bits);
@@ -329,7 +329,7 @@ fn bin_op(name: &str, a: &Expr, b: &Expr, sign: Signedness) -> (String, u8) {
     (format!("({name} {lhs} {rhs})"), target)
 }
 
-fn bool_op(name: &str, a: &Expr, b: &Expr, sign: Signedness) -> (String, u8) {
+fn bool_op(name: &str, a: &Expr, b: &Expr, sign: Signedness) -> (String, u16) {
     let (a_str, a_bits) = render_expr(a);
     let (b_str, b_bits) = render_expr(b);
     let target = a_bits.max(b_bits);
@@ -348,7 +348,7 @@ enum Signedness {
     Unsigned,
 }
 
-fn coerce_with_sign(rendered: &str, cur: u8, target: u8, sign: Signedness) -> String {
+fn coerce_with_sign(rendered: &str, cur: u16, target: u16, sign: Signedness) -> String {
     if cur >= target {
         return coerce(rendered, cur, target);
     }
@@ -359,7 +359,7 @@ fn coerce_with_sign(rendered: &str, cur: u8, target: u8, sign: Signedness) -> St
     }
 }
 
-fn bool_combiner(name: &str, a: &Expr, b: &Expr) -> (String, u8) {
+fn bool_combiner(name: &str, a: &Expr, b: &Expr) -> (String, u16) {
     let a_bool = bool_of(a);
     let b_bool = bool_of(b);
     (format!("(ite ({name} {a_bool} {b_bool}) #b1 #b0)"), 1)
@@ -374,7 +374,7 @@ fn bool_of(expr: &Expr) -> String {
     }
 }
 
-fn coerce(rendered: &str, cur: u8, target: u8) -> String {
+fn coerce(rendered: &str, cur: u16, target: u16) -> String {
     if cur == target {
         return rendered.to_string();
     }
