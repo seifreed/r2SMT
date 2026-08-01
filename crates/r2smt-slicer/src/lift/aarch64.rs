@@ -68,6 +68,12 @@ impl LiftCtx {
             // not detection.
             "ldr" => self.lift_aarch64_ldr(insn),
             "str" => self.lift_aarch64_str(insn),
+            // Paired load / store `ldp`/`stp Rt, Rt2, [Xn{, #imm}]`:
+            // the second element sits one register-width above the
+            // first. Pre / post-index writeback forms still decline
+            // via `aarch64_address_expr` returning `None`.
+            "ldp" => self.lift_aarch64_ldp(insn),
+            "stp" => self.lift_aarch64_stp(insn),
             _ => self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("at {addr} (aarch64)", addr = insn.address),
@@ -491,6 +497,125 @@ impl LiftCtx {
             value,
             bits: store_width,
         });
+    }
+
+    pub(super) fn lift_aarch64_ldp(&mut self, insn: &Instruction) {
+        let (Some(d0), Some(d1), Some(mem)) = (
+            insn.operands.first(),
+            insn.operands.get(1),
+            insn.operands.get(2),
+        ) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "ldp expects Rt, Rt2, [mem]".into(),
+            });
+            return;
+        };
+        if d0.kind != OperandKind::Register || d1.kind != OperandKind::Register {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "ldp operand shape (non-Register pair)".into(),
+            });
+            return;
+        }
+        let (Some(w0), Some(w1)) = (
+            nonzero_width(self.operand_width(d0)),
+            nonzero_width(self.operand_width(d1)),
+        ) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "ldp zero-width destination".into(),
+            });
+            return;
+        };
+        let Some((first, second)) = self.aarch64_pair_addresses(mem, w0) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: format!("ldp addressing mode not yet modelled: {}", mem.raw),
+            });
+            return;
+        };
+        self.load_into_register(insn, d0, first, w0);
+        self.load_into_register(insn, d1, second, w1);
+    }
+
+    pub(super) fn lift_aarch64_stp(&mut self, insn: &Instruction) {
+        let (Some(s0), Some(s1), Some(mem)) = (
+            insn.operands.first(),
+            insn.operands.get(1),
+            insn.operands.get(2),
+        ) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "stp expects Rt, Rt2, [mem]".into(),
+            });
+            return;
+        };
+        if s0.kind != OperandKind::Register || s1.kind != OperandKind::Register {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "stp operand shape (non-Register pair)".into(),
+            });
+            return;
+        }
+        let (Some(w0), Some(w1)) = (
+            nonzero_width(self.operand_width(s0)),
+            nonzero_width(self.operand_width(s1)),
+        ) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "stp zero-width source".into(),
+            });
+            return;
+        };
+        let Some((first, second)) = self.aarch64_pair_addresses(mem, w0) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: format!("stp addressing mode not yet modelled: {}", mem.raw),
+            });
+            return;
+        };
+        self.stmts.push(IrStmt::StoreMem {
+            address: first,
+            value: self.read_operand_at(s0, w0),
+            bits: w0,
+        });
+        self.stmts.push(IrStmt::StoreMem {
+            address: second,
+            value: self.read_operand_at(s1, w1),
+            bits: w1,
+        });
+    }
+
+    /// Two-statement load: into a fresh temp at `width`, then written to
+    /// `dst` so `write_register_to` zero-extends the parent X for the
+    /// W-form (the P26 `ldr` stash-then-write precedent).
+    fn load_into_register(&mut self, insn: &Instruction, dst: &Operand, address: Expr, width: u8) {
+        let tmp = self.new_temp(insn.address, width);
+        self.stmts.push(IrStmt::LoadMem {
+            dst: tmp.clone(),
+            address,
+            bits: width,
+        });
+        if !self.write_register_to(dst, Expr::Var(tmp)) {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "ldp destination not a supported register".into(),
+            });
+        }
+    }
+
+    /// Address of the two paired elements: the base address and the base
+    /// plus one element (`first_width / 8` bytes). Returns `None` for the
+    /// same writeback / register-offset forms the single `ldr` declines.
+    fn aarch64_pair_addresses(&self, mem: &Operand, first_width: u8) -> Option<(Expr, Expr)> {
+        if mem.kind != OperandKind::Memory {
+            return None;
+        }
+        let first = aarch64_address_expr(mem, self.bits)?;
+        let stride = u64::from(first_width / 8) & width_mask(self.bits);
+        let second = Expr::add(first.clone(), Expr::konst(stride, self.bits));
+        Some((first, second))
     }
 }
 

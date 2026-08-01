@@ -122,6 +122,10 @@ pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
         // forms (`tst` / `cmp` handled above).
         "ldr" => aarch64_ldr_effect(insn),
         "str" => aarch64_str_effect(insn),
+        // Paired forms: `ldp` defines both `Rt`/`Rt2`, `stp` uses them;
+        // both read the base register in the memory operand (index 2).
+        "ldp" => aarch64_ldp_effect(insn),
+        "stp" => aarch64_stp_effect(insn),
         _ => other_effect(insn),
     }
 }
@@ -174,6 +178,65 @@ fn aarch64_str_effect(insn: &Instruction) -> InstructionEffect {
         // semantically "data movement", and the memory side-effect is
         // surfaced through `has_memory_access`. The memory-aware
         // slice walker keeps it for any kept downstream `ldr`.
+        kind: InstructionKind::Mov,
+        defs: Vec::new(),
+        uses,
+        defines_flags: false,
+        has_memory_access: true,
+        is_call: false,
+        stack_defs: Vec::new(),
+        stack_uses: Vec::new(),
+        reads_flags: false,
+    }
+}
+
+fn aarch64_ldp_effect(insn: &Instruction) -> InstructionEffect {
+    let mut defs = Vec::new();
+    for op in insn.operands.iter().take(2) {
+        if let Some(reg) = canonical_register(&op.raw, Arch::Aarch64)
+            && !defs.contains(&reg)
+        {
+            defs.push(reg);
+        }
+    }
+    let mut uses = Vec::new();
+    if let Some(mem) = insn.operands.get(2) {
+        for r in registers_in_operand(mem, Arch::Aarch64) {
+            if !uses.contains(&r) {
+                uses.push(r);
+            }
+        }
+    }
+    InstructionEffect {
+        kind: InstructionKind::Mov,
+        defs,
+        uses,
+        defines_flags: false,
+        has_memory_access: true,
+        is_call: false,
+        stack_defs: Vec::new(),
+        stack_uses: Vec::new(),
+        reads_flags: false,
+    }
+}
+
+fn aarch64_stp_effect(insn: &Instruction) -> InstructionEffect {
+    let mut uses = Vec::new();
+    for op in insn.operands.iter().take(2) {
+        if let Some(reg) = canonical_register(&op.raw, Arch::Aarch64)
+            && !uses.contains(&reg)
+        {
+            uses.push(reg);
+        }
+    }
+    if let Some(mem) = insn.operands.get(2) {
+        for r in registers_in_operand(mem, Arch::Aarch64) {
+            if !uses.contains(&r) {
+                uses.push(r);
+            }
+        }
+    }
+    InstructionEffect {
         kind: InstructionKind::Mov,
         defs: Vec::new(),
         uses,

@@ -309,3 +309,77 @@ fn test_aarch64_str_emits_storemem_with_value_and_address() {
         "expected x2 in stored value: {value_dbg}",
     );
 }
+
+#[test]
+fn test_aarch64_ldp_emits_two_loadmem_at_consecutive_addresses() {
+    // `ldp x0, x1, [x2, #16]` → load x0 from `x2 + 16`, x1 from
+    // `x2 + 16 + 8`. Two 64-bit LoadMem, second address one register
+    // width above the first.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "ldp",
+            vec![
+                op("x0", OperandKind::Register),
+                op("x1", OperandKind::Register),
+                op("[x2, 16]", OperandKind::Memory),
+            ],
+        ),
+        Arch::Aarch64,
+    );
+    let loads: Vec<(Expr, u8)> = stmts
+        .iter()
+        .filter_map(|s| match s {
+            IrStmt::LoadMem { address, bits, .. } => Some((address.clone(), *bits)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        loads.len(),
+        2,
+        "ldp must produce two LoadMem, got {loads:?}"
+    );
+    assert_eq!(loads[0].1, 64);
+    assert_eq!(loads[1].1, 64);
+    assert_ne!(
+        format!("{:?}", loads[0].0),
+        format!("{:?}", loads[1].0),
+        "the two loaded addresses must differ by the element stride",
+    );
+}
+
+#[test]
+fn test_aarch64_stp_emits_two_storemem_for_the_pair() {
+    // `stp x0, x1, [sp, #16]` → store x0 at `sp + 16`, x1 at
+    // `sp + 16 + 8`.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "stp",
+            vec![
+                op("x0", OperandKind::Register),
+                op("x1", OperandKind::Register),
+                op("[sp, 16]", OperandKind::Memory),
+            ],
+        ),
+        Arch::Aarch64,
+    );
+    let stores: Vec<(Expr, Expr, u8)> = stmts
+        .iter()
+        .filter_map(|s| match s {
+            IrStmt::StoreMem {
+                address,
+                value,
+                bits,
+            } => Some((address.clone(), value.clone(), *bits)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stores.len(),
+        2,
+        "stp must produce two StoreMem, got {stores:?}"
+    );
+    assert!(format!("{:?}", stores[0].1).contains("\"x0\""));
+    assert!(format!("{:?}", stores[1].1).contains("\"x1\""));
+}
