@@ -56,6 +56,14 @@ pub struct Encoder {
     /// Disambiguates the fresh per-byte free variables minted by
     /// repeated `LoadMem` operations.
     load_counter: u32,
+    /// Load memo restoring read-read consistency: two `LoadMem`s of
+    /// the same address + width with no intervening `StoreMem` must
+    /// yield the *same* value (otherwise `x = *p; y = *p; x == y`
+    /// would be `BothPossible` because each load minted independent
+    /// free bytes). Keyed by (canonical address rendering, width);
+    /// cleared on every store and on havoc so a stale value can never
+    /// be reused across a write.
+    load_memo: HashMap<(String, u8), BV>,
 }
 
 impl Default for Encoder {
@@ -75,6 +83,7 @@ impl Encoder {
             mem_havoced: false,
             ptr_bits: 64,
             load_counter: 0,
+            load_memo: HashMap::new(),
         }
     }
 
@@ -124,6 +133,14 @@ impl Encoder {
         if bits == 0 {
             return;
         }
+        // Read-read consistency: reuse a prior identical load's value
+        // when no store has invalidated the memo since.
+        let memo_key = (format!("{address}"), bits);
+        if let Some(cached) = self.load_memo.get(&memo_key) {
+            let assertion = dst_bv.eq(cached);
+            solver.assert(&assertion);
+            return;
+        }
         let addr_bv = self.encode_address(address);
         let nbytes = bits.div_ceil(8);
         let load_id = self.load_counter;
@@ -151,6 +168,7 @@ impl Encoder {
         }
         let Some(loaded) = acc else { return };
         let value = coerce_bv(loaded, u32::from(bits));
+        self.load_memo.insert(memo_key, value.clone());
         let assertion = dst_bv.eq(&value);
         solver.assert(&assertion);
     }
@@ -164,6 +182,9 @@ impl Encoder {
         if bits == 0 {
             return;
         }
+        // Any store may alias a previously loaded address, so every
+        // memoized load value is now potentially stale — drop them.
+        self.load_memo.clear();
         let nbytes = usize::from(bits.div_ceil(8));
         if self.byte_stores.len().saturating_add(nbytes) > MEM_BYTE_STORE_CAP {
             self.byte_stores.clear();

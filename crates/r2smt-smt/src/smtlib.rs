@@ -14,6 +14,7 @@
 //! Output uses the `QF_BV` logic — no quantifiers, only the
 //! fixed-width bit-vector theory the slicer's IR maps onto.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use r2smt_common::smt::SolveOptions;
@@ -116,6 +117,11 @@ struct TextMemory {
     havoced: bool,
     load_counter: u32,
     ptr_bits: u8,
+    /// Load memo restoring read-read consistency, mirroring the Z3
+    /// encoder's `load_memo`. Keyed by (canonical address rendering,
+    /// width) → the destination name of the first identical load;
+    /// cleared on every store and on havoc.
+    load_memo: HashMap<(String, u8), String>,
 }
 
 impl TextMemory {
@@ -125,6 +131,7 @@ impl TextMemory {
             havoced: false,
             load_counter: 0,
             ptr_bits,
+            load_memo: HashMap::new(),
         }
     }
 
@@ -140,6 +147,8 @@ impl TextMemory {
         if bits == 0 {
             return;
         }
+        // Any store may alias a memoized load; drop the memo.
+        self.load_memo.clear();
         let nbytes = usize::from(bits.div_ceil(8));
         if self.stores.len().saturating_add(nbytes) > MEM_BYTE_STORE_CAP {
             self.stores.clear();
@@ -166,6 +175,13 @@ impl TextMemory {
         bits: u8,
     ) {
         if bits == 0 {
+            return;
+        }
+        // Read-read consistency: reuse a prior identical load's
+        // destination when no store has invalidated the memo since.
+        let memo_key = (render_expr_with_width(address, self.ptr_bits), bits);
+        if let Some(cached) = self.load_memo.get(&memo_key) {
+            let _ = writeln!(out, "(assert (= {lhs} {cached}))", lhs = dst.name);
             return;
         }
         let nbytes = bits.div_ceil(8);
@@ -195,6 +211,7 @@ impl TextMemory {
         let total_bits = nbytes.saturating_mul(8);
         let coerced = coerce(&loaded, total_bits, bits);
         let _ = writeln!(out, "(assert (= {lhs} {coerced}))", lhs = dst.name);
+        self.load_memo.insert(memo_key, dst.name.clone());
     }
 }
 

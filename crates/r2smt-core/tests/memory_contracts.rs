@@ -846,3 +846,71 @@ fn test_x86_stack_slot_still_uses_named_var_not_loadmem() {
         "stack slot must stay a named var, not a LoadMem: {stmts:?}"
     );
 }
+
+#[test]
+fn test_repeated_load_same_address_is_read_read_consistent() {
+    // Two loads of the SAME address with no intervening store must
+    // yield the same value, so `a != b` is AlwaysFalse. Without the
+    // load memo each load minted independent free bytes and this
+    // widened to BothPossible.
+    let p = Expr::Var(Var::new("p", 64));
+    let a = Var::new("a#0", 64);
+    let b = Var::new("b#0", 64);
+    let slice = synthetic_slice(
+        vec![
+            IrStmt::LoadMem {
+                dst: a.clone(),
+                address: p.clone(),
+                bits: 64,
+            },
+            IrStmt::LoadMem {
+                dst: b.clone(),
+                address: p,
+                bits: 64,
+            },
+        ],
+        Expr::ne(Expr::Var(a.clone()), Expr::Var(b.clone())),
+        vec![Var::new("p", 64)],
+        vec![a, b],
+    );
+
+    let verdict = solve_branch(&slice, solve_opts());
+    assert_eq!(verdict, SmtResult::AlwaysFalse);
+}
+
+#[test]
+fn test_store_between_loads_invalidates_read_read_memo() {
+    // A store at an UNKNOWN address between two loads of address `p`
+    // may alias `p`, so the second load is no longer guaranteed equal
+    // to the first: `a != b` must widen to BothPossible, proving the
+    // memo is dropped on every store (soundness guard on the memo).
+    let p = Expr::Var(Var::new("p", 64));
+    let q = Expr::Var(Var::new("q", 64));
+    let a = Var::new("a#0", 64);
+    let b = Var::new("b#0", 64);
+    let slice = synthetic_slice(
+        vec![
+            IrStmt::LoadMem {
+                dst: a.clone(),
+                address: p.clone(),
+                bits: 64,
+            },
+            IrStmt::StoreMem {
+                address: q,
+                value: Expr::konst(7, 64),
+                bits: 64,
+            },
+            IrStmt::LoadMem {
+                dst: b.clone(),
+                address: p,
+                bits: 64,
+            },
+        ],
+        Expr::ne(Expr::Var(a.clone()), Expr::Var(b.clone())),
+        vec![Var::new("p", 64), Var::new("q", 64)],
+        vec![a, b],
+    );
+
+    let verdict = solve_branch(&slice, solve_opts());
+    assert_eq!(verdict, SmtResult::BothPossible);
+}
