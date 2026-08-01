@@ -1184,6 +1184,135 @@ fn test_bounded_diamond_merge_recovered_as_complete() {
     );
 }
 
+/// Diamond whose THEN arm is a two-block straight-line chain
+/// (`0x401100 → 0x401150 → join`); the ELSE arm stays one block.
+fn diamond_multiblock_then_program() -> Program {
+    Program {
+        arch: Arch::X86_64,
+        bits: 64,
+        entry: Some(Address(0x40_1000)),
+        functions: vec![Function {
+            address: Address(0x40_1000),
+            name: Some("sym.main".into()),
+            blocks: vec![
+                BasicBlock {
+                    address: Address(0x40_1000),
+                    instructions: vec![
+                        insn(
+                            0x40_1000,
+                            3,
+                            "cmp",
+                            vec![
+                                op("ecx", OperandKind::Register),
+                                op("0", OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1003,
+                            6,
+                            "je",
+                            vec![op("0x401100", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![Address(0x40_1100), Address(0x40_1009)],
+                },
+                BasicBlock {
+                    address: Address(0x40_1009),
+                    instructions: vec![insn(
+                        0x40_1009,
+                        5,
+                        "mov",
+                        vec![
+                            op("eax", OperandKind::Register),
+                            op("22", OperandKind::Immediate),
+                        ],
+                    )],
+                    successors: vec![Address(0x40_1200)],
+                },
+                BasicBlock {
+                    address: Address(0x40_1100),
+                    instructions: vec![insn(
+                        0x40_1100,
+                        5,
+                        "mov",
+                        vec![
+                            op("eax", OperandKind::Register),
+                            op("10", OperandKind::Immediate),
+                        ],
+                    )],
+                    successors: vec![Address(0x40_1150)],
+                },
+                BasicBlock {
+                    address: Address(0x40_1150),
+                    instructions: vec![insn(
+                        0x40_1150,
+                        3,
+                        "add",
+                        vec![
+                            op("eax", OperandKind::Register),
+                            op("1", OperandKind::Immediate),
+                        ],
+                    )],
+                    successors: vec![Address(0x40_1200)],
+                },
+                BasicBlock {
+                    address: Address(0x40_1200),
+                    instructions: vec![
+                        insn(
+                            0x40_1200,
+                            3,
+                            "cmp",
+                            vec![
+                                op("eax", OperandKind::Register),
+                                op("7", OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1203,
+                            6,
+                            "je",
+                            vec![op("0x401300", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![],
+                },
+            ],
+            is_thumb: false,
+        }],
+    }
+}
+
+#[test]
+fn test_multiblock_arm_diamond_recovered_as_complete() {
+    // The THEN arm spans two blocks (`mov eax,10; add eax,1`). A
+    // straight-line multi-block arm is folded linearly, so the diamond
+    // is still recovered precisely rather than falling back to free
+    // inputs. The head is found by climbing the unique-predecessor
+    // chain above the arm tail, not just its direct predecessor.
+    let program = diamond_multiblock_then_program();
+    let limits = SliceLimits {
+        max_basic_blocks: 8,
+        allow_join_merge: true,
+        ..SliceLimits::default()
+    };
+    let slice = slice_join(&program, &limits);
+    assert_eq!(slice.status, SliceStatus::Complete);
+    assert_eq!(slice.merges.len(), 1);
+    let merge = &slice.merges[0];
+    assert_eq!(merge.head.taken_target, Some(Address(0x40_1100)));
+    assert_eq!(
+        merge
+            .taken_arm
+            .iter()
+            .map(|i| i.mnemonic.as_str())
+            .collect::<Vec<_>>(),
+        vec!["mov", "add"],
+        "two-block THEN arm is folded into one linear arm"
+    );
+    assert_eq!(merge.fallthrough_arm.len(), 1);
+    assert!(!slice.roots.contains(&"rax".to_string()));
+}
+
 #[test]
 fn test_bounded_diamond_default_off_byte_identical() {
     // With `allow_join_merge` off the join handling is unchanged:

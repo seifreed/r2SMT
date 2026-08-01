@@ -7,6 +7,8 @@
 //! parent's `slice_branch` / `single_pred` / `predecessors_of`
 //! (ancestor-private, reachable from a child module).
 
+use std::collections::BTreeSet;
+
 use r2smt_common::{Address, Arch};
 use r2smt_ir::program::{BasicBlock, Function, Instruction};
 use tracing::debug;
@@ -15,8 +17,8 @@ use crate::collector::BranchCandidate;
 use crate::effect::{InstructionKind, analyze};
 
 use super::{
-    MERGE_ARM_MAX_INSTRUCTIONS, MergedVar, SliceLimits, SliceMerge, WalkState, predecessors_of,
-    single_pred, slice_branch,
+    MERGE_ARM_MAX_INSTRUCTIONS, MergedVar, SliceLimits, SliceMerge, WalkState, single_pred,
+    slice_branch,
 };
 
 /// One resolved diamond edge: the arm body to lower (empty for an
@@ -32,13 +34,19 @@ struct ArmResolution {
 ///
 /// * `edge_target == join` → empty arm; the head itself is the join
 ///   predecessor this edge covers.
-/// * otherwise `edge_target` must be a single block whose only
-///   predecessor is the head and whose only successor is the join,
-///   call / memory / unsupported-free and within the instruction
-///   budget — a clean `≤1`-block arm.
+/// * otherwise `edge_target` starts a **straight-line chain** of blocks
+///   `edge_target → … → last`, where every block has a single successor
+///   (the next block in the chain, or the join for `last`), every
+///   non-first block's only predecessor is the previous block, the
+///   first block's only predecessor is the head, every instruction is
+///   call / memory / unsupported-free, and the whole chain fits the
+///   instruction budget. `last` is the join predecessor this edge
+///   covers.
 ///
 /// Any other shape returns `None`, forcing the caller to fall back to
-/// the sound free-input boundary.
+/// the sound free-input boundary. A straight-line chain is safe to fold
+/// linearly because it has no internal branches — it is just a longer
+/// single-path arm.
 fn resolve_arm_edge(
     function: &Function,
     head_addr: Address,
@@ -55,30 +63,49 @@ fn resolve_arm_edge(
     if edge_target == head_addr {
         return None;
     }
-    let arm = function
-        .blocks
-        .iter()
-        .find(|blk| blk.address == edge_target)?;
-    if arm.successors.as_slice() != [join] {
-        return None;
+    let mut instructions: Vec<Instruction> = Vec::new();
+    let mut block_addr = edge_target;
+    let mut chain: BTreeSet<Address> = BTreeSet::new();
+    loop {
+        if !chain.insert(block_addr) {
+            return None; // cycle inside the arm — not a straight-line chain
+        }
+        let blk = function.blocks.iter().find(|b| b.address == block_addr)?;
+        // The chain's first block must descend directly from the head;
+        // interior links are verified before advancing (next block's
+        // sole predecessor is the current one).
+        if block_addr == edge_target && single_pred(function, block_addr) != Some(head_addr) {
+            return None;
+        }
+        if !blk
+            .instructions
+            .iter()
+            .all(|insn| mergeable_arm_insn(insn, arch))
+        {
+            return None;
+        }
+        instructions.extend(blk.instructions.iter().cloned());
+        if instructions.len() > MERGE_ARM_MAX_INSTRUCTIONS {
+            return None;
+        }
+        match blk.successors.as_slice() {
+            [succ] if *succ == join => {
+                return Some(ArmResolution {
+                    instructions,
+                    covered_pred: block_addr,
+                });
+            }
+            [succ] => {
+                // Continue only through a genuine single-entry chain:
+                // the next block's sole predecessor must be this block.
+                if single_pred(function, *succ) != Some(block_addr) {
+                    return None;
+                }
+                block_addr = *succ;
+            }
+            _ => return None,
+        }
     }
-    if single_pred(function, arm.address) != Some(head_addr) {
-        return None;
-    }
-    if arm.instructions.len() > MERGE_ARM_MAX_INSTRUCTIONS {
-        return None;
-    }
-    if !arm
-        .instructions
-        .iter()
-        .all(|insn| mergeable_arm_insn(insn, arch))
-    {
-        return None;
-    }
-    Some(ArmResolution {
-        instructions: arm.instructions.clone(),
-        covered_pred: arm.address,
-    })
 }
 
 /// An instruction is safe to fold into a Φ-merge arm only if it is
@@ -104,22 +131,40 @@ fn head_terminator(function: &Function, head_addr: Address, arch: Arch) -> Optio
         })
 }
 
-/// Identify the head block of a 2-predecessor join, covering the full
-/// diamond (`sp(a) == sp(b)`) and the `if`-with-no-`else` shape (one
-/// predecessor *is* the head).
-fn diamond_head(function: &Function, a: Address, b: Address, join: Address) -> Option<Address> {
-    if let (Some(ha), Some(hb)) = (single_pred(function, a), single_pred(function, b))
-        && ha == hb
-    {
-        return Some(ha);
+/// Walk up the unique-predecessor chain from `from` to the nearest
+/// enclosing two-way conditional head, bounded by the arm budget. A
+/// join predecessor may be the last block of a *multi-block* arm, so the
+/// head is not necessarily its direct predecessor — this climbs the
+/// single-entry chain until it reaches a still-two-way `Jcc` head. The
+/// starting block itself counts (the `if`-with-no-`else` shape, where a
+/// join predecessor *is* the head).
+fn head_above(function: &Function, from: Address, arch: Arch) -> Option<Address> {
+    let mut addr = from;
+    let mut steps: usize = 0;
+    let mut seen: BTreeSet<Address> = BTreeSet::new();
+    loop {
+        if !seen.insert(addr) {
+            return None; // cycle
+        }
+        if head_terminator(function, addr, arch).is_some() {
+            return Some(addr);
+        }
+        if steps >= MERGE_ARM_MAX_INSTRUCTIONS {
+            return None;
+        }
+        steps += 1;
+        addr = single_pred(function, addr)?;
     }
-    if single_pred(function, b) == Some(a) && predecessors_of(function, join).contains(&a) {
-        return Some(a);
-    }
-    if single_pred(function, a) == Some(b) && predecessors_of(function, join).contains(&b) {
-        return Some(b);
-    }
-    None
+}
+
+/// Identify the enclosing two-way head of a 2-predecessor join. Each
+/// predecessor may be the tail of a multi-block straight-line arm, so
+/// the head is found by climbing the unique-predecessor chain above
+/// either predecessor to the nearest conditional head; the arm
+/// resolution + covered-predecessor check then verifies the two edges
+/// actually reconverge at this join.
+fn diamond_head(function: &Function, a: Address, b: Address, arch: Arch) -> Option<Address> {
+    head_above(function, a, arch).or_else(|| head_above(function, b, arch))
 }
 
 /// Slice the head block's condition within the head block only, so its
@@ -176,7 +221,7 @@ pub(super) fn try_build_diamond_merge(
     }
     let j = join.address;
     let (a, b) = (preds[0], preds[1]);
-    let head_addr = diamond_head(function, a, b, j)?;
+    let head_addr = diamond_head(function, a, b, arch)?;
     let head = head_terminator(function, head_addr, arch)?;
     let taken_target = head.taken_target?;
     let fallthrough_target = head.fallthrough_target?;
