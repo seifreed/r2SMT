@@ -97,6 +97,8 @@ fn is_x86_simd_mnemonic(mnemonic: &str) -> bool {
             | "vpand"
             | "por"
             | "vpor"
+            | "pandn"
+            | "vpandn"
     )
 }
 

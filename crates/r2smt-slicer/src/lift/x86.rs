@@ -46,6 +46,7 @@ impl LiftCtx {
             "pxor" | "vpxor" => self.lift_simd_bitwise(insn, SimdBitOp::Xor),
             "pand" | "vpand" => self.lift_simd_bitwise(insn, SimdBitOp::And),
             "por" | "vpor" => self.lift_simd_bitwise(insn, SimdBitOp::Or),
+            "pandn" | "vpandn" => self.lift_simd_bitwise(insn, SimdBitOp::AndNot),
             _ => self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("at {addr}", addr = insn.address),
@@ -435,7 +436,7 @@ impl LiftCtx {
         }
     }
 
-    /// `pxor`/`pand`/`por` (2-operand RMW) and their `v`-prefixed
+    /// `pxor`/`pand`/`por`/`pandn` (2-operand RMW) and their `v`-prefixed
     /// 3-operand VEX forms, modelled as 128-bit bit-vector ops. A
     /// `pxor`/`vpxor` of a register with itself is the zero idiom —
     /// the result is the 128-bit constant 0, independent of inputs.
@@ -469,6 +470,9 @@ impl LiftCtx {
             SimdBitOp::Xor => Expr::bv_xor(a, b),
             SimdBitOp::And => Expr::bv_and(a, b),
             SimdBitOp::Or => Expr::bv_or(a, b),
+            // `pandn`/`vpandn` compute `(~a) & b`. The IR has no bitwise
+            // NOT, so `~a` is `a XOR all-ones` at the vector width.
+            SimdBitOp::AndNot => Expr::bv_and(Expr::bv_xor(a, Expr::konst(u128::MAX, XMM_BITS)), b),
         };
         if !self.write_xmm_dst(dst, result) {
             self.push_simd_unsupported(insn);
@@ -489,6 +493,8 @@ enum SimdBitOp {
     Xor,
     And,
     Or,
+    /// `pandn`/`vpandn`: `(~a) & b`.
+    AndNot,
 }
 
 /// Whether two operands name the same `xmm` register (by canonical

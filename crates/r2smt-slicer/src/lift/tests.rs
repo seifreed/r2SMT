@@ -1081,3 +1081,30 @@ fn pxor_distinct_registers_lifts_to_128bit_xor() {
         Expr::bv_xor(Expr::var("zmm0", 128), Expr::var("zmm1", 128))
     );
 }
+
+#[test]
+fn pandn_distinct_registers_lifts_to_128bit_andnot() {
+    // `pandn xmm0, xmm1` (2-operand RMW) — `zmm0 := (~zmm0) & zmm1`.
+    // Regression: `pandn`/`vpandn` was classified `Simd` by the effect
+    // table but had no lifter arm, so it emitted a silent `Unsupported`
+    // no-op — a stale-def fabrication once an xmm→GPR bridge exists.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "pandn",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    assert_eq!(
+        *simd_dst_src(&stmts, "zmm0"),
+        Expr::bv_and(
+            Expr::bv_xor(Expr::var("zmm0", 128), Expr::konst(u128::MAX, 128)),
+            Expr::var("zmm1", 128)
+        )
+    );
+}
