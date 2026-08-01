@@ -667,11 +667,7 @@ impl LiftCtx {
         if !layout.parent.starts_with("zmm") {
             return None;
         }
-        let lane = Expr::extract(
-            Expr::var(layout.parent, SIMD_PARENT_BITS),
-            lane_bits - 1,
-            0,
-        );
+        let lane = Expr::extract(Expr::var(layout.parent, SIMD_PARENT_BITS), lane_bits - 1, 0);
         let (ebits, sbits) = fp_sort_bits(lane_bits);
         Some(Expr::bv_to_fp(lane, ebits, sbits))
     }
