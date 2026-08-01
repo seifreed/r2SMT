@@ -827,9 +827,11 @@ fn test_x86_store_to_scaled_index_emits_storemem() {
 }
 
 #[test]
-fn test_x86_stack_slot_still_uses_named_var_not_loadmem() {
-    // `mov rbx, [rbp - 8]` — stack slot: UNCHANGED, no LoadMem
-    // (still the named-slot scheme).
+fn test_x86_stack_slot_lowers_to_loadmem_named_by_slot() {
+    // `mov rbx, [rbp - 8]` — P41b: the stack slot now lowers to the
+    // byte-granular memory model like every other x86 memory operand.
+    // The load temp keeps the `stk_rbp_-8` canonical name so the
+    // analyst alias (`var_8h`) still resolves in the pretty-printer.
     let stmts = lift_per_mnemonic(
         &insn(
             0x1000,
@@ -841,9 +843,12 @@ fn test_x86_stack_slot_still_uses_named_var_not_loadmem() {
         ),
         Arch::X86_64,
     );
+    let named = stmts
+        .iter()
+        .any(|s| matches!(s, IrStmt::LoadMem { dst, .. } if dst.name == "stk_rbp_-8"));
     assert!(
-        !stmts.iter().any(|s| matches!(s, IrStmt::LoadMem { .. })),
-        "stack slot must stay a named var, not a LoadMem: {stmts:?}"
+        named,
+        "stack slot must lower to a LoadMem named by the slot: {stmts:?}"
     );
 }
 

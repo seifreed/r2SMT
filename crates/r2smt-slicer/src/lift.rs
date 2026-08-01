@@ -405,30 +405,36 @@ impl LiftCtx {
                 Some(value) => Expr::konst(value & width_mask(width), width),
                 None => Expr::Unknown(op.raw.clone()),
             },
-            OperandKind::Memory => match stack_slot(op) {
-                Some((slot, slot_width)) => {
-                    let var = Expr::var(slot, slot_width);
-                    coerce_to_width(var, width, slot_width)
-                }
-                None => Expr::Unknown(format!("mem {raw}", raw = op.raw)),
-            },
+            // x86 memory is lowered to a `LoadMem` by
+            // [`Self::read_operand_lowered`] before it can reach this
+            // pure (`&self`) fallback; anything arriving here is memory
+            // whose address cannot be modelled, so it stays opaque.
+            OperandKind::Memory => Expr::Unknown(format!("mem {raw}", raw = op.raw)),
             _ => Expr::Unknown(op.raw.clone()),
         }
     }
 
-    /// Read an operand, lowering a non-stack x86 memory source through
-    /// the byte-granular memory model: it emits a `LoadMem` into a fresh
-    /// temp and returns that temp, so `[rax]` / `[rbp + rax*4]` become
-    /// precise loads instead of the `Expr::Unknown` `read_operand_at`
-    /// produced. Registers, immediates, and recognised stack slots are
-    /// unchanged (delegated to [`Self::read_operand_at`]).
+    /// Read an operand, lowering an x86 memory source through the
+    /// byte-granular memory model: it emits a `LoadMem` into a temp and
+    /// returns that temp, so `[rax]` / `[rbp + rax*4]` / `[rbp - 8]`
+    /// become precise loads instead of the `Expr::Unknown` /
+    /// named-slot value `read_operand_at` produced. A load whose
+    /// address folds to a constant `rbp`/`rsp` offset names its temp
+    /// `stk_<base>_<off>` (the stack-slot canonical name) so the
+    /// analyst alias (`var_4h`) still resolves in the pretty-printer;
+    /// every other load uses a fresh `t_<addr>_<n>` temp. Registers,
+    /// immediates, and x86 memory whose address cannot be modelled
+    /// (rip / segment / subtracted-register) fall back to
+    /// [`Self::read_operand_at`].
     fn read_operand_lowered(&mut self, op: &Operand, width: u8) -> Expr {
         if matches!(self.arch, Arch::X86 | Arch::X86_64)
             && op.kind == OperandKind::Memory
-            && stack_slot(op).is_none()
             && let Some(address) = x86_address_expr(op, self.bits)
         {
-            let tmp = self.new_temp(self.cur_addr, width);
+            let tmp = match stack_slot(op) {
+                Some((name, _)) => Var::new(name, width),
+                None => self.new_temp(self.cur_addr, width),
+            };
             self.stmts.push(IrStmt::LoadMem {
                 dst: tmp.clone(),
                 address,
@@ -472,17 +478,15 @@ impl LiftCtx {
         Some((parent_var, rhs))
     }
 
-    /// Compute the destination [`Var`] (parent register or stack-slot)
-    /// the operand `op` writes to. Used by paths that build their own
-    /// right-hand side (`lea`, the unsupported-destination fall-throughs).
+    /// Compute the destination register [`Var`] the operand `op` writes
+    /// to. Used by paths that build their own right-hand side (`lea`,
+    /// the unsupported-destination fall-throughs); `lea` always targets
+    /// a register, so a non-register operand yields `None`.
     fn dst_var(&self, op: &Operand) -> Option<Var> {
         if let Some(layout) = register_layout(&op.raw, self.arch)
             && u16::from(layout.hi) < u16::from(self.bits)
         {
             return Some(Var::new(layout.parent, self.bits));
-        }
-        if let Some((slot, width)) = stack_slot(op) {
-            return Some(Var::new(slot, width));
         }
         None
     }
@@ -526,17 +530,16 @@ impl LiftCtx {
         false
     }
 
-    /// Emit an assignment for any supported destination (register or
-    /// stack slot). Memory destinations that resolve to a stack slot
-    /// preserve the slot's natural width.
+    /// Emit an assignment for any supported destination. Register
+    /// destinations account for sub-register semantics; x86 memory
+    /// destinations whose address can be modelled emit a byte-granular
+    /// `StoreMem` (including recognised stack slots — the named-slot
+    /// scheme no longer represents stack values, only the byte model
+    /// does). Unmodellable memory (rip / segment / subtracted-register)
+    /// returns `false` so the caller marks the instruction unsupported.
     fn write_dst(&mut self, dst_op: &Operand, value: Expr, dst_width: u8) -> bool {
         if dst_op.kind == OperandKind::Register {
             return self.write_register_to(dst_op, value);
-        }
-        if let Some((slot, width)) = stack_slot(dst_op) {
-            let coerced = coerce_to_width(value, width, dst_width);
-            self.assign(Var::new(slot, width), coerced);
-            return true;
         }
         if matches!(self.arch, Arch::X86 | Arch::X86_64)
             && dst_op.kind == OperandKind::Memory
