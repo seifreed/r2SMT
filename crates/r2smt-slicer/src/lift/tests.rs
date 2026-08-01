@@ -1011,3 +1011,73 @@ fn segment_prefixed_memory_stays_opaque_not_absolute_load() {
         "segment-prefixed memory must not lower to a LoadMem: {stmts:?}"
     );
 }
+
+fn simd_dst_src<'a>(stmts: &'a [IrStmt], dst: &str) -> &'a Expr {
+    stmts
+        .iter()
+        .find_map(|s| match s {
+            IrStmt::Assign { dst: d, src } if d.name == dst && d.bits == 128 => Some(src),
+            _ => None,
+        })
+        .expect("expected a 128-bit SIMD assignment")
+}
+
+#[test]
+fn vpxor_same_register_lifts_to_128bit_zero() {
+    // `vpxor xmm0, xmm0, xmm0` — the SIMD zero idiom. The result is
+    // the 128-bit constant 0, independent of xmm0's prior contents.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "vpxor",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm0", OperandKind::Register),
+                op("xmm0", OperandKind::Register),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    assert_eq!(*simd_dst_src(&stmts, "zmm0"), Expr::konst(0, 128));
+}
+
+#[test]
+fn movaps_copies_xmm_register_at_128_bits() {
+    // `movaps xmm0, xmm1` — a full 128-bit copy; both registers read
+    // through their canonical `zmm` vector parent.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "movaps",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    assert_eq!(*simd_dst_src(&stmts, "zmm0"), Expr::var("zmm1", 128));
+}
+
+#[test]
+fn pxor_distinct_registers_lifts_to_128bit_xor() {
+    // `pxor xmm0, xmm1` (2-operand RMW) — `zmm0 := zmm0 ^ zmm1`.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "pxor",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    assert_eq!(
+        *simd_dst_src(&stmts, "zmm0"),
+        Expr::bv_xor(Expr::var("zmm0", 128), Expr::var("zmm1", 128))
+    );
+}

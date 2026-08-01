@@ -2,13 +2,14 @@
 //! `lift.rs`. Methods on [`LiftCtx`]; shared infrastructure stays in
 //! the parent module.
 
+use r2smt_common::Arch;
 use r2smt_ir::expr::Expr;
-use r2smt_ir::program::{Instruction, OperandKind};
+use r2smt_ir::program::{Instruction, Operand, OperandKind};
 use r2smt_ir::stmt::IrStmt;
 
 use crate::registers::register_layout;
 
-use super::{BitwiseOp, ExtendKind, LiftCtx, ShiftOp, nonzero_width};
+use super::{BitwiseOp, ExtendKind, LiftCtx, ShiftOp, XMM_BITS, nonzero_width};
 
 /// x86 SHL/SHR/SAR/SAL mask the shift count before shifting: 5 bits
 /// for 8/16/32-bit operands, 6 bits for 64-bit operands (Intel SDM
@@ -39,6 +40,12 @@ impl LiftCtx {
             "shl" | "sal" => self.lift_shift(insn, ShiftOp::Shl),
             "shr" => self.lift_shift(insn, ShiftOp::Shr),
             "sar" => self.lift_shift(insn, ShiftOp::Sar),
+            "movaps" | "movups" | "movapd" | "movupd" | "movdqa" | "movdqu" => {
+                self.lift_simd_move(insn);
+            }
+            "pxor" | "vpxor" => self.lift_simd_bitwise(insn, SimdBitOp::Xor),
+            "pand" | "vpand" => self.lift_simd_bitwise(insn, SimdBitOp::And),
+            "por" | "vpor" => self.lift_simd_bitwise(insn, SimdBitOp::Or),
             _ => self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("at {addr}", addr = insn.address),
@@ -411,5 +418,87 @@ impl LiftCtx {
         self.set_flag("CF", Expr::Unknown(String::new()));
         self.set_flag("OF", Expr::Unknown(String::new()));
         self.set_flag("PF", Expr::Unknown(String::new()));
+    }
+
+    /// `movaps`/`movups`/`movdqa`/`movdqu dst, src` — a 128-bit copy of
+    /// `src` into `dst`, both `xmm` registers or modellable memory.
+    fn lift_simd_move(&mut self, insn: &Instruction) {
+        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
+            return;
+        };
+        let Some(value) = self.read_xmm_operand(src) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        if !self.write_xmm_dst(dst, value) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
+    /// `pxor`/`pand`/`por` (2-operand RMW) and their `v`-prefixed
+    /// 3-operand VEX forms, modelled as 128-bit bit-vector ops. A
+    /// `pxor`/`vpxor` of a register with itself is the zero idiom —
+    /// the result is the 128-bit constant 0, independent of inputs.
+    fn lift_simd_bitwise(&mut self, insn: &Instruction, op: SimdBitOp) {
+        let ops = &insn.operands;
+        let Some(dst) = ops.first() else {
+            return;
+        };
+        // Operand roles: 2-operand `OP dst, src` is RMW (a = dst,
+        // b = src); 3-operand VEX `OP dst, src1, src2` writes dst from
+        // (a = src1, b = src2).
+        let (a_op, b_op) = match ops.len() {
+            2 => (dst, &ops[1]),
+            3 => (&ops[1], &ops[2]),
+            _ => {
+                self.push_simd_unsupported(insn);
+                return;
+            }
+        };
+        if matches!(op, SimdBitOp::Xor) && same_xmm_register(a_op, b_op) {
+            if !self.write_xmm_dst(dst, Expr::konst(0, XMM_BITS)) {
+                self.push_simd_unsupported(insn);
+            }
+            return;
+        }
+        let (Some(a), Some(b)) = (self.read_xmm_operand(a_op), self.read_xmm_operand(b_op)) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let result = match op {
+            SimdBitOp::Xor => Expr::bv_xor(a, b),
+            SimdBitOp::And => Expr::bv_and(a, b),
+            SimdBitOp::Or => Expr::bv_or(a, b),
+        };
+        if !self.write_xmm_dst(dst, result) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
+    fn push_simd_unsupported(&mut self, insn: &Instruction) {
+        self.stmts.push(IrStmt::Unsupported {
+            mnemonic: insn.mnemonic.clone(),
+            comment: format!("unmodellable SIMD operand at {addr}", addr = insn.address),
+        });
+    }
+}
+
+/// Bit-vector operation of an integer-SIMD bitwise instruction.
+#[derive(Clone, Copy)]
+enum SimdBitOp {
+    Xor,
+    And,
+    Or,
+}
+
+/// Whether two operands name the same `xmm` register (by canonical
+/// vector parent) — the condition for a `pxor`/`vpxor` zero idiom.
+fn same_xmm_register(a: &Operand, b: &Operand) -> bool {
+    match (
+        register_layout(&a.raw, Arch::X86_64),
+        register_layout(&b.raw, Arch::X86_64),
+    ) {
+        (Some(la), Some(lb)) => la.parent == lb.parent && la.width() == 128,
+        _ => false,
     }
 }

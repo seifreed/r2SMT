@@ -48,6 +48,10 @@ pub enum InstructionKind {
     /// `lea` — defines a register from a memory expression without
     /// performing an actual load.
     Lea,
+    /// Integer-SIMD op modelled as wide bit-vector (`movaps`/`movdqa`,
+    /// `pxor`/`vpxor`, `pand`/`por`/`pandn`). Defines a vector
+    /// register, sets no flags.
+    Simd,
     /// Conditional jump (`jcc`).
     Jcc,
     /// `setcc`.

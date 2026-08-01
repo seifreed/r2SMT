@@ -362,7 +362,7 @@ fn call_is_flagged() {
 
 #[test]
 fn unknown_mnemonic_is_other() {
-    let e = ax86(&insn("vpxor", vec![]));
+    let e = ax86(&insn("cpuid", vec![]));
     assert_eq!(e.kind, InstructionKind::Other);
     assert!(!e.is_call);
 }

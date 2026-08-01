@@ -74,6 +74,32 @@ fn default_arch() -> Arch {
 
 const FLAGS: &[&str] = &["ZF", "CF", "SF", "OF", "PF"];
 
+/// Width of an x86 SSE `xmm` register. Modelled at 128 bits (fits the
+/// current `u8` width field); the wider `ymm`/`zmm` views are gated on
+/// the `u16` migration.
+const XMM_BITS: u8 = 128;
+
+/// SSE integer-SIMD mnemonics the per-mnemonic lifter models precisely
+/// at vector width. Kept in sync with the `simd_effect` dispatch in
+/// `effect/x86.rs`.
+fn is_x86_simd_mnemonic(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic.trim().to_ascii_lowercase().as_str(),
+        "movaps"
+            | "movups"
+            | "movapd"
+            | "movupd"
+            | "movdqa"
+            | "movdqu"
+            | "pxor"
+            | "vpxor"
+            | "pand"
+            | "vpand"
+            | "por"
+            | "vpor"
+    )
+}
+
 /// Lift `slice` under `arch`. The lifter still only handles x86
 /// mnemonics; passing a non-x86 arch results in every instruction
 /// falling through to `IrStmt::Unsupported`. The arch flows into
@@ -281,6 +307,16 @@ impl LiftCtx {
 
     fn lift_instruction(&mut self, insn: &Instruction) {
         self.cur_addr = insn.address;
+        // Integer-SIMD override: the ESIL / P-code lowerings model an
+        // `xmm` register at the pointer width (64 bits) and do not
+        // canonicalise it to its vector parent, so they produce a
+        // disconnected, wrong-width value. Our per-mnemonic handlers
+        // model these precisely at 128 bits — prefer them, bypassing
+        // the ESIL/P-code ladder for this closed mnemonic set.
+        if matches!(self.arch, Arch::X86 | Arch::X86_64) && is_x86_simd_mnemonic(&insn.mnemonic) {
+            self.lift_instruction_x86(insn);
+            return;
+        }
         // ESIL-first path: when radare2 has attached an ESIL string
         // to the instruction and the mini stack machine can evaluate
         // it, splice the resulting IrStmts straight into the buffer.
@@ -553,6 +589,36 @@ impl LiftCtx {
             return true;
         }
         false
+    }
+
+    /// Read a 128-bit x86 SIMD **register** operand as its canonical
+    /// vector parent (`zmm<n>`). Returns `None` for anything else,
+    /// including memory operands: SIMD memory loads/stores are deferred
+    /// (a follow-up) so this step introduces no byte-store-list
+    /// interaction, keeping it a strict widening. The caller marks the
+    /// instruction unsupported on `None` rather than fabricating a
+    /// narrow free value the encoder would range-cap.
+    fn read_xmm_operand(&self, op: &Operand) -> Option<Expr> {
+        if op.kind != OperandKind::Register {
+            return None;
+        }
+        let layout = register_layout(&op.raw, self.arch)?;
+        (layout.width() == XMM_BITS).then(|| Expr::var(layout.parent, XMM_BITS))
+    }
+
+    /// Write a 128-bit value to an x86 SIMD **register** destination.
+    /// Returns `false` for non-register destinations (memory deferred).
+    fn write_xmm_dst(&mut self, op: &Operand, value: Expr) -> bool {
+        if op.kind != OperandKind::Register {
+            return false;
+        }
+        match register_layout(&op.raw, self.arch) {
+            Some(layout) if layout.width() == XMM_BITS => {
+                self.assign(Var::new(layout.parent, XMM_BITS), value);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn binop_width(&self, lhs: &Operand, rhs: &Operand) -> u8 {

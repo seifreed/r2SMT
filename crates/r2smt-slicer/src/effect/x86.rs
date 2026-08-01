@@ -227,6 +227,83 @@ fn cmovcc_effect(insn: &Instruction) -> InstructionEffect {
     }
 }
 
+/// Operand shape of an integer-SIMD instruction.
+#[derive(Clone, Copy)]
+enum SimdShape {
+    /// `movaps dst, src` — dst fully overwritten by src (not RMW).
+    Move,
+    /// `pxor`/`pand`/`por`/`pandn` — 2-operand RMW (`dst := dst OP src`)
+    /// or 3-operand VEX (`dst := src1 OP src2`).
+    Bitwise,
+}
+
+/// `pxor`/`vpxor` of a register with itself is a zero idiom — the
+/// result is 0 independent of the register's prior contents. The two
+/// XOR'd operands are `[0],[1]` in the 2-operand form and `[1],[2]` in
+/// the 3-operand VEX form.
+fn xor_zero_idiom(insn: &Instruction) -> bool {
+    let ops = &insn.operands;
+    let same = |a: &r2smt_ir::program::Operand, b: &r2smt_ir::program::Operand| {
+        let ca = canonical_register(&a.raw, Arch::X86_64);
+        ca.is_some() && ca == canonical_register(&b.raw, Arch::X86_64)
+    };
+    match ops.len() {
+        2 => same(&ops[0], &ops[1]),
+        3 => same(&ops[1], &ops[2]),
+        _ => false,
+    }
+}
+
+fn simd_effect(insn: &Instruction, shape: SimdShape) -> InstructionEffect {
+    // Register-only SIMD is modelled at vector width. A SIMD op with a
+    // memory operand is deferred (a follow-up): fall back to `Other` so
+    // the slicer truncates on it exactly as before, rather than keeping
+    // an instruction whose store the lifter would drop — which could
+    // let a later load read a stale prior store (unsound).
+    if any_memory_operand(&insn.operands) {
+        return other_effect(insn);
+    }
+    let mnem = insn.mnemonic.trim().to_ascii_lowercase();
+    let three_op = insn.operands.len() == 3;
+    let is_xor = mnem == "pxor" || mnem == "vpxor";
+    let zero_idiom = is_xor && xor_zero_idiom(insn);
+
+    let mut defs = Vec::new();
+    let mut uses = Vec::new();
+    if let Some(dst) = insn.operands.first() {
+        if let Some(reg) = canonical_register(&dst.raw, Arch::X86_64) {
+            defs.push(reg);
+            // A 2-operand bitwise op reads its destination (RMW).
+            // Moves, 3-operand VEX forms, and the zero idiom write the
+            // destination without depending on its prior value.
+            if matches!(shape, SimdShape::Bitwise) && !three_op && !zero_idiom {
+                uses.push(reg);
+            }
+        } else {
+            // Memory destination: address registers are inputs.
+            uses.extend(registers_in_operand(dst, Arch::X86_64));
+        }
+    }
+    if !zero_idiom {
+        for src in insn.operands.iter().skip(1) {
+            for r in registers_in_operand(src, Arch::X86_64) {
+                if !uses.contains(&r) {
+                    uses.push(r);
+                }
+            }
+        }
+    }
+    InstructionEffect {
+        kind: InstructionKind::Simd,
+        defs,
+        uses,
+        defines_flags: false,
+        has_memory_access: any_memory_operand(&insn.operands),
+        is_call: false,
+        reads_flags: false,
+    }
+}
+
 pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
     let mnemonic = insn.mnemonic.trim().to_ascii_lowercase();
     match mnemonic.as_str() {
@@ -274,6 +351,12 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
             is_call: false,
             reads_flags: false,
         },
+        "movaps" | "movups" | "movapd" | "movupd" | "movdqa" | "movdqu" => {
+            simd_effect(insn, SimdShape::Move)
+        }
+        "pxor" | "vpxor" | "pand" | "vpand" | "por" | "vpor" | "pandn" | "vpandn" => {
+            simd_effect(insn, SimdShape::Bitwise)
+        }
         m if m.starts_with('j') => jcc_effect(insn),
         m if m.starts_with("set") => setcc_effect(insn),
         m if m.starts_with("cmov") => cmovcc_effect(insn),
