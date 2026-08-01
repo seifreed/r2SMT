@@ -8,7 +8,8 @@ use r2smt_ir::stmt::IrStmt;
 use crate::registers::register_layout;
 
 use super::{
-    BinOp, CsArithOp, LiftCtx, aarch64_cond_suffix_to_predicate, nonzero_width, width_mask,
+    BinOp, CsArithOp, LiftCtx, MemAccess, aarch64_cond_suffix_to_predicate, nonzero_width,
+    width_mask,
 };
 
 impl LiftCtx {
@@ -456,18 +457,21 @@ impl LiftCtx {
             return;
         };
         let load_width = width_override.unwrap_or(dst_width);
-        let Some(address) = aarch64_address_expr(mem, self.bits) else {
+        let Some(access) = aarch64_mem_access(mem, insn.operands.get(2), self.bits) else {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("ldr addressing mode not yet modelled: {}", mem.raw),
             });
             return;
         };
+        let MemAccess { address, writeback } = access;
         // Two-statement lower: load into a fresh temp at the load
         // width, then write that temp into the destination register
         // so `write_register_to` zero-extends to the parent X for
         // the W-form (mirrors the `add` / `sub` flag-ordering
-        // precedent: stash-then-write).
+        // precedent: stash-then-write). The base-register writeback
+        // (pre/post-index) is emitted last so its `Xn` read is the
+        // pre-write value under SSA.
         let tmp = self.new_temp(insn.address, load_width);
         self.stmts.push(IrStmt::LoadMem {
             dst: tmp.clone(),
@@ -489,6 +493,7 @@ impl LiftCtx {
                 comment: "ldr destination not a supported register".into(),
             });
         }
+        self.emit_writeback(writeback);
     }
 
     /// `str Rs, [Xn{, #imm}]` — write the source register (optionally
@@ -513,7 +518,7 @@ impl LiftCtx {
             return;
         };
         let store_width = width_override.unwrap_or(src_width);
-        let Some(address) = aarch64_address_expr(mem, self.bits) else {
+        let Some(access) = aarch64_mem_access(mem, insn.operands.get(2), self.bits) else {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("str addressing mode not yet modelled: {}", mem.raw),
@@ -522,10 +527,26 @@ impl LiftCtx {
         };
         let value = self.read_operand_at(src, store_width);
         self.stmts.push(IrStmt::StoreMem {
-            address,
+            address: access.address,
             value,
             bits: store_width,
         });
+        self.emit_writeback(access.writeback);
+    }
+
+    /// Emit the base-register mutation for a pre/post-index memory
+    /// access: `Xn := Xn + delta` at pointer width. A no-op when the
+    /// access has no writeback. Emitted after the load/store so the
+    /// `Xn` reads inside the access address stay the pre-write value
+    /// under SSA rename.
+    pub(super) fn emit_writeback(&mut self, writeback: Option<(String, i64)>) {
+        let Some((base, delta)) = writeback else {
+            return;
+        };
+        let base_var = Expr::Var(Var::new(&base, self.bits));
+        let masked = u64::from_le_bytes(delta.to_le_bytes()) & width_mask(self.bits);
+        let new_value = Expr::add(base_var, Expr::konst(masked, self.bits));
+        self.assign(Var::new(&base, self.bits), new_value);
     }
 
     pub(super) fn lift_aarch64_ldp(&mut self, insn: &Instruction) {
@@ -676,6 +697,62 @@ fn aarch64_address_expr(mem: &Operand, ptr_bits: u8) -> Option<Expr> {
     let masked = u64::from_le_bytes(offset.to_le_bytes()) & width_mask(ptr_bits);
     let off_const = Expr::konst(masked, ptr_bits);
     Some(Expr::add(base_var, off_const))
+}
+
+/// Resolve an `AArch64` memory operand, including the pre-index
+/// (`[Xn, #imm]!`) and post-index (`[Xn], #imm`) writeback forms.
+/// `post` is the instruction's trailing operand, which for a post-index
+/// access is the immediate offset. Register-offset and other
+/// unrecognised shapes still return `None` (sound decline).
+fn aarch64_mem_access(mem: &Operand, post: Option<&Operand>, ptr_bits: u8) -> Option<MemAccess> {
+    if mem.kind != OperandKind::Memory {
+        return None;
+    }
+    let raw = mem.raw.trim();
+    // Pre-index: `[Xn, #imm]!` — address is Xn+imm, then Xn := Xn+imm.
+    if let Some(body) = raw.strip_suffix('!') {
+        let (base, offset) = parse_aarch64_memory(body.trim())?;
+        let parent = aarch64_base_parent(&base);
+        return Some(MemAccess {
+            address: aarch64_addr_from(parent, offset, ptr_bits),
+            writeback: Some((parent.to_string(), offset)),
+        });
+    }
+    let (base, offset) = parse_aarch64_memory(raw)?;
+    let parent = aarch64_base_parent(&base);
+    // Post-index: `[Xn], #imm` — bare base plus a trailing immediate
+    // operand; address is Xn, then Xn := Xn+imm.
+    if let Some(op) = post
+        && op.kind == OperandKind::Immediate
+        && offset == 0
+    {
+        let delta = parse_signed_immediate(op.raw.strip_prefix('#').unwrap_or(&op.raw).trim())?;
+        return Some(MemAccess {
+            address: Expr::Var(Var::new(parent, ptr_bits)),
+            writeback: Some((parent.to_string(), delta)),
+        });
+    }
+    Some(MemAccess {
+        address: aarch64_addr_from(parent, offset, ptr_bits),
+        writeback: None,
+    })
+}
+
+/// The canonical parent register name for an addressing base.
+fn aarch64_base_parent(base: &str) -> &str {
+    register_layout(base, r2smt_common::Arch::Aarch64).map_or(base, |l| l.parent)
+}
+
+/// Build `base ± offset` at the pointer width (base alone if `offset`
+/// is zero). Shares the two's-complement offset handling with
+/// [`aarch64_address_expr`].
+fn aarch64_addr_from(parent: &str, offset: i64, ptr_bits: u8) -> Expr {
+    let base_var = Expr::Var(Var::new(parent, ptr_bits));
+    if offset == 0 {
+        return base_var;
+    }
+    let masked = u64::from_le_bytes(offset.to_le_bytes()) & width_mask(ptr_bits);
+    Expr::add(base_var, Expr::konst(masked, ptr_bits))
 }
 
 /// Parse `[base{, #?offset}]` into `(base, offset)`. Returns `None`

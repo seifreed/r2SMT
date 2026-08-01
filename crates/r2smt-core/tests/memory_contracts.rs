@@ -592,3 +592,109 @@ fn test_aarch64_strb_stores_one_byte() {
         .expect("strb must produce a StoreMem");
     assert_eq!(bits, 8, "strb must store a single byte");
 }
+
+// --- P35 pre/post-index writeback goldens ----------------------------
+
+fn has_writeback_to(stmts: &[IrStmt], reg: &str) -> bool {
+    stmts
+        .iter()
+        .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == reg))
+}
+
+#[test]
+fn test_aarch64_preindex_ldr_emits_load_and_base_writeback() {
+    // `ldr x0, [x1, 8]!` → load at x1+8, then x1 := x1+8.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "ldr",
+            vec![
+                op("x0", OperandKind::Register),
+                op("[x1, 8]!", OperandKind::Memory),
+            ],
+        ),
+        Arch::Aarch64,
+    );
+    assert!(
+        stmts.iter().any(|s| matches!(s, IrStmt::LoadMem { .. })),
+        "pre-index ldr must load: {stmts:?}"
+    );
+    assert!(
+        has_writeback_to(&stmts, "x1"),
+        "pre-index must write back the base x1: {stmts:?}"
+    );
+}
+
+#[test]
+fn test_aarch64_postindex_ldr_emits_load_and_base_writeback() {
+    // `ldr x0, [x1], 8` → three operands; load at x1, then x1 := x1+8.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "ldr",
+            vec![
+                op("x0", OperandKind::Register),
+                op("[x1]", OperandKind::Memory),
+                op("8", OperandKind::Immediate),
+            ],
+        ),
+        Arch::Aarch64,
+    );
+    assert!(
+        stmts.iter().any(|s| matches!(s, IrStmt::LoadMem { .. })),
+        "post-index ldr must load: {stmts:?}"
+    );
+    assert!(
+        has_writeback_to(&stmts, "x1"),
+        "post-index must write back the base x1: {stmts:?}"
+    );
+}
+
+#[test]
+fn test_aarch64_preindex_str_emits_store_and_base_writeback() {
+    // `str x0, [sp, -16]!` — the stp/str stack-frame push idiom.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "str",
+            vec![
+                op("x0", OperandKind::Register),
+                op("[sp, -16]!", OperandKind::Memory),
+            ],
+        ),
+        Arch::Aarch64,
+    );
+    assert!(
+        stmts.iter().any(|s| matches!(s, IrStmt::StoreMem { .. })),
+        "pre-index str must store: {stmts:?}"
+    );
+    assert!(
+        has_writeback_to(&stmts, "sp"),
+        "pre-index str must write back sp: {stmts:?}"
+    );
+}
+
+#[test]
+fn test_aarch32_postindex_ldr_emits_load_and_base_writeback() {
+    // `ldr r0, [r1], 4` → load at r1, then r1 := r1+4.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "ldr",
+            vec![
+                op("r0", OperandKind::Register),
+                op("[r1]", OperandKind::Memory),
+                op("4", OperandKind::Immediate),
+            ],
+        ),
+        Arch::Arm,
+    );
+    assert!(
+        stmts.iter().any(|s| matches!(s, IrStmt::LoadMem { .. })),
+        "aarch32 post-index ldr must load: {stmts:?}"
+    );
+    assert!(
+        has_writeback_to(&stmts, "r1"),
+        "aarch32 post-index must write back r1: {stmts:?}"
+    );
+}

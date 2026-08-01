@@ -574,6 +574,14 @@ enum ExtendKind {
 /// `AArch64` instructions are uniformly 3-operand (`Rd, Rs1, Rs2`)
 /// without the x86 RMW shape, so a single handler parameterised by
 /// this enum covers the whole arithmetic / logical / shift family.
+/// A memory access resolved from an operand: the effective address plus
+/// an optional base-register writeback (`Xn := Xn + delta`) for the
+/// pre/post-index forms. Shared by the `AArch64` and `AArch32` handlers.
+pub(super) struct MemAccess {
+    pub(super) address: Expr,
+    pub(super) writeback: Option<(String, i64)>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum BinOp {
     Add,

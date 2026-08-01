@@ -10,8 +10,8 @@ use r2smt_ir::stmt::IrStmt;
 use crate::registers::register_layout;
 
 use super::{
-    BinOp, LiftCtx, aarch64_cond_suffix_to_predicate, is_aarch32_base_supported, nonzero_width,
-    strip_aarch32_cond_suffix, width_mask,
+    BinOp, LiftCtx, MemAccess, aarch64_cond_suffix_to_predicate, is_aarch32_base_supported,
+    nonzero_width, strip_aarch32_cond_suffix, width_mask,
 };
 
 impl LiftCtx {
@@ -289,13 +289,14 @@ impl LiftCtx {
             return;
         };
         let load_width = width_override.unwrap_or(dst_width);
-        let Some(address) = aarch32_address_expr(mem, self.bits) else {
+        let Some(access) = aarch32_mem_access(mem, insn.operands.get(2), self.bits) else {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("ldr addressing mode not yet modelled: {}", mem.raw),
             });
             return;
         };
+        let MemAccess { address, writeback } = access;
         let tmp = self.new_temp(insn.address, load_width);
         self.stmts.push(IrStmt::LoadMem {
             dst: tmp.clone(),
@@ -313,6 +314,7 @@ impl LiftCtx {
                 comment: "ldr destination not a supported register".into(),
             });
         }
+        self.emit_writeback(writeback);
     }
 
     /// Lift an `AArch32` store. `width_override` is `Some(8)` for `strb`
@@ -337,7 +339,7 @@ impl LiftCtx {
             return;
         };
         let store_width = width_override.unwrap_or(src_width);
-        let Some(address) = aarch32_address_expr(mem, self.bits) else {
+        let Some(access) = aarch32_mem_access(mem, insn.operands.get(2), self.bits) else {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("str addressing mode not yet modelled: {}", mem.raw),
@@ -346,28 +348,57 @@ impl LiftCtx {
         };
         let value = self.read_operand_at(src, store_width);
         self.stmts.push(IrStmt::StoreMem {
-            address,
+            address: access.address,
             value,
             bits: store_width,
         });
+        self.emit_writeback(access.writeback);
     }
 }
 
-/// Parse an `AArch32` memory operand in the supported offset forms
-/// (`[Rn]` / `[Rn, #imm]`) into a symbolic address `base ± offset` at
-/// the pointer width. Returns `None` for register-offset, writeback,
-/// shifted, or otherwise unrecognised shapes so the caller declines
-/// soundly (the ARM `r0..r15` base is resolved through
-/// [`register_layout`] under [`Arch::Arm`]).
-fn aarch32_address_expr(mem: &Operand, ptr_bits: u8) -> Option<Expr> {
-    let (base, offset) = parse_aarch32_memory(&mem.raw)?;
+/// Resolve an `AArch32` memory operand, including the pre-index
+/// (`[Rn, #imm]!`) and post-index (`[Rn], #imm`) writeback forms.
+/// Mirrors the `AArch64` resolver but validates the base through the
+/// `Arch::Arm` register table. Unrecognised shapes still return `None`.
+fn aarch32_mem_access(mem: &Operand, post: Option<&Operand>, ptr_bits: u8) -> Option<MemAccess> {
+    if mem.kind != OperandKind::Memory {
+        return None;
+    }
+    let raw = mem.raw.trim();
+    if let Some(body) = raw.strip_suffix('!') {
+        let (base, offset) = parse_aarch32_memory(body.trim())?;
+        let parent = register_layout(&base, Arch::Arm).map(|l| l.parent)?;
+        return Some(MemAccess {
+            address: aarch32_addr_from(parent, offset, ptr_bits),
+            writeback: Some((parent.to_string(), offset)),
+        });
+    }
+    let (base, offset) = parse_aarch32_memory(raw)?;
     let parent = register_layout(&base, Arch::Arm).map(|l| l.parent)?;
+    if let Some(op) = post
+        && op.kind == OperandKind::Immediate
+        && offset == 0
+    {
+        let delta = parse_aarch32_immediate(op.raw.strip_prefix('#').unwrap_or(&op.raw).trim())?;
+        return Some(MemAccess {
+            address: Expr::Var(Var::new(parent, ptr_bits)),
+            writeback: Some((parent.to_string(), delta)),
+        });
+    }
+    Some(MemAccess {
+        address: aarch32_addr_from(parent, offset, ptr_bits),
+        writeback: None,
+    })
+}
+
+/// Build `base ± offset` at the pointer width (base alone if zero).
+fn aarch32_addr_from(parent: &str, offset: i64, ptr_bits: u8) -> Expr {
     let base_var = Expr::Var(Var::new(parent, ptr_bits));
     if offset == 0 {
-        return Some(base_var);
+        return base_var;
     }
     let masked = u64::from_le_bytes(offset.to_le_bytes()) & width_mask(ptr_bits);
-    Some(Expr::add(base_var, Expr::konst(masked, ptr_bits)))
+    Expr::add(base_var, Expr::konst(masked, ptr_bits))
 }
 
 /// Split `[base{, #?imm}]` into `(base, offset)`; `None` for any shape
