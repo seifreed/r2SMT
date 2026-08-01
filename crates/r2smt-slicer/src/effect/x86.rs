@@ -351,8 +351,12 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
             is_call: false,
             reads_flags: false,
         },
+        // The float-to-integer converts share the move shape: like a
+        // move they overwrite the whole destination register, so it is
+        // a def and not also a use.
         "movaps" | "movups" | "movapd" | "movupd" | "movdqa" | "movdqu" | "vmovaps" | "vmovups"
-        | "vmovapd" | "vmovupd" | "vmovdqa" | "vmovdqu" => simd_effect(insn, SimdShape::Move),
+        | "vmovapd" | "vmovupd" | "vmovdqa" | "vmovdqu" | "cvtss2si" | "cvtsd2si" | "cvttss2si"
+        | "cvttsd2si" => simd_effect(insn, SimdShape::Move),
         "pxor" | "vpxor" | "pand" | "vpand" | "por" | "vpor" | "pandn" | "vpandn" | "addss"
         | "subss" | "mulss" | "divss" | "addsd" | "subsd" | "mulsd" | "divsd" => {
             simd_effect(insn, SimdShape::Bitwise)
@@ -362,6 +366,9 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
         "comiss" | "ucomiss" | "comisd" | "ucomisd" => {
             cmp_or_test_effect(insn, InstructionKind::Cmp)
         }
+        // Integer to float writes one lane and preserves the rest, so
+        // it reads its destination as well as defining it.
+        "cvtsi2ss" | "cvtsi2sd" => simd_effect(insn, SimdShape::Bitwise),
         m if m.starts_with('j') => jcc_effect(insn),
         m if m.starts_with("set") => setcc_effect(insn),
         m if m.starts_with("cmov") => cmovcc_effect(insn),

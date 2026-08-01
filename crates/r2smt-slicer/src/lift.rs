@@ -125,6 +125,12 @@ fn is_x86_simd_mnemonic(mnemonic: &str) -> bool {
             | "ucomiss"
             | "comisd"
             | "ucomisd"
+            | "cvtsi2ss"
+            | "cvtsi2sd"
+            | "cvtss2si"
+            | "cvtsd2si"
+            | "cvttss2si"
+            | "cvttsd2si"
     )
 }
 

@@ -1259,6 +1259,119 @@ fn scalar_fp_compare_effect_reads_both_operands_and_writes_flags() {
 }
 
 #[test]
+fn cvtsi2ss_converts_a_signed_register_into_the_low_lane() {
+    use r2smt_ir::expr::RoundingMode;
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "cvtsi2ss",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    let converted = Expr::fp_to_ieee_bv(Expr::sbv_to_fp(
+        Expr::extract(Expr::var("rax", 64), 31, 0),
+        RoundingMode::NearestTiesEven,
+        8,
+        24,
+    ));
+    assert_eq!(
+        *simd_dst_src(&stmts, "zmm0"),
+        Expr::concat(Expr::extract(Expr::var("zmm0", 512), 511, 32), converted)
+    );
+}
+
+#[test]
+fn cvttss2si_truncates_toward_zero_into_the_destination_register() {
+    use r2smt_ir::expr::RoundingMode;
+    // The truncating form carries its rounding mode in the opcode, so
+    // it is round-toward-zero regardless of MXCSR.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "cvttss2si",
+            vec![
+                op("eax", OperandKind::Register),
+                op("xmm0", OperandKind::Register),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    let lane = Expr::bv_to_fp(Expr::extract(Expr::var("zmm0", 512), 31, 0), 8, 24);
+    assert_eq!(
+        find_assign(&stmts, "rax").and_then(|s| match s {
+            IrStmt::Assign { src, .. } => Some(src),
+            _ => None,
+        }),
+        Some(&Expr::zero_ext(
+            Expr::fp_to_sbv(lane, RoundingMode::TowardZero, 32),
+            64
+        ))
+    );
+}
+
+#[test]
+fn cvtss2si_without_truncation_uses_the_default_rounding_mode() {
+    use r2smt_ir::expr::RoundingMode;
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "cvtss2si",
+            vec![
+                op("eax", OperandKind::Register),
+                op("xmm0", OperandKind::Register),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    let rendered = format!("{:?}", find_assign(&stmts, "rax").expect("rax defined"));
+    assert!(
+        rendered.contains(&format!("{:?}", RoundingMode::NearestTiesEven)),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn integer_to_float_conversion_reads_its_destination_register() {
+    // `cvtsi2ss` preserves the lanes above the one it writes, so the
+    // destination is both a def and a use. Dropping the use would let
+    // the slicer treat the prior vector value as dead.
+    let i = insn(
+        0x1000,
+        4,
+        "cvtsi2ss",
+        vec![
+            op("xmm0", OperandKind::Register),
+            op("eax", OperandKind::Register),
+        ],
+    );
+    let e = crate::effect::analyze(&i, Arch::X86_64);
+    assert!(e.uses.contains(&"zmm0"), "{:?}", e.uses);
+}
+
+#[test]
+fn float_to_integer_conversion_does_not_read_its_destination_register() {
+    let i = insn(
+        0x1000,
+        4,
+        "cvttss2si",
+        vec![
+            op("eax", OperandKind::Register),
+            op("xmm0", OperandKind::Register),
+        ],
+    );
+    let e = crate::effect::analyze(&i, Arch::X86_64);
+    assert_eq!(e.defs, vec!["rax"]);
+    assert_eq!(e.uses, vec!["zmm0"]);
+}
+
+#[test]
 fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
     // Parity guard: the effect table keeps an instruction iff the lifter
     // models it. A mnemonic classified `Simd` by `analyze` but absent

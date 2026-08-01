@@ -9,7 +9,7 @@ use r2smt_ir::stmt::IrStmt;
 
 use crate::registers::register_layout;
 
-use super::{BitwiseOp, ExtendKind, LiftCtx, ShiftOp, nonzero_width};
+use super::{BitwiseOp, ExtendKind, LiftCtx, ShiftOp, fp_sort_bits, nonzero_width};
 
 /// x86 SHL/SHR/SAR/SAL mask the shift count before shifting: 5 bits
 /// for 8/16/32-bit operands, 6 bits for 64-bit operands (Intel SDM
@@ -58,6 +58,12 @@ impl LiftCtx {
             "divsd" => self.lift_simd_scalar_fp(insn, FpArithOp::Div, 64),
             "comiss" | "ucomiss" => self.lift_simd_fp_compare(insn, 32),
             "comisd" | "ucomisd" => self.lift_simd_fp_compare(insn, 64),
+            "cvtsi2ss" => self.lift_int_to_fp(insn, 32),
+            "cvtsi2sd" => self.lift_int_to_fp(insn, 64),
+            "cvtss2si" => self.lift_fp_to_int(insn, 32, RoundingMode::NearestTiesEven),
+            "cvtsd2si" => self.lift_fp_to_int(insn, 64, RoundingMode::NearestTiesEven),
+            "cvttss2si" => self.lift_fp_to_int(insn, 32, RoundingMode::TowardZero),
+            "cvttsd2si" => self.lift_fp_to_int(insn, 64, RoundingMode::TowardZero),
             _ => self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("at {addr}", addr = insn.address),
@@ -558,6 +564,46 @@ impl LiftCtx {
         self.set_flag("CF", Expr::bool_or(unordered, Expr::flt(a, b)));
         self.set_flag("OF", Expr::konst(0, 1));
         self.set_flag("SF", Expr::konst(0, 1));
+    }
+
+    /// `cvtsi2ss`/`cvtsi2sd` — convert a signed integer register to a
+    /// float and write it to the low lane of `dst`.
+    ///
+    /// The rounding mode is the architectural MXCSR default, pinned the
+    /// same way the SSE arithmetic handlers pin it; a program that
+    /// reprograms MXCSR is outside the value model either way.
+    fn lift_int_to_fp(&mut self, insn: &Instruction, lane: u16) {
+        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
+            return;
+        };
+        let Some(int) = self.read_register(src) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let (ebits, sbits) = fp_sort_bits(lane);
+        let converted = Expr::sbv_to_fp(int, RoundingMode::NearestTiesEven, ebits, sbits);
+        if !self.write_simd_lane(dst, Expr::fp_to_ieee_bv(converted), lane) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
+    /// `cvtss2si`/`cvtsd2si` and their truncating `cvtt…` forms —
+    /// convert the low lane of `src` to a signed integer register.
+    ///
+    /// The truncating forms carry the rounding mode in the opcode; the
+    /// others take the MXCSR default, pinned as in [`Self::lift_int_to_fp`].
+    fn lift_fp_to_int(&mut self, insn: &Instruction, lane: u16, rm: RoundingMode) {
+        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
+            return;
+        };
+        let Some(f) = self.read_simd_lane_fp(src, lane) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let width = self.operand_width(dst);
+        if !self.write_register_to(dst, Expr::fp_to_sbv(f, rm, width)) {
+            self.push_simd_unsupported(insn);
+        }
     }
 
     fn push_simd_unsupported(&mut self, insn: &Instruction) {
