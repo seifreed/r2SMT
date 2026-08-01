@@ -22,6 +22,36 @@ use r2smt_ir::expr::Expr;
 use r2smt_ir::stmt::IrStmt;
 use r2smt_ssa::SsaLiftedSlice;
 
+/// Mutable renderer state shared by every expression rendered into one
+/// script: auxiliary declarations / assertions awaiting a flush, and the
+/// counter minting their names.
+///
+/// A single instance must span a whole script — preamble *and* branch
+/// condition — or the fresh-name counter restarts and mints a duplicate
+/// declaration.
+#[derive(Debug, Default)]
+struct RenderCtx {
+    aux: Vec<String>,
+}
+
+impl RenderCtx {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drain the pending auxiliary lines into `out` in push order, so a
+    /// declaration always precedes the assertion referencing it.
+    ///
+    /// Every site that writes an `(assert …)` line must call this
+    /// immediately before doing so: an auxiliary assertion constrains a
+    /// name spliced into that very line.
+    fn flush_into(&mut self, out: &mut String) {
+        for line in self.aux.drain(..) {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+}
+
 /// Render the slice's preamble (declarations + statement assertions)
 /// into SMT-LIB2 text, leaving the branch-condition query to the
 /// caller. The output ends with a blank line so the caller can
@@ -29,6 +59,17 @@ use r2smt_ssa::SsaLiftedSlice;
 /// directly.
 #[must_use]
 pub fn emit_preamble(slice: &SsaLiftedSlice, options: &SolveOptions) -> String {
+    emit_preamble_with(slice, options, &mut RenderCtx::new())
+}
+
+/// [`emit_preamble`] against a caller-owned [`RenderCtx`], so the
+/// preamble and the branch condition appended by [`emit_query`] share
+/// one auxiliary-name namespace.
+fn emit_preamble_with(
+    slice: &SsaLiftedSlice,
+    options: &SolveOptions,
+    ctx: &mut RenderCtx,
+) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "(set-logic QF_BV)");
     let _ = writeln!(out, "(set-option :produce-models false)");
@@ -52,17 +93,21 @@ pub fn emit_preamble(slice: &SsaLiftedSlice, options: &SolveOptions) -> String {
         match stmt {
             IrStmt::Assign { dst, src } => {
                 declare_bv(&mut out, &dst.name, dst.bits, &mut declared);
-                let rhs = render_expr_with_width(src, dst.bits);
+                let rhs = render_expr_with_width(src, dst.bits, ctx);
+                ctx.flush_into(&mut out);
                 let _ = writeln!(out, "(assert (= {lhs} {rhs}))", lhs = dst.name);
             }
             IrStmt::StoreMem {
                 address,
                 value,
                 bits,
-            } => mem.record_store(address, value, *bits),
+            } => {
+                mem.record_store(address, value, *bits, ctx);
+                ctx.flush_into(&mut out);
+            }
             IrStmt::LoadMem { dst, address, bits } => {
                 declare_bv(&mut out, &dst.name, dst.bits, &mut declared);
-                mem.emit_load(&mut out, &mut declared, dst, address, *bits);
+                mem.emit_load(&mut out, &mut declared, dst, address, *bits, ctx);
             }
             // Unsupported / Nop emit nothing; the SMT side stays an
             // over-approximation for those (extra freedom can only widen
@@ -89,13 +134,15 @@ fn ptr_bits_for(arch: r2smt_common::Arch) -> u16 {
 /// run "taken" first, then "not-taken").
 #[must_use]
 pub fn emit_query(slice: &SsaLiftedSlice, options: &SolveOptions, polarity: bool) -> String {
-    let mut script = emit_preamble(slice, options);
-    let cond = render_expr_with_width(&slice.condition, 1);
+    let mut ctx = RenderCtx::new();
+    let mut script = emit_preamble_with(slice, options, &mut ctx);
+    let cond = render_expr_with_width(&slice.condition, 1, &mut ctx);
     let assertion = if polarity {
         format!("(= {cond} #b1)")
     } else {
         format!("(= {cond} #b0)")
     };
+    ctx.flush_into(&mut script);
     let _ = writeln!(&mut script, "(assert {assertion})");
     let _ = writeln!(&mut script, "(check-sat)");
     script
@@ -143,7 +190,7 @@ impl TextMemory {
         }
     }
 
-    fn record_store(&mut self, address: &Expr, value: &Expr, bits: u16) {
+    fn record_store(&mut self, address: &Expr, value: &Expr, bits: u16, ctx: &mut RenderCtx) {
         if bits == 0 {
             return;
         }
@@ -155,8 +202,8 @@ impl TextMemory {
             self.havoced = true;
             return;
         }
-        let addr = render_expr_with_width(address, self.ptr_bits);
-        let value_s = render_expr_with_width(value, bits);
+        let addr = render_expr_with_width(address, self.ptr_bits, ctx);
+        let value_s = render_expr_with_width(value, bits, ctx);
         for i in 0..u16::try_from(nbytes).unwrap_or(u16::MAX) {
             let byte_addr = self.byte_addr(&addr, i);
             let lo = u32::from(i) * 8;
@@ -173,19 +220,21 @@ impl TextMemory {
         dst: &r2smt_ir::expr::Var,
         address: &Expr,
         bits: u16,
+        ctx: &mut RenderCtx,
     ) {
         if bits == 0 {
             return;
         }
         // Read-read consistency: reuse a prior identical load's
         // destination when no store has invalidated the memo since.
-        let memo_key = (render_expr_with_width(address, self.ptr_bits), bits);
+        let memo_key = (render_expr_with_width(address, self.ptr_bits, ctx), bits);
         if let Some(cached) = self.load_memo.get(&memo_key) {
+            ctx.flush_into(out);
             let _ = writeln!(out, "(assert (= {lhs} {cached}))", lhs = dst.name);
             return;
         }
         let nbytes = bits.div_ceil(8);
-        let addr = render_expr_with_width(address, self.ptr_bits);
+        let addr = render_expr_with_width(address, self.ptr_bits, ctx);
         let load_id = self.load_counter;
         self.load_counter = self.load_counter.wrapping_add(1);
         let mut acc: Option<String> = None;
@@ -210,6 +259,7 @@ impl TextMemory {
         };
         let total_bits = nbytes.saturating_mul(8);
         let coerced = coerce(&loaded, total_bits, bits);
+        ctx.flush_into(out);
         let _ = writeln!(out, "(assert (= {lhs} {coerced}))", lhs = dst.name);
         self.load_memo.insert(memo_key, dst.name.clone());
     }
@@ -226,8 +276,8 @@ fn declare_bv(out: &mut String, name: &str, bits: u16, declared: &mut Vec<String
 /// Render an expression to SMT-LIB2 text, widening / narrowing to
 /// the target bit width before returning. Used at every assertion
 /// boundary so the produced SMT-LIB stays well-typed.
-fn render_expr_with_width(expr: &Expr, target_bits: u16) -> String {
-    let (rendered, bits) = render_expr(expr);
+fn render_expr_with_width(expr: &Expr, target_bits: u16, ctx: &mut RenderCtx) -> String {
+    let (rendered, bits) = render_expr(expr, ctx);
     coerce(&rendered, bits, target_bits)
 }
 
@@ -237,33 +287,33 @@ fn render_expr_with_width(expr: &Expr, target_bits: u16) -> String {
 // logic.
 // FP arms mirror the BV arms' shape but stay separate for legibility.
 #[allow(clippy::too_many_lines, clippy::match_same_arms)]
-fn render_expr(expr: &Expr) -> (String, u16) {
+fn render_expr(expr: &Expr, ctx: &mut RenderCtx) -> (String, u16) {
     match expr {
         Expr::Var(v) => (v.name.clone(), v.bits),
         Expr::Const { value, bits } => (format!("(_ bv{value} {bits})"), *bits),
-        Expr::Add(a, b) => bin_op("bvadd", a, b, Signedness::Unsigned),
-        Expr::Sub(a, b) => bin_op("bvsub", a, b, Signedness::Unsigned),
-        Expr::Mul(a, b) => bin_op("bvmul", a, b, Signedness::Unsigned),
-        Expr::UDiv(a, b) => bin_op("bvudiv", a, b, Signedness::Unsigned),
-        Expr::URem(a, b) => bin_op("bvurem", a, b, Signedness::Unsigned),
-        Expr::SDiv(a, b) => bin_op("bvsdiv", a, b, Signedness::Signed),
-        Expr::SRem(a, b) => bin_op("bvsrem", a, b, Signedness::Signed),
-        Expr::And(a, b) => bin_op("bvand", a, b, Signedness::Unsigned),
-        Expr::Or(a, b) => bin_op("bvor", a, b, Signedness::Unsigned),
-        Expr::Xor(a, b) => bin_op("bvxor", a, b, Signedness::Unsigned),
-        Expr::Shl(a, b) => bin_op("bvshl", a, b, Signedness::Unsigned),
-        Expr::LShr(a, b) => bin_op("bvlshr", a, b, Signedness::Unsigned),
-        Expr::AShr(a, b) => bin_op("bvashr", a, b, Signedness::Unsigned),
-        Expr::Eq(a, b) => bool_op("=", a, b, Signedness::Unsigned),
-        Expr::Ne(a, b) => bool_op("distinct", a, b, Signedness::Unsigned),
-        Expr::Ult(a, b) => bool_op("bvult", a, b, Signedness::Unsigned),
-        Expr::Ule(a, b) => bool_op("bvule", a, b, Signedness::Unsigned),
-        Expr::Slt(a, b) => bool_op("bvslt", a, b, Signedness::Signed),
-        Expr::Sle(a, b) => bool_op("bvsle", a, b, Signedness::Signed),
-        Expr::BoolAnd(a, b) => bool_combiner("and", a, b),
-        Expr::BoolOr(a, b) => bool_combiner("or", a, b),
+        Expr::Add(a, b) => bin_op("bvadd", a, b, Signedness::Unsigned, ctx),
+        Expr::Sub(a, b) => bin_op("bvsub", a, b, Signedness::Unsigned, ctx),
+        Expr::Mul(a, b) => bin_op("bvmul", a, b, Signedness::Unsigned, ctx),
+        Expr::UDiv(a, b) => bin_op("bvudiv", a, b, Signedness::Unsigned, ctx),
+        Expr::URem(a, b) => bin_op("bvurem", a, b, Signedness::Unsigned, ctx),
+        Expr::SDiv(a, b) => bin_op("bvsdiv", a, b, Signedness::Signed, ctx),
+        Expr::SRem(a, b) => bin_op("bvsrem", a, b, Signedness::Signed, ctx),
+        Expr::And(a, b) => bin_op("bvand", a, b, Signedness::Unsigned, ctx),
+        Expr::Or(a, b) => bin_op("bvor", a, b, Signedness::Unsigned, ctx),
+        Expr::Xor(a, b) => bin_op("bvxor", a, b, Signedness::Unsigned, ctx),
+        Expr::Shl(a, b) => bin_op("bvshl", a, b, Signedness::Unsigned, ctx),
+        Expr::LShr(a, b) => bin_op("bvlshr", a, b, Signedness::Unsigned, ctx),
+        Expr::AShr(a, b) => bin_op("bvashr", a, b, Signedness::Unsigned, ctx),
+        Expr::Eq(a, b) => bool_op("=", a, b, Signedness::Unsigned, ctx),
+        Expr::Ne(a, b) => bool_op("distinct", a, b, Signedness::Unsigned, ctx),
+        Expr::Ult(a, b) => bool_op("bvult", a, b, Signedness::Unsigned, ctx),
+        Expr::Ule(a, b) => bool_op("bvule", a, b, Signedness::Unsigned, ctx),
+        Expr::Slt(a, b) => bool_op("bvslt", a, b, Signedness::Signed, ctx),
+        Expr::Sle(a, b) => bool_op("bvsle", a, b, Signedness::Signed, ctx),
+        Expr::BoolAnd(a, b) => bool_combiner("and", a, b, ctx),
+        Expr::BoolOr(a, b) => bool_combiner("or", a, b, ctx),
         Expr::BoolNot(inner) => {
-            let r = bool_of(inner);
+            let r = bool_of(inner, ctx);
             (format!("(ite (not {r}) #b1 #b0)"), 1)
         }
         Expr::Ite {
@@ -271,9 +321,9 @@ fn render_expr(expr: &Expr) -> (String, u16) {
             then_expr,
             else_expr,
         } => {
-            let cond_str = bool_of(cond);
-            let (then_str, then_bits) = render_expr(then_expr);
-            let (else_str, else_bits) = render_expr(else_expr);
+            let cond_str = bool_of(cond, ctx);
+            let (then_str, then_bits) = render_expr(then_expr, ctx);
+            let (else_str, else_bits) = render_expr(else_expr, ctx);
             let target = then_bits.max(else_bits);
             let then_coerced = coerce(&then_str, then_bits, target);
             let else_coerced = coerce(&else_str, else_bits, target);
@@ -283,21 +333,21 @@ fn render_expr(expr: &Expr) -> (String, u16) {
             )
         }
         Expr::Extract { src, hi, lo } => {
-            let (src_str, _) = render_expr(src);
+            let (src_str, _) = render_expr(src, ctx);
             let width = hi - lo + 1;
             (format!("((_ extract {hi} {lo}) {src_str})"), width)
         }
         Expr::Concat { high, low } => {
-            let (high_str, hb) = render_expr(high);
-            let (low_str, lb) = render_expr(low);
+            let (high_str, hb) = render_expr(high, ctx);
+            let (low_str, lb) = render_expr(low, ctx);
             (format!("(concat {high_str} {low_str})"), hb + lb)
         }
         Expr::ZeroExtend { src, to_bits } => {
-            let (src_str, cur) = render_expr(src);
+            let (src_str, cur) = render_expr(src, ctx);
             (coerce(&src_str, cur, *to_bits), *to_bits)
         }
         Expr::SignExtend { src, to_bits } => {
-            let (src_str, cur) = render_expr(src);
+            let (src_str, cur) = render_expr(src, ctx);
             match cur.cmp(to_bits) {
                 std::cmp::Ordering::Equal => (src_str, *to_bits),
                 std::cmp::Ordering::Less => (
@@ -339,18 +389,18 @@ fn render_expr(expr: &Expr) -> (String, u16) {
     }
 }
 
-fn bin_op(name: &str, a: &Expr, b: &Expr, sign: Signedness) -> (String, u16) {
-    let (a_str, a_bits) = render_expr(a);
-    let (b_str, b_bits) = render_expr(b);
+fn bin_op(name: &str, a: &Expr, b: &Expr, sign: Signedness, ctx: &mut RenderCtx) -> (String, u16) {
+    let (a_str, a_bits) = render_expr(a, ctx);
+    let (b_str, b_bits) = render_expr(b, ctx);
     let target = a_bits.max(b_bits);
     let lhs = coerce_with_sign(&a_str, a_bits, target, sign);
     let rhs = coerce_with_sign(&b_str, b_bits, target, sign);
     (format!("({name} {lhs} {rhs})"), target)
 }
 
-fn bool_op(name: &str, a: &Expr, b: &Expr, sign: Signedness) -> (String, u16) {
-    let (a_str, a_bits) = render_expr(a);
-    let (b_str, b_bits) = render_expr(b);
+fn bool_op(name: &str, a: &Expr, b: &Expr, sign: Signedness, ctx: &mut RenderCtx) -> (String, u16) {
+    let (a_str, a_bits) = render_expr(a, ctx);
+    let (b_str, b_bits) = render_expr(b, ctx);
     let target = a_bits.max(b_bits);
     let lhs = coerce_with_sign(&a_str, a_bits, target, sign);
     let rhs = coerce_with_sign(&b_str, b_bits, target, sign);
@@ -378,14 +428,14 @@ fn coerce_with_sign(rendered: &str, cur: u16, target: u16, sign: Signedness) -> 
     }
 }
 
-fn bool_combiner(name: &str, a: &Expr, b: &Expr) -> (String, u16) {
-    let a_bool = bool_of(a);
-    let b_bool = bool_of(b);
+fn bool_combiner(name: &str, a: &Expr, b: &Expr, ctx: &mut RenderCtx) -> (String, u16) {
+    let a_bool = bool_of(a, ctx);
+    let b_bool = bool_of(b, ctx);
     (format!("(ite ({name} {a_bool} {b_bool}) #b1 #b0)"), 1)
 }
 
-fn bool_of(expr: &Expr) -> String {
-    let (rendered, bits) = render_expr(expr);
+fn bool_of(expr: &Expr, ctx: &mut RenderCtx) -> String {
+    let (rendered, bits) = render_expr(expr, ctx);
     if bits == 1 {
         format!("(= {rendered} #b1)")
     } else {
@@ -501,6 +551,21 @@ mod tests {
         assert!(script.contains("(check-sat)"));
         assert!(script.contains("(declare-fun "));
         assert!(script.contains("(assert ("));
+    }
+
+    #[test]
+    fn smtlib_slice_without_float_declares_no_auxiliary_lines() {
+        // A bit-vector-only slice must round-trip through the renderer
+        // leaving no auxiliary declaration behind: the FP inversion is
+        // the only producer of those, so an empty `aux` here is what
+        // keeps non-FP output byte-identical.
+        let statements = vec![IrStmt::Assign {
+            dst: r2smt_ir::expr::Var::new("t0", 32),
+            src: Expr::add(Expr::var("x", 32), Expr::konst(1, 32)),
+        }];
+        let mut ctx = RenderCtx::new();
+        let _ = emit_preamble_with(&mem_slice(statements), &SolveOptions::default(), &mut ctx);
+        assert!(ctx.aux.is_empty());
     }
 
     fn mem_slice(statements: Vec<IrStmt>) -> SsaLiftedSlice {
