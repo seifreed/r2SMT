@@ -493,6 +493,10 @@ fn walk_backwards(
                                     state.live.remove(mv.name.as_str());
                                 }
                             }
+                            // The merge defines the branch's flags via
+                            // per-arm `Ite`s, so the outstanding flag
+                            // obligation is discharged.
+                            state.needs_flags = false;
                             state.merges.push(merge);
                             let structural = format!(
                                 "join at {addr} resolved by bounded Φ-merge",

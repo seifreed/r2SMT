@@ -1649,6 +1649,101 @@ fn solve_diamond_join(program: &Program, allow_join_merge: bool) -> SmtResult {
     solve_branch(&ssa, SolveOptions::default())
 }
 
+/// Flag-merge diamond: each arm ends in `cmp eax, <imm>`, and the join
+/// is a bare `je` reading those flags directly. The join branch's flag
+/// obligation is discharged by merging NZCV across the arms.
+fn flag_diamond(then_cmp: &str, else_cmp: &str) -> Program {
+    let arm = |addr: u64, imm: &str| BasicBlock {
+        address: Address(addr),
+        instructions: vec![insn(
+            addr,
+            3,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op(imm, OperandKind::Immediate),
+            ],
+        )],
+        successors: vec![Address(0x40_1200)],
+    };
+    Program {
+        arch: Arch::X86_64,
+        bits: 64,
+        entry: Some(Address(0x40_1000)),
+        functions: vec![Function {
+            address: Address(0x40_1000),
+            name: Some("sym.main".into()),
+            blocks: vec![
+                BasicBlock {
+                    address: Address(0x40_1000),
+                    instructions: vec![
+                        insn(
+                            0x40_1000,
+                            3,
+                            "cmp",
+                            vec![
+                                op("ecx", OperandKind::Register),
+                                op("0", OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1003,
+                            6,
+                            "je",
+                            vec![op("0x401100", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![Address(0x40_1100), Address(0x40_1009)],
+                },
+                arm(0x40_1009, else_cmp),
+                arm(0x40_1100, then_cmp),
+                BasicBlock {
+                    address: Address(0x40_1200),
+                    instructions: vec![insn(
+                        0x40_1200,
+                        6,
+                        "je",
+                        vec![op("0x401300", OperandKind::Immediate)],
+                    )],
+                    successors: vec![],
+                },
+            ],
+            is_thumb: false,
+        }],
+    }
+}
+
+fn solve_flag_diamond(program: &Program) -> SmtResult {
+    let cands = collect_branches(program);
+    let join = cands
+        .iter()
+        .find(|c| c.address == Address(0x40_1200))
+        .expect("join branch present");
+    let limits = SliceLimits {
+        max_basic_blocks: 8,
+        allow_join_merge: true,
+        ..SliceLimits::default()
+    };
+    let slice = slice_branch(join, &program.functions[0], &limits, program.arch);
+    let lifted = lift_slice(&slice, program.arch);
+    let ssa = ssa_convert(&lifted);
+    solve_branch(&ssa, SolveOptions::default())
+}
+
+#[test]
+fn flag_merge_path_sensitive_predicate_stays_both_possible() {
+    // Soundness guard for the flag merge: arms set ZF differently
+    // (`eax==5` vs `eax==6`), so the merged `ZF = Ite(ecx==0, eax==5,
+    // eax==6)` depends on the free head input — the verdict must be
+    // BothPossible, NEVER a fabricated AlwaysX.
+    let program = flag_diamond("5", "6");
+    assert_eq!(
+        solve_flag_diamond(&program),
+        SmtResult::BothPossible,
+        "path-sensitive flag predicate must not be fabricated into AlwaysX"
+    );
+}
+
 #[test]
 fn diamond_path_insensitive_predicate_is_always_false_with_merge() {
     // Both arms set eax=5, so `eax==7` is false regardless of the

@@ -1313,6 +1313,103 @@ fn test_multiblock_arm_diamond_recovered_as_complete() {
     assert!(!slice.roots.contains(&"rax".to_string()));
 }
 
+/// Diamond where each arm ends in a flag-setting `cmp` and the join
+/// block is a bare `je` that reads those flags directly (no in-block
+/// `cmp`). Exercises the flag-merge path.
+fn diamond_flags_in_arms_program() -> Program {
+    let arm = |addr: u64| BasicBlock {
+        address: Address(addr),
+        instructions: vec![insn(
+            addr,
+            3,
+            "cmp",
+            vec![
+                op("edx", OperandKind::Register),
+                op("5", OperandKind::Immediate),
+            ],
+        )],
+        successors: vec![Address(0x40_1200)],
+    };
+    Program {
+        arch: Arch::X86_64,
+        bits: 64,
+        entry: Some(Address(0x40_1000)),
+        functions: vec![Function {
+            address: Address(0x40_1000),
+            name: Some("sym.main".into()),
+            blocks: vec![
+                BasicBlock {
+                    address: Address(0x40_1000),
+                    instructions: vec![
+                        insn(
+                            0x40_1000,
+                            3,
+                            "cmp",
+                            vec![
+                                op("ecx", OperandKind::Register),
+                                op("0", OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1003,
+                            6,
+                            "je",
+                            vec![op("0x401100", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![Address(0x40_1100), Address(0x40_1009)],
+                },
+                arm(0x40_1009),
+                arm(0x40_1100),
+                BasicBlock {
+                    address: Address(0x40_1200),
+                    instructions: vec![insn(
+                        0x40_1200,
+                        6,
+                        "je",
+                        vec![op("0x401300", OperandKind::Immediate)],
+                    )],
+                    successors: vec![],
+                },
+            ],
+            is_thumb: false,
+        }],
+    }
+}
+
+#[test]
+fn test_flag_merge_discharges_flag_obligation() {
+    // The join `je` needs its flags, and both arms define them via
+    // `cmp edx,5`. The merge lowers each flag to
+    // `flag := Ite(head_cond, taken_flag, fallthrough_flag)`, so the
+    // flag obligation is discharged and the slice is Complete rather
+    // than truncating for want of a flag-defining instruction.
+    let program = diamond_flags_in_arms_program();
+    let cands = collect_branches(&program);
+    let join = cands
+        .iter()
+        .find(|c| c.address == Address(0x40_1200))
+        .expect("join branch present");
+    let limits = SliceLimits {
+        max_basic_blocks: 8,
+        allow_join_merge: true,
+        ..SliceLimits::default()
+    };
+    let slice = slice_branch(join, &program.functions[0], &limits, program.arch);
+    assert_eq!(slice.status, SliceStatus::Complete);
+    assert!(!slice.treat_truncation_as_inputs);
+    assert_eq!(slice.merges.len(), 1);
+    let merged: Vec<&str> = slice.merges[0]
+        .merged
+        .iter()
+        .map(|v| v.name.as_str())
+        .collect();
+    assert!(
+        merged.contains(&"ZF") && merged.contains(&"CF") && merged.contains(&"SF"),
+        "flag obligation merged across arms: {merged:?}"
+    );
+}
+
 #[test]
 fn test_bounded_diamond_default_off_byte_identical() {
     // With `allow_join_merge` off the join handling is unchanged:

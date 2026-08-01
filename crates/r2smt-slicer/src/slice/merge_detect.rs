@@ -194,14 +194,21 @@ fn head_condition_instructions(
     Some(slice.instructions)
 }
 
+/// Flags merged across both arms when the join branch still needs its
+/// NZCV defined. The full x86-polarity set; unread flags collapse to
+/// their pre-diamond value and are dead-flag-eliminated downstream.
+const MERGED_FLAGS: &[&str] = &["ZF", "CF", "SF", "OF", "PF"];
+
 /// Attempt to recover a bounded simple-diamond Φ-merge at `join`.
 ///
 /// Returns `Some` only when the join is a fully-resolvable diamond:
 /// exactly two predecessors forming a `head → {taken, fallthrough} →
-/// join` shape, each arm a single call / memory / unsupported-free
-/// block within budget, the head ending in a still-two-way
-/// conditional branch, the pending live set register-only, and no
-/// outstanding flag obligation. Polarity is taken verbatim from the
+/// join` shape, each arm a straight-line call / memory / unsupported-free
+/// chain within budget, the head ending in a still-two-way conditional
+/// branch, and something pending (a live register or an outstanding flag
+/// obligation). Registers are merged from the live set; when the branch
+/// still needs flags, the NZCV set is merged from the arms too. Polarity
+/// is taken verbatim from the
 /// head [`BranchCandidate`] (`taken_target` → `taken_arm`). Any
 /// deviation returns `None`, so the caller falls back to the existing
 /// sound free-input boundary — the recovery only ever *adds*
@@ -213,7 +220,7 @@ pub(super) fn try_build_diamond_merge(
     state: &WalkState,
     arch: Arch,
 ) -> Option<SliceMerge> {
-    if state.needs_flags || state.live.is_empty() {
+    if !state.needs_flags && state.live.is_empty() {
         return None;
     }
     if preds.len() != 2 {
@@ -254,6 +261,21 @@ pub(super) fn try_build_diamond_merge(
             bits,
         })
         .collect();
+    // When the join branch still needs its flags defined, merge them
+    // across the arms too: each arm's fold yields its own flag values,
+    // so `flag := Ite(head_cond, taken_flag, fallthrough_flag)` models
+    // the branch's real NZCV precisely. An arm that does not set a flag
+    // falls back to the pre-diamond value (the arm-env miss in
+    // `lower_merge`), which is exactly its value on that path — never
+    // worse than the free-input boundary this replaces.
+    if state.needs_flags {
+        for flag in MERGED_FLAGS {
+            merged.push(MergedVar {
+                name: (*flag).to_string(),
+                bits: 1,
+            });
+        }
+    }
     merged.sort_by(|x, y| x.name.cmp(&y.name));
     if merged.is_empty() {
         return None;
