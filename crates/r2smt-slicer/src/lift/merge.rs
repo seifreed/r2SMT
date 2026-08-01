@@ -12,25 +12,45 @@ use crate::slice::SliceMerge;
 
 use super::{LiftCtx, lift_branch_condition};
 
+/// Folded representation of a straight-line arm: the register
+/// definitions it produces and the memory stores it performs, each
+/// resolved against the arm's own earlier definitions.
+struct ArmFold {
+    regs: HashMap<String, Expr>,
+    stores: Vec<ArmStore>,
+}
+
+/// One memory store performed by an arm, folded to closed expressions.
+struct ArmStore {
+    address: Expr,
+    value: Expr,
+    bits: u16,
+}
+
 /// Lower one bounded simple-diamond Φ-merge into the context.
 ///
 /// On success the emitted shape is, in execution order:
 /// 1. the head-condition definitions (so the selector's flag /
 ///    register reads resolve);
 /// 2. one `dst := Ite(head_condition, taken_value, fallthrough_value)`
-///    per merged register.
+///    per merged register;
+/// 3. one conditional `store addr := Ite(head_condition, taken_value,
+///    fallthrough_value)` per address written by either arm (the value
+///    on the non-storing side is the pre-diamond byte, loaded into a
+///    temp, so the store is a no-op on that path).
 ///
 /// Both arms are folded to closed expressions *before* anything is
-/// pushed, so a non-foldable arm (memory / call / unsupported survived
-/// detection) emits nothing at all and the merged register degrades to
-/// a sound free SSA input via its later use. Polarity comes verbatim
-/// from the head [`BranchCandidate`]: `taken_arm` feeds the `then`
-/// branch (selector true), `fallthrough_arm` the `else` branch.
+/// pushed, so a non-foldable arm (an arm-local load, a call, or an
+/// unsupported lowering that slipped past detection) emits nothing at
+/// all and the merged register/memory degrades to a sound free SSA
+/// input / free byte via its later use. Polarity comes verbatim from
+/// the head [`BranchCandidate`]: `taken_arm` feeds the `then` branch
+/// (selector true), `fallthrough_arm` the `else` branch.
 pub(super) fn lower_merge(ctx: &mut LiftCtx, merge: &SliceMerge, arch: Arch) {
-    let Some(taken_env) = fold_arm(&merge.taken_arm, arch) else {
+    let Some(taken) = fold_arm(&merge.taken_arm, arch) else {
         return;
     };
-    let Some(fallthrough_env) = fold_arm(&merge.fallthrough_arm, arch) else {
+    let Some(fallthrough) = fold_arm(&merge.fallthrough_arm, arch) else {
         return;
     };
     for insn in &merge.head_instructions {
@@ -38,52 +58,180 @@ pub(super) fn lower_merge(ctx: &mut LiftCtx, merge: &SliceMerge, arch: Arch) {
     }
     let cond = lift_branch_condition(&merge.head, arch);
     for mv in &merge.merged {
-        let then_expr = taken_env
+        let then_expr = taken
+            .regs
             .get(&mv.name)
             .cloned()
             .unwrap_or_else(|| Expr::var(mv.name.clone(), mv.bits));
-        let else_expr = fallthrough_env
+        let else_expr = fallthrough
+            .regs
             .get(&mv.name)
             .cloned()
             .unwrap_or_else(|| Expr::var(mv.name.clone(), mv.bits));
         ctx.stmts.push(IrStmt::Assign {
             dst: Var::new(mv.name.clone(), mv.bits),
-            src: Expr::Ite {
-                cond: Box::new(cond.clone()),
-                then_expr: Box::new(then_expr),
-                else_expr: Box::new(else_expr),
-            },
+            src: ite(&cond, then_expr, else_expr),
+        });
+    }
+    lower_merge_memory(ctx, merge, &cond, &taken.stores, &fallthrough.stores);
+}
+
+/// Emit one conditional store per address written by either arm. The
+/// byte-granular encoder resolves address equality inside its `Ite`
+/// chain, so this is sound even when two arms write structurally
+/// distinct addresses that alias at runtime.
+fn lower_merge_memory(
+    ctx: &mut LiftCtx,
+    merge: &SliceMerge,
+    cond: &Expr,
+    taken_stores: &[ArmStore],
+    fallthrough_stores: &[ArmStore],
+) {
+    // Union of stored addresses, deterministic order (by rendering).
+    let mut addrs: Vec<(Expr, u16)> = Vec::new();
+    for s in taken_stores.iter().chain(fallthrough_stores.iter()) {
+        if !addrs.iter().any(|(a, _)| *a == s.address) {
+            addrs.push((s.address.clone(), s.bits));
+        }
+    }
+    addrs.sort_by(|(a, _), (b, _)| a.to_string().cmp(&b.to_string()));
+
+    let last_val = |stores: &[ArmStore], addr: &Expr| {
+        stores
+            .iter()
+            .rev()
+            .find(|s| s.address == *addr)
+            .map(|s| s.value.clone())
+    };
+
+    // Pass 1: for an address written by only one arm, load the
+    // pre-diamond byte into a temp so the other path stores it back
+    // unchanged. All temps read memory before any conditional store, so
+    // they observe the pre-diamond state regardless of aliasing.
+    let mut keep: HashMap<String, Expr> = HashMap::new();
+    for (addr, bits) in &addrs {
+        let in_taken = last_val(taken_stores, addr).is_some();
+        let in_fallthrough = last_val(fallthrough_stores, addr).is_some();
+        if in_taken != in_fallthrough {
+            let temp = ctx.new_temp(merge.head.address, *bits);
+            ctx.stmts.push(IrStmt::LoadMem {
+                dst: temp.clone(),
+                address: addr.clone(),
+                bits: *bits,
+            });
+            keep.insert(addr.to_string(), Expr::Var(temp));
+        }
+    }
+
+    // Pass 2: one conditional store per address.
+    for (addr, bits) in &addrs {
+        let preserved = keep.get(&addr.to_string()).cloned();
+        let then_v = last_val(taken_stores, addr).or_else(|| preserved.clone());
+        let else_v = last_val(fallthrough_stores, addr).or_else(|| preserved.clone());
+        let (Some(then_v), Some(else_v)) = (then_v, else_v) else {
+            continue;
+        };
+        ctx.stmts.push(IrStmt::StoreMem {
+            address: addr.clone(),
+            value: ite(cond, then_v, else_v),
+            bits: *bits,
         });
     }
 }
 
-/// Symbolically fold a straight-line arm into a `register → value`
-/// environment by lifting it in isolation and inlining each
+/// Build `Ite(cond, then_expr, else_expr)`.
+fn ite(cond: &Expr, then_expr: Expr, else_expr: Expr) -> Expr {
+    Expr::Ite {
+        cond: Box::new(cond.clone()),
+        then_expr: Box::new(then_expr),
+        else_expr: Box::new(else_expr),
+    }
+}
+
+/// Symbolically fold a straight-line arm into its register definitions
+/// and memory stores by lifting it in isolation and inlining each
 /// definition into subsequent reads.
 ///
-/// Returns `None` when the arm lifts to anything other than
-/// [`IrStmt::Assign`] / [`IrStmt::Nop`] (memory, call, or unsupported
-/// that slipped past detection) — the caller then emits nothing,
+/// Returns `None` when the arm performs an arm-local load, stores to an
+/// unresolved (`Expr::Unknown`) address, or lifts to a call / unsupported
+/// construct that slipped past detection — the caller then emits nothing,
 /// keeping the result sound.
-fn fold_arm(arm: &[Instruction], arch: Arch) -> Option<HashMap<String, Expr>> {
+fn fold_arm(arm: &[Instruction], arch: Arch) -> Option<ArmFold> {
     let mut actx = LiftCtx::new(arch);
     for insn in arm {
         actx.lift_instruction(insn);
     }
-    let mut env: HashMap<String, Expr> = HashMap::new();
+    let mut regs: HashMap<String, Expr> = HashMap::new();
+    let mut stores: Vec<ArmStore> = Vec::new();
     for stmt in &actx.stmts {
         match stmt {
             IrStmt::Assign { dst, src } => {
-                let folded = subst_expr(src, &env);
-                env.insert(dst.name.clone(), folded);
+                let folded = subst_expr(src, &regs);
+                regs.insert(dst.name.clone(), folded);
+            }
+            IrStmt::StoreMem {
+                address,
+                value,
+                bits,
+            } => {
+                let address = subst_expr(address, &regs);
+                if expr_has_unknown(&address) {
+                    return None;
+                }
+                let value = subst_expr(value, &regs);
+                stores.retain(|s| s.address != address);
+                stores.push(ArmStore {
+                    address,
+                    value,
+                    bits: *bits,
+                });
             }
             IrStmt::Nop => {}
-            IrStmt::LoadMem { .. } | IrStmt::StoreMem { .. } | IrStmt::Unsupported { .. } => {
+            IrStmt::LoadMem { .. } | IrStmt::Unsupported { .. } => {
                 return None;
             }
         }
     }
-    Some(env)
+    Some(ArmFold { regs, stores })
+}
+
+/// Whether an expression contains an [`Expr::Unknown`] anywhere — an
+/// unresolved store address must not be merged, since the byte model
+/// would let it alias arbitrary memory.
+fn expr_has_unknown(expr: &Expr) -> bool {
+    match expr {
+        Expr::Unknown(_) => true,
+        Expr::Var(_) | Expr::Const { .. } => false,
+        Expr::BoolNot(a) | Expr::Extract { src: a, .. } | Expr::ZeroExtend { src: a, .. }
+        | Expr::SignExtend { src: a, .. } => expr_has_unknown(a),
+        Expr::Add(a, b)
+        | Expr::Sub(a, b)
+        | Expr::Mul(a, b)
+        | Expr::UDiv(a, b)
+        | Expr::URem(a, b)
+        | Expr::SDiv(a, b)
+        | Expr::SRem(a, b)
+        | Expr::And(a, b)
+        | Expr::Or(a, b)
+        | Expr::Xor(a, b)
+        | Expr::Shl(a, b)
+        | Expr::LShr(a, b)
+        | Expr::AShr(a, b)
+        | Expr::Eq(a, b)
+        | Expr::Ne(a, b)
+        | Expr::Ult(a, b)
+        | Expr::Ule(a, b)
+        | Expr::Slt(a, b)
+        | Expr::Sle(a, b)
+        | Expr::BoolAnd(a, b)
+        | Expr::BoolOr(a, b)
+        | Expr::Concat { high: a, low: b } => expr_has_unknown(a) || expr_has_unknown(b),
+        Expr::Ite {
+            cond,
+            then_expr,
+            else_expr,
+        } => expr_has_unknown(cond) || expr_has_unknown(then_expr) || expr_has_unknown(else_expr),
+    }
 }
 
 // Exhaustive structural recursion over every `Expr` variant —

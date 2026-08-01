@@ -1730,6 +1730,145 @@ fn solve_flag_diamond(program: &Program) -> SmtResult {
     solve_branch(&ssa, SolveOptions::default())
 }
 
+/// Memory diamond: each arm stores an immediate to the stack slot
+/// `[rbp-8]`, the join loads it back into `eax` and branches on
+/// `eax == cmp_imm`. Resolving the branch needs the conditional store.
+fn memory_diamond(then_store: &str, else_store: &str, cmp_imm: &str) -> Program {
+    let store = |addr: u64, imm: &str| BasicBlock {
+        address: Address(addr),
+        instructions: vec![insn(
+            addr,
+            7,
+            "mov",
+            vec![
+                op("dword [rbp-8]", OperandKind::Memory),
+                op(imm, OperandKind::Immediate),
+            ],
+        )],
+        successors: vec![Address(0x40_1200)],
+    };
+    Program {
+        arch: Arch::X86_64,
+        bits: 64,
+        entry: Some(Address(0x40_1000)),
+        functions: vec![Function {
+            address: Address(0x40_1000),
+            name: Some("sym.main".into()),
+            blocks: vec![
+                BasicBlock {
+                    address: Address(0x40_1000),
+                    instructions: vec![
+                        insn(
+                            0x40_1000,
+                            3,
+                            "cmp",
+                            vec![
+                                op("ecx", OperandKind::Register),
+                                op("0", OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1003,
+                            6,
+                            "je",
+                            vec![op("0x401100", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![Address(0x40_1100), Address(0x40_1009)],
+                },
+                store(0x40_1009, else_store),
+                store(0x40_1100, then_store),
+                BasicBlock {
+                    address: Address(0x40_1200),
+                    instructions: vec![
+                        insn(
+                            0x40_1200,
+                            3,
+                            "mov",
+                            vec![
+                                op("eax", OperandKind::Register),
+                                op("dword [rbp-8]", OperandKind::Memory),
+                            ],
+                        ),
+                        insn(
+                            0x40_1203,
+                            3,
+                            "cmp",
+                            vec![
+                                op("eax", OperandKind::Register),
+                                op(cmp_imm, OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1206,
+                            6,
+                            "je",
+                            vec![op("0x401300", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![],
+                },
+            ],
+            is_thumb: false,
+        }],
+    }
+}
+
+fn solve_memory_diamond(program: &Program, allow_join_merge: bool) -> SmtResult {
+    let cands = collect_branches(program);
+    let branch = cands
+        .iter()
+        .find(|c| c.address == Address(0x40_1206))
+        .expect("join branch present");
+    let limits = SliceLimits {
+        max_basic_blocks: 8,
+        allow_join_merge,
+        ..SliceLimits::default()
+    };
+    let slice = slice_branch(branch, &program.functions[0], &limits, program.arch);
+    let lifted = lift_slice(&slice, program.arch);
+    let ssa = ssa_convert(&lifted);
+    solve_branch(&ssa, SolveOptions::default())
+}
+
+#[test]
+fn memory_diamond_opaque_predicate_resolves_precisely() {
+    // Arms store 5 / 7 to `[rbp-8]`; the join loads it and tests
+    // `eax==6`. `[rbp-8] ∈ {5,7}` never equals 6, so the branch is
+    // never taken — but only the conditional store makes that provable.
+    let program = memory_diamond("5", "7", "6");
+    assert_eq!(
+        solve_memory_diamond(&program, true),
+        SmtResult::AlwaysFalse,
+        "conditional store must resolve the memory opaque predicate"
+    );
+}
+
+#[test]
+fn memory_diamond_without_merge_is_sound_but_imprecise() {
+    // Merge off: the arm stores are dropped, so the load reads a free
+    // byte and the verdict widens to BothPossible. Sound, imprecise.
+    let program = memory_diamond("5", "7", "6");
+    assert_eq!(
+        solve_memory_diamond(&program, false),
+        SmtResult::BothPossible,
+        "without the merge the loaded byte is free: sound, imprecise"
+    );
+}
+
+#[test]
+fn memory_diamond_path_sensitive_stays_both_possible() {
+    // Soundness guard: arms store 5 / 6, join tests `eax==6`. The stored
+    // value genuinely depends on the free head input `ecx`, so the
+    // verdict must be BothPossible — never a fabricated AlwaysX.
+    let program = memory_diamond("5", "6", "6");
+    assert_eq!(
+        solve_memory_diamond(&program, true),
+        SmtResult::BothPossible,
+        "path-sensitive memory predicate must not be fabricated into AlwaysX"
+    );
+}
+
 /// Two chained diamonds: inner sets `esi ∈ {then,else}`, outer branches
 /// on `esi==15` to set `eax ∈ {1,2}`, sliced branch tests `eax==1`.
 fn chained_diamond(inner_then: &str, inner_else: &str) -> Program {

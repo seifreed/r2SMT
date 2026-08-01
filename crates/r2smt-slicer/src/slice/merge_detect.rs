@@ -14,7 +14,7 @@ use r2smt_ir::program::{BasicBlock, Function, Instruction};
 use tracing::debug;
 
 use crate::collector::BranchCandidate;
-use crate::effect::{InstructionKind, analyze};
+use crate::effect::{InstructionKind, analyze, has_unmodellable_memory};
 
 use super::{
     MERGE_ARM_MAX_INSTRUCTIONS, MergedVar, SliceLimits, SliceMerge, WalkState, single_pred,
@@ -109,13 +109,21 @@ fn resolve_arm_edge(
 }
 
 /// An instruction is safe to fold into a Φ-merge arm only if it is
-/// inside the lifter's supported, side-effect-free subset — the same
-/// gate [`walk_block`] applies. The lift stage applies a second guard
-/// (any non-`Assign`/`Nop` lowering aborts the merge), so an
+/// inside the lifter's supported subset: not a call, not an `Other`
+/// (unmodelled) mnemonic, and — if it touches memory — only *modellable*
+/// memory (a resolvable byte-model address, never rip/segment/…). The
+/// lift stage applies a second guard (`fold_arm` aborts the merge on any
+/// arm-local load or non-`Assign`/`Store`/`Nop` lowering), so an
 /// over-permissive answer here can never produce an unsound verdict.
 fn mergeable_arm_insn(insn: &Instruction, arch: Arch) -> bool {
     let effect = analyze(insn, arch);
-    !effect.is_call && !effect.has_memory_access && effect.kind != InstructionKind::Other
+    if effect.is_call || effect.kind == InstructionKind::Other {
+        return false;
+    }
+    if effect.has_memory_access && has_unmodellable_memory(&insn.operands, arch) {
+        return false;
+    }
+    true
 }
 
 /// Locate the head block's still-two-way conditional terminator.
