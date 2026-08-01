@@ -255,6 +255,7 @@ struct LiftCtx {
     bits: u8,
     arch: Arch,
     temp_counter: u32,
+    cur_addr: Address,
 }
 
 impl LiftCtx {
@@ -264,6 +265,7 @@ impl LiftCtx {
             bits: arch.pointer_bits(),
             arch,
             temp_counter: 0,
+            cur_addr: Address::new(0),
         }
     }
 
@@ -278,6 +280,7 @@ impl LiftCtx {
     }
 
     fn lift_instruction(&mut self, insn: &Instruction) {
+        self.cur_addr = insn.address;
         // ESIL-first path: when radare2 has attached an ESIL string
         // to the instruction and the mini stack machine can evaluate
         // it, splice the resulting IrStmts straight into the buffer.
@@ -411,6 +414,29 @@ impl LiftCtx {
         }
     }
 
+    /// Read an operand, lowering a non-stack x86 memory source through
+    /// the byte-granular memory model: it emits a `LoadMem` into a fresh
+    /// temp and returns that temp, so `[rax]` / `[rbp + rax*4]` become
+    /// precise loads instead of the `Expr::Unknown` `read_operand_at`
+    /// produced. Registers, immediates, and recognised stack slots are
+    /// unchanged (delegated to [`Self::read_operand_at`]).
+    fn read_operand_lowered(&mut self, op: &Operand, width: u8) -> Expr {
+        if matches!(self.arch, Arch::X86 | Arch::X86_64)
+            && op.kind == OperandKind::Memory
+            && stack_slot(op).is_none()
+            && let Some(address) = x86_address_expr(op, self.bits)
+        {
+            let tmp = self.new_temp(self.cur_addr, width);
+            self.stmts.push(IrStmt::LoadMem {
+                dst: tmp.clone(),
+                address,
+                bits: width,
+            });
+            return Expr::Var(tmp);
+        }
+        self.read_operand_at(op, width)
+    }
+
     /// Build the right-hand-side expression that, when assigned to the
     /// parent register, captures writing `value` (already at the
     /// destination's natural width) to the operand `op`.
@@ -508,6 +534,17 @@ impl LiftCtx {
         if let Some((slot, width)) = stack_slot(dst_op) {
             let coerced = coerce_to_width(value, width, dst_width);
             self.assign(Var::new(slot, width), coerced);
+            return true;
+        }
+        if matches!(self.arch, Arch::X86 | Arch::X86_64)
+            && dst_op.kind == OperandKind::Memory
+            && let Some(address) = x86_address_expr(dst_op, self.bits)
+        {
+            self.stmts.push(IrStmt::StoreMem {
+                address,
+                value,
+                bits: dst_width,
+            });
             return true;
         }
         false
@@ -747,6 +784,88 @@ fn parse_immediate(raw: &str) -> Option<u64> {
     } else {
         Some(value)
     }
+}
+
+/// Build a symbolic address from an x86 memory operand
+/// `[base {+ index*scale} {± disp}]` at the pointer width. Registers
+/// resolve through [`register_layout`] to their 64-bit parent; the
+/// displacement folds into a single constant. Returns `None` for
+/// shapes it cannot model (e.g. `rip`-relative or a subtracted
+/// register), so the caller declines soundly.
+fn x86_address_expr(op: &Operand, ptr_bits: u8) -> Option<Expr> {
+    if op.kind != OperandKind::Memory {
+        return None;
+    }
+    let lower = op.raw.to_ascii_lowercase();
+    let lb = lower.find('[')?;
+    let rb = lower.find(']')?;
+    if rb <= lb {
+        return None;
+    }
+    let inner = lower[lb + 1..rb].trim();
+    if inner.is_empty() {
+        return None;
+    }
+    let mut acc: Option<Expr> = None;
+    let mut disp: i64 = 0;
+    for (term, negative) in split_signed_terms(inner) {
+        let term = term.trim();
+        if term.is_empty() {
+            continue;
+        }
+        if let Some((reg_s, scale_s)) = term.split_once('*') {
+            // index * scale — x86 never subtracts an index.
+            if negative {
+                return None;
+            }
+            let parent = register_layout(reg_s.trim(), Arch::X86_64).map(|l| l.parent)?;
+            let scale = parse_immediate(scale_s.trim())?;
+            let scaled = Expr::mul(
+                Expr::var(parent, ptr_bits),
+                Expr::konst(scale & width_mask(ptr_bits), ptr_bits),
+            );
+            acc = Some(match acc.take() {
+                None => scaled,
+                Some(a) => Expr::add(a, scaled),
+            });
+        } else if let Some(layout) = register_layout(term, Arch::X86_64) {
+            if negative {
+                return None;
+            }
+            let e = Expr::var(layout.parent, ptr_bits);
+            acc = Some(match acc.take() {
+                None => e,
+                Some(a) => Expr::add(a, e),
+            });
+        } else {
+            let mag = parse_immediate(term)?;
+            let signed = i64::try_from(mag).ok()?;
+            disp = disp.checked_add(if negative { -signed } else { signed })?;
+        }
+    }
+    let base = acc.unwrap_or_else(|| Expr::konst(0, ptr_bits));
+    if disp == 0 {
+        return Some(base);
+    }
+    let masked = u64::from_le_bytes(disp.to_le_bytes()) & width_mask(ptr_bits);
+    Some(Expr::add(base, Expr::konst(masked, ptr_bits)))
+}
+
+/// Split an x86 address body into `(term, is_negative)` pairs on
+/// top-level `+` / `-` separators.
+fn split_signed_terms(inner: &str) -> Vec<(&str, bool)> {
+    let mut terms = Vec::new();
+    let mut start = 0;
+    let mut negative = false;
+    for (i, ch) in inner.char_indices() {
+        if (ch == '+' || ch == '-') && i > 0 {
+            terms.push((&inner[start..i], negative));
+            negative = ch == '-';
+            start = i + 1;
+        }
+    }
+    terms.push((&inner[start..], negative));
+    terms
 }
 
 #[cfg(test)]

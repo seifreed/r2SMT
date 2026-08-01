@@ -775,3 +775,74 @@ fn test_aarch32_ldm_without_writeback_leaves_base_unchanged() {
         "ldm without ! must not write back r0: {stmts:?}"
     );
 }
+
+// --- P41a x86 non-stack memory → LoadMem/StoreMem --------------------
+
+#[test]
+fn test_x86_load_from_register_indirect_emits_loadmem() {
+    // `mov rbx, [rax]` → LoadMem at rax (was Expr::Unknown before P41).
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "mov",
+            vec![
+                op("rbx", OperandKind::Register),
+                op("[rax]", OperandKind::Memory),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    let load = stmts.iter().find_map(|s| match s {
+        IrStmt::LoadMem { address, .. } => Some(address.clone()),
+        _ => None,
+    });
+    let load = load.expect("mov reg, [rax] must emit a LoadMem");
+    assert!(
+        format!("{load:?}").contains("\"rax\""),
+        "load address must reference rax: {load:?}"
+    );
+}
+
+#[test]
+fn test_x86_store_to_scaled_index_emits_storemem() {
+    // `mov [rbp + rax*4], rbx` → StoreMem at rbp + rax*4.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "mov",
+            vec![
+                op("[rbp + rax*4]", OperandKind::Memory),
+                op("rbx", OperandKind::Register),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    let store = stmts.iter().find_map(|s| match s {
+        IrStmt::StoreMem { address, .. } => Some(address.clone()),
+        _ => None,
+    });
+    let store = store.expect("mov [rbp+rax*4], rbx must emit a StoreMem");
+    let dbg = format!("{store:?}");
+    assert!(dbg.contains("\"rbp\"") && dbg.contains("\"rax\""));
+}
+
+#[test]
+fn test_x86_stack_slot_still_uses_named_var_not_loadmem() {
+    // `mov rbx, [rbp - 8]` — stack slot: UNCHANGED, no LoadMem
+    // (still the named-slot scheme).
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "mov",
+            vec![
+                op("rbx", OperandKind::Register),
+                op("[rbp - 8]", OperandKind::Memory),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    assert!(
+        !stmts.iter().any(|s| matches!(s, IrStmt::LoadMem { .. })),
+        "stack slot must stay a named var, not a LoadMem: {stmts:?}"
+    );
+}

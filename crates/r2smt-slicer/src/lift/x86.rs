@@ -58,7 +58,7 @@ impl LiftCtx {
             return;
         }
         let dst_width = self.operand_width(dst);
-        let value = self.read_operand_at(src, dst_width);
+        let value = self.read_operand_lowered(src, dst_width);
         if !self.write_dst(dst, value, dst_width) {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
@@ -79,7 +79,7 @@ impl LiftCtx {
             return;
         };
         let src_width = self.operand_width(src);
-        let raw = self.read_operand_at(src, src_width);
+        let raw = self.read_operand_lowered(src, src_width);
         let extended = if src_width >= dst_width {
             raw
         } else {
@@ -145,8 +145,8 @@ impl LiftCtx {
             });
             return;
         }
-        let lhs = self.read_operand_at(dst, dst_width);
-        let rhs = self.read_operand_at(src, dst_width);
+        let lhs = self.read_operand_lowered(dst, dst_width);
+        let rhs = self.read_operand_lowered(src, dst_width);
         // Stash the computed result in a temporary before writing the
         // destination so flag updates that follow reference the value
         // the instruction actually produced — without the temp, SSA
@@ -182,8 +182,8 @@ impl LiftCtx {
             });
             return;
         }
-        let lhs = self.read_operand_at(dst, dst_width);
-        let rhs = self.read_operand_at(src, dst_width);
+        let lhs = self.read_operand_lowered(dst, dst_width);
+        let rhs = self.read_operand_lowered(src, dst_width);
         let result_expr = match kind {
             BitwiseOp::And => Expr::bv_and(lhs, rhs),
             BitwiseOp::Or => Expr::bv_or(lhs, rhs),
@@ -219,8 +219,8 @@ impl LiftCtx {
             });
             return;
         }
-        let lhs_before = self.read_operand_at(dst, dst_width);
-        let rhs = self.read_operand_at(src, dst_width);
+        let lhs_before = self.read_operand_lowered(dst, dst_width);
+        let rhs = self.read_operand_lowered(src, dst_width);
         // Stash the computed delta in a temporary before the destination
         // write so the flag updates that follow reference the value the
         // instruction actually produced. Without the temp, SSA would
@@ -275,8 +275,8 @@ impl LiftCtx {
                     });
                     return;
                 }
-                let lhs = self.read_operand_at(dst, dst_width);
-                let rhs = self.read_operand_at(src, dst_width);
+                let lhs = self.read_operand_lowered(dst, dst_width);
+                let rhs = self.read_operand_lowered(src, dst_width);
                 let result = Expr::mul(lhs, rhs);
                 if !self.write_register_to(dst, result) {
                     self.stmts.push(IrStmt::Unsupported {
@@ -305,8 +305,8 @@ impl LiftCtx {
                     });
                     return;
                 }
-                let lhs = self.read_operand_at(src1, dst_width);
-                let rhs = self.read_operand_at(src2, dst_width);
+                let lhs = self.read_operand_lowered(src1, dst_width);
+                let rhs = self.read_operand_lowered(src2, dst_width);
                 let result = Expr::mul(lhs, rhs);
                 if !self.write_register_to(dst, result) {
                     self.stmts.push(IrStmt::Unsupported {
@@ -329,8 +329,8 @@ impl LiftCtx {
             return;
         };
         let cmp_width = self.binop_width(lhs_op, rhs_op);
-        let lhs = self.read_operand_at(lhs_op, cmp_width);
-        let rhs = self.read_operand_at(rhs_op, cmp_width);
+        let lhs = self.read_operand_lowered(lhs_op, cmp_width);
+        let rhs = self.read_operand_lowered(rhs_op, cmp_width);
         let tmp = self.new_temp(insn.address, cmp_width);
         self.assign(tmp.clone(), Expr::sub(lhs.clone(), rhs.clone()));
         let tmp_expr = Expr::Var(tmp);
@@ -347,8 +347,8 @@ impl LiftCtx {
             return;
         };
         let cmp_width = self.binop_width(lhs_op, rhs_op);
-        let lhs = self.read_operand_at(lhs_op, cmp_width);
-        let rhs = self.read_operand_at(rhs_op, cmp_width);
+        let lhs = self.read_operand_lowered(lhs_op, cmp_width);
+        let rhs = self.read_operand_lowered(rhs_op, cmp_width);
         let tmp = self.new_temp(insn.address, cmp_width);
         self.assign(tmp.clone(), Expr::bv_and(lhs, rhs));
         let tmp_expr = Expr::Var(tmp);
@@ -379,8 +379,8 @@ impl LiftCtx {
             });
             return;
         }
-        let lhs = self.read_operand_at(dst, dst_width);
-        let raw_shift = self.read_operand_at(count, dst_width);
+        let lhs = self.read_operand_lowered(dst, dst_width);
+        let raw_shift = self.read_operand_lowered(count, dst_width);
         let count_mask = if dst_width == X86_WIDTH_64 {
             X86_SHIFT_COUNT_MASK_64
         } else {
