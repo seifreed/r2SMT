@@ -5,7 +5,7 @@ use super::{
     registers_in_operand,
 };
 use r2smt_common::Arch;
-use r2smt_ir::program::Instruction;
+use r2smt_ir::program::{Instruction, Operand};
 
 pub(super) fn analyze_aarch32(insn: &Instruction) -> InstructionEffect {
     let mnemonic = insn.mnemonic.trim().to_ascii_lowercase();
@@ -130,7 +130,93 @@ fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> Instruct
         // them under `--allow-memory`.
         "ldr" | "ldrb" | "ldrh" => aarch32_ldr_effect(insn),
         "str" | "strb" | "strh" => aarch32_str_effect(insn),
+        // Register-list multiple: `push`/`pop` use the implicit `sp`
+        // base; `ldm`/`stm` an explicit base (index 0) plus the list
+        // (index 1). Both touch memory so the memory-aware slice walker
+        // keeps them.
+        "push" => aarch32_push_pop_effect(insn, false),
+        "pop" => aarch32_push_pop_effect(insn, true),
+        "ldm" | "ldmia" => aarch32_ldm_stm_effect(insn, true),
+        "stm" | "stmia" => aarch32_ldm_stm_effect(insn, false),
         _ => other_effect(insn),
+    }
+}
+
+/// Canonical register names inside a `{r4, r5, lr}` list operand.
+fn reglist_registers(op: &Operand) -> Vec<&'static str> {
+    let raw = op.raw.trim();
+    let body = raw
+        .strip_prefix('{')
+        .and_then(|b| b.strip_suffix('}'))
+        .unwrap_or(raw);
+    body.split(',')
+        .filter_map(|s| canonical_register(s.trim(), Arch::Arm))
+        .collect()
+}
+
+fn aarch32_push_pop_effect(insn: &Instruction, is_pop: bool) -> InstructionEffect {
+    let regs = insn
+        .operands
+        .first()
+        .map(reglist_registers)
+        .unwrap_or_default();
+    let mut defs = vec!["sp"];
+    let mut uses = vec!["sp"];
+    for r in regs {
+        if is_pop {
+            if !defs.contains(&r) {
+                defs.push(r);
+            }
+        } else if !uses.contains(&r) {
+            uses.push(r);
+        }
+    }
+    InstructionEffect {
+        kind: InstructionKind::Mov,
+        defs,
+        uses,
+        defines_flags: false,
+        has_memory_access: true,
+        is_call: false,
+        stack_defs: Vec::new(),
+        stack_uses: Vec::new(),
+        reads_flags: false,
+    }
+}
+
+fn aarch32_ldm_stm_effect(insn: &Instruction, is_load: bool) -> InstructionEffect {
+    let base = insn
+        .operands
+        .first()
+        .and_then(|o| canonical_register(o.raw.trim().trim_end_matches('!').trim(), Arch::Arm));
+    let regs = insn
+        .operands
+        .get(1)
+        .map(reglist_registers)
+        .unwrap_or_default();
+    // The base is read for the address and may be written back; listing
+    // it as both use and def is a sound superset for the slicer.
+    let mut defs: Vec<&'static str> = base.into_iter().collect();
+    let mut uses: Vec<&'static str> = base.into_iter().collect();
+    for r in regs {
+        if is_load {
+            if !defs.contains(&r) {
+                defs.push(r);
+            }
+        } else if !uses.contains(&r) {
+            uses.push(r);
+        }
+    }
+    InstructionEffect {
+        kind: InstructionKind::Mov,
+        defs,
+        uses,
+        defines_flags: false,
+        has_memory_access: true,
+        is_call: false,
+        stack_defs: Vec::new(),
+        stack_uses: Vec::new(),
+        reads_flags: false,
     }
 }
 

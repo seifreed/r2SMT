@@ -87,6 +87,15 @@ impl LiftCtx {
             "str" => self.lift_aarch32_store(insn, None),
             "strb" => self.lift_aarch32_store(insn, Some(8)),
             "strh" => self.lift_aarch32_store(insn, Some(16)),
+            // Register-list load/store multiple. `push`/`pop` are the
+            // stack idioms (`stmdb sp!` / `ldmia sp!`); `ldm`/`stm`
+            // (increment-after) carry an explicit base. Other
+            // addressing suffixes (`stmdb`/`ldmdb`/`stmib`/`ldmda`) are
+            // not in this match and decline soundly.
+            "push" => self.lift_aarch32_push(insn),
+            "pop" => self.lift_aarch32_pop(insn),
+            "ldm" | "ldmia" => self.lift_aarch32_ldm(insn),
+            "stm" | "stmia" => self.lift_aarch32_stm(insn),
             _ => self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("at {addr} (aarch32)", addr = insn.address),
@@ -354,6 +363,182 @@ impl LiftCtx {
         });
         self.emit_writeback(access.writeback);
     }
+
+    /// `push {regs}` ≡ `stmdb sp!, {regs}` — store each register to a
+    /// descending stack slot (lowest register number at the lowest
+    /// address) and decrement `sp` by `4 * n`.
+    fn lift_aarch32_push(&mut self, insn: &Instruction) {
+        let Some(regs) = insn.operands.first().and_then(|o| parse_reglist(&o.raw)) else {
+            self.unsupported_aarch32(insn, "push expects a register list");
+            return;
+        };
+        let n = i64::try_from(regs.len()).unwrap_or(0);
+        self.emit_store_multiple("sp", &regs, -4 * n);
+        self.emit_writeback(Some(("sp".to_string(), -4 * n)));
+    }
+
+    /// `pop {regs}` ≡ `ldmia sp!, {regs}` — load each register from an
+    /// ascending stack slot and increment `sp` by `4 * n`.
+    fn lift_aarch32_pop(&mut self, insn: &Instruction) {
+        let Some(regs) = insn.operands.first().and_then(|o| parse_reglist(&o.raw)) else {
+            self.unsupported_aarch32(insn, "pop expects a register list");
+            return;
+        };
+        let n = i64::try_from(regs.len()).unwrap_or(0);
+        self.emit_load_multiple(insn, "sp", &regs, 0);
+        self.emit_writeback(Some(("sp".to_string(), 4 * n)));
+    }
+
+    /// `ldm{ia} Rn{!}, {regs}` — increment-after load multiple from the
+    /// explicit base register, with optional writeback.
+    fn lift_aarch32_ldm(&mut self, insn: &Instruction) {
+        let (Some(base_op), Some(list_op)) = (insn.operands.first(), insn.operands.get(1)) else {
+            self.unsupported_aarch32(insn, "ldm expects base and register list");
+            return;
+        };
+        let (Some((base, writeback)), Some(regs)) = (
+            aarch32_base_writeback(&base_op.raw),
+            parse_reglist(&list_op.raw),
+        ) else {
+            self.unsupported_aarch32(insn, "ldm base or list not modelled");
+            return;
+        };
+        let n = i64::try_from(regs.len()).unwrap_or(0);
+        self.emit_load_multiple(insn, &base, &regs, 0);
+        if writeback {
+            self.emit_writeback(Some((base, 4 * n)));
+        }
+    }
+
+    /// `stm{ia} Rn{!}, {regs}` — increment-after store multiple to the
+    /// explicit base register, with optional writeback.
+    fn lift_aarch32_stm(&mut self, insn: &Instruction) {
+        let (Some(base_op), Some(list_op)) = (insn.operands.first(), insn.operands.get(1)) else {
+            self.unsupported_aarch32(insn, "stm expects base and register list");
+            return;
+        };
+        let (Some((base, writeback)), Some(regs)) = (
+            aarch32_base_writeback(&base_op.raw),
+            parse_reglist(&list_op.raw),
+        ) else {
+            self.unsupported_aarch32(insn, "stm base or list not modelled");
+            return;
+        };
+        let n = i64::try_from(regs.len()).unwrap_or(0);
+        self.emit_store_multiple(&base, &regs, 0);
+        if writeback {
+            self.emit_writeback(Some((base, 4 * n)));
+        }
+    }
+
+    /// Store `regs` at `base + start_off + 4*i` (ascending register
+    /// number → ascending address), one word each.
+    fn emit_store_multiple(&mut self, base: &str, regs: &[String], start_off: i64) {
+        for (i, reg) in regs.iter().enumerate() {
+            let off = start_off + 4 * i64::try_from(i).unwrap_or(0);
+            let address = aarch32_addr_from(base, off, self.bits);
+            let value = self.read_named_register(reg, self.bits);
+            self.stmts.push(IrStmt::StoreMem {
+                address,
+                value,
+                bits: self.bits,
+            });
+        }
+    }
+
+    /// Load `regs` from `base + start_off + 4*i` into each register.
+    fn emit_load_multiple(
+        &mut self,
+        insn: &Instruction,
+        base: &str,
+        regs: &[String],
+        start_off: i64,
+    ) {
+        for (i, reg) in regs.iter().enumerate() {
+            let off = start_off + 4 * i64::try_from(i).unwrap_or(0);
+            let address = aarch32_addr_from(base, off, self.bits);
+            let tmp = self.new_temp(insn.address, self.bits);
+            self.stmts.push(IrStmt::LoadMem {
+                dst: tmp.clone(),
+                address,
+                bits: self.bits,
+            });
+            if !self.write_named_register(reg, Expr::Var(tmp)) {
+                self.unsupported_aarch32(insn, "ldm/pop destination not a register");
+            }
+        }
+    }
+
+    fn read_named_register(&self, name: &str, width: u8) -> Expr {
+        let op = Operand {
+            raw: name.to_string(),
+            kind: OperandKind::Register,
+        };
+        self.read_operand_at(&op, width)
+    }
+
+    fn write_named_register(&mut self, name: &str, value: Expr) -> bool {
+        let op = Operand {
+            raw: name.to_string(),
+            kind: OperandKind::Register,
+        };
+        self.write_register_to(&op, value)
+    }
+
+    fn unsupported_aarch32(&mut self, insn: &Instruction, reason: &str) {
+        self.stmts.push(IrStmt::Unsupported {
+            mnemonic: insn.mnemonic.clone(),
+            comment: reason.to_string(),
+        });
+    }
+}
+
+/// Parse a `{r4, r5, lr}` register list into canonical register names
+/// sorted by architectural register number (lowest number first, which
+/// is the lowest stack address). `None` if any entry is not a
+/// recognised `AArch32` GPR.
+fn parse_reglist(raw: &str) -> Option<Vec<String>> {
+    let body = raw.trim().strip_prefix('{')?.strip_suffix('}')?;
+    let mut regs: Vec<String> = body
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if regs.is_empty() || regs.iter().any(|r| aarch32_reg_number(r).is_none()) {
+        return None;
+    }
+    regs.sort_by_key(|r| aarch32_reg_number(r).unwrap_or(u8::MAX));
+    Some(regs)
+}
+
+/// Architectural register number for an `AArch32` GPR name (`r0..r15`
+/// plus the AAPCS aliases). `None` for anything else.
+fn aarch32_reg_number(name: &str) -> Option<u8> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "sp" => Some(13),
+        "lr" => Some(14),
+        "pc" => Some(15),
+        "fp" => Some(11),
+        "ip" => Some(12),
+        "sb" => Some(9),
+        "sl" => Some(10),
+        other => other
+            .strip_prefix('r')
+            .and_then(|d| d.parse::<u8>().ok())
+            .filter(|&n| n <= 15),
+    }
+}
+
+/// Split an `ldm`/`stm` base operand `Rn` or `Rn!` into
+/// `(base_name, writeback)`. `None` if `Rn` is not a recognised base.
+fn aarch32_base_writeback(raw: &str) -> Option<(String, bool)> {
+    let trimmed = raw.trim();
+    let (name, writeback) = match trimmed.strip_suffix('!') {
+        Some(base) => (base.trim(), true),
+        None => (trimmed, false),
+    };
+    let parent = register_layout(name, Arch::Arm).map(|l| l.parent)?;
+    Some((parent.to_string(), writeback))
 }
 
 /// Resolve an `AArch32` memory operand, including the pre-index

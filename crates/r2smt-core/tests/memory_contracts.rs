@@ -698,3 +698,80 @@ fn test_aarch32_postindex_ldr_emits_load_and_base_writeback() {
         "aarch32 post-index must write back r1: {stmts:?}"
     );
 }
+
+// --- P36 AArch32 register-list multiple goldens ----------------------
+
+fn count_stores(stmts: &[IrStmt]) -> usize {
+    stmts
+        .iter()
+        .filter(|s| matches!(s, IrStmt::StoreMem { .. }))
+        .count()
+}
+
+fn count_loads(stmts: &[IrStmt]) -> usize {
+    stmts
+        .iter()
+        .filter(|s| matches!(s, IrStmt::LoadMem { .. }))
+        .count()
+}
+
+#[test]
+fn test_aarch32_push_stores_each_register_and_decrements_sp() {
+    // `push {r4, r5, lr}` → three StoreMem + sp writeback.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "push",
+            vec![op("{r4, r5, lr}", OperandKind::Unknown)],
+        ),
+        Arch::Arm,
+    );
+    assert_eq!(
+        count_stores(&stmts),
+        3,
+        "push of 3 regs → 3 stores: {stmts:?}"
+    );
+    assert!(
+        has_writeback_to(&stmts, "sp"),
+        "push must update sp: {stmts:?}"
+    );
+}
+
+#[test]
+fn test_aarch32_pop_loads_each_register_and_increments_sp() {
+    // `pop {r4, r5, pc}` → three LoadMem + sp writeback.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "pop",
+            vec![op("{r4, r5, pc}", OperandKind::Unknown)],
+        ),
+        Arch::Arm,
+    );
+    assert_eq!(count_loads(&stmts), 3, "pop of 3 regs → 3 loads: {stmts:?}");
+    assert!(
+        has_writeback_to(&stmts, "sp"),
+        "pop must update sp: {stmts:?}"
+    );
+}
+
+#[test]
+fn test_aarch32_ldm_without_writeback_leaves_base_unchanged() {
+    // `ldm r0, {r1, r2}` (no `!`) → two LoadMem, r0 NOT written back.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "ldm",
+            vec![
+                op("r0", OperandKind::Register),
+                op("{r1, r2}", OperandKind::Unknown),
+            ],
+        ),
+        Arch::Arm,
+    );
+    assert_eq!(count_loads(&stmts), 2, "ldm of 2 regs → 2 loads: {stmts:?}");
+    assert!(
+        !has_writeback_to(&stmts, "r0"),
+        "ldm without ! must not write back r0: {stmts:?}"
+    );
+}
