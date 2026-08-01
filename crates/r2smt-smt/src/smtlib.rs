@@ -18,13 +18,39 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use r2smt_common::smt::SolveOptions;
-use r2smt_ir::expr::Expr;
+use r2smt_ir::expr::{Expr, RoundingMode};
 use r2smt_ir::stmt::IrStmt;
 use r2smt_ssa::SsaLiftedSlice;
 
+/// Why the renderer could not produce a faithful script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderError {
+    /// A floating-point term the textual backend cannot encode
+    /// portably. Carries an open-domain description of the offending
+    /// shape: the set of rejectable shapes is not a closed enumeration
+    /// (it grows with the IR), so a typed kind would be a lie.
+    UnrenderableFloat(String),
+}
+
+impl std::fmt::Display for RenderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnrenderableFloat(detail) => {
+                write!(f, "floating-point term not renderable in SMT-LIB: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RenderError {}
+
+/// Prefix for the bit-vector variables minted by [`fp_bridge_to_bv`].
+const IEEE_BRIDGE_PREFIX: &str = "__fpbv_";
+
 /// Mutable renderer state shared by every expression rendered into one
-/// script: auxiliary declarations / assertions awaiting a flush, and the
-/// counter minting their names.
+/// script: auxiliary declarations / assertions awaiting a flush, the
+/// counter minting their names, and the first shape the renderer had to
+/// refuse.
 ///
 /// A single instance must span a whole script — preamble *and* branch
 /// condition — or the fresh-name counter restarts and mints a duplicate
@@ -32,11 +58,28 @@ use r2smt_ssa::SsaLiftedSlice;
 #[derive(Debug, Default)]
 struct RenderCtx {
     aux: Vec<String>,
+    fresh_fp_bv: u32,
+    unsupported: Option<RenderError>,
 }
 
 impl RenderCtx {
     fn new() -> Self {
         Self::default()
+    }
+
+    fn fresh_ieee_name(&mut self) -> String {
+        let name = format!("{IEEE_BRIDGE_PREFIX}{n}", n = self.fresh_fp_bv);
+        self.fresh_fp_bv = self.fresh_fp_bv.wrapping_add(1);
+        name
+    }
+
+    /// Record a shape the renderer cannot encode. First one wins: it is
+    /// the one closest to the root of the refusal, and the caller only
+    /// needs a single reason to decline the whole slice.
+    fn note_unsupported(&mut self, detail: impl Into<String>) {
+        if self.unsupported.is_none() {
+            self.unsupported = Some(RenderError::UnrenderableFloat(detail.into()));
+        }
     }
 
     /// Drain the pending auxiliary lines into `out` in push order, so a
@@ -71,7 +114,14 @@ fn emit_preamble_with(
     ctx: &mut RenderCtx,
 ) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "(set-logic QF_BV)");
+    // A float-free slice must keep emitting exactly `QF_BV`: widening
+    // the logic unnecessarily changes every existing script.
+    let logic = if slice_uses_fp(slice) {
+        "QF_BVFP"
+    } else {
+        "QF_BV"
+    };
+    let _ = writeln!(out, "(set-logic {logic})");
     let _ = writeln!(out, "(set-option :produce-models false)");
     // Pin the subprocess backends' PRNG (standard SMT-LIB option,
     // honoured by Z3 / CVC5 / Bitwuzla) so a query's verdict is
@@ -265,6 +315,305 @@ impl TextMemory {
     }
 }
 
+/// Whether any expression rendered into the script carries a
+/// floating-point node, which decides the declared logic.
+fn slice_uses_fp(slice: &SsaLiftedSlice) -> bool {
+    if expr_uses_fp(&slice.condition) {
+        return true;
+    }
+    slice.statements.iter().any(|stmt| match stmt {
+        IrStmt::Assign { src, .. } => expr_uses_fp(src),
+        IrStmt::StoreMem { address, value, .. } => expr_uses_fp(address) || expr_uses_fp(value),
+        IrStmt::LoadMem { address, .. } => expr_uses_fp(address),
+        IrStmt::Unsupported { .. } | IrStmt::Nop => false,
+    })
+}
+
+/// Whether `expr` contains any floating-point node. Written without a
+/// wildcard arm so a new `Expr` variant forces this to be revisited.
+// Exhaustive `Expr` dispatch: FP arms mirror the BV arms' shape but stay separate for legibility (CLAUDE.md exhaustive-dispatch exception).
+#[allow(clippy::match_same_arms, clippy::too_many_lines)]
+fn expr_uses_fp(expr: &Expr) -> bool {
+    match expr {
+        Expr::FAdd(..)
+        | Expr::FSub(..)
+        | Expr::FMul(..)
+        | Expr::FDiv(..)
+        | Expr::FEq(..)
+        | Expr::FLt(..)
+        | Expr::FLe(..)
+        | Expr::FIsNaN(_)
+        | Expr::FpConst { .. }
+        | Expr::BvToFp { .. }
+        | Expr::FpToIeeeBv(_)
+        | Expr::FpToSbv { .. }
+        | Expr::SbvToFp { .. } => true,
+        Expr::Var(_) | Expr::Const { .. } | Expr::Unknown(_) => false,
+        Expr::BoolNot(a)
+        | Expr::Extract { src: a, .. }
+        | Expr::ZeroExtend { src: a, .. }
+        | Expr::SignExtend { src: a, .. } => expr_uses_fp(a),
+        Expr::Add(a, b)
+        | Expr::Sub(a, b)
+        | Expr::Mul(a, b)
+        | Expr::UDiv(a, b)
+        | Expr::URem(a, b)
+        | Expr::SDiv(a, b)
+        | Expr::SRem(a, b)
+        | Expr::And(a, b)
+        | Expr::Or(a, b)
+        | Expr::Xor(a, b)
+        | Expr::Shl(a, b)
+        | Expr::LShr(a, b)
+        | Expr::AShr(a, b)
+        | Expr::Eq(a, b)
+        | Expr::Ne(a, b)
+        | Expr::Ult(a, b)
+        | Expr::Ule(a, b)
+        | Expr::Slt(a, b)
+        | Expr::Sle(a, b)
+        | Expr::BoolAnd(a, b)
+        | Expr::BoolOr(a, b)
+        | Expr::Concat { high: a, low: b } => expr_uses_fp(a) || expr_uses_fp(b),
+        Expr::Ite {
+            cond,
+            then_expr,
+            else_expr,
+        } => expr_uses_fp(cond) || expr_uses_fp(then_expr) || expr_uses_fp(else_expr),
+    }
+}
+
+/// IEEE-754 binary32 `(exponent, significand)` sort.
+const IEEE_SINGLE: (u16, u16) = (8, 24);
+/// IEEE-754 binary64 `(exponent, significand)` sort.
+const IEEE_DOUBLE: (u16, u16) = (11, 53);
+
+/// Whether a floating-point sort is one every target solver accepts
+/// without extra flags. CVC5 gates non-standard sorts behind
+/// `--fp-exp`, and the slicer's `fp_sort_bits` can only produce these
+/// two, so anything else declines rather than risking a solver error.
+const fn is_portable_fp_sort(ebits: u16, sbits: u16) -> bool {
+    let sort = (ebits, sbits);
+    matches!(sort, IEEE_SINGLE | IEEE_DOUBLE)
+}
+
+/// A rendered floating-point term together with its sort. Mirrors the
+/// Z3 encoder's `Encoded::Fp`: the textual renderer's `(String, u16)`
+/// pair cannot express an FP sort, and an FP term is never a bit
+/// vector of `ebits + sbits` bits — it is a distinct SMT-LIB sort.
+struct FpTerm {
+    text: String,
+    ebits: u16,
+    sbits: u16,
+}
+
+impl FpTerm {
+    /// Total width of the IEEE bit pattern this sort reinterprets.
+    fn bv_width(&self) -> u16 {
+        self.ebits.saturating_add(self.sbits)
+    }
+}
+
+/// SMT-LIB spelling of a rounding mode, mirroring the Z3 encoder's
+/// `to_z3_rm`.
+const fn rm_smtlib(rm: RoundingMode) -> &'static str {
+    match rm {
+        RoundingMode::NearestTiesEven => "RNE",
+        RoundingMode::NearestTiesAway => "RNA",
+        RoundingMode::TowardPositive => "RTP",
+        RoundingMode::TowardNegative => "RTN",
+        RoundingMode::TowardZero => "RTZ",
+    }
+}
+
+/// Render an FP-sorted expression, or `None` when the expression is not
+/// FP-sorted or carries a shape the renderer refuses.
+///
+/// Written without a wildcard arm so a new `Expr` variant forces this
+/// to be revisited rather than silently treated as non-FP.
+// Exhaustive `Expr` dispatch: every non-FP-producing variant is listed
+// explicitly so the variant set stays in lockstep with the renderer
+// (CLAUDE.md exhaustive-dispatch exception).
+#[allow(clippy::match_same_arms)]
+fn render_fp(expr: &Expr, ctx: &mut RenderCtx) -> Option<FpTerm> {
+    match expr {
+        Expr::FpConst { bits, ebits, sbits } => {
+            let term = fp_sort_checked(*ebits, *sbits, ctx)?;
+            let width = term.0;
+            Some(FpTerm {
+                text: format!("((_ to_fp {ebits} {sbits}) (_ bv{bits} {width}))"),
+                ebits: *ebits,
+                sbits: *sbits,
+            })
+        }
+        Expr::BvToFp { src, ebits, sbits } => {
+            let (width, _) = fp_sort_checked(*ebits, *sbits, ctx)?;
+            let (text, bits) = render_expr(src, ctx);
+            if bits != width {
+                ctx.note_unsupported(format!(
+                    "bit-pattern reinterpret of a {bits}-bit value into a {width}-bit sort"
+                ));
+                return None;
+            }
+            Some(FpTerm {
+                text: format!("((_ to_fp {ebits} {sbits}) {text})"),
+                ebits: *ebits,
+                sbits: *sbits,
+            })
+        }
+        Expr::SbvToFp {
+            src,
+            rm,
+            ebits,
+            sbits,
+        } => {
+            fp_sort_checked(*ebits, *sbits, ctx)?;
+            let (text, _) = render_expr(src, ctx);
+            Some(FpTerm {
+                text: format!(
+                    "((_ to_fp {ebits} {sbits}) {rm} {text})",
+                    rm = rm_smtlib(*rm)
+                ),
+                ebits: *ebits,
+                sbits: *sbits,
+            })
+        }
+        Expr::FAdd(a, b, rm) => fp_arith("fp.add", a, b, *rm, ctx),
+        Expr::FSub(a, b, rm) => fp_arith("fp.sub", a, b, *rm, ctx),
+        Expr::FMul(a, b, rm) => fp_arith("fp.mul", a, b, *rm, ctx),
+        Expr::FDiv(a, b, rm) => fp_arith("fp.div", a, b, *rm, ctx),
+        // Everything below is bit-vector sorted, including the bridges
+        // *out* of FP (`FpToIeeeBv`, `FpToSbv`) and the FP predicates,
+        // which render as 1-bit bit vectors.
+        Expr::Var(_)
+        | Expr::Const { .. }
+        | Expr::Unknown(_)
+        | Expr::Add(..)
+        | Expr::Sub(..)
+        | Expr::Mul(..)
+        | Expr::UDiv(..)
+        | Expr::URem(..)
+        | Expr::SDiv(..)
+        | Expr::SRem(..)
+        | Expr::And(..)
+        | Expr::Or(..)
+        | Expr::Xor(..)
+        | Expr::Shl(..)
+        | Expr::LShr(..)
+        | Expr::AShr(..)
+        | Expr::Eq(..)
+        | Expr::Ne(..)
+        | Expr::Ult(..)
+        | Expr::Ule(..)
+        | Expr::Slt(..)
+        | Expr::Sle(..)
+        | Expr::BoolAnd(..)
+        | Expr::BoolOr(..)
+        | Expr::BoolNot(_)
+        | Expr::Ite { .. }
+        | Expr::Extract { .. }
+        | Expr::Concat { .. }
+        | Expr::ZeroExtend { .. }
+        | Expr::SignExtend { .. }
+        | Expr::FEq(..)
+        | Expr::FLt(..)
+        | Expr::FLe(..)
+        | Expr::FIsNaN(_)
+        | Expr::FpToIeeeBv(_)
+        | Expr::FpToSbv { .. } => None,
+    }
+}
+
+/// Validate an FP sort, returning its IEEE bit-pattern width. Declines
+/// (recording the reason) for sorts outside [`is_portable_fp_sort`].
+fn fp_sort_checked(ebits: u16, sbits: u16, ctx: &mut RenderCtx) -> Option<(u16, u16)> {
+    if !is_portable_fp_sort(ebits, sbits) {
+        ctx.note_unsupported(format!(
+            "non-portable sort (_ FloatingPoint {ebits} {sbits})"
+        ));
+        return None;
+    }
+    Some((ebits.saturating_add(sbits), sbits))
+}
+
+fn fp_arith(
+    name: &str,
+    a: &Expr,
+    b: &Expr,
+    rm: RoundingMode,
+    ctx: &mut RenderCtx,
+) -> Option<FpTerm> {
+    let lhs = render_fp(a, ctx)?;
+    let rhs = render_fp(b, ctx)?;
+    if (lhs.ebits, lhs.sbits) != (rhs.ebits, rhs.sbits) {
+        ctx.note_unsupported("floating-point arithmetic mixing two sorts");
+        return None;
+    }
+    Some(FpTerm {
+        text: format!(
+            "({name} {rm} {l} {r})",
+            rm = rm_smtlib(rm),
+            l = lhs.text,
+            r = rhs.text
+        ),
+        ebits: lhs.ebits,
+        sbits: lhs.sbits,
+    })
+}
+
+/// Reinterpret a float as its IEEE bit pattern.
+///
+/// `fp.to_ieee_bv` is a Z3-only extension — CVC5 and Bitwuzla reject it
+/// — so the direction is inverted instead: mint a fresh bit vector and
+/// constrain the float to be *its* reinterpretation, using only the
+/// standard `(_ to_fp e s)` form.
+///
+/// The equality must be structural `=`, not `fp.eq`, which conflates
+/// `+0` with `-0` and makes `NaN` differ from itself. Under `=` the
+/// inversion is exact except for `NaN`: SMT-LIB has a single NaN value,
+/// so every NaN bit pattern satisfies the constraint. That is an
+/// over-approximation, which can only widen an always-true / always-
+/// false verdict to both-possible, never fabricate one.
+fn fp_bridge_to_bv(src: &Expr, ctx: &mut RenderCtx) -> (String, u16) {
+    let Some(term) = render_fp(src, ctx) else {
+        ctx.note_unsupported("bit-pattern reinterpret of a term with no floating-point sort");
+        return (UNRENDERABLE_PLACEHOLDER.to_string(), 1);
+    };
+    let width = term.bv_width();
+    let name = ctx.fresh_ieee_name();
+    ctx.aux
+        .push(format!("(declare-fun {name} () (_ BitVec {width}))"));
+    ctx.aux.push(format!(
+        "(assert (= {term} ((_ to_fp {e} {s}) {name})))",
+        term = term.text,
+        e = term.ebits,
+        s = term.sbits
+    ));
+    (name, width)
+}
+
+/// Render an FP predicate as the 1-bit bit vector the rest of the
+/// renderer expects, matching `bool_op`'s convention.
+fn fp_predicate(name: &str, operands: [&Expr; 2], ctx: &mut RenderCtx) -> (String, u16) {
+    let (Some(lhs), Some(rhs)) = (render_fp(operands[0], ctx), render_fp(operands[1], ctx)) else {
+        ctx.note_unsupported(format!("{name} over a term with no floating-point sort"));
+        return (UNRENDERABLE_PLACEHOLDER.to_string(), 1);
+    };
+    if (lhs.ebits, lhs.sbits) != (rhs.ebits, rhs.sbits) {
+        ctx.note_unsupported(format!("{name} comparing two floating-point sorts"));
+        return (UNRENDERABLE_PLACEHOLDER.to_string(), 1);
+    }
+    (
+        format!("(ite ({name} {l} {r}) #b1 #b0)", l = lhs.text, r = rhs.text),
+        1,
+    )
+}
+
+/// Stand-in emitted where the renderer had to refuse. It only keeps the
+/// script parseable for render-only consumers; a refusal is recorded on
+/// the context, and the verdict paths decline before solving.
+const UNRENDERABLE_PLACEHOLDER: &str = "(_ bv0 1)";
+
 fn declare_bv(out: &mut String, name: &str, bits: u16, declared: &mut Vec<String>) {
     if declared.iter().any(|n| n == name) {
         return;
@@ -367,24 +716,41 @@ fn render_expr(expr: &Expr, ctx: &mut RenderCtx) -> (String, u16) {
         // (`crate::cvc5::solve_branch_cvc5`) declines any slice that
         // contains an `Unknown` before this is ever solved, so no
         // verdict is derived from this placeholder.
-        Expr::Unknown(_) => ("(_ bv0 1)".to_string(), 1),
-        // Floating point has no sound QF_BV text encoding. Like
-        // `Unknown`, these placeholders only keep the script parseable
-        // for render-only consumers; the CVC5 / Bitwuzla verdict paths
-        // decline any slice containing a float (`slice_contains_float`)
-        // before this is ever solved, so no verdict is derived from a
-        // placeholder. Precise `QF_BVFP` rendering lands in P40-f-4.
+        Expr::Unknown(_) => (UNRENDERABLE_PLACEHOLDER.to_string(), 1),
+        Expr::FpToIeeeBv(src) => fp_bridge_to_bv(src, ctx),
+        // An FP-sorted node reached directly in bit-vector position.
+        // The lifter always wraps its results in `FpToIeeeBv`, but
+        // hand-built IR need not, and the bridge is precise either way.
         Expr::FAdd(..)
         | Expr::FSub(..)
         | Expr::FMul(..)
         | Expr::FDiv(..)
         | Expr::FpConst { .. }
         | Expr::BvToFp { .. }
-        | Expr::FpToIeeeBv(_)
-        | Expr::SbvToFp { .. } => ("(_ bv0 1)".to_string(), 1),
-        Expr::FpToSbv { bits, .. } => (format!("(_ bv0 {bits})"), *bits),
-        Expr::FEq(..) | Expr::FLt(..) | Expr::FLe(..) | Expr::FIsNaN(_) => {
-            ("(_ bv0 1)".to_string(), 1)
+        | Expr::SbvToFp { .. } => fp_bridge_to_bv(expr, ctx),
+        Expr::FpToSbv { src, rm, bits } => {
+            let Some(f) = render_fp(src, ctx) else {
+                ctx.note_unsupported("float-to-signed conversion of a term with no float sort");
+                return (format!("(_ bv0 {bits})"), *bits);
+            };
+            (
+                format!(
+                    "((_ fp.to_sbv {bits}) {rm} {f})",
+                    rm = rm_smtlib(*rm),
+                    f = f.text
+                ),
+                *bits,
+            )
+        }
+        Expr::FEq(a, b) => fp_predicate("fp.eq", [a, b], ctx),
+        Expr::FLt(a, b) => fp_predicate("fp.lt", [a, b], ctx),
+        Expr::FLe(a, b) => fp_predicate("fp.leq", [a, b], ctx),
+        Expr::FIsNaN(a) => {
+            let Some(f) = render_fp(a, ctx) else {
+                ctx.note_unsupported("fp.isNaN over a term with no floating-point sort");
+                return (UNRENDERABLE_PLACEHOLDER.to_string(), 1);
+            };
+            (format!("(ite (fp.isNaN {f}) #b1 #b0)", f = f.text), 1)
         }
     }
 }
@@ -566,6 +932,151 @@ mod tests {
         let mut ctx = RenderCtx::new();
         let _ = emit_preamble_with(&mem_slice(statements), &SolveOptions::default(), &mut ctx);
         assert!(ctx.aux.is_empty());
+    }
+
+    /// IEEE-754 binary32 bit patterns used by the floating-point tests.
+    const F32_ONE: u128 = 0x3f80_0000;
+    const F32_TWO: u128 = 0x4000_0000;
+    const F32_QUIET_NAN: u128 = 0x7fc0_0000;
+
+    fn f32_const(bits: u128) -> Expr {
+        Expr::FpConst {
+            bits,
+            ebits: 8,
+            sbits: 24,
+        }
+    }
+
+    /// A slice whose single statement defines `t0` from `src`, with
+    /// `condition` as the branch predicate.
+    fn fp_slice(src: Expr, condition: Expr) -> SsaLiftedSlice {
+        let mut slice = mem_slice(vec![IrStmt::Assign {
+            dst: r2smt_ir::expr::Var::new("t0", 32),
+            src,
+        }]);
+        slice.condition = condition;
+        slice
+    }
+
+    /// Solve an emitted script with the already-linked Z3, so the text
+    /// backend's *own output* is checked rather than only its shape.
+    fn z3_check(script: &str) -> z3::SatResult {
+        let solver = z3::Solver::new();
+        solver.from_string(script);
+        solver.check()
+    }
+
+    #[test]
+    fn smtlib_scalar_fp_add_emits_qf_bvfp_logic_and_fp_add() {
+        let slice = fp_slice(
+            Expr::fp_to_ieee_bv(Expr::fadd(
+                f32_const(F32_ONE),
+                f32_const(F32_ONE),
+                RoundingMode::NearestTiesEven,
+            )),
+            Expr::eq(Expr::var("t0", 32), Expr::konst(F32_TWO, 32)),
+        );
+        let script = emit_query(&slice, &SolveOptions::default(), true);
+        assert!(script.starts_with("(set-logic QF_BVFP)\n"), "{script}");
+        assert!(script.contains("(fp.add RNE "), "{script}");
+    }
+
+    #[test]
+    fn smtlib_fp_to_ieee_bv_inverts_through_standard_to_fp() {
+        // `fp.to_ieee_bv` is a Z3-only extension that CVC5 and Bitwuzla
+        // reject, so the reinterpret must invert through the standard
+        // one-argument `to_fp` against a freshly declared bit vector.
+        let slice = fp_slice(
+            Expr::fp_to_ieee_bv(f32_const(F32_ONE)),
+            Expr::eq(Expr::var("t0", 32), Expr::konst(F32_ONE, 32)),
+        );
+        let script = emit_query(&slice, &SolveOptions::default(), true);
+        assert!(!script.contains("fp.to_ieee_bv"), "{script}");
+        assert!(
+            script.contains("(declare-fun __fpbv_0 () (_ BitVec 32))"),
+            "{script}"
+        );
+        assert!(script.contains("((_ to_fp 8 24) __fpbv_0)))"), "{script}");
+    }
+
+    #[test]
+    fn smtlib_fp_inversion_declares_bridge_before_the_assert_using_it() {
+        let slice = fp_slice(
+            Expr::fp_to_ieee_bv(f32_const(F32_ONE)),
+            Expr::eq(Expr::var("t0", 32), Expr::konst(F32_ONE, 32)),
+        );
+        let script = emit_query(&slice, &SolveOptions::default(), true);
+        let declared = script
+            .find("(declare-fun __fpbv_0")
+            .expect("bridge declaration");
+        let used = script.find("(assert (= t0 __fpbv_0))").expect("bridge use");
+        assert!(declared < used, "{script}");
+    }
+
+    #[test]
+    fn smtlib_fp_inversion_on_nan_keeps_both_polarities_satisfiable() {
+        // The soundness contract for the inversion. SMT-LIB collapses
+        // every NaN bit pattern onto one NaN value, so constraining the
+        // float leaves the bridge variable free across all of them —
+        // an over-approximation. Both polarities must stay satisfiable:
+        // the earlier constant placeholder pinned the value and would
+        // fabricate an always-false verdict here.
+        let slice = fp_slice(
+            Expr::fp_to_ieee_bv(f32_const(F32_QUIET_NAN)),
+            Expr::eq(Expr::var("t0", 32), Expr::konst(F32_QUIET_NAN, 32)),
+        );
+        let taken = z3_check(&emit_query(&slice, &SolveOptions::default(), true));
+        let not_taken = z3_check(&emit_query(&slice, &SolveOptions::default(), false));
+        assert_eq!((taken, not_taken), (z3::SatResult::Sat, z3::SatResult::Sat));
+    }
+
+    #[test]
+    fn smtlib_fp_inversion_still_proves_an_exact_sum_always_true() {
+        // The companion to the NaN test: over-approximating NaN must
+        // not cost precision on ordinary values, or the renderer would
+        // be sound but useless. `1.0f + 1.0f == 2.0f` stays provable.
+        let slice = fp_slice(
+            Expr::fp_to_ieee_bv(Expr::fadd(
+                f32_const(F32_ONE),
+                f32_const(F32_ONE),
+                RoundingMode::NearestTiesEven,
+            )),
+            Expr::eq(Expr::var("t0", 32), Expr::konst(F32_TWO, 32)),
+        );
+        let taken = z3_check(&emit_query(&slice, &SolveOptions::default(), true));
+        let not_taken = z3_check(&emit_query(&slice, &SolveOptions::default(), false));
+        assert_eq!(
+            (taken, not_taken),
+            (z3::SatResult::Sat, z3::SatResult::Unsat)
+        );
+    }
+
+    #[test]
+    #[ignore = "writes a script for manual replay against cvc5 / bitwuzla"]
+    fn smtlib_writes_fp_script_for_external_solver_replay() {
+        // Opt-in: the default suite must not depend on a solver binary
+        // being installed, but the emitted text is what CVC5 and
+        // Bitwuzla actually parse, so keep a way to hand it to them:
+        //   cargo test -p r2smt-smt --lib -- --ignored \
+        //     smtlib_writes_fp_script_for_external_solver_replay
+        //   cvc5 --lang smt2 < target/fp-replay-taken.smt2
+        //   bitwuzla < target/fp-replay-not-taken.smt2
+        let slice = fp_slice(
+            Expr::fp_to_ieee_bv(Expr::fadd(
+                f32_const(F32_ONE),
+                f32_const(F32_ONE),
+                RoundingMode::NearestTiesEven,
+            )),
+            Expr::eq(Expr::var("t0", 32), Expr::konst(F32_TWO, 32)),
+        );
+        // A unit test runs with the crate directory as its working
+        // directory, so reach the workspace target dir explicitly.
+        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        for (polarity, name) in [(true, "taken"), (false, "not-taken")] {
+            let script = emit_query(&slice, &SolveOptions::default(), polarity);
+            std::fs::write(target.join(format!("fp-replay-{name}.smt2")), script)
+                .expect("write replay script");
+        }
     }
 
     fn mem_slice(statements: Vec<IrStmt>) -> SsaLiftedSlice {
