@@ -4,17 +4,19 @@
 
 use std::collections::HashMap;
 
-use r2smt_ir::expr::{Expr, Var};
+use r2smt_ir::expr::{Expr, RoundingMode, Var};
 use r2smt_ir::stmt::IrStmt;
 use r2smt_ssa::SsaLiftedSlice;
 use z3::Solver;
-use z3::ast::{BV, Bool};
+use z3::ast::{BV, Bool, Float, RoundingMode as Z3RoundingMode};
 
-/// Either a multi-bit bit-vector or a boolean produced by the encoder.
+/// A multi-bit bit-vector, a boolean, or a floating-point value produced
+/// by the encoder.
 #[derive(Debug, Clone)]
 enum Encoded {
     Bv(BV),
     Bool(Bool),
+    Fp(Float),
 }
 
 /// One byte recorded by an [`IrStmt::StoreMem`]: byte address (at the
@@ -224,6 +226,10 @@ impl Encoder {
         match self.encode_expr(expr) {
             Encoded::Bv(bv) => bv,
             Encoded::Bool(b) => Self::bool_to_bv(&b),
+            // A float used where a bit-vector is expected is its IEEE
+            // bit pattern (the lifter only does this via `FpToIeeeBv`,
+            // but coerce soundly here too).
+            Encoded::Fp(f) => f.to_ieee_bv(),
         }
     }
 
@@ -242,9 +248,29 @@ impl Encoder {
         match self.encode_expr(expr) {
             Encoded::Bool(b) => b,
             Encoded::Bv(bv) => Self::bv_is_true(&bv),
+            // A float is never a boolean; fall back to a fresh free
+            // boolean (sound over-approximation). The lifter never
+            // produces this shape.
+            Encoded::Fp(_) => {
+                let free = self.fresh_unknown(1);
+                Self::bv_is_true(&free)
+            }
         }
     }
 
+    /// Encode `expr` expecting a floating-point value. Falls back to a
+    /// fresh free float (sound) if the expression does not encode as one
+    /// — a shape the lifter never emits.
+    fn encode_as_fp(&mut self, expr: &Expr) -> Float {
+        if let Encoded::Fp(f) = self.encode_expr(expr) {
+            return f;
+        }
+        let (ebits, sbits) = fp_sort_of(expr).unwrap_or((11, 53));
+        self.fresh_unknown_fp(ebits, sbits)
+    }
+
+    // Exhaustive `Expr` dispatch: FP arms mirror the BV arms' shape but stay separate for legibility (CLAUDE.md exhaustive-dispatch exception).
+    #[allow(clippy::match_same_arms, clippy::too_many_lines)]
     fn encode_expr(&mut self, expr: &Expr) -> Encoded {
         match expr {
             Expr::Var(v) => Encoded::Bv(self.encode_var(v)),
@@ -347,29 +373,86 @@ impl Encoder {
             // weaken, never fabricate" invariant. A 64-bit free var is
             // only ever *truncated* downstream, which stays sound.
             Expr::Unknown(_) => Encoded::Bv(self.fresh_unknown(64)),
-            // Floating point: modelled as fresh free values — a sound
-            // over-approximation (any value possible → widens `AlwaysX`
-            // to `BothPossible`, never fabricates a verdict). Each FP
-            // node is independently free, so no two need consistent
-            // widths. Precise FP encoding lands in P40-f-3. FP-typed
-            // results are declared at their `ebits + sbits` width so a
-            // downstream `Extract` / `FpToIeeeBv` consumer sees enough
-            // bits; predicates yield a fresh free boolean.
-            Expr::FAdd(a, ..) | Expr::FSub(a, ..) | Expr::FMul(a, ..) | Expr::FDiv(a, ..) => {
-                Encoded::Bv(self.fresh_unknown(fp_total_bits(a)))
+            // Floating point: precise IEEE-754 encoding via Z3's FP
+            // theory. The two BV↔FP reinterprets missing from the safe
+            // `z3` API come from the audited `r2smt-z3fp` shim; on the
+            // (never-in-practice) `None` we degrade to a fresh free
+            // float, which stays sound.
+            Expr::FAdd(a, b, rm) => {
+                let (fa, fb) = (self.encode_as_fp(a), self.encode_as_fp(b));
+                Encoded::Fp(fa.add_with_rounding_mode(&fb, &to_z3_rm(*rm)))
             }
-            Expr::FpConst { ebits, sbits, .. }
-            | Expr::BvToFp { ebits, sbits, .. }
-            | Expr::SbvToFp { ebits, sbits, .. } => {
-                Encoded::Bv(self.fresh_unknown(u32::from(*ebits) + u32::from(*sbits)))
+            Expr::FSub(a, b, rm) => {
+                let (fa, fb) = (self.encode_as_fp(a), self.encode_as_fp(b));
+                Encoded::Fp(fa.sub_with_rounding_mode(&fb, &to_z3_rm(*rm)))
             }
-            Expr::FpToIeeeBv(src) => Encoded::Bv(self.fresh_unknown(fp_total_bits(src))),
-            Expr::FpToSbv { bits, .. } => Encoded::Bv(self.fresh_unknown(u32::from(*bits))),
-            Expr::FEq(..) | Expr::FLt(..) | Expr::FLe(..) | Expr::FIsNaN(_) => {
-                let free = self.fresh_unknown(1);
-                Encoded::Bool(Self::bv_is_true(&free))
+            Expr::FMul(a, b, rm) => {
+                let (fa, fb) = (self.encode_as_fp(a), self.encode_as_fp(b));
+                Encoded::Fp(fa.mul_with_rounding_mode(&fb, &to_z3_rm(*rm)))
+            }
+            Expr::FDiv(a, b, rm) => {
+                let (fa, fb) = (self.encode_as_fp(a), self.encode_as_fp(b));
+                Encoded::Fp(fa.div_with_rounding_mode(&fb, &to_z3_rm(*rm)))
+            }
+            Expr::FEq(a, b) => {
+                let (fa, fb) = (self.encode_as_fp(a), self.encode_as_fp(b));
+                Encoded::Bool(fa.eq_fpa(&fb))
+            }
+            Expr::FLt(a, b) => {
+                let (fa, fb) = (self.encode_as_fp(a), self.encode_as_fp(b));
+                Encoded::Bool(fa.lt(&fb))
+            }
+            Expr::FLe(a, b) => {
+                let (fa, fb) = (self.encode_as_fp(a), self.encode_as_fp(b));
+                Encoded::Bool(fa.le(&fb))
+            }
+            Expr::FIsNaN(a) => Encoded::Bool(self.encode_as_fp(a).is_nan()),
+            Expr::FpConst { bits, ebits, sbits } => {
+                let bv = bv_const(*bits, ebits.saturating_add(*sbits));
+                Encoded::Fp(self.fp_from_bv(&bv, *ebits, *sbits))
+            }
+            Expr::BvToFp { src, ebits, sbits } => {
+                let bv = self.encode_as_bv(src);
+                Encoded::Fp(self.fp_from_bv(&bv, *ebits, *sbits))
+            }
+            Expr::FpToIeeeBv(src) => Encoded::Bv(self.encode_as_fp(src).to_ieee_bv()),
+            Expr::FpToSbv { src, rm, bits } => {
+                let f = self.encode_as_fp(src);
+                Encoded::Bv(f.to_sbv_with_rounding_mode(&to_z3_rm(*rm), u32::from(*bits)))
+            }
+            Expr::SbvToFp {
+                src,
+                rm,
+                ebits,
+                sbits,
+            } => {
+                let bv = self.encode_as_bv(src);
+                match r2smt_z3fp::sbv_to_fp(
+                    &bv,
+                    &to_z3_rm(*rm),
+                    u32::from(*ebits),
+                    u32::from(*sbits),
+                ) {
+                    Some(f) => Encoded::Fp(f),
+                    None => Encoded::Fp(self.fresh_unknown_fp(*ebits, *sbits)),
+                }
             }
         }
+    }
+
+    /// Reinterpret a bit-vector as a float via the audited shim, falling
+    /// back to a fresh free float if Z3 rejects the reinterpret.
+    fn fp_from_bv(&mut self, bv: &BV, ebits: u16, sbits: u16) -> Float {
+        r2smt_z3fp::bv_to_fp(bv, u32::from(ebits), u32::from(sbits))
+            .unwrap_or_else(|| self.fresh_unknown_fp(ebits, sbits))
+    }
+
+    /// A fresh free float of sort `(ebits, sbits)` — sound
+    /// over-approximation of an unmodelled floating-point value.
+    fn fresh_unknown_fp(&mut self, ebits: u16, sbits: u16) -> Float {
+        let name = format!("__unkfp_{}", self.unknown_counter);
+        self.unknown_counter += 1;
+        Float::new_const(name.as_str(), u32::from(ebits), u32::from(sbits))
     }
 
     fn encode_var(&mut self, var: &Var) -> BV {
@@ -414,18 +497,29 @@ impl Encoder {
     }
 }
 
-/// Total IEEE bit width (`ebits + sbits`) of a floating-point-typed
-/// expression, recovered from the sort it carries or the sort of its
-/// first operand. Falls back to 64 for shapes that carry no sort.
-fn fp_total_bits(expr: &Expr) -> u32 {
+/// Floating-point sort `(ebits, sbits)` of an FP-typed expression,
+/// recovered from the sort it carries or the sort of its first operand.
+/// `None` for shapes that carry no sort (never an FP-typed node).
+fn fp_sort_of(expr: &Expr) -> Option<(u16, u16)> {
     match expr {
         Expr::FpConst { ebits, sbits, .. }
         | Expr::BvToFp { ebits, sbits, .. }
-        | Expr::SbvToFp { ebits, sbits, .. } => u32::from(*ebits) + u32::from(*sbits),
+        | Expr::SbvToFp { ebits, sbits, .. } => Some((*ebits, *sbits)),
         Expr::FAdd(a, ..) | Expr::FSub(a, ..) | Expr::FMul(a, ..) | Expr::FDiv(a, ..) => {
-            fp_total_bits(a)
+            fp_sort_of(a)
         }
-        _ => 64,
+        _ => None,
+    }
+}
+
+/// Map the IR's rounding mode onto Z3's.
+fn to_z3_rm(rm: RoundingMode) -> Z3RoundingMode {
+    match rm {
+        RoundingMode::NearestTiesEven => Z3RoundingMode::round_nearest_ties_to_even(),
+        RoundingMode::NearestTiesAway => Z3RoundingMode::round_nearest_ties_to_away(),
+        RoundingMode::TowardPositive => Z3RoundingMode::round_towards_positive(),
+        RoundingMode::TowardNegative => Z3RoundingMode::round_towards_negative(),
+        RoundingMode::TowardZero => Z3RoundingMode::round_towards_zero(),
     }
 }
 

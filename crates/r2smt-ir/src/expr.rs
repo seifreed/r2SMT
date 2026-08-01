@@ -634,10 +634,7 @@ mod tests {
             ebits: 8,
             sbits: 24,
         };
-        let expr = Expr::feq(
-            Expr::fadd(x, one, RoundingMode::NearestTiesEven),
-            two,
-        );
+        let expr = Expr::feq(Expr::fadd(x, one, RoundingMode::NearestTiesEven), two);
         let json = serde_json::to_string(&expr).unwrap();
         let back: Expr = serde_json::from_str(&json).unwrap();
         assert_eq!(back, expr);

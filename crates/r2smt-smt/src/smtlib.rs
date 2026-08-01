@@ -235,7 +235,8 @@ fn render_expr_with_width(expr: &Expr, target_bits: u16) -> String {
 // each arm is a 1-3 line emitter; splitting per-arm would hide the parity
 // between the variant set and the SMT-LIB renderer without removing any
 // logic.
-#[allow(clippy::too_many_lines)]
+// FP arms mirror the BV arms' shape but stay separate for legibility.
+#[allow(clippy::too_many_lines, clippy::match_same_arms)]
 fn render_expr(expr: &Expr) -> (String, u16) {
     match expr {
         Expr::Var(v) => (v.name.clone(), v.bits),
@@ -323,10 +324,14 @@ fn render_expr(expr: &Expr) -> (String, u16) {
         // decline any slice containing a float (`slice_contains_float`)
         // before this is ever solved, so no verdict is derived from a
         // placeholder. Precise `QF_BVFP` rendering lands in P40-f-4.
-        Expr::FAdd(..) | Expr::FSub(..) | Expr::FMul(..) | Expr::FDiv(..) | Expr::FpConst { .. }
-        | Expr::BvToFp { .. } | Expr::FpToIeeeBv(_) | Expr::SbvToFp { .. } => {
-            ("(_ bv0 1)".to_string(), 1)
-        }
+        Expr::FAdd(..)
+        | Expr::FSub(..)
+        | Expr::FMul(..)
+        | Expr::FDiv(..)
+        | Expr::FpConst { .. }
+        | Expr::BvToFp { .. }
+        | Expr::FpToIeeeBv(_)
+        | Expr::SbvToFp { .. } => ("(_ bv0 1)".to_string(), 1),
         Expr::FpToSbv { bits, .. } => (format!("(_ bv0 {bits})"), *bits),
         Expr::FEq(..) | Expr::FLt(..) | Expr::FLe(..) | Expr::FIsNaN(_) => {
             ("(_ bv0 1)".to_string(), 1)

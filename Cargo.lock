@@ -759,6 +759,7 @@ dependencies = [
  "r2smt-slicer",
  "r2smt-solver-port",
  "r2smt-ssa",
+ "r2smt-z3fp",
  "serde",
  "serde_json",
  "tracing",
@@ -795,6 +796,14 @@ dependencies = [
  "r2smt-ssa",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "r2smt-z3fp"
+version = "0.1.0"
+dependencies = [
+ "z3",
+ "z3-sys",
 ]
 
 [[package]]

@@ -105,7 +105,7 @@ fn slice_contains_unknown(slice: &SsaLiftedSlice) -> bool {
 }
 
 /// Whether any expression rendered into the SMT-LIB query carries a
-/// floating-point node. The QF_BV text backend cannot encode FP theory,
+/// floating-point node. The `QF_BV` text backend cannot encode FP theory,
 /// so such slices are declined (see [`solve_branch_bitwuzla`]).
 fn slice_contains_float(slice: &SsaLiftedSlice) -> bool {
     if expr_has_float(&slice.condition) {
@@ -113,9 +113,7 @@ fn slice_contains_float(slice: &SsaLiftedSlice) -> bool {
     }
     slice.statements.iter().any(|stmt| match stmt {
         IrStmt::Assign { src, .. } => expr_has_float(src),
-        IrStmt::StoreMem { address, value, .. } => {
-            expr_has_float(address) || expr_has_float(value)
-        }
+        IrStmt::StoreMem { address, value, .. } => expr_has_float(address) || expr_has_float(value),
         IrStmt::LoadMem { address, .. } => expr_has_float(address),
         IrStmt::Unsupported { .. } | IrStmt::Nop => false,
     })
@@ -123,6 +121,8 @@ fn slice_contains_float(slice: &SsaLiftedSlice) -> bool {
 
 /// Whether `expr` contains any floating-point node. Written without a
 /// wildcard arm so a new `Expr` variant forces this to be revisited.
+// Exhaustive `Expr` dispatch: FP arms mirror the BV arms' shape but stay separate for legibility (CLAUDE.md exhaustive-dispatch exception).
+#[allow(clippy::match_same_arms, clippy::too_many_lines)]
 fn expr_has_float(expr: &Expr) -> bool {
     match expr {
         Expr::FAdd(..)
@@ -176,6 +176,8 @@ fn expr_has_float(expr: &Expr) -> bool {
 /// Exhaustive recursive check for an [`Expr::Unknown`] anywhere in the
 /// tree. Written without a wildcard arm so a new `Expr` variant forces
 /// this to be revisited rather than silently treated as Unknown-free.
+// Exhaustive `Expr` dispatch: FP arms mirror the BV arms' shape but stay separate for legibility (CLAUDE.md exhaustive-dispatch exception).
+#[allow(clippy::match_same_arms, clippy::too_many_lines)]
 fn expr_has_unknown(expr: &Expr) -> bool {
     match expr {
         Expr::Unknown(_) => true,
@@ -211,10 +213,13 @@ fn expr_has_unknown(expr: &Expr) -> bool {
             then_expr,
             else_expr,
         } => expr_has_unknown(cond) || expr_has_unknown(then_expr) || expr_has_unknown(else_expr),
-        Expr::FAdd(a, b, _) | Expr::FSub(a, b, _) | Expr::FMul(a, b, _) | Expr::FDiv(a, b, _)
-        | Expr::FEq(a, b) | Expr::FLt(a, b) | Expr::FLe(a, b) => {
-            expr_has_unknown(a) || expr_has_unknown(b)
-        }
+        Expr::FAdd(a, b, _)
+        | Expr::FSub(a, b, _)
+        | Expr::FMul(a, b, _)
+        | Expr::FDiv(a, b, _)
+        | Expr::FEq(a, b)
+        | Expr::FLt(a, b)
+        | Expr::FLe(a, b) => expr_has_unknown(a) || expr_has_unknown(b),
         Expr::FIsNaN(s)
         | Expr::FpToIeeeBv(s)
         | Expr::BvToFp { src: s, .. }

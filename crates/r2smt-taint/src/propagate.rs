@@ -110,6 +110,8 @@ pub fn propagate(ssa: &SsaLiftedSlice, seeds: &TaintSeeds) -> Option<TaintOutcom
 /// The taint of an expression: the union of the taints of the variables
 /// it reads. An `Unknown` node contributes nothing to the set but flags
 /// the outcome opaque (its hidden reads cannot be accounted for).
+// Exhaustive `Expr` dispatch: FP arms mirror the BV arms' shape but stay separate for legibility (CLAUDE.md exhaustive-dispatch exception).
+#[allow(clippy::match_same_arms, clippy::too_many_lines)]
 fn taint_of_expr(
     expr: &Expr,
     taint: &BTreeMap<String, TaintSet>,

@@ -1428,29 +1428,30 @@ fn chained_diamond_program() -> Program {
         )],
         successors: vec![Address(succ)],
     };
-    let head = |addr: u64, cmp_reg: &str, cmp_imm: &str, jmp: &str, taken: u64, fallthrough: u64| {
-        BasicBlock {
-            address: Address(addr),
-            instructions: vec![
-                insn(
-                    addr,
-                    3,
-                    "cmp",
-                    vec![
-                        op(cmp_reg, OperandKind::Register),
-                        op(cmp_imm, OperandKind::Immediate),
-                    ],
-                ),
-                insn(
-                    addr + 3,
-                    6,
-                    jmp,
-                    vec![op(&format!("{taken:#x}"), OperandKind::Immediate)],
-                ),
-            ],
-            successors: vec![Address(taken), Address(fallthrough)],
-        }
-    };
+    let head =
+        |addr: u64, cmp_reg: &str, cmp_imm: &str, jmp: &str, taken: u64, fallthrough: u64| {
+            BasicBlock {
+                address: Address(addr),
+                instructions: vec![
+                    insn(
+                        addr,
+                        3,
+                        "cmp",
+                        vec![
+                            op(cmp_reg, OperandKind::Register),
+                            op(cmp_imm, OperandKind::Immediate),
+                        ],
+                    ),
+                    insn(
+                        addr + 3,
+                        6,
+                        jmp,
+                        vec![op(&format!("{taken:#x}"), OperandKind::Immediate)],
+                    ),
+                ],
+                successors: vec![Address(taken), Address(fallthrough)],
+            }
+        };
     Program {
         arch: Arch::X86_64,
         bits: 64,
@@ -1477,12 +1478,7 @@ fn chained_diamond_program() -> Program {
                                 op("1", OperandKind::Immediate),
                             ],
                         ),
-                        insn(
-                            0x1403,
-                            6,
-                            "je",
-                            vec![op("0x1500", OperandKind::Immediate)],
-                        ),
+                        insn(0x1403, 6, "je", vec![op("0x1500", OperandKind::Immediate)]),
                     ],
                     successors: vec![],
                 },

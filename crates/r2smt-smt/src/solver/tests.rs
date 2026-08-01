@@ -1649,6 +1649,77 @@ fn solve_diamond_join(program: &Program, allow_join_merge: bool) -> SmtResult {
     solve_branch(&ssa, SolveOptions::default())
 }
 
+/// Solve a hand-built slice whose branch condition is `cond`. Borrows a
+/// valid `BranchCandidate` from a trivial program (no FP lifter exists
+/// yet), so this exercises the encoder's FP path directly.
+fn solve_fp_condition(cond: r2smt_ir::expr::Expr, inputs: Vec<r2smt_ir::expr::Var>) -> SmtResult {
+    let program = diamond("5", "5");
+    let cands = collect_branches(&program);
+    let branch = cands
+        .iter()
+        .find(|c| c.address == Address(0x40_1203))
+        .expect("branch present")
+        .clone();
+    let ssa = SsaLiftedSlice {
+        branch,
+        statements: Vec::new(),
+        condition: cond,
+        status: SliceStatus::Complete,
+        treat_truncation_as_inputs: false,
+        inputs,
+        defs: Vec::new(),
+        arch: Arch::X86_64,
+    };
+    solve_branch(&ssa, SolveOptions::default())
+}
+
+#[test]
+fn fp_precise_encoding_folds_constant_predicate_to_always_true() {
+    use r2smt_ir::expr::{Expr, RoundingMode};
+    // IEEE single-precision `(1.0 + 1.0) == 2.0` — always true, proved
+    // precisely by Z3's FP theory (the BV→FP reinterpret via the shim).
+    let one_bits = 0x3f80_0000u128;
+    let two_bits = 0x4000_0000u128;
+    let one = Expr::bv_to_fp(Expr::konst(one_bits, 32), 8, 24);
+    let cond = Expr::feq(
+        Expr::fadd(
+            one,
+            Expr::FpConst {
+                bits: one_bits,
+                ebits: 8,
+                sbits: 24,
+            },
+            RoundingMode::NearestTiesEven,
+        ),
+        Expr::FpConst {
+            bits: two_bits,
+            ebits: 8,
+            sbits: 24,
+        },
+    );
+    assert_eq!(solve_fp_condition(cond, Vec::new()), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn fp_free_input_predicate_stays_both_possible() {
+    use r2smt_ir::expr::{Expr, Var};
+    // A free 32-bit input reinterpreted as a float, compared to 2.0 —
+    // the verdict depends on the input, so BothPossible: the precise FP
+    // encoding must not fabricate an AlwaysX for a genuinely free value.
+    let cond = Expr::feq(
+        Expr::bv_to_fp(Expr::var("x", 32), 8, 24),
+        Expr::FpConst {
+            bits: 0x4000_0000,
+            ebits: 8,
+            sbits: 24,
+        },
+    );
+    assert_eq!(
+        solve_fp_condition(cond, vec![Var::new("x", 32)]),
+        SmtResult::BothPossible
+    );
+}
+
 /// Flag-merge diamond: each arm ends in `cmp eax, <imm>`, and the join
 /// is a bare `je` reading those flags directly. The join branch's flag
 /// obligation is discharged by merging NZCV across the arms.
@@ -2066,12 +2137,7 @@ fn chained_diamond(inner_then: &str, inner_else: &str) -> Program {
                                 op("1", OperandKind::Immediate),
                             ],
                         ),
-                        insn(
-                            0x1403,
-                            6,
-                            "je",
-                            vec![op("0x1500", OperandKind::Immediate)],
-                        ),
+                        insn(0x1403, 6, "je", vec![op("0x1500", OperandKind::Immediate)]),
                     ],
                     successors: vec![],
                 },

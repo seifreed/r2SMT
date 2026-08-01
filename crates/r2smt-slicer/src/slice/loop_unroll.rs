@@ -71,7 +71,12 @@ pub(super) fn try_unroll_counted_loop(
         "counted loop unrolled to constant"
     );
 
-    Some(synthetic_mov(loop_block, &shape.counter_operand, exit_value, shape.width))
+    Some(synthetic_mov(
+        loop_block,
+        &shape.counter_operand,
+        exit_value,
+        shape.width,
+    ))
 }
 
 /// The concrete ingredients of a counted loop body.
@@ -206,17 +211,14 @@ fn concrete_init(
     let mut init: Option<u128> = None;
     for insn in &entry_block.instructions {
         let effect = analyze(insn, arch);
-        let writes_counter = effect
-            .defs
-            .iter()
-            .any(|d| *d == counter_parent);
+        let writes_counter = effect.defs.contains(&counter_parent);
         if !writes_counter {
             continue;
         }
         // Only a `mov counter, imm` gives a concrete init; any other
         // writer (add, load, call result, …) makes the entry value
         // non-constant, so decline.
-        if insn.mnemonic.trim().to_ascii_lowercase() != "mov" {
+        if !insn.mnemonic.trim().eq_ignore_ascii_case("mov") {
             return None;
         }
         let (reg, imm) = reg_imm_operands(insn)?;
@@ -230,6 +232,9 @@ fn concrete_init(
 
 /// Forward-simulate the loop; return the counter's value at exit, or
 /// `None` if the condition is unsupported or it does not converge.
+// The `step as u128` reinterprets a signed delta as its two's-complement
+// bit pattern for `wrapping_add` at the counter width — intentional.
+#[allow(clippy::cast_sign_loss)]
 fn simulate(init: u128, shape: &LoopShape) -> Option<u128> {
     let mask = width_mask(shape.width);
     let mut v = init & mask;
@@ -266,6 +271,9 @@ fn continue_loop(cond: BranchCondition, counter: u128, bound: u128, width: u16) 
     })
 }
 
+// Two's-complement reinterpretation of a `width`-bit value as `i128`;
+// the `u128 as i128` casts are the intended sign reinterpret.
+#[allow(clippy::cast_possible_wrap)]
 fn as_signed(value: u128, width: u16) -> i128 {
     if width == 0 || width >= 128 {
         return value as i128;
@@ -286,7 +294,12 @@ fn width_mask(width: u16) -> u128 {
     }
 }
 
-fn synthetic_mov(loop_block: &BasicBlock, counter_operand: &str, value: u128, width: u16) -> Instruction {
+fn synthetic_mov(
+    loop_block: &BasicBlock,
+    counter_operand: &str,
+    value: u128,
+    width: u16,
+) -> Instruction {
     Instruction {
         address: loop_block.address,
         size: 0,

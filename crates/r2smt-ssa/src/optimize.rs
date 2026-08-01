@@ -143,6 +143,8 @@ fn substitute_stmt(stmt: &mut IrStmt, map: &HashMap<String, Expr>) {
 /// Replace every `Var` whose name is a key of `map` with the mapped
 /// expression. One level per call; chained copies resolve across the
 /// outer fixed-point loop in [`optimize_slice`].
+// Exhaustive `Expr` dispatch: FP arms mirror the BV arms' shape but stay separate for legibility (CLAUDE.md exhaustive-dispatch exception).
+#[allow(clippy::match_same_arms, clippy::too_many_lines)]
 fn substitute(expr: &Expr, map: &HashMap<String, Expr>, depth: usize) -> Expr {
     if depth >= SUBST_MAX_DEPTH {
         return expr.clone();
@@ -266,6 +268,8 @@ fn stmt_is_live(stmt: &IrStmt, live: &HashSet<String>) -> bool {
     }
 }
 
+// Exhaustive `Expr` dispatch: FP arms mirror the BV arms' shape but stay separate for legibility (CLAUDE.md exhaustive-dispatch exception).
+#[allow(clippy::match_same_arms, clippy::too_many_lines)]
 fn collect_var_names(expr: &Expr, out: &mut HashSet<String>) {
     match expr {
         Expr::Var(v) => {
@@ -369,6 +373,8 @@ fn recompute_defs_inputs(statements: &[IrStmt], condition: &Expr) -> (Vec<Var>, 
     (defs, inputs.into_values().collect())
 }
 
+// Exhaustive `Expr` dispatch: FP arms mirror the BV arms' shape but stay separate for legibility (CLAUDE.md exhaustive-dispatch exception).
+#[allow(clippy::match_same_arms, clippy::too_many_lines)]
 fn collect_vars(expr: &Expr, out: &mut Vec<Var>) {
     match expr {
         Expr::Var(v) => out.push(v.clone()),

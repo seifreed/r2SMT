@@ -480,6 +480,8 @@ fn strip_ssa_suffix(name: &str) -> &str {
     name.split_once('#').map_or(name, |(base, _)| base)
 }
 
+// Exhaustive `Expr` dispatch: FP arms mirror the BV arms' shape but stay separate for legibility (CLAUDE.md exhaustive-dispatch exception).
+#[allow(clippy::match_same_arms, clippy::too_many_lines)]
 fn count_unknowns(expr: &Expr) -> usize {
     match expr {
         Expr::Unknown(_) => 1,

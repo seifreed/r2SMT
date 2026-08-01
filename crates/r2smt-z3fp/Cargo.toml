@@ -1,0 +1,29 @@
+[package]
+name         = "r2smt-z3fp"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+description = "Thin, audited FFI shim for the Z3 floating-point reinterpret constructors missing from the safe `z3` 0.20 API (BV→FP and signed-int→FP)."
+
+# This crate intentionally does NOT inherit `[lints] workspace = true`:
+# the workspace forbids `unsafe_code`, which cannot be relaxed by an inner
+# `#[allow]`. FFI to the two missing Z3 constructors is unavoidable, so
+# the crate sets `unsafe_code = "deny"` and grants a single, audited,
+# documented `#[allow(unsafe_code)]` at each shim. Every other important
+# lint from the workspace is mirrored here.
+[lints.rust]
+missing_docs = "deny"
+unsafe_code  = "deny"
+
+[lints.clippy]
+all         = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic       = "deny"
+
+[dependencies]
+z3     = { workspace = true }
+z3-sys = { workspace = true }

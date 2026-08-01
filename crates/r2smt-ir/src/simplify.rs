@@ -25,7 +25,7 @@ use crate::expr::Expr;
 #[must_use]
 pub fn simplify_expr(expr: &Expr) -> Expr {
     match expr {
-        Expr::Var(_) | Expr::Const { .. } | Expr::Unknown(_) => expr.clone(),
+        Expr::Var(_) | Expr::Const { .. } | Expr::Unknown(_) | Expr::FpConst { .. } => expr.clone(),
         Expr::Add(a, b) => fold_add(simplify_expr(a), simplify_expr(b)),
         Expr::Sub(a, b) => fold_sub(simplify_expr(a), simplify_expr(b)),
         Expr::Mul(a, b) => fold_mul(simplify_expr(a), simplify_expr(b)),
@@ -79,7 +79,6 @@ pub fn simplify_expr(expr: &Expr) -> Expr {
         Expr::FLt(a, b) => Expr::FLt(Box::new(simplify_expr(a)), Box::new(simplify_expr(b))),
         Expr::FLe(a, b) => Expr::FLe(Box::new(simplify_expr(a)), Box::new(simplify_expr(b))),
         Expr::FIsNaN(a) => Expr::FIsNaN(Box::new(simplify_expr(a))),
-        Expr::FpConst { .. } => expr.clone(),
         Expr::BvToFp { src, ebits, sbits } => Expr::BvToFp {
             src: Box::new(simplify_expr(src)),
             ebits: *ebits,
@@ -112,7 +111,7 @@ pub fn simplify_expr(expr: &Expr) -> Expr {
 fn expr_bits(expr: &Expr) -> Option<u16> {
     match expr {
         Expr::Var(v) => Some(v.bits),
-        Expr::Const { bits, .. } => Some(*bits),
+        Expr::Const { bits, .. } | Expr::FpToSbv { bits, .. } => Some(*bits),
         Expr::Add(a, _)
         | Expr::Sub(a, _)
         | Expr::Mul(a, _)
@@ -125,7 +124,11 @@ fn expr_bits(expr: &Expr) -> Option<u16> {
         | Expr::Xor(a, _)
         | Expr::Shl(a, _)
         | Expr::LShr(a, _)
-        | Expr::AShr(a, _) => expr_bits(a),
+        | Expr::AShr(a, _)
+        | Expr::FAdd(a, ..)
+        | Expr::FSub(a, ..)
+        | Expr::FMul(a, ..)
+        | Expr::FDiv(a, ..) => expr_bits(a),
         Expr::Eq(_, _)
         | Expr::Ne(_, _)
         | Expr::Ult(_, _)
@@ -134,7 +137,11 @@ fn expr_bits(expr: &Expr) -> Option<u16> {
         | Expr::Sle(_, _)
         | Expr::BoolAnd(_, _)
         | Expr::BoolOr(_, _)
-        | Expr::BoolNot(_) => Some(1),
+        | Expr::BoolNot(_)
+        | Expr::FEq(..)
+        | Expr::FLt(..)
+        | Expr::FLe(..)
+        | Expr::FIsNaN(_) => Some(1),
         Expr::Ite {
             then_expr,
             else_expr,
@@ -148,15 +155,10 @@ fn expr_bits(expr: &Expr) -> Option<u16> {
         }
         Expr::ZeroExtend { to_bits, .. } | Expr::SignExtend { to_bits, .. } => Some(*to_bits),
         Expr::Unknown(_) => None,
-        Expr::FAdd(a, ..) | Expr::FSub(a, ..) | Expr::FMul(a, ..) | Expr::FDiv(a, ..) => {
-            expr_bits(a)
-        }
-        Expr::FEq(..) | Expr::FLt(..) | Expr::FLe(..) | Expr::FIsNaN(_) => Some(1),
         Expr::FpConst { ebits, sbits, .. }
         | Expr::BvToFp { ebits, sbits, .. }
         | Expr::SbvToFp { ebits, sbits, .. } => ebits.checked_add(*sbits),
         Expr::FpToIeeeBv(src) => expr_bits(src),
-        Expr::FpToSbv { bits, .. } => Some(*bits),
     }
 }
 

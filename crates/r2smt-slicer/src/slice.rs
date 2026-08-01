@@ -37,7 +37,7 @@
 //! merging across arms, chained / nested diamonds (the walk resumes
 //! after each merge), and merged memory state (per-arm conditional
 //! stores). Concrete counted self-loops are resolved by a bounded
-//! forward unroll to the counter's exit constant (see [`loop_unroll`]);
+//! forward unroll to the counter's exit constant (see `loop_unroll`);
 //! non-concrete or non-convergent loops decline and stay free.
 
 use std::collections::BTreeSet;
@@ -418,6 +418,9 @@ enum BlockWalkOutcome {
     Truncated(String),
 }
 
+// Backward-walk dispatcher grown by the bounded-merge / loop-unroll
+// hooks; the body is structural control flow, not extractable domain logic.
+#[allow(clippy::too_many_lines)]
 fn walk_backwards(
     candidate: &BranchCandidate,
     function: &Function,

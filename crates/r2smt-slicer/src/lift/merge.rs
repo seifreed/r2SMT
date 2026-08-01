@@ -94,7 +94,7 @@ fn lower_merge_memory(
             addrs.push((s.address.clone(), s.bits));
         }
     }
-    addrs.sort_by(|(a, _), (b, _)| a.to_string().cmp(&b.to_string()));
+    addrs.sort_by_key(|(a, _)| a.to_string());
 
     let last_val = |stores: &[ArmStore], addr: &Expr| {
         stores
@@ -198,11 +198,18 @@ fn fold_arm(arm: &[Instruction], arch: Arch) -> Option<ArmFold> {
 /// Whether an expression contains an [`Expr::Unknown`] anywhere — an
 /// unresolved store address must not be merged, since the byte model
 /// would let it alias arbitrary memory.
+// `match_same_arms`: the floating-point arms deliberately mirror the
+// bit-vector arms' recursion but are kept structurally separate so the
+// FP / BV split stays legible; merging them into the 20-variant BV
+// groups would obscure that intent for no behavioural gain.
+#[allow(clippy::match_same_arms)]
 fn expr_has_unknown(expr: &Expr) -> bool {
     match expr {
         Expr::Unknown(_) => true,
         Expr::Var(_) | Expr::Const { .. } => false,
-        Expr::BoolNot(a) | Expr::Extract { src: a, .. } | Expr::ZeroExtend { src: a, .. }
+        Expr::BoolNot(a)
+        | Expr::Extract { src: a, .. }
+        | Expr::ZeroExtend { src: a, .. }
         | Expr::SignExtend { src: a, .. } => expr_has_unknown(a),
         Expr::Add(a, b)
         | Expr::Sub(a, b)
@@ -297,18 +304,26 @@ fn subst_expr(expr: &Expr, env: &HashMap<String, Expr>) -> Expr {
         Expr::ZeroExtend { src, to_bits } => Expr::zero_ext(subst_expr(src, env), *to_bits),
         Expr::SignExtend { src, to_bits } => Expr::sign_ext(subst_expr(src, env), *to_bits),
         Expr::Unknown(hint) => Expr::Unknown(hint.clone()),
-        Expr::FAdd(a, b, rm) => {
-            Expr::FAdd(Box::new(subst_expr(a, env)), Box::new(subst_expr(b, env)), *rm)
-        }
-        Expr::FSub(a, b, rm) => {
-            Expr::FSub(Box::new(subst_expr(a, env)), Box::new(subst_expr(b, env)), *rm)
-        }
-        Expr::FMul(a, b, rm) => {
-            Expr::FMul(Box::new(subst_expr(a, env)), Box::new(subst_expr(b, env)), *rm)
-        }
-        Expr::FDiv(a, b, rm) => {
-            Expr::FDiv(Box::new(subst_expr(a, env)), Box::new(subst_expr(b, env)), *rm)
-        }
+        Expr::FAdd(a, b, rm) => Expr::FAdd(
+            Box::new(subst_expr(a, env)),
+            Box::new(subst_expr(b, env)),
+            *rm,
+        ),
+        Expr::FSub(a, b, rm) => Expr::FSub(
+            Box::new(subst_expr(a, env)),
+            Box::new(subst_expr(b, env)),
+            *rm,
+        ),
+        Expr::FMul(a, b, rm) => Expr::FMul(
+            Box::new(subst_expr(a, env)),
+            Box::new(subst_expr(b, env)),
+            *rm,
+        ),
+        Expr::FDiv(a, b, rm) => Expr::FDiv(
+            Box::new(subst_expr(a, env)),
+            Box::new(subst_expr(b, env)),
+            *rm,
+        ),
         Expr::FEq(a, b) => Expr::FEq(Box::new(subst_expr(a, env)), Box::new(subst_expr(b, env))),
         Expr::FLt(a, b) => Expr::FLt(Box::new(subst_expr(a, env)), Box::new(subst_expr(b, env))),
         Expr::FLe(a, b) => Expr::FLe(Box::new(subst_expr(a, env)), Box::new(subst_expr(b, env))),

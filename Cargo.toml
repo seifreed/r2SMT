@@ -20,6 +20,7 @@ tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 r2pipe             = "0.8"
 z3                 = { version = "0.20", features = ["vendored"] }
+z3-sys             = "0.11"
 sha2               = "0.10"
 hex                = "0.4"
 tempfile           = "3"
@@ -40,6 +41,7 @@ r2smt-patch   = { path = "crates/r2smt-patch",   version = "0.1.0" }
 r2smt-difflift = { path = "crates/r2smt-difflift", version = "0.1.0" }
 r2smt-explore = { path = "crates/r2smt-explore", version = "0.1.0" }
 r2smt-taint   = { path = "crates/r2smt-taint",   version = "0.1.0" }
+r2smt-z3fp    = { path = "crates/r2smt-z3fp",    version = "0.1.0" }
 
 [workspace.lints.rust]
 missing_docs              = "deny"

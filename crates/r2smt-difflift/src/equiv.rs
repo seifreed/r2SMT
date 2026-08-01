@@ -223,6 +223,8 @@ fn tainted_defs(ssa: &SsaLiftedSlice) -> Option<BTreeSet<String>> {
     Some(tainted)
 }
 
+// Exhaustive `Expr` dispatch: FP arms mirror the BV arms' shape but stay separate for legibility (CLAUDE.md exhaustive-dispatch exception).
+#[allow(clippy::match_same_arms, clippy::too_many_lines)]
 fn expr_is_tainted(expr: &Expr, tainted: &BTreeSet<String>, depth: u32) -> Option<bool> {
     if depth > EXPR_DEPTH_BUDGET {
         return None;
@@ -275,7 +277,9 @@ fn expr_is_tainted(expr: &Expr, tainted: &BTreeSet<String>, depth: u32) -> Optio
         | Expr::FDiv(a, b, _)
         | Expr::FEq(a, b)
         | Expr::FLt(a, b)
-        | Expr::FLe(a, b) => expr_is_tainted(a, tainted, next)? || expr_is_tainted(b, tainted, next)?,
+        | Expr::FLe(a, b) => {
+            expr_is_tainted(a, tainted, next)? || expr_is_tainted(b, tainted, next)?
+        }
         Expr::FIsNaN(s)
         | Expr::FpToIeeeBv(s)
         | Expr::BvToFp { src: s, .. }
@@ -341,6 +345,8 @@ fn namespace_var(var: &Var, pfx: &str) -> Var {
     }
 }
 
+// Exhaustive `Expr` dispatch: FP arms mirror the BV arms' shape but stay separate for legibility (CLAUDE.md exhaustive-dispatch exception).
+#[allow(clippy::match_same_arms, clippy::too_many_lines)]
 fn namespace_expr(expr: &Expr, pfx: &str, depth: u32) -> Option<Expr> {
     if depth > EXPR_DEPTH_BUDGET {
         return None;

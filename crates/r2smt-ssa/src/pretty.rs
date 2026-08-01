@@ -80,6 +80,8 @@ fn collect_defs(statements: &[IrStmt]) -> HashMap<String, &Expr> {
     out
 }
 
+// Exhaustive `Expr` dispatch: FP arms mirror the BV arms' shape but stay separate for legibility (CLAUDE.md exhaustive-dispatch exception).
+#[allow(clippy::match_same_arms, clippy::too_many_lines)]
 fn write_expr(out: &mut String, expr: &Expr, ctx: &FmtCtx<'_>, depth: usize) {
     if depth >= MAX_DEPTH {
         let _ = write!(out, "<depth-limit>");
