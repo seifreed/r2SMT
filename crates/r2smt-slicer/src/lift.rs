@@ -31,7 +31,7 @@ use tracing::debug;
 
 use crate::collector::BranchCandidate;
 use crate::condition::BranchCondition;
-use crate::effect::stack_slot;
+use crate::effect::{memory_operand_width, stack_slot};
 use crate::registers::register_layout;
 use crate::slice::{Slice, SliceStatus};
 
@@ -350,7 +350,9 @@ impl LiftCtx {
             OperandKind::Register => {
                 register_layout(&op.raw, self.arch).map_or(self.bits, |layout| layout.width())
             }
-            OperandKind::Memory => stack_slot(op).map_or(self.bits, |(_, w)| w),
+            OperandKind::Memory => memory_operand_width(&op.raw)
+                .or_else(|| stack_slot(op).map(|(_, w)| w))
+                .unwrap_or(self.bits),
             _ => self.bits,
         }
     }
@@ -788,12 +790,20 @@ fn parse_immediate(raw: &str) -> Option<u64> {
 
 /// Build a symbolic address from an x86 memory operand
 /// `[base {+ index*scale} {± disp}]` at the pointer width. Registers
-/// resolve through [`register_layout`] to their 64-bit parent; the
-/// displacement folds into a single constant. Returns `None` for
-/// shapes it cannot model (e.g. `rip`-relative or a subtracted
-/// register), so the caller declines soundly.
+/// resolve through [`register_layout`] to their 64-bit parent (a
+/// `rip`-relative base resolves the same way, yielding a free
+/// symbolic `rip` — sound-widening); the displacement folds into a
+/// single constant. Returns `None` for shapes it cannot model
+/// soundly: a subtracted register, or a segment-prefixed operand
+/// (`fs:[…]` / `gs:[…]`) whose true address is `segment_base + offset`
+/// — modelling it as a bare `offset` would alias with an absolute
+/// access at that offset and could *fabricate* a verdict, so the
+/// caller declines and the operand stays opaque.
 fn x86_address_expr(op: &Operand, ptr_bits: u8) -> Option<Expr> {
     if op.kind != OperandKind::Memory {
+        return None;
+    }
+    if has_segment_prefix(&op.raw) {
         return None;
     }
     let lower = op.raw.to_ascii_lowercase();
@@ -849,6 +859,17 @@ fn x86_address_expr(op: &Operand, ptr_bits: u8) -> Option<Expr> {
     }
     let masked = u64::from_le_bytes(disp.to_le_bytes()) & width_mask(ptr_bits);
     Some(Expr::add(base, Expr::konst(masked, ptr_bits)))
+}
+
+/// x86 segment-override prefixes. A memory operand carrying one
+/// (`fs:[0x30]`, `gs:[0x60]`, …) addresses `segment_base + offset`,
+/// not `offset`, so the byte-model address parser must decline it.
+const X86_SEGMENT_PREFIXES: [&str; 6] = ["fs:", "gs:", "cs:", "ds:", "es:", "ss:"];
+
+/// Whether a memory operand carries an x86 segment-override prefix.
+fn has_segment_prefix(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    X86_SEGMENT_PREFIXES.iter().any(|seg| lower.contains(seg))
 }
 
 /// Split an x86 address body into `(term, is_negative)` pairs on

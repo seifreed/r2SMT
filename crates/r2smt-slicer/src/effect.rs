@@ -178,25 +178,34 @@ fn has_unresolved_memory(operands: &[Operand]) -> bool {
         .any(|o| stack_slot(o).is_none())
 }
 
-/// Pointer width of a recognised stack slot, in bits.
+/// Explicit pointer width of a memory operand, in bits, from its
+/// `byte ptr` / `word ptr` / `dword ptr` / `qword ptr` prefix.
 ///
-/// Inferred from the `byte ptr` / `word ptr` / `dword ptr` /
-/// `qword ptr` prefix when present. Without an explicit width prefix
-/// we default to 64-bit so the slot is interoperable with native
-/// pointer-sized accesses.
-fn stack_slot_width(raw: &str) -> u8 {
+/// Returns `None` when the operand carries no width prefix, so callers
+/// can fall back to their own natural pointer width. Applies to any
+/// memory operand, not just recognised stack slots — `dword ptr [rax]`
+/// is a 32-bit access regardless of the base register.
+#[must_use]
+pub fn memory_operand_width(raw: &str) -> Option<u8> {
     let lower = raw.to_ascii_lowercase();
     if lower.contains("qword") {
-        64
+        Some(64)
     } else if lower.contains("dword") {
-        32
+        Some(32)
     } else if lower.contains("word") {
-        16
+        Some(16)
     } else if lower.contains("byte") {
-        8
+        Some(8)
     } else {
-        64
+        None
     }
+}
+
+/// Pointer width of a recognised stack slot, in bits. Uses the
+/// explicit prefix width when present, defaulting to 64-bit so the
+/// slot is interoperable with native pointer-sized accesses.
+fn stack_slot_width(raw: &str) -> u8 {
+    memory_operand_width(raw).unwrap_or(64)
 }
 
 fn parse_integer(raw: &str) -> Option<i64> {

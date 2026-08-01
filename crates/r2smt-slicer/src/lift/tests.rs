@@ -960,3 +960,54 @@ fn movsx_eax_ah_sign_extends_to_eax_then_zero_extends_to_rax() {
         other => panic!("expected Assign, got {other:?}"),
     }
 }
+
+#[test]
+fn cmp_dword_ptr_memory_loads_at_prefix_width_not_pointer_width() {
+    // `cmp dword ptr [rax], 5` — the compare width comes from the
+    // memory operand's `dword ptr` prefix (32), so the emitted
+    // `LoadMem` reads 32 bits, not the 64-bit pointer default.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            3,
+            "cmp",
+            vec![
+                op("dword ptr [rax]", OperandKind::Memory),
+                op("5", OperandKind::Immediate),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    let load = stmts
+        .iter()
+        .find_map(|s| match s {
+            IrStmt::LoadMem { bits, .. } => Some(*bits),
+            _ => None,
+        })
+        .expect("cmp against a memory operand emits a LoadMem");
+    assert_eq!(load, 32);
+}
+
+#[test]
+fn segment_prefixed_memory_stays_opaque_not_absolute_load() {
+    // `mov rax, qword fs:[0x30]` — a segment-relative access whose
+    // true address is `fs_base + 0x30`. Modelling it as an absolute
+    // load at `0x30` would alias with `[0x30]` and could fabricate a
+    // verdict, so the operand stays opaque: no LoadMem is emitted.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            8,
+            "mov",
+            vec![
+                op("rax", OperandKind::Register),
+                op("qword fs:[0x30]", OperandKind::Memory),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    assert!(
+        !stmts.iter().any(|s| matches!(s, IrStmt::LoadMem { .. })),
+        "segment-prefixed memory must not lower to a LoadMem: {stmts:?}"
+    );
+}
