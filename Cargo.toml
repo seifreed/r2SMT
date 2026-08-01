@@ -20,7 +20,7 @@ tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 r2pipe             = "0.8"
 z3                 = { version = "0.20", features = ["vendored"] }
-sha2               = "0.10"
+sha2               = "0.11"
 hex                = "0.4"
 tempfile           = "3"
 rayon              = "1"
