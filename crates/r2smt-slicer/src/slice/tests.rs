@@ -1799,13 +1799,15 @@ fn test_bounded_diamond_lift_polarity_taken_edge_is_then_branch() {
 }
 
 #[test]
-fn aarch64_packed_write_over_a_live_vector_register_truncates() {
-    // The fabrication teeth. `add v0.4s, …` overwrites `v0`, which the
-    // branch reads back through `s0`. Before the arrangement guard the
-    // arranged destination canonicalised to `None`, so the instruction
-    // reported no definition: the walk stepped straight over it and
-    // bound `s0` to the *earlier* `fmov`, yielding a Complete slice and
-    // a High-confidence verdict over a value that had been replaced.
+fn aarch64_packed_write_over_a_live_vector_register_is_modelled() {
+    // The fabrication teeth, now resolved rather than truncated.
+    // `add v0.4s, …` overwrites `v0`, which the branch reads back
+    // through `s0`. The arranged destination once canonicalised to
+    // `None`, so the instruction reported no definition: the walk
+    // stepped straight over it and bound `s0` to the *earlier* `fmov`,
+    // yielding a High-confidence verdict over a value that had been
+    // replaced. The packed handler models the write, so the slice keeps
+    // the instruction and the earlier `fmov` is correctly dead.
     let program = Program {
         arch: Arch::Aarch64,
         bits: 64,
@@ -1830,9 +1832,9 @@ fn aarch64_packed_write_over_a_live_vector_register_truncates() {
                         4,
                         "add",
                         vec![
-                            op("v0.4s", OperandKind::Unknown),
-                            op("v1.4s", OperandKind::Unknown),
-                            op("v2.4s", OperandKind::Unknown),
+                            op("v0.4s", OperandKind::Register),
+                            op("v1.4s", OperandKind::Register),
+                            op("v2.4s", OperandKind::Register),
                         ],
                     ),
                     insn(
@@ -1858,8 +1860,165 @@ fn aarch64_packed_write_over_a_live_vector_register_truncates() {
     };
     let slice = slice_first(&program);
     assert!(
+        slice
+            .instructions
+            .iter()
+            .any(|i| i.address == Address(0x40_1004)),
+        "the packed write defines the register the branch reads and must be kept: {:?}",
+        slice.instructions
+    );
+}
+
+#[test]
+fn aarch64_packed_write_supersedes_the_earlier_definition_it_overwrites() {
+    // The other half of the same contract: once the packed write is
+    // recognised as a definition of `v0`, the `fmov` upstream of it is
+    // dead and must not enter the slice.
+    let program = packed_over_live_vector_program("add", "v1.4s", "v2.4s");
+    let slice = slice_first(&program);
+    assert!(
+        !slice
+            .instructions
+            .iter()
+            .any(|i| i.address == Address(0x40_1000)),
+        "the overwritten `fmov` must not be kept: {:?}",
+        slice.instructions
+    );
+}
+
+#[test]
+fn aarch64_unmodelled_packed_write_over_a_live_vector_register_truncates() {
+    // The teeth for the shapes still outside the packed handler.
+    // `umlal` accumulates half-width lanes into full-width ones; nothing
+    // models it, so the slice must truncate rather than step over a
+    // write to the register the branch reads.
+    let program = packed_over_live_vector_program("umlal", "v1.4h", "v2.4h");
+    let slice = slice_first(&program);
+    assert!(
         matches!(slice.status, SliceStatus::Truncated { .. }),
         "expected truncation at the unmodelled packed write, got {:?}",
+        slice.status
+    );
+}
+
+/// `fmov s0, s3` / `<mnemonic> v0.4s, <a>, <b>` / `fcmp s0, s1` /
+/// `b.eq`: a vector write sitting between a definition of `v0` and a
+/// branch that reads it back.
+fn packed_over_live_vector_program(mnemonic: &str, a: &str, b: &str) -> Program {
+    Program {
+        arch: Arch::Aarch64,
+        bits: 64,
+        entry: Some(Address(0x40_1000)),
+        functions: vec![Function {
+            address: Address(0x40_1000),
+            name: Some("sym.main".into()),
+            blocks: vec![BasicBlock {
+                address: Address(0x40_1000),
+                instructions: vec![
+                    insn(
+                        0x40_1000,
+                        4,
+                        "fmov",
+                        vec![
+                            op("s0", OperandKind::Register),
+                            op("s3", OperandKind::Register),
+                        ],
+                    ),
+                    insn(
+                        0x40_1004,
+                        4,
+                        mnemonic,
+                        vec![
+                            op("v0.4s", OperandKind::Register),
+                            op(a, OperandKind::Register),
+                            op(b, OperandKind::Register),
+                        ],
+                    ),
+                    insn(
+                        0x40_1008,
+                        4,
+                        "fcmp",
+                        vec![
+                            op("s0", OperandKind::Register),
+                            op("s1", OperandKind::Register),
+                        ],
+                    ),
+                    insn(
+                        0x40_100c,
+                        4,
+                        "b.eq",
+                        vec![op("0x401080", OperandKind::Immediate)],
+                    ),
+                ],
+                successors: vec![],
+            }],
+            is_thumb: false,
+        }],
+    }
+}
+
+#[test]
+fn aarch64_floating_point_slice_truncates_when_the_function_reprograms_fpcr() {
+    // The rounding-mode guard, previously inert on ARM because
+    // `pins_rounding_mode` reported `false` for every ARM mnemonic. The
+    // `msr` sits *after* the branch, so the backward walk never visits
+    // it — the function-wide scan is the only thing that can catch it,
+    // and without it the slice reports Complete while the hardware
+    // rounded some other way.
+    let program = Program {
+        arch: Arch::Aarch64,
+        bits: 64,
+        entry: Some(Address(0x40_1000)),
+        functions: vec![Function {
+            address: Address(0x40_1000),
+            name: Some("sym.main".into()),
+            blocks: vec![BasicBlock {
+                address: Address(0x40_1000),
+                instructions: vec![
+                    insn(
+                        0x40_1000,
+                        4,
+                        "fadd",
+                        vec![
+                            op("s0", OperandKind::Register),
+                            op("s1", OperandKind::Register),
+                            op("s2", OperandKind::Register),
+                        ],
+                    ),
+                    insn(
+                        0x40_1004,
+                        4,
+                        "fcmp",
+                        vec![
+                            op("s0", OperandKind::Register),
+                            op("s3", OperandKind::Register),
+                        ],
+                    ),
+                    insn(
+                        0x40_1008,
+                        4,
+                        "b.eq",
+                        vec![op("0x401080", OperandKind::Immediate)],
+                    ),
+                    insn(
+                        0x40_100c,
+                        4,
+                        "msr",
+                        vec![
+                            op("fpcr", OperandKind::Register),
+                            op("x0", OperandKind::Register),
+                        ],
+                    ),
+                ],
+                successors: vec![],
+            }],
+            is_thumb: false,
+        }],
+    };
+    let slice = slice_first(&program);
+    assert!(
+        matches!(slice.status, SliceStatus::Truncated { .. }),
+        "expected truncation on the unpinned rounding mode, got {:?}",
         slice.status
     );
 }

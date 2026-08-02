@@ -10,9 +10,9 @@ use r2smt_ir::stmt::IrStmt;
 use crate::registers::register_layout;
 
 use super::{
-    BinOp, FpArithOp, LiftCtx, MemAccess, aarch64_cond_suffix_to_predicate, declines_vector_shape,
-    fp_lane_result, fp_sort_bits, is_aarch32_base_supported, nonzero_width,
-    strip_aarch32_cond_suffix, width_mask,
+    BinOp, FpArithOp, LiftCtx, MemAccess, PackedIntOp, PackedOp, VectorShape,
+    aarch64_cond_suffix_to_predicate, fp_lane_result, fp_sort_bits, is_aarch32_base_supported,
+    nonzero_width, strip_aarch32_cond_suffix, vector_shape, width_mask,
 };
 
 impl LiftCtx {
@@ -26,7 +26,7 @@ impl LiftCtx {
         // register operands, so the operand-shape collision is narrower
         // than on `AArch64` — but the indexed form (`vmov r0, d0[1]`)
         // reaches the integer arms by exactly the same route.
-        if declines_vector_shape(insn, Arch::Arm) {
+        if vector_shape(insn, Arch::Arm) == VectorShape::Declined {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!(
@@ -111,6 +111,21 @@ impl LiftCtx {
             "pop" => self.lift_aarch32_pop(insn),
             "ldm" | "ldmia" => self.lift_aarch32_ldm(insn),
             "stm" | "stmia" => self.lift_aarch32_stm(insn),
+            // NEON packed data processing. Recognised ahead of the VFP
+            // arm because the two families share mnemonics: `vadd.f32`
+            // is scalar when its destination is an `s` register and
+            // packed when it is a `d` (two lanes) or a `q` (four).
+            // `neon_packed_shape` answers `None` for the single-lane
+            // case, so everything the scalar handler lifts today still
+            // reaches it.
+            _ if self.neon_packed_shape(insn).is_some() => {
+                if let Some((op, lane)) = self.neon_packed_shape(insn) {
+                    // A NEON write preserves the vector register above
+                    // the destination's view — `d1` survives a write to
+                    // `d0`, both being halves of `q0`.
+                    self.lift_packed_vector(insn, op, lane, false);
+                }
+            }
             // VFP scalar floating point. Unlike AArch64, the lane
             // width is spelled in the mnemonic (`vadd.f32` /
             // `vadd.f64`), not in the operand, and every mnemonic is
@@ -641,6 +656,102 @@ fn parse_aarch32_immediate(raw: &str) -> Option<i64> {
         return i64::from_str_radix(hex, 16).ok().map(|v| -v);
     }
     s.parse::<i64>().ok()
+}
+
+/// Element width named by an `AArch32` NEON data type (`i32`, `s16`,
+/// `u8`, `f32`). Signedness does not change the width, and for the
+/// operations modelled here it does not change the result either:
+/// two's-complement add, subtract and multiply are sign-agnostic at a
+/// fixed width.
+fn neon_element_bits(ty: &str) -> Option<u16> {
+    let (kind, width) = ty.split_at(1);
+    if !matches!(kind, "i" | "s" | "u" | "f") {
+        return None;
+    }
+    match width {
+        "8" if kind != "f" => Some(8),
+        "16" => Some(16),
+        "32" => Some(32),
+        "64" => Some(64),
+        _ => None,
+    }
+}
+
+/// The packed operation and element width an `AArch32` NEON
+/// data-processing mnemonic names.
+///
+/// Two spellings exist. The arithmetic family carries an element type
+/// (`vadd.i32`, `vmul.f32`); the bitwise family operates on raw bits and
+/// the assembler makes the type optional, so disassemblers emit it bare
+/// (`vand q0, q1, q2`). A bitwise operation needs no element width to be
+/// exact — it is lane-independent — so the bare forms report the byte,
+/// the smallest element the register file admits.
+pub(crate) fn neon_packed_op(mnemonic: &str) -> Option<(PackedOp, u16)> {
+    const NEON_BITWISE_ELEMENT_BITS: u16 = 8;
+    if let Some(op) = neon_bitwise_op(mnemonic) {
+        return Some((PackedOp::Int(op), NEON_BITWISE_ELEMENT_BITS));
+    }
+    let (base, ty) = mnemonic.split_once('.')?;
+    let lane_bits = neon_element_bits(ty)?;
+    let op = if ty.starts_with('f') {
+        PackedOp::Fp(match base {
+            "vadd" => FpArithOp::Add,
+            "vsub" => FpArithOp::Sub,
+            "vmul" => FpArithOp::Mul,
+            "vdiv" => FpArithOp::Div,
+            _ => return None,
+        })
+    } else {
+        PackedOp::Int(PackedIntOp::Bin(match base {
+            "vadd" => BinOp::Add,
+            "vsub" => BinOp::Sub,
+            "vmul" => BinOp::Mul,
+            _ => return None,
+        }))
+    };
+    Some((op, lane_bits))
+}
+
+/// The bitwise NEON mnemonics, which carry no element type.
+///
+/// `vmov` is deliberately absent: untyped `vmov` also spells the
+/// general-register transfers (`vmov r0, s0`), which move between
+/// register files rather than within the vector one.
+fn neon_bitwise_op(mnemonic: &str) -> Option<PackedIntOp> {
+    Some(match mnemonic {
+        "vand" => PackedIntOp::Bin(BinOp::And),
+        "vorr" => PackedIntOp::Bin(BinOp::Or),
+        "veor" => PackedIntOp::Bin(BinOp::Xor),
+        "vbic" => PackedIntOp::BitClear,
+        "vmvn" => PackedIntOp::Not,
+        _ => return None,
+    })
+}
+
+impl LiftCtx {
+    /// The packed operation and element width an `AArch32` instruction
+    /// lowers to, or `None` when the scalar VFP handler owns it.
+    ///
+    /// The lane *count* comes from the destination register, because
+    /// `AArch32` puts only the element type in the mnemonic: `q0` holds
+    /// four `i32` elements, `d0` two. A destination holding exactly one
+    /// element is the scalar VFP form — `vadd.f32 s0, s1, s2` and
+    /// `vadd.f64 d0, d1, d2` — which the scalar handler already lifts,
+    /// so this declines and leaves that path byte-identical.
+    ///
+    /// `vadd.f32 d0, d1, d2` is the case the distinction exists for: it
+    /// holds *two* single-precision elements, and the scalar handler
+    /// would compute only the low one while leaving the high one at
+    /// whatever it held before.
+    fn neon_packed_shape(&self, insn: &Instruction) -> Option<(PackedOp, u16)> {
+        let mnem = insn.mnemonic.trim().to_ascii_lowercase();
+        let (op, lane_bits) = neon_packed_op(&mnem)?;
+        if insn.operands.len() != op.operand_count() {
+            return None;
+        }
+        let view = self.simd_view_bits(insn.operands.first()?)?;
+        (Self::packed_lane_count(view, lane_bits)? > 1).then_some((op, lane_bits))
+    }
 }
 
 /// What a VFP scalar mnemonic does, and at what precision.

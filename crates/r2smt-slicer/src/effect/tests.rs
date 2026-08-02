@@ -513,31 +513,88 @@ fn memory_operand_width_ignores_size_keywords_inside_symbols() {
 }
 
 #[test]
-fn aarch64_packed_add_is_not_reported_as_a_register_definition() {
-    // The soundness contract: an arranged destination canonicalises to
-    // `None`, so before the guard this passed with `kind: Add` and empty
+fn aarch64_packed_add_defines_its_vector_destination() {
+    // The soundness contract this replaces: an arranged destination used
+    // to canonicalise to `None`, so the instruction passed with empty
     // `defs` while `v1`/`v2` still resolved as `uses`. The slicer then
     // neither truncated nor kept it, and a later read of `v0` bound to a
-    // stale definition.
+    // stale definition. Now the packed handler models it, so the
+    // definition is reported.
     let i = insn(
         "add",
         vec![
-            op("v0.4s", OperandKind::Unknown),
-            op("v1.4s", OperandKind::Unknown),
-            op("v2.4s", OperandKind::Unknown),
+            op("v0.4s", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+            op("v2.4s", OperandKind::Register),
         ],
     );
-    assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);
+    let effect = analyze(&i, Arch::Aarch64);
+    assert_eq!(effect.defs, vec!["v0"]);
 }
 
 #[test]
-fn aarch64_packed_floating_point_declines() {
+fn aarch64_packed_add_reads_both_vector_sources() {
+    let i = insn(
+        "add",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+            op("v2.4s", OperandKind::Register),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).uses, vec!["v1", "v2"]);
+}
+
+#[test]
+fn aarch64_packed_add_is_classified_as_simd() {
+    let i = insn(
+        "add",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+            op("v2.4s", OperandKind::Register),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Simd);
+}
+
+#[test]
+fn aarch64_packed_floating_point_defines_its_vector_destination() {
     let i = insn(
         "fadd",
         vec![
-            op("v0.2d", OperandKind::Unknown),
-            op("v1.2d", OperandKind::Unknown),
-            op("v2.2d", OperandKind::Unknown),
+            op("v0.2d", OperandKind::Register),
+            op("v1.2d", OperandKind::Register),
+            op("v2.2d", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert_eq!(effect.defs, vec!["v0"]);
+}
+
+#[test]
+fn aarch64_packed_vector_instruction_sets_no_flags() {
+    let i = insn(
+        "add",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+            op("v2.4s", OperandKind::Register),
+        ],
+    );
+    assert!(!analyze(&i, Arch::Aarch64).defines_flags);
+}
+
+#[test]
+fn aarch64_widening_arrangement_declines() {
+    // Not modelled, so the effect table has to fail closed — otherwise
+    // the slicer retains a definition the lifter drops.
+    let i = insn(
+        "umlal",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4h", OperandKind::Register),
+            op("v2.4h", OperandKind::Register),
         ],
     );
     assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);
@@ -626,4 +683,53 @@ fn aarch32_aapcs_vector_alias_is_still_a_general_purpose_register() {
     let effect = analyze(&i, Arch::Arm);
     assert_eq!(effect.kind, InstructionKind::Add);
     assert_eq!(effect.defs, vec!["r4"]);
+}
+
+#[test]
+fn aarch32_packed_integer_defines_its_vector_destination() {
+    let i = insn(
+        "vadd.i32",
+        vec![
+            op("q0", OperandKind::Register),
+            op("q1", OperandKind::Register),
+            op("q2", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Arm);
+    assert_eq!(effect.defs, vec!["v0"]);
+}
+
+#[test]
+fn aarch32_packed_integer_also_reads_its_destination() {
+    // An AArch32 vector write merges, so the prior value stays live.
+    let i = insn(
+        "vadd.i32",
+        vec![
+            op("d0", OperandKind::Register),
+            op("d1", OperandKind::Register),
+            op("d2", OperandKind::Register),
+        ],
+    );
+    assert!(analyze(&i, Arch::Arm).uses.contains(&"v0"));
+}
+
+#[test]
+fn aarch32_untyped_bitwise_neon_is_classified_as_simd() {
+    let i = insn(
+        "vand",
+        vec![
+            op("q0", OperandKind::Register),
+            op("q1", OperandKind::Register),
+            op("q2", OperandKind::Register),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Arm).kind, InstructionKind::Simd);
+}
+
+#[test]
+fn aarch32_general_purpose_push_list_is_still_data_movement() {
+    // A GPR register list is spelled like a NEON one; judging it by the
+    // braces alone would truncate every AArch32 stack-frame setup.
+    let i = insn("push", vec![op("{r4, r5, lr}", OperandKind::Unknown)]);
+    assert_eq!(analyze(&i, Arch::Arm).kind, InstructionKind::Mov);
 }

@@ -41,7 +41,7 @@ mod aarch32;
 mod aarch64;
 mod merge;
 mod x86;
-pub(crate) use aarch32::{VfpOp, vfp_scalar};
+pub(crate) use aarch32::{VfpOp, neon_packed_op, vfp_scalar};
 use merge::lower_merge;
 pub(crate) use x86::{is_fp_compare_mnemonic, sse_scalar_move_lane};
 
@@ -99,10 +99,18 @@ const FLAGS: &[&str] = &["ZF", "CF", "SF", "OF", "PF"];
 /// uses, splitting the data-flow graph in a way no unit test would
 /// notice.
 fn is_simd_instruction(insn: &Instruction, arch: Arch) -> bool {
+    // Any vector-shaped ARM operand belongs to the vector dispatch,
+    // whether or not a packed handler models it: the ESIL lowering of a
+    // declined one would model the arranged operand at pointer width,
+    // which is neither the register the shape names nor a decline.
+    if vector_shape(insn, arch) != VectorShape::None {
+        return true;
+    }
+    let mnem = insn.mnemonic.trim().to_ascii_lowercase();
     match arch {
         Arch::X86 | Arch::X86_64 => is_x86_simd_instruction(insn),
         Arch::Aarch64 => is_aarch64_fp_instruction(insn),
-        Arch::Arm => vfp_scalar(&insn.mnemonic.trim().to_ascii_lowercase()).is_some(),
+        Arch::Arm => vfp_scalar(&mnem).is_some() || aarch32::neon_packed_op(&mnem).is_some(),
         _ => false,
     }
 }
@@ -225,23 +233,49 @@ fn is_x86_simd_instruction(insn: &Instruction) -> bool {
     )
 }
 
-/// Whether `insn` carries ARM vector shape — an element arrangement
-/// (`v0.4s`), an indexed lane (`v0.s[1]`, `d0[1]`), or a multi-register
-/// list (`{v0.4s, v1.4s}`) — that no handler models.
+/// How the lifter handles an instruction whose operands carry ARM vector
+/// shape — an element arrangement (`v0.4s`), an indexed lane
+/// (`v0.s[1]`, `d0[1]`), or a multi-register list (`{v0.4s, v1.4s}`).
 ///
 /// The single source of truth for the effect tables and the
-/// per-mnemonic dispatchers, which have to agree: the register table now
+/// per-mnemonic dispatchers, which have to agree: the register table
 /// resolves an arranged name to its vector parent, so a mnemonic like
 /// `add` that has both a scalar and a NEON form would otherwise be
 /// retained by the slicer as a definition of `v0` and then lowered by
 /// the scalar handler as a single 128-bit addition — wrong values, not a
-/// decline. Both consumers call this and both fail closed on it: the
-/// effect table reports [`crate::effect::InstructionKind::Other`] so the
-/// slice truncates, the dispatcher emits [`IrStmt::Unsupported`].
-pub(crate) fn declines_vector_shape(insn: &Instruction, arch: Arch) -> bool {
-    insn.operands
+/// decline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VectorShape {
+    /// No operand carries vector shape; the scalar dispatch applies.
+    None,
+    /// Vector-shaped and lowered by the packed handler.
+    Lifted,
+    /// Vector-shaped and not modelled. The effect table reports
+    /// [`crate::effect::InstructionKind::Other`] so the slice truncates,
+    /// and the dispatcher emits [`IrStmt::Unsupported`].
+    Declined,
+}
+
+/// Classify `insn` against the vector shapes the lifter models.
+///
+/// `AArch32` NEON spells its element type on the mnemonic and leaves the
+/// operands bare, so the only shapes an `AArch32` operand carries are the
+/// indexed element and the vector register list — neither of which is
+/// modelled, hence no `Lifted` on that ISA. Its packed forms are
+/// recognised from the mnemonic instead, below the shape question
+/// entirely.
+pub(crate) fn vector_shape(insn: &Instruction, arch: Arch) -> VectorShape {
+    if !insn
+        .operands
         .iter()
         .any(|op| has_vector_arrangement(&op.raw, arch))
+    {
+        return VectorShape::None;
+    }
+    match arch {
+        Arch::Aarch64 if aarch64::packed_shape(insn).is_some() => VectorShape::Lifted,
+        _ => VectorShape::Declined,
+    }
 }
 
 /// Whether `insn` reprograms the FPU control register that
@@ -272,15 +306,90 @@ pub(crate) fn writes_rounding_control(insn: &Instruction, arch: Arch) -> bool {
 
 /// Whether lifting `mnemonic` pins the architectural default rounding
 /// mode, and so depends on nothing having reprogrammed it.
+/// Deliberately narrow on every ISA: only the operations that actually
+/// round are listed. `fmax` / `fmin` select an operand, `fcvtzs` /
+/// `fcvtzu` carry round-toward-zero in the opcode, and `fmov` / `fabs` /
+/// `fneg` / `fcmp` move or inspect a bit pattern.
 #[must_use]
 pub(crate) fn pins_rounding_mode(mnemonic: &str, arch: Arch) -> bool {
+    let lower = mnemonic.trim().to_ascii_lowercase();
     match arch {
         Arch::X86 | Arch::X86_64 => x86::pins_rounding_mode(mnemonic),
-        // ARM floating-point arithmetic is not lifted yet. The guard is
-        // wired ahead of it deliberately: the moment a handler pins a
-        // rounding mode it has to be listed here, or the slice would
-        // report `Complete` while the hardware rounded some other way.
+        // Same mnemonics scalar and packed, so the arrangement never
+        // enters this question.
+        Arch::Aarch64 => matches!(
+            lower.as_str(),
+            "fadd" | "fsub" | "fmul" | "fdiv" | "fsqrt" | "fcvt" | "scvtf" | "ucvtf"
+        ),
+        // `AArch32` spells the precision on the mnemonic, so the same
+        // parsers that dispatch the VFP and NEON families answer this.
+        Arch::Arm => {
+            let vfp_rounds = matches!(
+                vfp_scalar(&lower),
+                Some((
+                    VfpOp::Arith(FpArithOp::Add | FpArithOp::Sub | FpArithOp::Mul | FpArithOp::Div)
+                        | VfpOp::Sqrt,
+                    _
+                ))
+            );
+            vfp_rounds || matches!(aarch32::neon_packed_op(&lower), Some((PackedOp::Fp(_), _)))
+        }
         _ => false,
+    }
+}
+
+/// Integer operation a packed ARM vector instruction applies to each
+/// lane.
+#[derive(Clone, Copy)]
+pub(crate) enum PackedIntOp {
+    /// A lane-wise binary operation over two sources.
+    Bin(BinOp),
+    /// `bic` — `a & ~b`.
+    BitClear,
+    /// `mvn` / `not` — `~a`, one source.
+    Not,
+    /// `mov` — copy, one source.
+    Copy,
+}
+
+/// What a packed ARM vector data-processing instruction computes.
+#[derive(Clone, Copy)]
+pub(crate) enum PackedOp {
+    /// Integer lanes.
+    Int(PackedIntOp),
+    /// IEEE floating-point lanes.
+    Fp(FpArithOp),
+}
+
+impl PackedOp {
+    /// Number of operands the instruction's packed form carries,
+    /// destination included.
+    const fn operand_count(self) -> usize {
+        match self {
+            Self::Int(PackedIntOp::Not | PackedIntOp::Copy) => 2,
+            _ => 3,
+        }
+    }
+
+    /// Whether applying the operation to the whole vector view at once
+    /// yields the same bits as applying it to each lane separately.
+    ///
+    /// True for the bitwise family, where no carry crosses a lane
+    /// boundary — lowering those lane by lane would multiply the formula
+    /// the solver sees by the lane count (sixteen extracts and fifteen
+    /// concatenations for a `.16b` operand) for an identical result.
+    /// False for the arithmetic family, where the lane boundary is
+    /// exactly what stops the carry.
+    const fn is_lane_independent(self) -> bool {
+        matches!(
+            self,
+            Self::Int(
+                PackedIntOp::Bin(BinOp::And | BinOp::Or | BinOp::Xor)
+                    | PackedIntOp::BitClear
+                    | PackedIntOp::Not
+                    | PackedIntOp::Copy
+            )
+        )
     }
 }
 
@@ -337,6 +446,22 @@ pub(crate) fn fp_lane_result(op: FpArithOp, a_bits: Expr, b_bits: Expr, lane_bit
         }
     };
     Expr::fp_to_ieee_bv(arith)
+}
+
+/// Apply an integer packed operation to one lane (or, for the
+/// lane-independent operations, to a whole view) of `bits` width.
+///
+/// `None` when a two-source operation was handed no second source — an
+/// operand-count mismatch the caller declines on rather than inventing a
+/// value for.
+fn packed_int_lane(op: PackedIntOp, a: Expr, b: Option<Expr>, bits: u16) -> Option<Expr> {
+    Some(match op {
+        PackedIntOp::Bin(bin) => bin.apply(a, b?),
+        // The IR has no bitwise NOT, so `~x` is `x XOR all-ones`.
+        PackedIntOp::BitClear => Expr::bv_and(a, Expr::bv_xor(b?, aarch64::all_ones(bits))),
+        PackedIntOp::Not => Expr::bv_xor(a, aarch64::all_ones(bits)),
+        PackedIntOp::Copy => a,
+    })
 }
 
 /// IEEE `(ebits, sbits)` sort for an FP lane width: 16→half `(5, 11)`,
@@ -1047,6 +1172,126 @@ impl LiftCtx {
         Some(acc)
     }
 
+    /// Build the full-view result of a packed floating-point lane
+    /// operation, or `None` when any operand is unmodellable.
+    ///
+    /// Each operand is materialised **once** and the lanes are extracted
+    /// from that value, so a memory operand costs one load rather than
+    /// one per lane.
+    ///
+    /// Arch-neutral: every step below is expressed in views, lanes and
+    /// operand values, none of which is x86-specific. `addps xmm0, xmm1`
+    /// and `fadd v0.4s, v1.4s, v2.4s` are the same computation over the
+    /// same model, differing only in how the caller derived the lane
+    /// width — from the mnemonic on x86, from the arrangement on ARM.
+    pub(super) fn packed_fp_result(
+        &mut self,
+        dst: &Operand,
+        a_op: &Operand,
+        b_op: &Operand,
+        op: FpArithOp,
+        lane_bits: u16,
+    ) -> Option<Expr> {
+        let view = self.simd_instruction_view_bits(&[dst, a_op, b_op])?;
+        let count = Self::packed_lane_count(view, lane_bits)?;
+        let a_val = self.simd_operand_value(a_op, view)?;
+        let b_val = self.simd_operand_value(b_op, view)?;
+        let mut lanes = Vec::with_capacity(usize::from(count));
+        for index in 0..count {
+            let a = Self::extract_lane(a_val.clone(), lane_bits, index)?;
+            let b = Self::extract_lane(b_val.clone(), lane_bits, index)?;
+            lanes.push(fp_lane_result(op, a, b, lane_bits));
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// The integer twin of [`Self::packed_fp_result`]. `b_op` is absent
+    /// for the one-source forms (`mvn`, `mov`).
+    ///
+    /// A lane-independent operation is emitted once over the whole view
+    /// instead of once per lane — see [`PackedOp::is_lane_independent`].
+    fn packed_int_result(
+        &mut self,
+        dst: &Operand,
+        a_op: &Operand,
+        b_op: Option<&Operand>,
+        op: PackedIntOp,
+        lane_bits: u16,
+    ) -> Option<Expr> {
+        let mut refs = vec![dst, a_op];
+        refs.extend(b_op);
+        let view = self.simd_instruction_view_bits(&refs)?;
+        let a_val = self.simd_operand_value(a_op, view)?;
+        let b_val = match b_op {
+            Some(b) => Some(self.simd_operand_value(b, view)?),
+            None => None,
+        };
+        if PackedOp::Int(op).is_lane_independent() {
+            return packed_int_lane(op, a_val, b_val, view);
+        }
+        let count = Self::packed_lane_count(view, lane_bits)?;
+        let mut lanes = Vec::with_capacity(usize::from(count));
+        for index in 0..count {
+            let a = Self::extract_lane(a_val.clone(), lane_bits, index)?;
+            let b = match b_val.as_ref() {
+                Some(value) => Some(Self::extract_lane(value.clone(), lane_bits, index)?),
+                None => None,
+            };
+            lanes.push(packed_int_lane(op, a, b, lane_bits)?);
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// Lower one packed ARM vector data-processing instruction: the same
+    /// lane operation applied independently to every lane of the
+    /// destination's view.
+    ///
+    /// `zero_upper` is the ISA's rule for the vector-register bits above
+    /// the view. `AArch64` zeroes them on every SIMD write; `AArch32`
+    /// preserves them, because a `Dd` operand is one half of a `Qd` and
+    /// the other half survives the instruction.
+    ///
+    /// A decline here is sound by the free-input boundary: the slicer
+    /// consumed the destination as a definition and therefore stopped
+    /// tracking its upstream definitions, so emitting no assignment
+    /// leaves the register a free SSA input rather than bound to a stale
+    /// value.
+    pub(super) fn lift_packed_vector(
+        &mut self,
+        insn: &Instruction,
+        op: PackedOp,
+        lane_bits: u16,
+        zero_upper: bool,
+    ) {
+        let ops = &insn.operands;
+        let (Some(dst), Some(a_op)) = (ops.first(), ops.get(1)) else {
+            self.push_packed_unsupported(insn);
+            return;
+        };
+        let b_op = ops.get(2);
+        let result = match op {
+            PackedOp::Fp(fp) => match b_op {
+                Some(b) => self.packed_fp_result(dst, a_op, b, fp, lane_bits),
+                None => None,
+            },
+            PackedOp::Int(int) => self.packed_int_result(dst, a_op, b_op, int, lane_bits),
+        };
+        let Some(value) = result else {
+            self.push_packed_unsupported(insn);
+            return;
+        };
+        if !self.write_xmm_dst(dst, value, zero_upper) {
+            self.push_packed_unsupported(insn);
+        }
+    }
+
+    fn push_packed_unsupported(&mut self, insn: &Instruction) {
+        self.stmts.push(IrStmt::Unsupported {
+            mnemonic: insn.mnemonic.clone(),
+            comment: format!("unmodellable packed operand at {addr}", addr = insn.address),
+        });
+    }
+
     /// Width of a SIMD operand's view: 128 / 256 / 512 for a register,
     /// and for memory whatever size prefix radare2 attached
     /// (`xmmword [rsi]` → 128). `None` if `op` is neither, or is a
@@ -1171,7 +1416,7 @@ pub(super) struct MemAccess {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum BinOp {
+pub(crate) enum BinOp {
     Add,
     Sub,
     Mul,

@@ -649,33 +649,6 @@ impl LiftCtx {
         }
     }
 
-    /// Build the full-view result of a packed lane operation, or `None`
-    /// when any operand is unmodellable.
-    ///
-    /// Each operand is materialised **once** and the lanes are extracted
-    /// from that value, so a memory operand costs one load rather than
-    /// one per lane.
-    fn packed_fp_result(
-        &mut self,
-        dst: &Operand,
-        a_op: &Operand,
-        b_op: &Operand,
-        op: FpArithOp,
-        lane_bits: u16,
-    ) -> Option<Expr> {
-        let view = self.simd_instruction_view_bits(&[dst, a_op, b_op])?;
-        let count = Self::packed_lane_count(view, lane_bits)?;
-        let a_val = self.simd_operand_value(a_op, view)?;
-        let b_val = self.simd_operand_value(b_op, view)?;
-        let mut lanes = Vec::with_capacity(usize::from(count));
-        for index in 0..count {
-            let a = Self::extract_lane(a_val.clone(), lane_bits, index)?;
-            let b = Self::extract_lane(b_val.clone(), lane_bits, index)?;
-            lanes.push(fp_lane_result(op, a, b, lane_bits));
-        }
-        Self::concat_lanes(lanes)
-    }
-
     /// `vcvtph2ps` — widen packed half-precision lanes to single.
     ///
     /// The lane count comes from the *destination* view: each 32-bit
