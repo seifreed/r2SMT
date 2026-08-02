@@ -56,7 +56,9 @@ fn case_and_whitespace_insensitive() {
 
 #[test]
 fn non_gpr_returns_none() {
-    // MMX / x87 stay unmodelled; only SSE `xmm` is wired (P40-b).
+    // MMX stays unmodelled. `st0` is radare2's ESIL spelling of the
+    // x87 stack, not a disassembly operand — the stack resolves under
+    // the bare token `st` that `st(0)` tokenises to, and nothing else.
     assert!(register_layout("st0", Arch::X86_64).is_none());
     assert!(register_layout("mm0", Arch::X86_64).is_none());
     assert!(register_layout("ptr", Arch::X86_64).is_none());

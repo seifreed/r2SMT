@@ -39,9 +39,12 @@ mod aarch32;
 mod aarch64;
 mod merge;
 mod x86;
+mod x87;
 pub(crate) use aarch32::{VfpOp, vfp_scalar};
 use merge::lower_merge;
 pub(crate) use x86::{is_fp_compare_mnemonic, sse_scalar_move_lane};
+use x87::X87Stack;
+pub(crate) use x87::{X87_STACK_REGISTER, is_modelled_x87};
 
 /// IR representation of a [`Slice`] plus the branch's symbolic
 /// condition.
@@ -76,8 +79,8 @@ fn default_arch() -> Arch {
 
 const FLAGS: &[&str] = &["ZF", "CF", "SF", "OF", "PF"];
 
-/// SSE / AVX mnemonics whose per-mnemonic handler must win over the
-/// ESIL and P-code ladders, which model an `xmm` operand at pointer
+/// SSE / AVX / x87 mnemonics whose per-mnemonic handler must win over
+/// the ESIL and P-code ladders, which model an `xmm` operand at pointer
 /// width instead of canonicalising it to its vector parent.
 ///
 /// Most of these define the vector register; the scalar compares
@@ -96,9 +99,18 @@ const FLAGS: &[&str] = &["ZF", "CF", "SF", "OF", "PF"];
 /// a differently-named, differently-sized node than the vector lifter
 /// uses, splitting the data-flow graph in a way no unit test would
 /// notice.
+///
+/// x87 is in the same boat for a sharper reason. ESIL describes `fld1`
+/// as eight register moves plus a 64-bit immediate — `st6,st7,=,…,
+/// 0x3ff0000000000000,st0,=` — every token of which the mini stack
+/// machine evaluates happily, producing eight `st<n>` variables at
+/// pointer width that no x87 handler will ever read. `fldz`, `fld
+/// st(i)` and `fxch` are the same shape. The x87 handlers do not model
+/// the stack as registers at all (see `lift/x87.rs`), so without this
+/// pre-empt the two models would silently coexist in one slice.
 fn is_simd_instruction(insn: &Instruction, arch: Arch) -> bool {
     match arch {
-        Arch::X86 | Arch::X86_64 => is_x86_simd_instruction(insn),
+        Arch::X86 | Arch::X86_64 => is_x86_simd_instruction(insn) || is_modelled_x87(insn),
         Arch::Aarch64 => is_aarch64_fp_instruction(insn),
         Arch::Arm => vfp_scalar(&insn.mnemonic.trim().to_ascii_lowercase()).is_some(),
         _ => false,
@@ -318,15 +330,44 @@ pub(crate) fn fp_lane_result(op: FpArithOp, a_bits: Expr, b_bits: Expr, lane_bit
     Expr::fp_to_ieee_bv(arith)
 }
 
+/// IEEE interchange formats the pipeline can name and render.
+const FP_HALF_BITS: u16 = 16;
+/// IEEE binary32.
+const FP_SINGLE_BITS: u16 = 32;
+/// IEEE binary64.
+pub(crate) const FP_DOUBLE_BITS: u16 = 64;
+
 /// IEEE `(ebits, sbits)` sort for an FP lane width: 16→half `(5, 11)`,
-/// 32→single `(8, 24)`, anything else→double `(11, 53)`.
-fn fp_sort_bits(lane_bits: u16) -> (u16, u16) {
-    match lane_bits {
-        16 => (5, 11),
-        32 => (8, 24),
-        _ => (11, 53),
-    }
+/// 32→single `(8, 24)`, 64→double `(11, 53)`.
+///
+/// `None` for every other width, which is the only honest answer: the
+/// IR carries the sort verbatim into the solver, so resolving an
+/// unrecognised width to *some* sort would silently reinterpret the
+/// value. x87's 80-bit double-extended format is exactly that case —
+/// it is a real format this pipeline cannot render, and it has to
+/// decline rather than be read as a double.
+pub(crate) fn fp_sort_bits_checked(lane_bits: u16) -> Option<(u16, u16)> {
+    Some(match lane_bits {
+        FP_HALF_BITS => (5, 11),
+        FP_SINGLE_BITS => (8, 24),
+        FP_DOUBLE_BITS => (11, 53),
+        _ => return None,
+    })
 }
+
+/// Total form of [`fp_sort_bits_checked`], for the handlers that select
+/// a lane width from a closed set of literals and so cannot present an
+/// unmodelled one.
+///
+/// The fallback exists because `fp_lane_result` — shared with the ARM
+/// scalar-FP handlers — returns an `Expr` rather than an `Option`.
+/// Prefer the checked form anywhere a width is derived from an operand.
+fn fp_sort_bits(lane_bits: u16) -> (u16, u16) {
+    fp_sort_bits_checked(lane_bits).unwrap_or(FP_DOUBLE_SORT)
+}
+
+/// `(ebits, sbits)` of IEEE binary64.
+const FP_DOUBLE_SORT: (u16, u16) = (11, 53);
 
 /// `Extract(Extract(x, inner_hi, 0), hi, lo)` denotes the same bits as
 /// `Extract(x, hi, lo)` whenever the outer slice fits inside the inner
@@ -547,6 +588,10 @@ struct LiftCtx {
     arch: Arch,
     temp_counter: u32,
     cur_addr: Address,
+    /// Symbolic x87 register stack, valid for the duration of one
+    /// slice. A slice is a linear instruction sequence, so pushes and
+    /// pops compose exactly; see `lift/x87.rs`.
+    x87: X87Stack,
 }
 
 impl LiftCtx {
@@ -557,6 +602,7 @@ impl LiftCtx {
             arch,
             temp_counter: 0,
             cur_addr: Address::new(0),
+            x87: X87Stack::new(),
         }
     }
 
@@ -932,7 +978,7 @@ impl LiftCtx {
     /// 64→double). Used by the scalar SSE FP handlers.
     fn read_simd_lane_fp(&mut self, op: &Operand, lane_bits: u16) -> Option<Expr> {
         let raw = self.read_simd_lane_bits(op, lane_bits)?;
-        let (ebits, sbits) = fp_sort_bits(lane_bits);
+        let (ebits, sbits) = fp_sort_bits_checked(lane_bits)?;
         Some(Expr::bv_to_fp(raw, ebits, sbits))
     }
 

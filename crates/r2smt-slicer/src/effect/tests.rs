@@ -37,7 +37,9 @@ fn canonical_register_covers_aliases() {
         assert_eq!(canonical_register(alias, Arch::X86_64), Some("rax"));
     }
     assert_eq!(canonical_register("r8d", Arch::X86_64), Some("r8"));
-    // `xmm` now resolves (P40-b); MMX/x87 stay unmodelled.
+    // `xmm` now resolves (P40-b); MMX stays unmodelled. `st0` is the
+    // ESIL spelling of the x87 stack, which resolves only under the
+    // bare `st` token that the disassembly spelling `st(0)` yields.
     assert_eq!(canonical_register("st0", Arch::X86_64), None);
     assert_eq!(canonical_register("ptr", Arch::X86_64), None);
     assert_eq!(canonical_register("0x10", Arch::X86_64), None);
@@ -120,8 +122,9 @@ fn canonical_register_recognises_aarch64_simd_aliases() {
         assert_eq!(canonical_register(alias, Arch::Aarch64), Some("v0"));
     }
     assert_eq!(canonical_register("d31", Arch::Aarch64), Some("v31"));
-    // Adding ARM SIMD does not accidentally widen the x86 table:
-    // x86 MMX / x87 stay None (only SSE `xmm` is wired, under X86_64).
+    // Adding ARM SIMD does not accidentally widen the x86 table: MMX
+    // stays None, and so does the ESIL-only `st0` spelling of the x87
+    // stack (whose disassembly spelling `st(0)` tokenises to `st`).
     assert_eq!(canonical_register("mm0", Arch::X86_64), None);
     assert_eq!(canonical_register("st0", Arch::X86_64), None);
 }

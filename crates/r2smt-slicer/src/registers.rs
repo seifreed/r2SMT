@@ -58,8 +58,14 @@
 //! - **`x86_64`**: SIMD vector registers (`xmm<n>` / `ymm<n>` /
 //!   `zmm<n>`, n=0..31) resolve to bits `[127:0]` / `[255:0]` /
 //!   `[511:0]` of a synthetic `zmm<n>` parent, so the three views
-//!   alias on one data-flow node. The x87 stack (`st0`…`st7`) and MMX
-//!   (`mm0`…) stay `None`, gated on their own lifters.
+//!   alias on one data-flow node. MMX (`mm0`…) stays `None`, gated on
+//!   its own lifter. The x87 stack collapses onto the single synthetic
+//!   parent `st`: TOP rotates under every push and pop, so `st(1)`
+//!   names a different physical register after each `fld` and an
+//!   index-keyed node would alias two of them. Slot-level precision
+//!   lives in the lifter's slice-scoped stack instead
+//!   (`lift/x87.rs`). The bare `st0`…`st7` spelling stays `None` — it
+//!   is what radare2 emits in ESIL, never in disassembly.
 //!
 //! Name disambiguation across ISAs is critical: `AArch64` `sp` is
 //! the 64-bit stack pointer; x86 `sp` is the 16-bit alias of `rsp`;
@@ -103,7 +109,7 @@ impl RegisterLayout {
 /// Look up the [`RegisterLayout`] for a register operand name under
 /// the given ISA.
 ///
-/// Returns `None` for non-GPR registers (SIMD `xmm0`, FPU `st0`,
+/// Returns `None` for registers outside the modelled files (MMX `mm0`,
 /// segment selectors, debug / control registers, …) and for any token
 /// that does not match a known register alias in `arch`.
 /// Case-insensitive; leading / trailing whitespace is trimmed.

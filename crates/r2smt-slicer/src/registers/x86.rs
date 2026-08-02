@@ -94,6 +94,17 @@ pub(super) fn x86_layout(lower: &str) -> Option<RegisterLayout> {
         "r15w" => word("r15"),
         "r15b" => low_byte("r15"),
 
+        // The x87 register *stack*. `st` is not an architectural
+        // register name: it is the single canonical data-flow node the
+        // whole stack collapses onto, reached by tokenising the
+        // disassembler spelling `st(0)`..`st(7)` (see
+        // [`crate::effect::registers_in_operand`]). The index is
+        // deliberately lost — TOP rotates under every push and pop, so
+        // an index-keyed node would alias two different physical
+        // registers. The lifter models the individual slots with its own
+        // slice-scoped stack instead (`lift/x87.rs`).
+        "st" => full("st"),
+
         _ => return x86_simd_layout(lower),
     };
     Some(layout)
@@ -102,8 +113,10 @@ pub(super) fn x86_layout(lower: &str) -> Option<RegisterLayout> {
 /// x86 SIMD register layout. `xmm<n>` / `ymm<n>` / `zmm<n>` map to bits
 /// `[127:0]` / `[255:0]` / `[511:0]` of a synthetic `zmm<n>` parent —
 /// the widest architectural view — so every view lands on the same
-/// data-flow node without renaming the parent. `mm<n>` (MMX) and
-/// `st<n>` (x87) stay `None` until their own lifters land.
+/// data-flow node without renaming the parent. `mm<n>` (MMX) stays
+/// `None` until its own lifter lands, and so does `st<n>`: that is the
+/// spelling radare2 uses in *ESIL*, never in disassembly, so resolving
+/// it would only ever canonicalise a token no operand carries.
 fn x86_simd_layout(lower: &str) -> Option<RegisterLayout> {
     let hi: u16 = match lower.get(..3)? {
         "xmm" => 127,

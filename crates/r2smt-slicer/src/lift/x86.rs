@@ -100,6 +100,10 @@ impl LiftCtx {
             "cvttsd2si" => self.lift_fp_to_int(insn, 64, RoundingMode::TowardZero),
             "cvtss2sd" => self.lift_fp_to_fp(insn, 32, 64),
             "cvtsd2ss" => self.lift_fp_to_fp(insn, 64, 32),
+            // x87 keeps its own slice-scoped stack rather than a
+            // register model, so it is recognised by shape rather than
+            // by mnemonic alone — see `lift/x87.rs`.
+            _ if crate::lift::is_modelled_x87(insn) => self.lift_instruction_x87(insn),
             _ => self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("at {addr}", addr = insn.address),

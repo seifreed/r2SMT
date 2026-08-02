@@ -396,7 +396,47 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
         m if m.starts_with('j') => jcc_effect(insn),
         m if m.starts_with("set") => setcc_effect(insn),
         m if m.starts_with("cmov") => cmovcc_effect(insn),
+        // Recognised through the lifter's own predicate so the two
+        // cannot drift: an x87 shape the lifter would decline must stay
+        // `Other` here, or the slicer keeps an instruction whose stack
+        // effect the lifter then drops.
+        _ if crate::lift::is_modelled_x87(insn) => x87_effect(insn),
         _ => other_effect(insn),
+    }
+}
+
+/// Every x87 instruction reads and writes the whole register stack.
+///
+/// TOP rotates under almost every one of them, so an instruction that
+/// merely reads `ST(0)` still renames every other slot; and the flat
+/// register model has no way to say "slot 1, as numbered before the
+/// previous push". Collapsing the file onto the single pseudo-register
+/// `st` and marking it both a def and a use is the conservative
+/// resolution: the slicer keeps the entire chain back to the values'
+/// origin rather than stepping over the instruction that moved TOP
+/// underneath it. Slot-level precision is recovered at lift time by the
+/// slice-scoped stack in `lift/x87.rs`, which sees the chain in
+/// execution order and so needs no numbering at all.
+fn x87_effect(insn: &Instruction) -> InstructionEffect {
+    let mut uses = vec![crate::lift::X87_STACK_REGISTER];
+    for op in &insn.operands {
+        for r in registers_in_operand(op, Arch::X86_64) {
+            if !uses.contains(&r) {
+                uses.push(r);
+            }
+        }
+    }
+    InstructionEffect {
+        kind: InstructionKind::X87,
+        defs: vec![crate::lift::X87_STACK_REGISTER],
+        uses,
+        // The x87 status word is a separate register file the lifter
+        // does not model; the mnemonics that write it (`fcom`, `fcomi`,
+        // `fnstsw`) are not in the modelled set and stay `Other`.
+        defines_flags: false,
+        has_memory_access: any_memory_operand(&insn.operands),
+        is_call: false,
+        reads_flags: false,
     }
 }
 

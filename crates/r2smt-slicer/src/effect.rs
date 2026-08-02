@@ -52,6 +52,11 @@ pub enum InstructionKind {
     /// `pxor`/`vpxor`, `pand`/`por`/`pandn`). Defines a vector
     /// register, sets no flags.
     Simd,
+    /// x87 floating-point op (`fld`, `faddp`, `fstp`, …). Defines and
+    /// uses the single canonical stack pseudo-register `st`, sets no
+    /// EFLAGS bit — the compare family that writes the status word is
+    /// not modelled and stays [`InstructionKind::Other`].
+    X87,
     /// Conditional jump (`jcc`).
     Jcc,
     /// `setcc`.
@@ -116,11 +121,14 @@ pub struct InstructionEffect {
 /// under the supplied ISA.
 ///
 /// Returns `None` for non-registers (immediates, memory expressions,
-/// segment selectors, debug / control regs, x86 SIMD/FPU stacks like
-/// `xmm0` / `st0`) and for any token that does not resolve in `arch`'s
-/// register table. ARM SIMD / FPU aliases (`vN`/`qN`/`dN`/`sN`/`hN`/
-/// `bN` on `AArch64`; `vN`/`qN`/`dN`/`sN` on `AArch32`) are
-/// recognised and collapse to the synthetic `vN` parent.
+/// segment selectors, debug / control regs, MMX `mm0`) and for any
+/// token that does not resolve in `arch`'s register table. ARM SIMD /
+/// FPU aliases (`vN`/`qN`/`dN`/`sN`/`hN`/`bN` on `AArch64`;
+/// `vN`/`qN`/`dN`/`sN` on `AArch32`) are recognised and collapse to the
+/// synthetic `vN` parent. The x86 vector file collapses onto `zmmN`,
+/// and the whole x87 stack onto the synthetic `st` — the *token*, which
+/// [`registers_in_operand`] recovers from the disassembler spelling
+/// `st(0)`; the bare name `st(0)` itself does not resolve.
 ///
 /// Delegates to [`crate::registers::register_layout`] so the single
 /// source of truth for register naming lives in `registers.rs`. The
@@ -220,12 +228,18 @@ pub fn has_unmodellable_memory(operands: &[Operand], arch: Arch) -> bool {
 /// `xmmword`/`ymmword`/`zmmword` all contain `"word"` (they are 128 /
 /// 256 / 512-bit, not 16), and a symbol name that merely contains a
 /// size keyword (e.g. `[obj.dword_table]`) must not be read as sized.
+///
+/// `tbyte` is the x87 double-extended access (`fld tbyte [ebp - 0xc]`).
+/// Reporting its true 80 bits matters more than being able to model
+/// them: without the entry the operand looks unsized, the caller falls
+/// back to pointer width, and an 80-bit value is read as eight bytes.
 #[must_use]
 pub fn memory_operand_width(raw: &str) -> Option<u16> {
-    const WIDTHS: [(&str, u16); 7] = [
+    const WIDTHS: [(&str, u16); 8] = [
         ("zmmword", 512),
         ("ymmword", 256),
         ("xmmword", 128),
+        ("tbyte", 80),
         ("qword", 64),
         ("dword", 32),
         ("word", 16),
