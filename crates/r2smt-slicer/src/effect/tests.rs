@@ -759,3 +759,89 @@ fn aarch64_vector_register_list_is_still_a_vector_shape() {
     );
     assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);
 }
+
+// --- N3a: NEON broadcast and permutation ---
+
+#[test]
+fn aarch64_element_insert_reads_its_destination() {
+    // `ins` preserves every lane it does not write, so the register's
+    // prior definition is still live and the slicer must keep it.
+    let i = insn(
+        "ins",
+        vec![
+            op("v0.s[1]", OperandKind::Register),
+            op("w1", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert!(effect.uses.contains(&"v0"), "{effect:?}");
+}
+
+#[test]
+fn aarch64_element_insert_still_defines_its_destination() {
+    let i = insn(
+        "ins",
+        vec![
+            op("v0.s[1]", OperandKind::Register),
+            op("w1", OperandKind::Register),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).defs, vec!["v0"]);
+}
+
+#[test]
+fn aarch64_permutation_does_not_read_its_destination() {
+    // A permutation writes every lane, so the prior value is dead.
+    let i = insn(
+        "zip1",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+            op("v2.4s", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert!(!effect.uses.contains(&"v0"), "{effect:?}");
+}
+
+#[test]
+fn aarch64_element_to_general_register_defines_the_general_register() {
+    let i = insn(
+        "umov",
+        vec![
+            op("w0", OperandKind::Register),
+            op("v1.s[1]", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert_eq!(effect.defs, vec!["x0"]);
+    assert_eq!(effect.uses, vec!["v1"]);
+}
+
+#[test]
+fn aarch64_broadcast_immediate_reads_no_register() {
+    let i = insn(
+        "movi",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("0x1", OperandKind::Immediate),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert_eq!(effect.defs, vec!["v0"]);
+    assert!(effect.uses.is_empty(), "{effect:?}");
+}
+
+#[test]
+fn aarch64_structured_load_still_declines() {
+    // `ld1`/`ld2`/`ld4` are multi-register lists with interleaving that
+    // the single-parent register model cannot express.
+    let i = insn(
+        "ld2",
+        vec![
+            op("{v0.4s, v1.4s}", OperandKind::Unknown),
+            op("[x2]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);
+}

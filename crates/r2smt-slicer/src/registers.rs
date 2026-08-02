@@ -229,7 +229,7 @@ impl Arrangement {
 }
 
 /// Width in bits of an ARM vector element-type letter (`b`/`h`/`s`/`d`).
-const fn element_type_bits(letter: char) -> Option<u16> {
+pub(crate) const fn element_type_bits(letter: char) -> Option<u16> {
     match letter {
         'b' => Some(8),
         'h' => Some(16),

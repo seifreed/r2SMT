@@ -8,12 +8,12 @@ use r2smt_ir::stmt::IrStmt;
 use crate::registers::register_layout;
 
 use super::{
-    BinOp, CsArithOp, FpArithOp, LiftCtx, MemAccess, PackedIntOp, PackedOp, VectorShape,
-    aarch64_cond_suffix_to_predicate, fp_lane_result, fp_sort_bits, nonzero_width, vector_shape,
-    width_mask,
+    BinOp, CsArithOp, FpArithOp, LiftCtx, MemAccess, VectorShape, aarch64_cond_suffix_to_predicate,
+    fp_lane_result, fp_sort_bits, nonzero_width, vector_shape, width_mask,
 };
-use crate::registers::{Arrangement, is_simd_parent, parse_arrangement};
 use r2smt_common::Arch;
+
+pub(super) mod neon;
 
 impl LiftCtx {
     pub(super) fn lift_instruction_aarch64(&mut self, insn: &Instruction) {
@@ -24,12 +24,9 @@ impl LiftCtx {
         // scalar handler would happily add as one 128-bit value.
         match vector_shape(insn, Arch::Aarch64) {
             VectorShape::None => {}
-            VectorShape::Lifted => {
-                if let Some((op, arrangement)) = packed_shape(insn) {
-                    // The write zeroes the vector register above the
-                    // arrangement's view: `AArch64` SIMD&FP has no
-                    // merging write.
-                    self.lift_packed_vector(insn, op, arrangement.lane_bits, true);
+            VectorShape::Lifted { .. } => {
+                if let Some(shape) = neon::shape(insn) {
+                    self.lift_neon(insn, shape);
                 }
                 return;
             }
@@ -895,11 +892,11 @@ impl LiftCtx {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
-        let Some(a) = self.read_simd_lane_bits(lhs, lane) else {
+        let Some(a) = self.read_simd_lane_bits(lhs, lane, 0) else {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
-        let Some(b) = self.read_simd_lane_bits(rhs, lane) else {
+        let Some(b) = self.read_simd_lane_bits(rhs, lane, 0) else {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
@@ -919,7 +916,7 @@ impl LiftCtx {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
-        let Some(value) = self.read_simd_lane_fp(src, lane) else {
+        let Some(value) = self.read_simd_lane_fp(src, lane, 0) else {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
@@ -940,7 +937,7 @@ impl LiftCtx {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
-        let Some(bits) = self.read_simd_lane_bits(src, lane) else {
+        let Some(bits) = self.read_simd_lane_bits(src, lane, 0) else {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
@@ -972,7 +969,7 @@ impl LiftCtx {
                     self.push_aarch64_fp_unsupported(insn);
                     return;
                 };
-                let Some(bits) = self.read_simd_lane_bits(src, lane) else {
+                let Some(bits) = self.read_simd_lane_bits(src, lane, 0) else {
                     self.push_aarch64_fp_unsupported(insn);
                     return;
                 };
@@ -1001,7 +998,7 @@ impl LiftCtx {
                     self.push_aarch64_fp_unsupported(insn);
                     return;
                 };
-                let Some(bits) = self.read_simd_lane_bits(src, lane) else {
+                let Some(bits) = self.read_simd_lane_bits(src, lane, 0) else {
                     self.push_aarch64_fp_unsupported(insn);
                     return;
                 };
@@ -1042,13 +1039,13 @@ impl LiftCtx {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
-        let Some(a) = self.read_simd_lane_fp(lhs, lane) else {
+        let Some(a) = self.read_simd_lane_fp(lhs, lane, 0) else {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
         // `fcmp Rn, #0.0` is the ISA's only immediate form.
         let b = if self.is_simd_register(rhs) {
-            let Some(value) = self.read_simd_lane_fp(rhs, lane) else {
+            let Some(value) = self.read_simd_lane_fp(rhs, lane, 0) else {
                 self.push_aarch64_fp_unsupported(insn);
                 return;
             };
@@ -1083,7 +1080,7 @@ impl LiftCtx {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
-        let Some(value) = self.read_simd_lane_fp(src, src_lane) else {
+        let Some(value) = self.read_simd_lane_fp(src, src_lane, 0) else {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
@@ -1141,7 +1138,7 @@ impl LiftCtx {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
-        let Some(value) = self.read_simd_lane_fp(src, lane) else {
+        let Some(value) = self.read_simd_lane_fp(src, lane, 0) else {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
@@ -1173,76 +1170,6 @@ impl LiftCtx {
             comment: format!("unmodellable operand at {addr}", addr = insn.address),
         });
     }
-}
-
-/// The packed operation an `AArch64` NEON data-processing mnemonic
-/// computes, or `None` for a mnemonic no packed handler models.
-fn packed_op(mnemonic: &str) -> Option<PackedOp> {
-    Some(match mnemonic {
-        "add" => PackedOp::Int(PackedIntOp::Bin(BinOp::Add)),
-        "sub" => PackedOp::Int(PackedIntOp::Bin(BinOp::Sub)),
-        "mul" => PackedOp::Int(PackedIntOp::Bin(BinOp::Mul)),
-        "and" => PackedOp::Int(PackedIntOp::Bin(BinOp::And)),
-        "orr" => PackedOp::Int(PackedIntOp::Bin(BinOp::Or)),
-        "eor" => PackedOp::Int(PackedIntOp::Bin(BinOp::Xor)),
-        "bic" => PackedOp::Int(PackedIntOp::BitClear),
-        "mvn" | "not" => PackedOp::Int(PackedIntOp::Not),
-        "mov" => PackedOp::Int(PackedIntOp::Copy),
-        "fadd" => PackedOp::Fp(FpArithOp::Add),
-        "fsub" => PackedOp::Fp(FpArithOp::Sub),
-        "fmul" => PackedOp::Fp(FpArithOp::Mul),
-        "fdiv" => PackedOp::Fp(FpArithOp::Div),
-        _ => return None,
-    })
-}
-
-/// The packed operation and lane geometry an `AArch64` instruction
-/// lowers to, or `None` when no handler models it.
-///
-/// Every operand must be a vector register carrying the *same*
-/// arrangement. That is what the architecture spells for these
-/// mnemonics, and requiring it is what rejects the widening forms
-/// (`umlal v0.4s, v1.4h, v2.4h`), the by-element forms
-/// (`mul v0.4s, v1.4s, v2.s[0]`) and the immediate ones
-/// (`bic v0.4h, #0x10`) without listing any of them.
-///
-/// Deciding the whole question here — rather than letting the handler
-/// discover a mismatch — is what keeps the effect table and the lifter
-/// in agreement about which instructions the slicer may retain.
-pub(super) fn packed_shape(insn: &Instruction) -> Option<(PackedOp, Arrangement)> {
-    let op = packed_op(insn.mnemonic.trim().to_ascii_lowercase().as_str())?;
-    if insn.operands.len() != op.operand_count() {
-        return None;
-    }
-    let mut shared: Option<Arrangement> = None;
-    for operand in &insn.operands {
-        let arrangement = operand_arrangement(operand)?;
-        if *shared.get_or_insert(arrangement) != arrangement {
-            return None;
-        }
-    }
-    let arrangement = shared?;
-    // A floating-point lane has to name a float sort; `.16b` does not.
-    if matches!(op, PackedOp::Fp(_)) && !matches!(arrangement.lane_bits, 16 | 32 | 64) {
-        return None;
-    }
-    Some((op, arrangement))
-}
-
-/// The arrangement an operand carries, if it is a vector register that
-/// carries one.
-fn operand_arrangement(op: &Operand) -> Option<Arrangement> {
-    if op.kind != OperandKind::Register {
-        return None;
-    }
-    let raw = op.raw.trim().to_ascii_lowercase();
-    if !register_layout(&raw, Arch::Aarch64)
-        .is_some_and(|layout| is_simd_parent(layout.parent, Arch::Aarch64))
-    {
-        return None;
-    }
-    let (_, body) = raw.split_once('.')?;
-    parse_arrangement(body)
 }
 
 /// A bit-vector of `bits` with only the sign bit set.

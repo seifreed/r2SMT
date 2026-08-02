@@ -815,7 +815,7 @@ impl LiftCtx {
                 .operands
                 .get(1)
                 .cloned()
-                .and_then(|src| self.read_simd_lane_bits(&src, lane)),
+                .and_then(|src| self.read_simd_lane_bits(&src, lane, 0)),
             VfpOp::Compare => {
                 self.lift_aarch32_vcmp(insn, lane);
                 return;
@@ -828,7 +828,7 @@ impl LiftCtx {
         // `AArch32` VFP writes the addressed slice and preserves the
         // rest of the register file — the opposite of `AArch64`, and
         // the reason `write_simd_lane` has to honour the view's offset.
-        if !self.write_simd_lane(&dst, value, lane) {
+        if !self.write_simd_lane(&dst, value, lane, 0) {
             self.push_aarch32_vfp_unsupported(insn);
         }
     }
@@ -836,14 +836,14 @@ impl LiftCtx {
     fn vfp_arith_value(&mut self, insn: &Instruction, arith: FpArithOp, lane: u16) -> Option<Expr> {
         let lhs = insn.operands.get(1)?.clone();
         let rhs = insn.operands.get(2)?.clone();
-        let a = self.read_simd_lane_bits(&lhs, lane)?;
-        let b = self.read_simd_lane_bits(&rhs, lane)?;
+        let a = self.read_simd_lane_bits(&lhs, lane, 0)?;
+        let b = self.read_simd_lane_bits(&rhs, lane, 0)?;
         Some(fp_lane_result(arith, a, b, lane))
     }
 
     fn vfp_sqrt_value(&mut self, insn: &Instruction, lane: u16) -> Option<Expr> {
         let src = insn.operands.get(1)?.clone();
-        let value = self.read_simd_lane_fp(&src, lane)?;
+        let value = self.read_simd_lane_fp(&src, lane, 0)?;
         Some(Expr::fp_to_ieee_bv(Expr::fsqrt(
             value,
             r2smt_ir::expr::RoundingMode::NearestTiesEven,
@@ -852,7 +852,7 @@ impl LiftCtx {
 
     fn vfp_sign_value(&mut self, insn: &Instruction, lane: u16, negate: bool) -> Option<Expr> {
         let src = insn.operands.get(1)?.clone();
-        let bits = self.read_simd_lane_bits(&src, lane)?;
+        let bits = self.read_simd_lane_bits(&src, lane, 0)?;
         let sign = super::aarch64::sign_bit_mask(lane)?;
         Some(if negate {
             Expr::bv_xor(bits, sign)
@@ -873,12 +873,12 @@ impl LiftCtx {
             self.push_aarch32_vfp_unsupported(insn);
             return;
         };
-        let Some(a) = self.read_simd_lane_fp(&lhs, lane) else {
+        let Some(a) = self.read_simd_lane_fp(&lhs, lane, 0) else {
             self.push_aarch32_vfp_unsupported(insn);
             return;
         };
         let b = if self.is_simd_register(&rhs) {
-            let Some(value) = self.read_simd_lane_fp(&rhs, lane) else {
+            let Some(value) = self.read_simd_lane_fp(&rhs, lane, 0) else {
                 self.push_aarch32_vfp_unsupported(insn);
                 return;
             };
