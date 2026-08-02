@@ -262,6 +262,55 @@ fn classify_operand_known_cases() {
     assert_eq!(classify_operand("w0"), OperandKind::Register);
 }
 
+#[test]
+fn classify_operand_reads_neon_arrangements_as_registers() {
+    assert_eq!(classify_operand("v0.4s"), OperandKind::Register);
+    assert_eq!(classify_operand("v31.16b"), OperandKind::Register);
+    assert_eq!(classify_operand("v2.2d"), OperandKind::Register);
+}
+
+#[test]
+fn classify_operand_reads_indexed_vector_lanes_as_registers() {
+    // These carry a bracket and were read as memory addresses before.
+    assert_eq!(classify_operand("v0.s[1]"), OperandKind::Register);
+    assert_eq!(classify_operand("d0[1]"), OperandKind::Register);
+    assert_eq!(classify_operand("q1[0]"), OperandKind::Register);
+}
+
+#[test]
+fn classify_operand_leaves_multi_register_lists_unknown() {
+    // A list names more than one register, which the single-parent
+    // model cannot express; the slicer declines it.
+    assert_eq!(
+        classify_operand("{v16.4s, v17.4s, v18.4s, v19.4s}"),
+        OperandKind::Unknown
+    );
+    assert_eq!(classify_operand("{v0.s}"), OperandKind::Unknown);
+}
+
+#[test]
+fn classify_operand_reads_x87_stack_slots_as_registers() {
+    // radare2 spells these with parentheses in disassembly.
+    assert_eq!(classify_operand("st(0)"), OperandKind::Register);
+    assert_eq!(classify_operand("st(7)"), OperandKind::Register);
+    assert_eq!(classify_operand("st(8)"), OperandKind::Unknown);
+}
+
+#[test]
+fn classify_operand_keeps_memory_operands_out_of_the_vector_path() {
+    // The vector rules run first, so this is the guard that they never
+    // swallow an address.
+    for raw in [
+        "[rbp - 4]",
+        "dword ptr [eax]",
+        "[x1, #8]",
+        "qword [rsi + rax*8]",
+        "[sp, #-16]!",
+    ] {
+        assert_eq!(classify_operand(raw), OperandKind::Memory, "{raw}");
+    }
+}
+
 // The radare2 schema migrated from `offset` to `addr` between r2 5.x
 // and 6.x. The parsers use `#[serde(alias = "offset")]` so both
 // schemas keep working; these tests pin that behaviour.

@@ -605,8 +605,45 @@ pub fn parse_flag(json: &str) -> Result<Option<String>> {
     }
 }
 
+/// A single ARM vector register carrying element shape: an arrangement
+/// (`v0.4s`, `v0.16b`), an indexed lane (`v0.s[1]`), or `AArch32`'s
+/// dotless indexed form (`d0[1]`).
+///
+/// Checked ahead of the memory test because the indexed forms contain a
+/// bracket and would otherwise be read as an address. A multi-register
+/// list (`{v0.4s, v1.4s}`) deliberately does not match: it names more
+/// than one register, which the single-parent register model cannot
+/// express, so it stays `Unknown` and the slicer declines it.
+fn is_shaped_vector_register(raw: &str) -> bool {
+    let lower = raw.trim().to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix(['v', 'q', 'd', 's', 'h', 'b']) else {
+        return false;
+    };
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 {
+        return false;
+    }
+    let tail = &rest[digits..];
+    (tail.starts_with('.') || tail.starts_with('['))
+        && !tail.contains([' ', ',', '{'])
+        && tail.ends_with(|c: char| c.is_ascii_alphanumeric() || c == ']')
+}
+
+/// An x87 stack slot as radare2 spells it in disassembly: `st(0)`
+/// through `st(7)`, with parentheses. Note r2's *ESIL* for the same
+/// instruction uses the bare `st0` form instead.
+fn is_x87_stack_register(raw: &str) -> bool {
+    raw.trim()
+        .to_ascii_lowercase()
+        .strip_prefix("st(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .is_some_and(|index| matches!(index, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7"))
+}
+
 fn classify_operand(raw: &str) -> OperandKind {
-    if raw.starts_with('[') || raw.contains("ptr ") || raw.contains('[') {
+    if is_shaped_vector_register(raw) || is_x87_stack_register(raw) {
+        OperandKind::Register
+    } else if raw.starts_with('[') || raw.contains("ptr ") || raw.contains('[') {
         OperandKind::Memory
     } else if raw.starts_with("0x")
         || raw.starts_with("-0x")
