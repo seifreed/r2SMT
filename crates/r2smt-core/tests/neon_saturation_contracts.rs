@@ -284,3 +284,83 @@ fn sqrshrn_rounding_saturates_at_the_top_not_the_bottom() {
         0x7f,
     );
 }
+
+// --- same-width shifts ---
+
+#[test]
+fn shl_shifts_the_element_left() {
+    assert_computes("shl", &["v0.4h", "v1.4h", "#4"], &[("v1", 0x1)], 0x10);
+}
+
+#[test]
+fn ushr_shifts_in_zeroes() {
+    assert_computes("ushr", &["v0.4h", "v1.4h", "#4"], &[("v1", 0x8000)], 0x0800);
+}
+
+#[test]
+fn sshr_shifts_in_sign_bits() {
+    // 0x8000 is negative; an arithmetic shift keeps it negative.
+    assert_computes("sshr", &["v0.4h", "v1.4h", "#4"], &[("v1", 0x8000)], 0xf800);
+}
+
+#[test]
+fn urshr_rounding_does_not_overflow_the_element() {
+    // (0xffff + 1) >> 1 = 0x8000. Adding the rounding term at the
+    // element's own width wraps to zero and would give zero.
+    assert_computes(
+        "urshr",
+        &["v0.4h", "v1.4h", "#1"],
+        &[("v1", 0xffff)],
+        0x8000,
+    );
+}
+
+#[test]
+fn srshr_rounds_a_negative_element() {
+    // -3 (0xfffd) rounded right by one is -1: (-3 + 1) >> 1.
+    assert_computes(
+        "srshr",
+        &["v0.4h", "v1.4h", "#1"],
+        &[("v1", 0xfffd)],
+        0xffff,
+    );
+}
+
+#[test]
+fn ushl_shifts_left_when_the_amount_is_positive() {
+    assert_computes("ushl", &HALF, &[("v1", 0x1), ("v2", 0x4)], 0x10);
+}
+
+#[test]
+fn ushl_shifts_right_when_the_amount_is_negative() {
+    // The per-lane amount is signed: 0xfffc is -4, so this lane shifts
+    // right even though the mnemonic says "shift left".
+    assert_computes("ushl", &HALF, &[("v1", 0x10), ("v2", 0xfffc)], 0x1);
+}
+
+#[test]
+fn sshl_shifts_right_arithmetically_on_a_negative_amount() {
+    assert_computes("sshl", &HALF, &[("v1", 0x8000), ("v2", 0xfffc)], 0xf800);
+}
+
+#[test]
+fn ushl_lanes_can_shift_in_opposite_directions() {
+    // Lane 0 shifts left by 4, lane 1 shifts right by 4 — the whole
+    // reason the amount is a vector rather than an immediate.
+    let sources = [
+        ("v1", 0x0010_0001_u128),
+        ("v2", (0xfffc_u128 << 16) | 0x0004),
+    ];
+    assert_computes("ushl", &HALF, &sources, 0x0001_0010);
+}
+
+#[test]
+fn ushl_yields_zero_when_the_amount_exceeds_the_element_width() {
+    assert_computes("ushl", &HALF, &[("v1", 0xffff), ("v2", 0x20)], 0x0);
+}
+
+#[test]
+fn urshl_rounds_a_negative_shift() {
+    // amount -1 shifts right by one with rounding: (0xffff + 1) >> 1.
+    assert_computes("urshl", &HALF, &[("v1", 0xffff), ("v2", 0xffff)], 0x8000);
+}

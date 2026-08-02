@@ -3428,3 +3428,53 @@ fn aarch64_saturating_narrow_two_form_preserves_the_lower_half() {
         "the surviving lower half must read the destination: {stmts:?}"
     );
 }
+
+// --- N3d: NEON same-width shifts ---
+
+#[test]
+fn aarch64_left_shift_declines_an_amount_at_the_element_width() {
+    // `shl` encodes shifts in `0 .. esize-1`; the element width itself
+    // is not an encoding.
+    assert!(neon_declines("shl", &["v0.4h", "v1.4h", "#16"]));
+}
+
+#[test]
+fn aarch64_right_shift_declines_a_zero_amount() {
+    // `ushr` encodes shifts in `1 .. esize`.
+    assert!(neon_declines("ushr", &["v0.4h", "v1.4h", "#0"]));
+}
+
+#[test]
+fn aarch64_right_shift_declines_an_amount_past_the_element_width() {
+    assert!(neon_declines("ushr", &["v0.4h", "v1.4h", "#17"]));
+}
+
+#[test]
+fn aarch64_register_shift_declines_an_immediate_amount() {
+    // `ushl` takes a vector of per-lane amounts, not an immediate.
+    assert!(neon_declines("ushl", &["v0.4h", "v1.4h", "#4"]));
+}
+
+#[test]
+fn aarch64_immediate_shift_declines_a_vector_amount() {
+    assert!(neon_declines("ushr", &["v0.4h", "v1.4h", "v2.4h"]));
+}
+
+#[test]
+fn aarch64_register_shift_builds_both_directions() {
+    // The per-lane amount's sign chooses the direction at run time, so
+    // the lowering selects between a left and a right shift rather than
+    // committing to one.
+    let i = insn(
+        0x1000,
+        4,
+        "ushl",
+        vec![reg("v0.4h"), reg("v1.4h"), reg("v2.4h")],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    let rendered = stmts
+        .first()
+        .map(std::string::ToString::to_string)
+        .unwrap_or_default();
+    assert!(rendered.contains("ite"), "{rendered}");
+}

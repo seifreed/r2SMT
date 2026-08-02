@@ -96,6 +96,28 @@ enum NeonOp {
         signed_sources: bool,
         upper: bool,
     },
+    /// A same-width shift, by an immediate or by a per-lane amount.
+    Shift { kind: ShiftKind, signed: bool },
+}
+
+/// The same-width shift operations.
+///
+/// The immediate forms and the register forms are genuinely different
+/// shapes, not one shape with a different operand: an immediate shift
+/// names its direction in the mnemonic, while `sshl` and `ushl` take a
+/// *signed* per-lane amount whose sign chooses the direction at run
+/// time.
+#[derive(Debug, Clone, Copy)]
+enum ShiftKind {
+    /// `shl` — shift left by an immediate.
+    LeftImmediate { shift: u16 },
+    /// `ushr` / `sshr` / `urshr` / `srshr` — shift right by an
+    /// immediate, optionally rounding.
+    RightImmediate { shift: u16, rounding: bool },
+    /// `ushl` / `sshl` / `urshl` / `srshl` — shift by the second
+    /// source's per-lane amount, left when positive and right when
+    /// negative.
+    Register { rounding: bool },
 }
 
 /// How a multiply-accumulate reads its source elements.
@@ -246,6 +268,79 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| widen_shape(insn, &mnemonic))
         .or_else(|| multiply_accumulate_shape(insn, &mnemonic))
         .or_else(|| saturating_shape(insn, &mnemonic))
+        .or_else(|| shift_shape(insn, &mnemonic))
+}
+
+// ===================== same-width shifts =====================
+
+/// The same-width shift family.
+///
+/// The immediate forms carry their amount as an operand and their
+/// direction in the mnemonic. The register forms carry a whole vector of
+/// per-lane amounts, each read as a *signed* value whose sign chooses
+/// the direction — so one lane of a `sshl` can shift left while its
+/// neighbour shifts right.
+fn shift_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let immediate_shift =
+        || -> Option<u16> { u16::try_from(parse_immediate(&insn.operands.get(2)?.raw)?).ok() };
+    let right = |rounding| -> Option<ShiftKind> {
+        Some(ShiftKind::RightImmediate {
+            shift: immediate_shift()?,
+            rounding,
+        })
+    };
+    let (kind, signed) = match mnemonic {
+        "shl" => (
+            ShiftKind::LeftImmediate {
+                shift: immediate_shift()?,
+            },
+            false,
+        ),
+        "ushr" => (right(false)?, false),
+        "sshr" => (right(false)?, true),
+        "urshr" => (right(true)?, false),
+        "srshr" => (right(true)?, true),
+        "ushl" => (ShiftKind::Register { rounding: false }, false),
+        "sshl" => (ShiftKind::Register { rounding: false }, true),
+        "urshl" => (ShiftKind::Register { rounding: true }, false),
+        "srshl" => (ShiftKind::Register { rounding: true }, true),
+        _ => return None,
+    };
+    let register_form = matches!(kind, ShiftKind::Register { .. });
+    if insn.operands.len() != 3 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    // Every vector operand shares the destination's arrangement; the
+    // immediate forms' third operand is not one.
+    for (index, operand) in insn.operands.iter().enumerate().skip(1) {
+        let Some(arrangement) = operand_arrangement(operand) else {
+            if !register_form && index == 2 {
+                continue;
+            }
+            return None;
+        };
+        if arrangement != destination {
+            return None;
+        }
+    }
+    // A left shift by the element width, or a right shift past it, is
+    // outside the immediate encodings' range.
+    let bounded = match kind {
+        ShiftKind::LeftImmediate { shift } => shift < destination.lane_bits,
+        ShiftKind::RightImmediate { shift, .. } => shift > 0 && shift <= destination.lane_bits,
+        ShiftKind::Register { .. } => true,
+    };
+    if !bounded {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::Shift { kind, signed },
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
 }
 
 // ===================== saturation and rounding =====================
@@ -967,7 +1062,37 @@ impl LiftCtx {
                 signed_sources,
                 upper,
             } => self.saturating_lanes(insn, shape, kind, signed_sources, upper),
+            NeonOp::Shift { kind, signed } => self.shift_lanes(insn, shape, kind, signed),
         }
+    }
+
+    /// The same-width shift family.
+    fn shift_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        kind: ShiftKind,
+        signed: bool,
+    ) -> Option<Expr> {
+        let first = self.widen_source(insn, 1)?;
+        let amounts = match kind {
+            ShiftKind::Register { .. } => Some(self.widen_source(insn, 2)?),
+            _ => None,
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let value = LiftCtx::extract_lane(first.clone(), shape.lane_bits, index)?;
+            let amount = match amounts.as_ref() {
+                Some(vector) => Some(LiftCtx::extract_lane(
+                    vector.clone(),
+                    shape.lane_bits,
+                    index,
+                )?),
+                None => None,
+            };
+            lanes.push(shift_lane(kind, signed, value, amount, shape.lane_bits)?);
+        }
+        Self::concat_lanes(lanes)
     }
 
     /// The saturating, halving and rounding-narrow family.
@@ -1466,6 +1591,87 @@ fn saturating_lane(
             }
             let high = Expr::ashr(doubled, Expr::konst(u128::from(lane_bits), wide));
             clamp(high, wide, lane_bits, SaturateTo::Signed)
+        }
+    }
+}
+
+/// Shift `value` right by `amount`, rounding when asked.
+///
+/// Rounding adds half an ulp of the shift *before* the low bits are
+/// discarded, and at the element's own width that addition can carry out
+/// — `0xff + 1` in eight bits is zero. The sum is therefore taken one
+/// bit wider, which is the narrowest width that reproduces ARM's
+/// unbounded-integer definition.
+fn shift_right(
+    value: Expr,
+    amount: &Expr,
+    lane_bits: u16,
+    signed: bool,
+    rounding: bool,
+) -> Option<Expr> {
+    let shift_by = |v: Expr, by: Expr| {
+        if signed {
+            Expr::ashr(v, by)
+        } else {
+            Expr::lshr(v, by)
+        }
+    };
+    if !rounding {
+        return Some(shift_by(value, amount.clone()));
+    }
+    let wide = lane_bits.checked_add(1)?;
+    let wide_amount = Expr::zero_ext(amount.clone(), wide);
+    let half = Expr::shl(
+        Expr::konst(1, wide),
+        Expr::sub(wide_amount.clone(), Expr::konst(1, wide)),
+    );
+    let sum = Expr::add(extend(value, wide, signed), half);
+    Some(Expr::extract(shift_by(sum, wide_amount), lane_bits - 1, 0))
+}
+
+/// One destination lane of a same-width shift.
+///
+/// The register forms read a *signed* per-lane amount whose sign chooses
+/// the direction, so both directions are built and an `Ite` selects
+/// between them. An out-of-range amount needs no special case: a
+/// bit-vector shift by more than the width already yields zero, or all
+/// sign bits for an arithmetic right shift, which is what the
+/// architecture specifies.
+fn shift_lane(
+    kind: ShiftKind,
+    signed: bool,
+    value: Expr,
+    amount: Option<Expr>,
+    lane_bits: u16,
+) -> Option<Expr> {
+    match kind {
+        ShiftKind::LeftImmediate { shift } => {
+            Some(Expr::shl(value, Expr::konst(u128::from(shift), lane_bits)))
+        }
+        ShiftKind::RightImmediate { shift, rounding } => shift_right(
+            value,
+            &Expr::konst(u128::from(shift), lane_bits),
+            lane_bits,
+            signed,
+            rounding,
+        ),
+        ShiftKind::Register { rounding } => {
+            // Only the low byte of the amount element is read, as a
+            // signed value.
+            let raw = amount?;
+            let signed_amount = if lane_bits > BITS_PER_BYTE {
+                Expr::sign_ext(Expr::extract(raw, BITS_PER_BYTE - 1, 0), lane_bits)
+            } else {
+                raw
+            };
+            let left = Expr::shl(value.clone(), signed_amount.clone());
+            let negated = Expr::sub(Expr::konst(0, lane_bits), signed_amount.clone());
+            let right = shift_right(value, &negated, lane_bits, signed, rounding)?;
+            Some(Expr::Ite {
+                cond: Box::new(Expr::slt(signed_amount, Expr::konst(0, lane_bits))),
+                then_expr: Box::new(right),
+                else_expr: Box::new(left),
+            })
         }
     }
 }
