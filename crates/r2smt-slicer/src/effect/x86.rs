@@ -358,7 +358,9 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
         | "vmovapd" | "vmovupd" | "vmovdqa" | "vmovdqu" | "cvtss2si" | "cvtsd2si" | "cvttss2si"
         | "cvttsd2si" => simd_effect(insn, SimdShape::Move),
         "pxor" | "vpxor" | "pand" | "vpand" | "por" | "vpor" | "pandn" | "vpandn" | "addss"
-        | "subss" | "mulss" | "divss" | "addsd" | "subsd" | "mulsd" | "divsd" => {
+        | "subss" | "mulss" | "divss" | "addsd" | "subsd" | "mulsd" | "divsd" | "addps"
+        | "subps" | "mulps" | "divps" | "vaddps" | "vsubps" | "vmulps" | "vdivps" | "addpd"
+        | "subpd" | "mulpd" | "divpd" | "vaddpd" | "vsubpd" | "vmulpd" | "vdivpd" => {
             simd_effect(insn, SimdShape::Bitwise)
         }
         // The scalar FP compares share `cmp`'s shape, not the SIMD one:

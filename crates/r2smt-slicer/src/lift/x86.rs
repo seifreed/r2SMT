@@ -56,6 +56,14 @@ impl LiftCtx {
             "subsd" => self.lift_simd_scalar_fp(insn, FpArithOp::Sub, 64),
             "mulsd" => self.lift_simd_scalar_fp(insn, FpArithOp::Mul, 64),
             "divsd" => self.lift_simd_scalar_fp(insn, FpArithOp::Div, 64),
+            "addps" | "vaddps" => self.lift_simd_packed_fp(insn, FpArithOp::Add, 32),
+            "subps" | "vsubps" => self.lift_simd_packed_fp(insn, FpArithOp::Sub, 32),
+            "mulps" | "vmulps" => self.lift_simd_packed_fp(insn, FpArithOp::Mul, 32),
+            "divps" | "vdivps" => self.lift_simd_packed_fp(insn, FpArithOp::Div, 32),
+            "addpd" | "vaddpd" => self.lift_simd_packed_fp(insn, FpArithOp::Add, 64),
+            "subpd" | "vsubpd" => self.lift_simd_packed_fp(insn, FpArithOp::Sub, 64),
+            "mulpd" | "vmulpd" => self.lift_simd_packed_fp(insn, FpArithOp::Mul, 64),
+            "divpd" | "vdivpd" => self.lift_simd_packed_fp(insn, FpArithOp::Div, 64),
             "comiss" | "ucomiss" => self.lift_simd_fp_compare(insn, 32),
             "comisd" | "ucomisd" => self.lift_simd_fp_compare(insn, 64),
             "cvtsi2ss" => self.lift_int_to_fp(insn, 32),
@@ -506,6 +514,58 @@ impl LiftCtx {
         }
     }
 
+    /// Packed floating-point arithmetic: the same lane operation applied
+    /// independently to every `lane_bits`-wide lane of the destination's
+    /// vector view (`addps` → 4 single lanes over 128 bits, `vaddps ymm`
+    /// → 8 over 256).
+    ///
+    /// Operand roles and the upper-bits rule are shared with
+    /// [`Self::lift_simd_bitwise`]: 2-operand is RMW, 3-operand VEX reads
+    /// its two explicit sources, and a VEX write zeroes above the view.
+    fn lift_simd_packed_fp(&mut self, insn: &Instruction, op: FpArithOp, lane_bits: u16) {
+        let ops = &insn.operands;
+        let Some(dst) = ops.first() else {
+            return;
+        };
+        let zero_upper = is_vex(insn);
+        let (a_op, b_op) = match ops.len() {
+            2 => (dst, &ops[1]),
+            3 => (&ops[1], &ops[2]),
+            _ => {
+                self.push_simd_unsupported(insn);
+                return;
+            }
+        };
+        let Some(result) = self.packed_fp_result(dst, a_op, b_op, op, lane_bits) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        if !self.write_xmm_dst(dst, result, zero_upper) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
+    /// Build the full-view result of a packed lane operation, or `None`
+    /// when any operand is unmodellable.
+    fn packed_fp_result(
+        &self,
+        dst: &Operand,
+        a_op: &Operand,
+        b_op: &Operand,
+        op: FpArithOp,
+        lane_bits: u16,
+    ) -> Option<Expr> {
+        let view = self.simd_view_bits(dst)?;
+        let count = Self::packed_lane_count(view, lane_bits)?;
+        let mut lanes = Vec::with_capacity(usize::from(count));
+        for index in 0..count {
+            let a = self.read_simd_lane_fp_at(a_op, lane_bits, index)?;
+            let b = self.read_simd_lane_fp_at(b_op, lane_bits, index)?;
+            lanes.push(Expr::fp_to_ieee_bv(fp_lane_op(op, a, b)));
+        }
+        Self::concat_lanes(lanes)
+    }
+
     /// `addss`/`subss`/`mulss`/`divss` (32-bit lane) and their `sd`
     /// double-precision (64-bit lane) forms — a scalar FP op on the low
     /// lane of `dst`, with the upper parent bits preserved (legacy SSE
@@ -521,13 +581,7 @@ impl LiftCtx {
             self.push_simd_unsupported(insn);
             return;
         };
-        let rm = RoundingMode::NearestTiesEven;
-        let result = match op {
-            FpArithOp::Add => Expr::fadd(a, b, rm),
-            FpArithOp::Sub => Expr::fsub(a, b, rm),
-            FpArithOp::Mul => Expr::fmul(a, b, rm),
-            FpArithOp::Div => Expr::fdiv(a, b, rm),
-        };
+        let result = fp_lane_op(op, a, b);
         if !self.write_simd_lane(dst, Expr::fp_to_ieee_bv(result), lane) {
             self.push_simd_unsupported(insn);
         }
@@ -647,14 +701,27 @@ enum SimdBitOp {
     AndNot,
 }
 
-/// Scalar floating-point arithmetic operation of an SSE `add/sub/mul/div
-/// ss/sd` instruction.
+/// Floating-point operation applied to one lane, shared by the scalar
+/// (`addss`) and packed (`addps`) handlers.
 #[derive(Clone, Copy)]
 enum FpArithOp {
     Add,
     Sub,
     Mul,
     Div,
+}
+
+/// Apply `op` to one lane pair. The rounding mode is the architectural
+/// MXCSR default; a function that reprograms MXCSR is rejected by the
+/// slicer's guard rather than silently rounded here.
+fn fp_lane_op(op: FpArithOp, a: Expr, b: Expr) -> Expr {
+    let rm = RoundingMode::NearestTiesEven;
+    match op {
+        FpArithOp::Add => Expr::fadd(a, b, rm),
+        FpArithOp::Sub => Expr::fsub(a, b, rm),
+        FpArithOp::Mul => Expr::fmul(a, b, rm),
+        FpArithOp::Div => Expr::fdiv(a, b, rm),
+    }
 }
 
 /// Whether two operands name the same SIMD register view (same vector

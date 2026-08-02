@@ -1419,6 +1419,74 @@ fn cvtsd2ss_narrows_the_low_lane_to_the_single_sort() {
     assert!(rendered.contains("ebits: 8"), "{rendered}");
 }
 
+/// The IEEE float of lane `index` of `parent` at `lane_bits` width.
+fn fp_lane(parent: &str, lane_bits: u16, index: u16) -> Expr {
+    let lo = lane_bits * index;
+    let (ebits, sbits) = if lane_bits == 32 { (8, 24) } else { (11, 53) };
+    Expr::bv_to_fp(
+        Expr::extract(Expr::var(parent, 512), lo + lane_bits - 1, lo),
+        ebits,
+        sbits,
+    )
+}
+
+#[test]
+fn addps_applies_the_lane_operation_to_all_four_single_lanes() {
+    use r2smt_ir::expr::RoundingMode;
+    let stmts = lift_xmm_pair("addps");
+    let lane = |i: u16| {
+        Expr::fp_to_ieee_bv(Expr::fadd(
+            fp_lane("zmm0", 32, i),
+            fp_lane("zmm1", 32, i),
+            RoundingMode::NearestTiesEven,
+        ))
+    };
+    let packed = Expr::concat(
+        lane(3),
+        Expr::concat(lane(2), Expr::concat(lane(1), lane(0))),
+    );
+    assert_eq!(
+        *simd_dst_src(&stmts, "zmm0"),
+        preserve_upper("zmm0", 128, packed)
+    );
+}
+
+#[test]
+fn addpd_uses_two_double_lanes_not_four_single_ones() {
+    // The lane width comes from the mnemonic suffix, so `pd` must halve
+    // the lane count relative to `ps` at the same view width.
+    let stmts = lift_xmm_pair("addpd");
+    let rendered = format!("{:?}", simd_dst_src(&stmts, "zmm0"));
+    assert_eq!(rendered.matches("FAdd").count(), 2, "{rendered}");
+}
+
+#[test]
+fn vaddps_on_ymm_covers_eight_lanes_and_zeroes_the_upper_parent_bits() {
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "vaddps",
+            vec![
+                op("ymm0", OperandKind::Register),
+                op("ymm1", OperandKind::Register),
+                op("ymm2", OperandKind::Register),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    let src = simd_dst_src(&stmts, "zmm0");
+    let rendered = format!("{src:?}");
+    assert_eq!(rendered.matches("FAdd").count(), 8, "{rendered}");
+    // A VEX write zeroes above the view rather than preserving it.
+    assert!(
+        matches!(src, Expr::ZeroExtend { to_bits: 512, .. }),
+        "{rendered}"
+    );
+    // The 3-operand form reads its two explicit sources, not the dest.
+    assert!(!rendered.contains("zmm0"), "{rendered}");
+}
+
 #[test]
 fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
     // Parity guard: the effect table keeps an instruction iff the lifter
@@ -1430,7 +1498,7 @@ fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
         "movaps", "movups", "movapd", "movupd", "movdqa", "movdqu", "vmovaps", "vmovups",
         "vmovapd", "vmovupd", "vmovdqa", "vmovdqu", "pxor", "vpxor", "pand", "vpand", "por",
         "vpor", "pandn", "vpandn", "addss", "subss", "mulss", "divss", "addsd", "subsd", "mulsd",
-        "divsd",
+        "divsd", "addps", "subps", "mulps", "divps", "addpd", "subpd", "mulpd", "divpd",
     ];
     for m in mnemonics {
         assert!(

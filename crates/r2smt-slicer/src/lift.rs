@@ -121,6 +121,22 @@ fn is_x86_simd_mnemonic(mnemonic: &str) -> bool {
             | "subsd"
             | "mulsd"
             | "divsd"
+            | "addps"
+            | "subps"
+            | "mulps"
+            | "divps"
+            | "vaddps"
+            | "vsubps"
+            | "vmulps"
+            | "vdivps"
+            | "addpd"
+            | "subpd"
+            | "mulpd"
+            | "divpd"
+            | "vaddpd"
+            | "vsubpd"
+            | "vmulpd"
+            | "vdivpd"
             | "comiss"
             | "ucomiss"
             | "comisd"
@@ -677,6 +693,23 @@ impl LiftCtx {
     /// operand and reinterpret it as an IEEE float of the matching sort
     /// (32→single, 64→double). Used by the scalar SSE FP handlers.
     fn read_simd_lane_fp(&self, op: &Operand, lane_bits: u16) -> Option<Expr> {
+        self.read_simd_lane_fp_at(op, lane_bits, 0)
+    }
+
+    /// Read lane `index` (counting from the least-significant lane) of an
+    /// x86 SIMD register operand as an IEEE float. The packed handlers
+    /// walk every lane of the operand's view; the scalar ones read lane
+    /// 0 through [`Self::read_simd_lane_fp`].
+    fn read_simd_lane_fp_at(&self, op: &Operand, lane_bits: u16, index: u16) -> Option<Expr> {
+        let raw = self.read_simd_lane_bits_at(op, lane_bits, index)?;
+        let (ebits, sbits) = fp_sort_bits(lane_bits);
+        Some(Expr::bv_to_fp(raw, ebits, sbits))
+    }
+
+    /// The raw bit-vector of lane `index`, before any float
+    /// reinterpretation. Kept separate so the compare handlers can build
+    /// a mask without a pointless round trip through the float sort.
+    fn read_simd_lane_bits_at(&self, op: &Operand, lane_bits: u16, index: u16) -> Option<Expr> {
         if op.kind != OperandKind::Register {
             return None;
         }
@@ -684,9 +717,16 @@ impl LiftCtx {
         if !layout.parent.starts_with("zmm") {
             return None;
         }
-        let lane = Expr::extract(Expr::var(layout.parent, SIMD_PARENT_BITS), lane_bits - 1, 0);
-        let (ebits, sbits) = fp_sort_bits(lane_bits);
-        Some(Expr::bv_to_fp(lane, ebits, sbits))
+        let lo = lane_bits.checked_mul(index)?;
+        let hi = lo.checked_add(lane_bits)?.checked_sub(1)?;
+        if hi >= SIMD_PARENT_BITS {
+            return None;
+        }
+        Some(Expr::extract(
+            Expr::var(layout.parent, SIMD_PARENT_BITS),
+            hi,
+            lo,
+        ))
     }
 
     /// Write `lane_value` (an IEEE bit-vector of `lane_bits`) to the low
@@ -712,6 +752,26 @@ impl LiftCtx {
             Expr::concat(preserved, lane_value),
         );
         true
+    }
+
+    /// Number of `lane_bits`-wide lanes in a `view_bits`-wide vector
+    /// view, or `None` when the view is not a whole multiple of the lane.
+    fn packed_lane_count(view_bits: u16, lane_bits: u16) -> Option<u16> {
+        if lane_bits == 0 || view_bits % lane_bits != 0 {
+            return None;
+        }
+        Some(view_bits / lane_bits)
+    }
+
+    /// Assemble per-lane bit-vectors, least-significant lane first, into
+    /// one value of the full view width.
+    fn concat_lanes(lanes: Vec<Expr>) -> Option<Expr> {
+        let mut iter = lanes.into_iter();
+        let mut acc = iter.next()?;
+        for lane in iter {
+            acc = Expr::concat(lane, acc);
+        }
+        Some(acc)
     }
 
     /// Width of an x86 SIMD **register** view (128 / 256 / 512), or
