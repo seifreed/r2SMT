@@ -3478,3 +3478,77 @@ fn aarch64_register_shift_builds_both_directions() {
         .unwrap_or_default();
     assert!(rendered.contains("ite"), "{rendered}");
 }
+
+// --- N3e: NEON conversions and compares ---
+
+#[test]
+fn aarch64_vector_compare_writes_a_mask_not_a_flag() {
+    // The scalar compare path writes NZCV; a vector compare writes the
+    // destination register, because its result feeds another vector op.
+    let i = insn(
+        0x1000,
+        4,
+        "cmgt",
+        vec![reg("v0.4h"), reg("v1.4h"), reg("v2.4h")],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(stmts.as_slice(), [IrStmt::Assign { dst, .. }] if dst.name == "v0"),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_vector_compare_sets_no_flags() {
+    let i = insn(
+        0x1000,
+        4,
+        "cmgt",
+        vec![reg("v0.4h"), reg("v1.4h"), reg("v2.4h")],
+    );
+    let effect = crate::effect::analyze(&i, Arch::Aarch64);
+    assert!(!effect.defines_flags, "{effect:?}");
+}
+
+#[test]
+fn aarch64_float_compare_declines_a_byte_arrangement() {
+    // `.16b` names an 8-bit element, which is not an IEEE sort.
+    assert!(neon_declines("fcmgt", &["v0.16b", "v1.16b", "v2.16b"]));
+}
+
+#[test]
+fn aarch64_test_bits_has_no_compare_with_zero_form() {
+    // `cmtst v0.4h, v1.4h, #0` is not an encoding — the AND against zero
+    // would be constant.
+    assert!(neon_declines("cmtst", &["v0.4h", "v1.4h", "#0"]));
+}
+
+#[test]
+fn aarch64_compare_declines_a_non_zero_immediate() {
+    // The immediate form compares against zero only.
+    assert!(neon_declines("cmgt", &["v0.4h", "v1.4h", "#1"]));
+}
+
+#[test]
+fn aarch64_fixed_point_convert_declines() {
+    // The three-operand form scales by a fractional-bit count, which is
+    // a different operation from the plain conversion.
+    assert!(neon_declines("scvtf", &["v0.2s", "v1.2s", "#4"]));
+}
+
+#[test]
+fn aarch64_convert_declines_mismatched_lane_geometry() {
+    // `scvtf` converts element-for-element.
+    assert!(neon_declines("scvtf", &["v0.2d", "v1.2s"]));
+}
+
+#[test]
+fn aarch64_float_widen_two_form_reads_the_upper_half() {
+    let i = insn(0x1000, 4, "fcvtl2", vec![reg("v0.2d"), reg("v1.4s")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    let rendered = stmts
+        .first()
+        .map(std::string::ToString::to_string)
+        .unwrap_or_default();
+    assert!(rendered.contains("127:96"), "{rendered}");
+}

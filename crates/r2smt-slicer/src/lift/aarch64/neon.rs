@@ -98,6 +98,44 @@ enum NeonOp {
     },
     /// A same-width shift, by an immediate or by a per-lane amount.
     Shift { kind: ShiftKind, signed: bool },
+    /// A lane-wise compare, writing an all-ones or all-zeros mask per
+    /// lane rather than a flag.
+    Compare { kind: CompareKind, zero: bool },
+    /// A lane-wise conversion between integer and floating point, or
+    /// between float widths.
+    Convert(ConvertKind),
+}
+
+/// The lane-wise compares.
+///
+/// Each writes a mask, not a condition flag: the whole point is that the
+/// result feeds another vector operation.
+#[derive(Debug, Clone, Copy)]
+enum CompareKind {
+    /// `cmeq` / `fcmeq` — equality.
+    Equal { float: bool },
+    /// `cmgt` / `cmge` / `cmhi` / `cmhs` and the float `fcmgt` /
+    /// `fcmge` — ordered comparison. `or_equal` picks `ge` over `gt`.
+    Ordered {
+        float: bool,
+        signed: bool,
+        or_equal: bool,
+    },
+    /// `cmtst` — true where the bitwise AND of the lanes is non-zero.
+    TestBits,
+}
+
+/// The lane-wise conversions.
+#[derive(Debug, Clone, Copy)]
+enum ConvertKind {
+    /// `scvtf` / `ucvtf` — integer lane to float of the same width.
+    IntToFloat { signed: bool },
+    /// `fcvtzs` / `fcvtzu` — float lane to integer, rounding toward
+    /// zero as the mnemonic's `z` spells.
+    FloatToInt { signed: bool },
+    /// `fcvtl` / `fcvtn` — between float widths, one lane doubling or
+    /// halving in size.
+    FloatToFloat { widening: bool },
 }
 
 /// The same-width shift operations.
@@ -269,6 +307,147 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| multiply_accumulate_shape(insn, &mnemonic))
         .or_else(|| saturating_shape(insn, &mnemonic))
         .or_else(|| shift_shape(insn, &mnemonic))
+        .or_else(|| compare_shape(insn, &mnemonic))
+        .or_else(|| convert_shape(insn, &mnemonic))
+}
+
+// ===================== lane-wise compares =====================
+
+/// The lane-wise compare family.
+///
+/// Each member has a two-operand form comparing against zero
+/// (`cmgt v0.4s, v1.4s, #0`) as well as the three-operand register form,
+/// and the zero form is what most opaque-predicate patterns use.
+fn compare_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let ordered = |float, signed, or_equal| CompareKind::Ordered {
+        float,
+        signed,
+        or_equal,
+    };
+    let kind = match mnemonic {
+        "cmeq" => CompareKind::Equal { float: false },
+        "fcmeq" => CompareKind::Equal { float: true },
+        "cmgt" => ordered(false, true, false),
+        "cmge" => ordered(false, true, true),
+        "cmhi" => ordered(false, false, false),
+        "cmhs" => ordered(false, false, true),
+        "fcmgt" => ordered(true, true, false),
+        "fcmge" => ordered(true, true, true),
+        "cmtst" => CompareKind::TestBits,
+        _ => return None,
+    };
+    if insn.operands.len() != 3 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    if operand_arrangement(insn.operands.get(1)?)? != destination {
+        return None;
+    }
+    let second = insn.operands.get(2)?;
+    let zero = if let Some(arrangement) = operand_arrangement(second) {
+        if arrangement != destination {
+            return None;
+        }
+        false
+    } else {
+        // The compare-with-zero form. `cmtst` has none.
+        if matches!(kind, CompareKind::TestBits) || !is_zero_immediate(second) {
+            return None;
+        }
+        true
+    };
+    // A floating-point compare needs an IEEE lane.
+    let float = matches!(
+        kind,
+        CompareKind::Equal { float: true } | CompareKind::Ordered { float: true, .. }
+    );
+    if float && !matches!(destination.lane_bits, 16 | 32 | 64) {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::Compare { kind, zero },
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+/// Whether an operand is the `#0` (or `#0.0`) the compare-with-zero
+/// forms take.
+fn is_zero_immediate(op: &Operand) -> bool {
+    let raw = op.raw.trim().trim_start_matches('#');
+    matches!(raw, "0" | "0.0" | "0x0" | "0.00000")
+}
+
+// ===================== lane-wise conversions =====================
+
+/// The lane-wise conversion family.
+fn convert_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (base, upper) = peel_upper(mnemonic);
+    let kind = match base {
+        "scvtf" => ConvertKind::IntToFloat { signed: true },
+        "ucvtf" => ConvertKind::IntToFloat { signed: false },
+        "fcvtzs" => ConvertKind::FloatToInt { signed: true },
+        "fcvtzu" => ConvertKind::FloatToInt { signed: false },
+        "fcvtl" => ConvertKind::FloatToFloat { widening: true },
+        "fcvtn" => ConvertKind::FloatToFloat { widening: false },
+        _ => return None,
+    };
+    let widths_differ = matches!(kind, ConvertKind::FloatToFloat { .. });
+    if upper && !widths_differ {
+        return None;
+    }
+    // The two-operand register forms only; the fixed-point variants
+    // carry a third immediate operand and scale by it.
+    if insn.operands.len() != 2 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    let source = operand_arrangement(insn.operands.get(1)?)?;
+    let (source_bits, written) = match kind {
+        ConvertKind::FloatToFloat { widening: true } => {
+            // `fcvtl` doubles the element and halves the lane count; the
+            // `2` form reads the source's upper half.
+            (destination.lane_bits / 2, destination.lanes)
+        }
+        ConvertKind::FloatToFloat { widening: false } => {
+            // `fcvtn` halves the element; `fcvtn2` writes the
+            // destination's upper half.
+            let written = if upper {
+                destination.lanes / 2
+            } else {
+                destination.lanes
+            };
+            (destination.lane_bits.checked_mul(2)?, written)
+        }
+        _ => (destination.lane_bits, destination.lanes),
+    };
+    if written == 0 || source_bits == 0 {
+        return None;
+    }
+    let expected_lanes = match kind {
+        ConvertKind::FloatToFloat { widening: true } if upper => written.checked_mul(2)?,
+        _ => written,
+    };
+    if source.lane_bits != source_bits || source.lanes != expected_lanes {
+        return None;
+    }
+    // Every one of these names an IEEE lane on at least one side.
+    let float_bits = match kind {
+        ConvertKind::FloatToInt { .. } => source_bits,
+        _ => destination.lane_bits,
+    };
+    if !matches!(float_bits, 16 | 32 | 64) {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::Convert(kind),
+        lane_bits: destination.lane_bits,
+        lanes: written,
+        dest_index: 0,
+        source_index: u16::from(upper),
+    })
 }
 
 // ===================== same-width shifts =====================
@@ -1063,7 +1242,75 @@ impl LiftCtx {
                 upper,
             } => self.saturating_lanes(insn, shape, kind, signed_sources, upper),
             NeonOp::Shift { kind, signed } => self.shift_lanes(insn, shape, kind, signed),
+            NeonOp::Compare { kind, zero } => self.compare_lanes(insn, shape, kind, zero),
+            NeonOp::Convert(kind) => self.convert_lanes(insn, shape, kind),
         }
+    }
+
+    /// The lane-wise compares, each writing an all-ones or all-zeros
+    /// mask per lane.
+    fn compare_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        kind: CompareKind,
+        zero: bool,
+    ) -> Option<Expr> {
+        let first = self.widen_source(insn, 1)?;
+        let second = if zero {
+            None
+        } else {
+            Some(self.widen_source(insn, 2)?)
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let a = LiftCtx::extract_lane(first.clone(), shape.lane_bits, index)?;
+            let b = match second.as_ref() {
+                Some(value) => LiftCtx::extract_lane(value.clone(), shape.lane_bits, index)?,
+                None => Expr::konst(0, shape.lane_bits),
+            };
+            lanes.push(compare_lane(kind, a, b, shape.lane_bits)?);
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// The lane-wise conversions.
+    fn convert_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        kind: ConvertKind,
+    ) -> Option<Expr> {
+        let upper = shape.source_index == 1;
+        let source = self.widen_source(insn, 1)?;
+        let source_bits = match kind {
+            ConvertKind::FloatToFloat { widening: true } => shape.lane_bits / 2,
+            ConvertKind::FloatToFloat { widening: false } => shape.lane_bits.checked_mul(2)?,
+            _ => shape.lane_bits,
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            // `fcvtl2` reads the source's upper half; `fcvtn2` reads the
+            // same lanes `fcvtn` does and moves only the destination.
+            let source_lane =
+                if upper && matches!(kind, ConvertKind::FloatToFloat { widening: true }) {
+                    index.checked_add(shape.lanes)?
+                } else {
+                    index
+                };
+            let element = LiftCtx::extract_lane(source.clone(), source_bits, source_lane)?;
+            lanes.push(convert_lane(kind, element, source_bits, shape.lane_bits)?);
+        }
+        let converted = Self::concat_lanes(lanes)?;
+        if !upper || !matches!(kind, ConvertKind::FloatToFloat { widening: false }) {
+            return Some(converted);
+        }
+        let view = shape.lane_bits.checked_mul(shape.lanes)?;
+        let destination = self.simd_operand_value(&insn.operands.first()?.clone(), view * 2)?;
+        Some(Expr::concat(
+            converted,
+            Expr::extract(destination, view - 1, 0),
+        ))
     }
 
     /// The same-width shift family.
@@ -1672,6 +1919,128 @@ fn shift_lane(
                 then_expr: Box::new(right),
                 else_expr: Box::new(left),
             })
+        }
+    }
+}
+
+/// One destination lane of a compare: an all-ones mask where the
+/// predicate holds and all-zeros where it does not.
+///
+/// A vector compare produces a *value*, not a flag, because its result
+/// feeds another vector operation — which is why this cannot reuse the
+/// scalar compare path that writes NZCV.
+fn compare_lane(kind: CompareKind, a: Expr, b: Expr, lane_bits: u16) -> Option<Expr> {
+    let predicate = match kind {
+        CompareKind::Equal { float: false } => Expr::eq(a, b),
+        CompareKind::Equal { float: true } => {
+            let (ebits, sbits) = fp_sort(lane_bits)?;
+            Expr::feq(
+                Expr::bv_to_fp(a, ebits, sbits),
+                Expr::bv_to_fp(b, ebits, sbits),
+            )
+        }
+        CompareKind::Ordered {
+            float: true,
+            or_equal,
+            ..
+        } => {
+            let (ebits, sbits) = fp_sort(lane_bits)?;
+            let (x, y) = (
+                Expr::bv_to_fp(a, ebits, sbits),
+                Expr::bv_to_fp(b, ebits, sbits),
+            );
+            // `fcmgt`/`fcmge` are *ordered*: unordered compares false,
+            // which `fp.lt` / `fp.leq` already give.
+            if or_equal {
+                Expr::fle(y, x)
+            } else {
+                Expr::flt(y, x)
+            }
+        }
+        CompareKind::Ordered {
+            float: false,
+            signed,
+            or_equal,
+        } => match (signed, or_equal) {
+            (true, false) => Expr::slt(b, a),
+            (true, true) => Expr::sle(b, a),
+            (false, false) => Expr::ult(b, a),
+            (false, true) => Expr::ule(b, a),
+        },
+        CompareKind::TestBits => Expr::ne(Expr::bv_and(a, b), Expr::konst(0, lane_bits)),
+    };
+    Some(Expr::Ite {
+        cond: Box::new(predicate),
+        then_expr: Box::new(all_ones(lane_bits)?),
+        else_expr: Box::new(Expr::konst(0, lane_bits)),
+    })
+}
+
+/// An all-ones bit-vector of `bits`.
+fn all_ones(bits: u16) -> Option<Expr> {
+    Some(Expr::konst(unsigned_max(bits)?, bits))
+}
+
+/// The IEEE `(ebits, sbits)` pair for a float lane width.
+fn fp_sort(lane_bits: u16) -> Option<(u16, u16)> {
+    match lane_bits {
+        16 => Some((5, 11)),
+        32 => Some((8, 24)),
+        64 => Some((11, 53)),
+        _ => None,
+    }
+}
+
+/// One destination lane of a conversion.
+///
+/// The IR carries no unsigned integer conversion, so the unsigned forms
+/// go through the signed node with one extra bit of range — which covers
+/// the unsigned range exactly rather than approximately, the same trick
+/// the scalar `ucvtf` / `fcvtzu` already use.
+fn convert_lane(
+    kind: ConvertKind,
+    element: Expr,
+    source_bits: u16,
+    lane_bits: u16,
+) -> Option<Expr> {
+    let round = r2smt_ir::expr::RoundingMode::NearestTiesEven;
+    match kind {
+        ConvertKind::IntToFloat { signed } => {
+            let (ebits, sbits) = fp_sort(lane_bits)?;
+            let source = if signed {
+                element
+            } else {
+                Expr::zero_ext(element, source_bits.checked_add(1)?)
+            };
+            Some(Expr::fp_to_ieee_bv(Expr::sbv_to_fp(
+                source, round, ebits, sbits,
+            )))
+        }
+        ConvertKind::FloatToInt { signed } => {
+            let (ebits, sbits) = fp_sort(source_bits)?;
+            let value = Expr::bv_to_fp(element, ebits, sbits);
+            // The `z` in the mnemonic is round-toward-zero, so no
+            // control register is assumed.
+            let toward_zero = r2smt_ir::expr::RoundingMode::TowardZero;
+            Some(if signed {
+                Expr::fp_to_sbv(value, toward_zero, lane_bits)
+            } else {
+                Expr::extract(
+                    Expr::fp_to_sbv(value, toward_zero, lane_bits.checked_add(1)?),
+                    lane_bits - 1,
+                    0,
+                )
+            })
+        }
+        ConvertKind::FloatToFloat { .. } => {
+            let (from_e, from_s) = fp_sort(source_bits)?;
+            let (to_e, to_s) = fp_sort(lane_bits)?;
+            Some(Expr::fp_to_ieee_bv(Expr::fp_to_fp(
+                Expr::bv_to_fp(element, from_e, from_s),
+                round,
+                to_e,
+                to_s,
+            )))
         }
     }
 }

@@ -364,3 +364,108 @@ fn urshl_rounds_a_negative_shift() {
     // amount -1 shifts right by one with rounding: (0xffff + 1) >> 1.
     assert_computes("urshl", &HALF, &[("v1", 0xffff), ("v2", 0xffff)], 0x8000);
 }
+
+// --- lane-wise compares and conversions ---
+
+#[test]
+fn cmgt_writes_an_all_ones_mask_where_the_predicate_holds() {
+    // A vector compare produces a value, not a flag: lane 0 is greater
+    // so it becomes all ones, lane 1 is not so it becomes zero. The
+    // remaining lanes hold zero on both sides, and zero is not greater
+    // than zero.
+    let sources = [
+        ("v1", (0x0001_u128 << 16) | 0x0005),
+        ("v2", (0x0009_u128 << 16) | 0x0003),
+    ];
+    assert_computes("cmgt", &HALF, &sources, 0xffff);
+}
+
+#[test]
+fn cmgt_compares_signed() {
+    // 0xffff is -1, which is not greater than 1.
+    assert_computes("cmgt", &HALF, &[("v1", 0xffff), ("v2", 0x1)], 0x0);
+}
+
+#[test]
+fn cmhi_compares_unsigned() {
+    // The same bits read unsigned are 65535, which is greater than 1.
+    assert_computes("cmhi", &HALF, &[("v1", 0xffff), ("v2", 0x1)], 0xffff);
+}
+
+#[test]
+fn cmeq_against_zero_uses_the_two_operand_form() {
+    assert_computes(
+        "cmeq",
+        &["v0.4h", "v1.4h", "#0"],
+        &[("v1", 0x0)],
+        0xffff_ffff_ffff_ffff,
+    );
+}
+
+#[test]
+fn cmge_includes_equality() {
+    // Every lane compares equal — including the three holding zero — so
+    // the whole 64-bit arrangement becomes all ones.
+    let equal = 0x0003_0003_0003_0003_u128;
+    assert_computes(
+        "cmge",
+        &HALF,
+        &[("v1", equal), ("v2", equal)],
+        0xffff_ffff_ffff_ffff,
+    );
+}
+
+#[test]
+fn cmtst_is_true_where_the_bitwise_and_is_non_zero() {
+    assert_computes("cmtst", &HALF, &[("v1", 0x6), ("v2", 0x3)], 0xffff);
+}
+
+#[test]
+fn cmtst_is_false_on_disjoint_bits() {
+    assert_computes("cmtst", &HALF, &[("v1", 0x4), ("v2", 0x3)], 0x0);
+}
+
+#[test]
+fn scvtf_converts_an_integer_lane_to_a_float_lane() {
+    // 1.0 in binary32 is 0x3f800000.
+    assert_computes("scvtf", &["v0.2s", "v1.2s"], &[("v1", 0x1)], 0x3f80_0000);
+}
+
+#[test]
+fn ucvtf_reads_the_lane_as_unsigned() {
+    // 0xffffffff is -1 signed but 4294967295 unsigned, which is
+    // 0x4f800000 in binary32.
+    assert_computes(
+        "ucvtf",
+        &["v0.2s", "v1.2s"],
+        &[("v1", 0xffff_ffff)],
+        0x4f80_0000,
+    );
+}
+
+#[test]
+fn fcvtzs_truncates_toward_zero() {
+    // 1.5 (0x3fc00000) truncates to 1, not 2.
+    assert_computes("fcvtzs", &["v0.2s", "v1.2s"], &[("v1", 0x3fc0_0000)], 0x1);
+}
+
+#[test]
+fn fcvtl_widens_single_to_double() {
+    // 1.0f (0x3f800000) becomes 1.0 (0x3ff0000000000000).
+    assert_computes(
+        "fcvtl",
+        &["v0.2d", "v1.2s"],
+        &[("v1", 0x3f80_0000)],
+        0x3ff0_0000_0000_0000,
+    );
+}
+
+#[test]
+fn fcvtn_narrows_double_to_single() {
+    assert_computes(
+        "fcvtn",
+        &["v0.2s", "v1.2d"],
+        &[("v1", 0x3ff0_0000_0000_0000)],
+        0x3f80_0000,
+    );
+}
