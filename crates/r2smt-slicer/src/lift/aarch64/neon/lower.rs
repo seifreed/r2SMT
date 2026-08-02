@@ -75,7 +75,7 @@ impl LiftCtx {
             } => self.saturating_lanes(insn, shape, kind, signed_sources, upper),
             NeonOp::Shift { kind, signed } => self.shift_lanes(insn, shape, kind, signed),
             NeonOp::Compare { kind, zero } => self.compare_lanes(insn, shape, kind, zero),
-            NeonOp::Convert(kind) => self.convert_lanes(insn, shape, kind),
+            NeonOp::Convert { kind, upper } => self.convert_lanes(insn, shape, kind, upper),
             NeonOp::BitwiseSelect(role) => self.bitwise_select(insn, shape, role),
         }
     }
@@ -142,8 +142,8 @@ impl LiftCtx {
         insn: &Instruction,
         shape: NeonShape,
         kind: ConvertKind,
+        upper: bool,
     ) -> Option<Expr> {
-        let upper = shape.source_index == 1;
         let source = self.widen_source(insn, 1)?;
         let source_bits = match kind {
             ConvertKind::FloatToFloat { widening: true } => shape.lane_bits / 2,

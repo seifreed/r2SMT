@@ -101,8 +101,9 @@ enum NeonOp {
     /// lane rather than a flag.
     Compare { kind: CompareKind, zero: bool },
     /// A lane-wise conversion between integer and floating point, or
-    /// between float widths.
-    Convert(ConvertKind),
+    /// between float widths. `upper` is the `2` suffix, which only the
+    /// width-changing forms carry.
+    Convert { kind: ConvertKind, upper: bool },
     /// `bsl` / `bit` / `bif` — bitwise select, where one of the three
     /// registers supplies the mask and the destination is always one of
     /// the three.
@@ -501,11 +502,11 @@ fn convert_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
         return None;
     }
     Some(NeonShape {
-        op: NeonOp::Convert(kind),
+        op: NeonOp::Convert { kind, upper },
         lane_bits: destination.lane_bits,
         lanes: written,
         dest_index: 0,
-        source_index: u16::from(upper),
+        source_index: 0,
     })
 }
 
