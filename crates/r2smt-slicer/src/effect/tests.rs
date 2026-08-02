@@ -589,15 +589,15 @@ fn aarch64_packed_vector_instruction_sets_no_flags() {
 }
 
 #[test]
-fn aarch64_widening_arrangement_declines() {
+fn aarch64_unmodelled_vector_mnemonic_declines() {
     // Not modelled, so the effect table has to fail closed — otherwise
     // the slicer retains a definition the lifter drops.
     let i = insn(
-        "umlal",
+        "pmull",
         vec![
-            op("v0.4s", OperandKind::Register),
-            op("v1.4h", OperandKind::Register),
-            op("v2.4h", OperandKind::Register),
+            op("v0.8h", OperandKind::Register),
+            op("v1.8b", OperandKind::Register),
+            op("v2.8b", OperandKind::Register),
         ],
     );
     assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);
@@ -885,4 +885,33 @@ fn aarch64_widening_long_defines_its_destination() {
     let effect = analyze(&i, Arch::Aarch64);
     assert_eq!(effect.defs, vec!["v0"]);
     assert_eq!(effect.kind, InstructionKind::Simd);
+}
+
+#[test]
+fn aarch64_multiply_accumulate_reads_its_destination() {
+    // The accumulator's prior definition is live; without this the
+    // slicer drops it and the accumulation reads a free input.
+    let i = insn(
+        "mla",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+            op("v2.4s", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert!(effect.uses.contains(&"v0"), "{effect:?}");
+}
+
+#[test]
+fn aarch64_long_multiply_accumulate_reads_its_destination() {
+    let i = insn(
+        "umlal",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4h", OperandKind::Register),
+            op("v2.4h", OperandKind::Register),
+        ],
+    );
+    assert!(analyze(&i, Arch::Aarch64).uses.contains(&"v0"));
 }

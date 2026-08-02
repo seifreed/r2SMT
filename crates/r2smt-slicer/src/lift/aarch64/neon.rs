@@ -84,6 +84,36 @@ enum NeonOp {
         signed: bool,
         upper: bool,
     },
+    /// `mla` / `mls` and the long `umlal` / `smlal` / `umlsl` / `smlsl`:
+    /// multiply the two sources and accumulate the product into the
+    /// destination.
+    MultiplyAccumulate(AccumulateKind),
+}
+
+/// How a multiply-accumulate reads its source elements.
+///
+/// A separate type rather than a `widen` flag beside a `signed` one,
+/// because signedness is meaningless without widening: `mla` extends
+/// nothing, so there is no extension to choose.
+#[derive(Debug, Clone, Copy)]
+enum AccumulateSources {
+    /// `mla` / `mls` — sources are already the destination's element
+    /// width.
+    SameWidth,
+    /// `umlal` / `smlal` / `umlsl` / `smlsl` — sources are half the
+    /// destination's element width and are extended before the multiply.
+    Long { signed: bool },
+}
+
+/// How a multiply-accumulate reads its sources and combines the product.
+#[derive(Debug, Clone, Copy)]
+struct AccumulateKind {
+    /// Whether the product is added to or subtracted from the
+    /// accumulator.
+    combine: BinOp,
+    sources: AccumulateSources,
+    /// The `2` suffix — read the sources' upper half.
+    upper: bool,
 }
 
 /// The widening and narrowing element operations.
@@ -130,6 +160,7 @@ impl NeonShape {
         matches!(
             self.op,
             NeonOp::Insert { .. }
+                | NeonOp::MultiplyAccumulate { .. }
                 | NeonOp::Widen {
                     kind: WidenKind::Narrow,
                     upper: true,
@@ -162,6 +193,73 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| element_to_gpr_shape(insn, &mnemonic))
         .or_else(|| insert_shape(insn, &mnemonic))
         .or_else(|| widen_shape(insn, &mnemonic))
+        .or_else(|| multiply_accumulate_shape(insn, &mnemonic))
+}
+
+// ===================== multiply-accumulate =====================
+
+/// The multiply-accumulate family.
+///
+/// Same-width (`mla` / `mls`) and long (`umlal` / `smlal` / `umlsl` /
+/// `smlsl`) share one lowering: multiply the sources, then add or
+/// subtract the product against the destination's existing lane. The
+/// long forms multiply at the destination's width, so the product cannot
+/// overflow the element the way a same-width multiply can.
+///
+/// Every member reads its destination. That is the whole point of an
+/// accumulator, and it is what the effect table has to be told, or the
+/// slicer will drop the definition the accumulation builds on.
+fn multiply_accumulate_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (base, upper) = peel_upper(mnemonic);
+    let long = |signed| AccumulateSources::Long { signed };
+    let (combine, sources) = match base {
+        "mla" => (BinOp::Add, AccumulateSources::SameWidth),
+        "mls" => (BinOp::Sub, AccumulateSources::SameWidth),
+        "umlal" => (BinOp::Add, long(false)),
+        "smlal" => (BinOp::Add, long(true)),
+        "umlsl" => (BinOp::Sub, long(false)),
+        "smlsl" => (BinOp::Sub, long(true)),
+        _ => return None,
+    };
+    let widen = matches!(sources, AccumulateSources::Long { .. });
+    // The same-width forms have no `2` variant.
+    if upper && !widen {
+        return None;
+    }
+    if insn.operands.len() != 3 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    let source_bits = if widen {
+        destination.lane_bits / 2
+    } else {
+        destination.lane_bits
+    };
+    if source_bits == 0 {
+        return None;
+    }
+    let expected_lanes = if upper {
+        destination.lanes.checked_mul(2)?
+    } else {
+        destination.lanes
+    };
+    for operand in insn.operands.iter().skip(1) {
+        let arrangement = operand_arrangement(operand)?;
+        if arrangement.lane_bits != source_bits || arrangement.lanes != expected_lanes {
+            return None;
+        }
+    }
+    Some(NeonShape {
+        op: NeonOp::MultiplyAccumulate(AccumulateKind {
+            combine,
+            sources,
+            upper,
+        }),
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
 }
 
 // ===================== widening and narrowing =====================
@@ -671,7 +769,55 @@ impl LiftCtx {
                 signed,
                 upper,
             } => self.widen_lanes(insn, shape, kind, signed, upper),
+            NeonOp::MultiplyAccumulate(kind) => self.multiply_accumulate_lanes(insn, shape, kind),
         }
+    }
+
+    /// The multiply-accumulate family: each destination lane is its own
+    /// prior value plus or minus the product of the two source lanes.
+    fn multiply_accumulate_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        kind: AccumulateKind,
+    ) -> Option<Expr> {
+        let AccumulateKind {
+            combine,
+            sources,
+            upper,
+        } = kind;
+        let view = shape.lane_bits.checked_mul(shape.lanes)?;
+        let accumulator = self.simd_operand_value(&insn.operands.first()?.clone(), view)?;
+        let first = self.widen_source(insn, 1)?;
+        let second = self.widen_source(insn, 2)?;
+        let source_bits = match sources {
+            AccumulateSources::SameWidth => shape.lane_bits,
+            AccumulateSources::Long { .. } => shape.lane_bits / 2,
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let source_lane = if upper {
+                index.checked_add(shape.lanes)?
+            } else {
+                index
+            };
+            let read = |value: &Expr| -> Option<Expr> {
+                let element = LiftCtx::extract_lane(value.clone(), source_bits, source_lane)?;
+                Some(match sources {
+                    AccumulateSources::SameWidth => element,
+                    AccumulateSources::Long { signed: true } => {
+                        Expr::sign_ext(element, shape.lane_bits)
+                    }
+                    AccumulateSources::Long { signed: false } => {
+                        Expr::zero_ext(element, shape.lane_bits)
+                    }
+                })
+            };
+            let product = Expr::mul(read(&first)?, read(&second)?);
+            let previous = LiftCtx::extract_lane(accumulator.clone(), shape.lane_bits, index)?;
+            lanes.push(combine.apply(previous, product));
+        }
+        Self::concat_lanes(lanes)
     }
 
     /// The widening and narrowing family: read each source element,

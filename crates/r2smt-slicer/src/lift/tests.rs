@@ -2735,15 +2735,15 @@ fn aarch64_half_width_arrangement_write_zeroes_the_upper_half() {
 }
 
 #[test]
-fn aarch64_widening_arrangement_declines() {
-    // `umlal` reads half-width lanes and accumulates into full-width
-    // ones. Requiring every operand to share the destination's
-    // arrangement rejects it without naming it.
+fn aarch64_unmodelled_vector_mnemonic_declines() {
+    // `pmull` is a polynomial multiply — carry-less, so no combination
+    // of the integer primitives expresses it. A mnemonic no family
+    // claims must decline rather than fall into a same-width handler.
     let i = insn(
         0x1000,
         4,
-        "umlal",
-        vec![reg("v0.4s"), reg("v1.4h"), reg("v2.4h")],
+        "pmull",
+        vec![reg("v0.8h"), reg("v1.8b"), reg("v2.8b")],
     );
     let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
     assert!(
@@ -3294,4 +3294,74 @@ fn aarch64_widening_declines_a_non_two_form_reading_a_full_register() {
 #[test]
 fn aarch64_two_form_declines_a_half_register_source() {
     assert!(neon_declines("uaddl2", &["v0.4s", "v1.4h", "v2.4h"]));
+}
+
+// --- N3c: NEON multiply-accumulate ---
+
+#[test]
+fn aarch64_mla_accumulates_the_product_into_the_destination() {
+    assert_eq!(
+        neon_lowering("mla", &["v0.4s", "v1.4s", "v2.4s"]),
+        "v0 := concat((v0[127:96] + (v1[127:96] * v2[127:96])), \
+concat((v0[95:64] + (v1[95:64] * v2[95:64])), \
+concat((v0[63:32] + (v1[63:32] * v2[63:32])), \
+(v0[31:0] + (v1[31:0] * v2[31:0])))))"
+    );
+}
+
+#[test]
+fn aarch64_mls_subtracts_the_product_from_the_destination() {
+    assert_eq!(
+        neon_lowering("mls", &["v0.4s", "v1.4s", "v2.4s"]),
+        "v0 := concat((v0[127:96] - (v1[127:96] * v2[127:96])), \
+concat((v0[95:64] - (v1[95:64] * v2[95:64])), \
+concat((v0[63:32] - (v1[63:32] * v2[63:32])), \
+(v0[31:0] - (v1[31:0] * v2[31:0])))))"
+    );
+}
+
+#[test]
+fn aarch64_umlal_multiplies_at_the_accumulator_width() {
+    assert_eq!(
+        neon_lowering("umlal", &["v0.4s", "v1.4h", "v2.4h"]),
+        "v0 := concat((v0[127:96] + (zext(v1[63:48], 32) * zext(v2[63:48], 32))), \
+concat((v0[95:64] + (zext(v1[47:32], 32) * zext(v2[47:32], 32))), \
+concat((v0[63:32] + (zext(v1[31:16], 32) * zext(v2[31:16], 32))), \
+(v0[31:0] + (zext(v1[15:0], 32) * zext(v2[15:0], 32))))))"
+    );
+}
+
+#[test]
+fn aarch64_smlal2_reads_the_upper_half_of_its_sources() {
+    assert_eq!(
+        neon_lowering("smlal2", &["v0.4s", "v1.8h", "v2.8h"]),
+        "v0 := concat((v0[127:96] + (sext(v1[127:112], 32) * sext(v2[127:112], 32))), \
+concat((v0[95:64] + (sext(v1[111:96], 32) * sext(v2[111:96], 32))), \
+concat((v0[63:32] + (sext(v1[95:80], 32) * sext(v2[95:80], 32))), \
+(v0[31:0] + (sext(v1[79:64], 32) * sext(v2[79:64], 32))))))"
+    );
+}
+
+#[test]
+fn aarch64_umlsl_subtracts_the_widened_product() {
+    assert_eq!(
+        neon_lowering("umlsl", &["v0.4s", "v1.4h", "v2.4h"]),
+        "v0 := concat((v0[127:96] - (zext(v1[63:48], 32) * zext(v2[63:48], 32))), \
+concat((v0[95:64] - (zext(v1[47:32], 32) * zext(v2[47:32], 32))), \
+concat((v0[63:32] - (zext(v1[31:16], 32) * zext(v2[31:16], 32))), \
+(v0[31:0] - (zext(v1[15:0], 32) * zext(v2[15:0], 32))))))"
+    );
+}
+
+#[test]
+fn aarch64_same_width_accumulate_has_no_two_form() {
+    // `mla2` is not an encoding; only the long forms have one.
+    assert!(neon_declines("mla2", &["v0.4s", "v1.4s", "v2.4s"]));
+}
+
+#[test]
+fn aarch64_accumulate_declines_a_by_element_source() {
+    // `mla v0.4s, v1.4s, v2.s[0]` broadcasts one lane of the second
+    // source; the indexed operand carries no arrangement.
+    assert!(neon_declines("mla", &["v0.4s", "v1.4s", "v2.s[0]"]));
 }
