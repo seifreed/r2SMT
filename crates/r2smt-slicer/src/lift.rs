@@ -174,13 +174,19 @@ fn is_x86_simd_mnemonic(mnemonic: &str) -> bool {
             | "cvttsd2si"
             | "cvtss2sd"
             | "cvtsd2ss"
+            | "vcvtph2ps"
+            | "vcvtps2ph"
     )
 }
 
-/// IEEE `(ebits, sbits)` sort for a scalar FP lane width: 32→single
-/// `(8, 24)`, anything else→double `(11, 53)`.
+/// IEEE `(ebits, sbits)` sort for an FP lane width: 16→half `(5, 11)`,
+/// 32→single `(8, 24)`, anything else→double `(11, 53)`.
 fn fp_sort_bits(lane_bits: u16) -> (u16, u16) {
-    if lane_bits == 32 { (8, 24) } else { (11, 53) }
+    match lane_bits {
+        16 => (5, 11),
+        32 => (8, 24),
+        _ => (11, 53),
+    }
 }
 
 /// Lift `slice` under `arch`. The lifter still only handles x86

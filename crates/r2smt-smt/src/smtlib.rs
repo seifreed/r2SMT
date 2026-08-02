@@ -436,21 +436,34 @@ fn expr_uses_fp(expr: &Expr) -> bool {
 /// `FloatingPoint` sort — the theory requires both to exceed 1.
 const MIN_FP_SORT_FIELD: u16 = 2;
 
-/// Whether a floating-point sort is one the renderer can emit.
+/// IEEE-754 binary32 `(exponent, significand)` sort.
+const IEEE_SINGLE: (u16, u16) = (8, 24);
+/// IEEE-754 binary64 `(exponent, significand)` sort.
+const IEEE_DOUBLE: (u16, u16) = (11, 53);
+
+/// Whether a floating-point sort is one the renderer can emit for a
+/// *verdict*. Two independent constraints, both load-bearing.
 ///
-/// The constraint is the sort's own validity, not a solver limitation:
-/// cvc5 1.3.4, Bitwuzla 0.9.1 and Z3 were each measured accepting
-/// binary16, binary32, binary64, binary128 and even a 79-bit sort with
-/// no extra flags, so there is nothing to gate on.
+/// The sort must be well formed — both fields wider than one bit, total
+/// width not overflowing — or the emitted text is nonsense.
 ///
-/// x87's 80-bit extended format remains unrepresentable, for a reason
-/// of its own: it carries an explicit integer bit, so its bit pattern
-/// is 80 bits wide while `ebits + sbits` is 79. Every width computation
-/// here — and in the Z3 encoder — assumes those coincide, so such a
-/// value declines at a reinterpret's width check rather than rendering
-/// one bit narrower than the register it came from.
+/// It must also be binary32 or binary64. cvc5 1.3.4 rejects any other
+/// width outright ("only Float32 (8/24) or Float64 (11/53) types are
+/// supported in default mode"), offering `--fp-exp`, which its own
+/// message calls experimental and "use at your own risk". A
+/// soundness-critical verdict path should not depend on an experimental
+/// solver mode, so other sorts decline here and are left to the Z3
+/// backend, which handles them natively.
+///
+/// x87's 80-bit extended format would fail regardless, for a reason of
+/// its own: it carries an explicit integer bit, so its pattern is 80
+/// bits wide while `ebits + sbits` is 79, and every width computation
+/// here and in the Z3 encoder assumes those coincide.
 const fn is_renderable_fp_sort(ebits: u16, sbits: u16) -> bool {
-    ebits >= MIN_FP_SORT_FIELD && sbits >= MIN_FP_SORT_FIELD && ebits.checked_add(sbits).is_some()
+    ebits >= MIN_FP_SORT_FIELD
+        && sbits >= MIN_FP_SORT_FIELD
+        && ebits.checked_add(sbits).is_some()
+        && matches!((ebits, sbits), IEEE_SINGLE | IEEE_DOUBLE)
 }
 
 /// A rendered floating-point term together with its sort. Mirrors the
@@ -1274,9 +1287,11 @@ mod tests {
     }
 
     #[test]
-    fn smtlib_renders_a_half_precision_sort() {
-        // Measured: cvc5, Bitwuzla and Z3 all accept binary16 with no
-        // extra flags, so the renderer has no reason to refuse it.
+    fn smtlib_declines_half_precision_rather_than_needing_an_experimental_solver() {
+        // Measured against cvc5 1.3.4: a real binary16 query is
+        // rejected unless `--fp-exp` is passed, and cvc5 documents that
+        // mode as experimental. The Z3 backend handles the sort
+        // natively, so the text path declines instead.
         let slice = fp_slice(
             Expr::fp_to_ieee_bv(Expr::FpConst {
                 bits: 0x3c00,
@@ -1285,12 +1300,10 @@ mod tests {
             }),
             Expr::eq(Expr::var("t0", 32), Expr::konst(0x3c00, 32)),
         );
-        let script = emit_query(&slice, &SolveOptions::default(), true);
-        assert!(script.contains("((_ to_fp 5 11)"), "{script}");
-        assert!(
-            emit_query_strict(&slice, &SolveOptions::default(), true).is_ok(),
-            "{script}"
-        );
+        assert!(matches!(
+            emit_query_strict(&slice, &SolveOptions::default(), true),
+            Err(RenderError::UnrenderableFloat(_))
+        ));
     }
 
     #[test]

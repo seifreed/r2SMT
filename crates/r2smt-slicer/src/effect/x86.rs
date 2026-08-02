@@ -356,7 +356,7 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
         // a def and not also a use.
         "movaps" | "movups" | "movapd" | "movupd" | "movdqa" | "movdqu" | "vmovaps" | "vmovups"
         | "vmovapd" | "vmovupd" | "vmovdqa" | "vmovdqu" | "cvtss2si" | "cvtsd2si" | "cvttss2si"
-        | "cvttsd2si" | "sqrtps" | "sqrtpd" | "vsqrtps" | "vsqrtpd" => {
+        | "cvttsd2si" | "sqrtps" | "sqrtpd" | "vsqrtps" | "vsqrtpd" | "vcvtph2ps" | "vcvtps2ph" => {
             simd_effect(insn, SimdShape::Move)
         }
         // Everything here is a 2-operand RMW (or its 3-operand VEX

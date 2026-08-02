@@ -81,6 +81,8 @@ impl LiftCtx {
                     self.lift_simd_fp_mask_compare(insn, &cmp);
                 }
             }
+            "vcvtph2ps" => self.lift_f16c_widen(insn),
+            "vcvtps2ph" => self.lift_f16c_narrow(insn),
             "comiss" | "ucomiss" => self.lift_simd_fp_compare(insn, 32),
             "comisd" | "ucomisd" => self.lift_simd_fp_compare(insn, 64),
             "cvtsi2ss" => self.lift_int_to_fp(insn, 32),
@@ -583,6 +585,82 @@ impl LiftCtx {
         Self::concat_lanes(lanes)
     }
 
+    /// `vcvtph2ps` — widen packed half-precision lanes to single.
+    ///
+    /// The lane count comes from the *destination* view: each 32-bit
+    /// result lane consumes one 16-bit source lane, so a 128-bit
+    /// destination reads the low 64 bits of the source.
+    fn lift_f16c_widen(&mut self, insn: &Instruction) {
+        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
+            return;
+        };
+        let Some(result) = self.f16c_lanes(dst, src, F16C_HALF_BITS, F16C_SINGLE_BITS) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        if !self.write_xmm_dst(dst, result, true) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
+    /// `vcvtps2ph` — narrow packed single lanes to half-precision.
+    ///
+    /// The lane count comes from the *source* view. The result is half
+    /// as wide as that view, and the VEX write zeroes everything above
+    /// it, so the narrower value is handed to the write as-is.
+    ///
+    /// The immediate selects the rounding mode, and bit 2 means "use
+    /// MXCSR" — which this lifter cannot pin, so that encoding declines
+    /// rather than assuming a mode.
+    fn lift_f16c_narrow(&mut self, insn: &Instruction) {
+        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
+            return;
+        };
+        let uses_mxcsr = insn
+            .operands
+            .get(2)
+            .and_then(|o| parse_immediate(&o.raw))
+            .is_none_or(|imm| imm & F16C_IMM_USE_MXCSR != 0);
+        if uses_mxcsr {
+            self.push_simd_unsupported(insn);
+            return;
+        }
+        let Some(result) = self.f16c_lanes(src, src, F16C_SINGLE_BITS, F16C_HALF_BITS) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        if !self.write_xmm_dst(dst, result, true) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
+    /// Convert every lane of `src` from `from_bits` to `to_bits`, with
+    /// the lane count taken from `count_from`'s view divided by the
+    /// wider of the two lane widths.
+    fn f16c_lanes(
+        &self,
+        count_from: &Operand,
+        src: &Operand,
+        from_bits: u16,
+        to_bits: u16,
+    ) -> Option<Expr> {
+        let count =
+            Self::packed_lane_count(self.simd_view_bits(count_from)?, from_bits.max(to_bits))?;
+        let (from_e, from_s) = fp_sort_bits(from_bits);
+        let (to_e, to_s) = fp_sort_bits(to_bits);
+        let mut lanes = Vec::with_capacity(usize::from(count));
+        for index in 0..count {
+            let raw = self.read_simd_lane_bits_at(src, from_bits, index)?;
+            lanes.push(Expr::fp_to_ieee_bv(Expr::fp_to_fp(
+                Expr::bv_to_fp(raw, from_e, from_s),
+                RoundingMode::NearestTiesEven,
+                to_e,
+                to_s,
+            )));
+        }
+        Self::concat_lanes(lanes)
+    }
+
     /// The SSE/AVX compares, which write a per-lane mask of all-ones
     /// (predicate true) or all-zeros rather than a float.
     fn lift_simd_fp_mask_compare(&mut self, insn: &Instruction, cmp: &FpCompare) {
@@ -1062,4 +1140,21 @@ fn lane_all_ones(lane_bits: u16) -> Expr {
         (1u128 << lane_bits) - 1
     };
     Expr::konst(value, lane_bits)
+}
+
+/// IEEE binary16 lane width used by the F16C conversions.
+const F16C_HALF_BITS: u16 = 16;
+/// IEEE binary32 lane width used by the F16C conversions.
+const F16C_SINGLE_BITS: u16 = 32;
+/// `vcvtps2ph` immediate bit selecting "round per MXCSR" instead of an
+/// explicit mode.
+const F16C_IMM_USE_MXCSR: u64 = 0b100;
+
+/// Parse an immediate operand as radare2 renders it (`0`, `0x10`).
+fn parse_immediate(raw: &str) -> Option<u64> {
+    let text = raw.trim();
+    text.strip_prefix("0x").map_or_else(
+        || text.parse::<u64>().ok(),
+        |hex| u64::from_str_radix(hex, 16).ok(),
+    )
 }

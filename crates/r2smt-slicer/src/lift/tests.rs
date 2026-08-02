@@ -1698,6 +1698,62 @@ fn rounding_insensitive_floating_point_survives_an_mxcsr_write() {
 }
 
 #[test]
+fn vcvtph2ps_widens_four_half_lanes_into_single_lanes() {
+    let stmts = lift_xmm_pair("vcvtph2ps");
+    let rendered = format!("{:?}", simd_dst_src(&stmts, "zmm0"));
+    // Four conversions, each reading a 16-bit lane of the source.
+    assert_eq!(rendered.matches("FpToFp").count(), 4, "{rendered}");
+    assert!(rendered.contains("ebits: 5"), "{rendered}");
+    assert!(rendered.contains("ebits: 8"), "{rendered}");
+}
+
+#[test]
+fn vcvtps2ph_declines_when_the_immediate_defers_to_mxcsr() {
+    // Bit 2 of the immediate means "round per MXCSR", which this lifter
+    // cannot pin — so it declines instead of assuming a mode.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            5,
+            "vcvtps2ph",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+                op("4", OperandKind::Immediate),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn vcvtps2ph_narrows_with_an_explicit_rounding_immediate() {
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            5,
+            "vcvtps2ph",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+                op("0", OperandKind::Immediate),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    let rendered = format!("{:?}", simd_dst_src(&stmts, "zmm0"));
+    assert_eq!(rendered.matches("FpToFp").count(), 4, "{rendered}");
+    // The VEX write zeroes everything above the 64 bits of halves.
+    assert!(rendered.contains("ZeroExtend"), "{rendered}");
+}
+
+#[test]
 fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
     // Parity guard: the effect table keeps an instruction iff the lifter
     // models it. A mnemonic classified `Simd` by `analyze` but absent

@@ -1751,6 +1751,29 @@ fn scalar_fp_compare_of_free_inputs_stays_both_possible() {
 }
 
 #[test]
+fn half_precision_is_solved_natively_by_the_z3_backend() {
+    // The text backends decline binary16 (cvc5 needs its experimental
+    // FP solver for it), but Z3 handles the sort natively — so the
+    // F16C conversions stay analysable on the default backend.
+    let half_one = r2smt_ir::expr::Expr::FpConst {
+        bits: 0x3c00,
+        ebits: 5,
+        sbits: 11,
+    };
+    let widened = r2smt_ir::expr::Expr::fp_to_fp(
+        half_one,
+        r2smt_ir::expr::RoundingMode::NearestTiesEven,
+        8,
+        24,
+    );
+    let cond = r2smt_ir::expr::Expr::eq(
+        r2smt_ir::expr::Expr::fp_to_ieee_bv(widened),
+        r2smt_ir::expr::Expr::konst(0x3f80_0000, 32),
+    );
+    assert_eq!(solve_fp_condition(cond, Vec::new()), SmtResult::AlwaysTrue);
+}
+
+#[test]
 fn float_square_root_is_encoded_precisely() {
     // sqrt(4.0f) is exactly 2.0f, so the predicate must fold rather
     // than stay undecided — the encoding is the real `fp.sqrt`, not an
