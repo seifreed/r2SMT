@@ -682,8 +682,34 @@ fn walk_block(
         let insn = &block.instructions[i];
         let effect = analyze(insn, arch);
 
-        if !limits.allow_calls && effect.is_call {
-            return BlockWalkOutcome::Truncated(format!("call at {addr}", addr = insn.address));
+        if effect.is_call {
+            if !limits.allow_calls {
+                return BlockWalkOutcome::Truncated(format!("call at {addr}", addr = insn.address));
+            }
+            // A permitted call is a *value barrier*, not a no-op. The
+            // callee may write any register the ABI lets it clobber —
+            // the return value above all — so a definition found
+            // upstream of the call does not describe the value the
+            // branch actually reads. Stepping over it and continuing
+            // the walk would bind live registers to pre-call
+            // definitions and fabricate verdicts.
+            //
+            // Modelling the clobber exactly needs an ABI table and
+            // interprocedural analysis; neither exists here. The sound
+            // alternative is to end the walk at the call, which hands
+            // the still-live registers to the SMT layer as free inputs
+            // via `roots` — a widening, never a fabrication.
+            //
+            // A pending flag obligation cannot be discharged that way:
+            // the callee clobbers the flags too, so a `cmp` upstream of
+            // the call is not the definition the branch reads.
+            if state.needs_flags {
+                return BlockWalkOutcome::Truncated(format!(
+                    "call at {addr} clobbers the flags the branch reads",
+                    addr = insn.address
+                ));
+            }
+            return BlockWalkOutcome::Done;
         }
         // Truncate only on memory the byte-granular model cannot build
         // (rip / segment / subtracted-register on x86; any memory on

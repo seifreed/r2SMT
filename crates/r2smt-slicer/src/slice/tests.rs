@@ -266,6 +266,217 @@ fn xor_zero_idiom_terminates_slice_without_roots() {
     assert!(slice.roots.is_empty());
 }
 
+/// `SliceLimits::default()` with calls permitted — the configuration
+/// the `--allow-calls` CLI flag produces.
+fn limits_allowing_calls() -> SliceLimits {
+    SliceLimits {
+        allow_calls: true,
+        ..SliceLimits::default()
+    }
+}
+
+/// `xor eax, eax ; call f ; test eax, eax ; <branch>` — the shape that
+/// exposes whether a permitted call is treated as a value barrier.
+///
+/// `eax` after the call is the callee's return value, unconstrained. The
+/// `xor` before it is dead. A slicer that steps over the call binds
+/// `eax` to the `xor` and "proves" a branch that is in fact free.
+fn zeroed_then_call_then_test(branch: &str) -> Program {
+    one_block_program(vec![
+        insn(
+            0x40_1000,
+            2,
+            "xor",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1002,
+            5,
+            "call",
+            vec![op("0x402000", OperandKind::Immediate)],
+        ),
+        insn(
+            0x40_1007,
+            2,
+            "test",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1009,
+            6,
+            branch,
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ])
+}
+
+#[test]
+fn permitted_call_does_not_resolve_a_register_the_callee_returns() {
+    // Teeth for the `--allow-calls` value barrier. `eax` holds the
+    // callee's return value; the `xor` before the call says nothing
+    // about it. Keeping the `xor` in the slice would let the solver
+    // prove `test eax, eax` sets ZF, fabricating a verdict.
+    let slice = slice_first_with(&zeroed_then_call_then_test("je"), &limits_allowing_calls());
+    let mnemonics: Vec<&str> = slice
+        .instructions
+        .iter()
+        .map(|i| i.mnemonic.as_str())
+        .collect();
+    assert!(!mnemonics.contains(&"xor"), "slice kept: {mnemonics:?}");
+}
+
+#[test]
+fn permitted_call_leaves_the_live_register_as_a_free_root() {
+    // The sound outcome of the barrier: the walk stops at the call and
+    // hands `rax` to the SMT layer as a free input, rather than
+    // truncating to `Unsound` or inventing a definition.
+    let slice = slice_first_with(&zeroed_then_call_then_test("je"), &limits_allowing_calls());
+    assert!(
+        slice.roots.contains(&"rax".to_string()),
+        "{:?}",
+        slice.roots
+    );
+}
+
+#[test]
+fn permitted_call_before_the_flag_producer_still_truncates() {
+    // The flags a `cmp` sets before a call do not survive it, so a slice
+    // whose flag obligation is still open at the call cannot complete.
+    let program = one_block_program(vec![
+        insn(
+            0x40_1000,
+            3,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op("0", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1003,
+            5,
+            "call",
+            vec![op("0x402000", OperandKind::Immediate)],
+        ),
+        insn(
+            0x40_1008,
+            6,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let slice = slice_first_with(&program, &limits_allowing_calls());
+    assert!(matches!(slice.status, SliceStatus::Truncated { .. }));
+}
+
+#[test]
+fn permitted_call_after_the_slice_is_satisfied_is_never_reached() {
+    // The barrier must not cost precision it does not have to: a call
+    // upstream of an already-satisfied live set is behind the walk's
+    // stopping point, so the slice still completes.
+    let program = one_block_program(vec![
+        insn(
+            0x40_1000,
+            5,
+            "call",
+            vec![op("0x402000", OperandKind::Immediate)],
+        ),
+        insn(
+            0x40_1005,
+            2,
+            "xor",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1007,
+            2,
+            "test",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1009,
+            6,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let slice = slice_first_with(&program, &limits_allowing_calls());
+    assert!(
+        matches!(slice.status, SliceStatus::Complete),
+        "{:?}",
+        slice.status
+    );
+}
+
+#[test]
+fn permitted_aarch64_bl_is_a_value_barrier_too() {
+    // The barrier lives in the arch-agnostic walk and keys off
+    // `effect.is_call`, which `bl` / `blr` / `blx` set as well. This
+    // fails the moment someone makes it x86-only.
+    //
+    // `cbz` compares a register directly, so the flag obligation is
+    // never raised and the register path is what is under test.
+    let program = Program {
+        arch: Arch::Aarch64,
+        bits: 64,
+        entry: Some(Address(0x40_1000)),
+        functions: vec![Function {
+            address: Address(0x40_1000),
+            name: Some("sym.main".into()),
+            blocks: vec![BasicBlock {
+                address: Address(0x40_1000),
+                instructions: vec![
+                    insn(
+                        0x40_1000,
+                        4,
+                        "mov",
+                        vec![
+                            op("x0", OperandKind::Register),
+                            op("0", OperandKind::Immediate),
+                        ],
+                    ),
+                    insn(
+                        0x40_1004,
+                        4,
+                        "bl",
+                        vec![op("0x402000", OperandKind::Immediate)],
+                    ),
+                    insn(
+                        0x40_1008,
+                        4,
+                        "cbz",
+                        vec![
+                            op("x0", OperandKind::Register),
+                            op("0x401080", OperandKind::Immediate),
+                        ],
+                    ),
+                ],
+                successors: vec![],
+            }],
+            is_thumb: false,
+        }],
+    };
+    let slice = slice_first_with(&program, &limits_allowing_calls());
+    let mnemonics: Vec<&str> = slice
+        .instructions
+        .iter()
+        .map(|i| i.mnemonic.as_str())
+        .collect();
+    assert!(!mnemonics.contains(&"mov"), "slice kept: {mnemonics:?}");
+}
+
 #[test]
 fn call_before_flag_producer_truncates() {
     // call f; cmp eax, 0; je → truncated because the call destroys
