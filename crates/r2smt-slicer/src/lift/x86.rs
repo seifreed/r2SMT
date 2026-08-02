@@ -23,6 +23,15 @@ const X86_SHIFT_COUNT_MASK_NARROW: u64 = 0x1F;
 const X86_SHIFT_COUNT_MASK_64: u64 = 0x3F;
 const X86_WIDTH_64: u16 = 64;
 
+/// Which bit of AH each flag `sahf` transfers comes from (Intel SDM
+/// Vol. 2, "SAHF"). AF is omitted because the flag model does not carry
+/// it, and OF because `sahf` does not write it.
+const SAHF_FLAG_BITS: [(&str, u16); 4] = [("CF", 0), ("PF", 2), ("ZF", 6), ("SF", 7)];
+
+/// Width of the x87 double-extended memory image. A float store to
+/// anything narrower rounds; a store of this width does not.
+const X87_EXTENDED_MEMORY_BITS: u16 = 80;
+
 impl LiftCtx {
     pub(super) fn lift_instruction_x86(&mut self, insn: &Instruction) {
         let mnem = insn.mnemonic.trim().to_ascii_lowercase();
@@ -100,6 +109,7 @@ impl LiftCtx {
             "cvttsd2si" => self.lift_fp_to_int(insn, 64, RoundingMode::TowardZero),
             "cvtss2sd" => self.lift_fp_to_fp(insn, 32, 64),
             "cvtsd2ss" => self.lift_fp_to_fp(insn, 64, 32),
+            "sahf" => self.lift_sahf(),
             // x87 keeps its own slice-scoped stack rather than a
             // register model, so it is recognised by shape rather than
             // by mnemonic alone — see `lift/x87.rs`.
@@ -954,6 +964,32 @@ impl LiftCtx {
         }
     }
 
+    /// `sahf` — load SF, ZF, AF and PF and CF from the bits of AH.
+    ///
+    /// The bit positions are the point rather than an implementation
+    /// detail: they are why `fnstsw ax ; sahf` transfers an x87 compare
+    /// into the integer flags at all. `fnstsw` puts status-word bits
+    /// 15..8 into AH, which lands C0 at bit 0, C2 at bit 2 and C3 at
+    /// bit 6 — the CF, PF and ZF positions this reads.
+    ///
+    /// OF is deliberately absent: `sahf` does not write it, so whatever
+    /// defined it upstream still holds. AF is not modelled at all.
+    fn lift_sahf(&mut self) {
+        let Some(ah) = self.read_register(&Operand {
+            raw: "ah".into(),
+            kind: OperandKind::Register,
+        }) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: "sahf".into(),
+                comment: "no ah in this register model".into(),
+            });
+            return;
+        };
+        for (flag, bit) in SAHF_FLAG_BITS {
+            self.set_flag(flag, Expr::extract(ah.clone(), bit, bit));
+        }
+    }
+
     fn push_simd_unsupported(&mut self, insn: &Instruction) {
         self.stmts.push(IrStmt::Unsupported {
             mnemonic: insn.mnemonic.clone(),
@@ -1073,14 +1109,61 @@ struct FpCompare {
 /// the boolean negations of the four base ones — which is also why they
 /// are the "unordered" variants: negating a comparison that is false on
 /// NaN yields one that is true on NaN.
-/// Mnemonics whose lifting pins the MXCSR rounding mode to the
-/// architectural default.
+/// Mnemonics whose lifting pins a floating-point control field to its
+/// architectural default: the rounding mode in both control words, and
+/// on x87 the precision-control field as well.
 ///
-/// Deliberately narrow: `max`/`min` select an operand and the `cvtt`
-/// forms carry round-toward-zero in the opcode, so neither depends on
-/// MXCSR. Only the operations that actually round are listed.
-pub(crate) fn pins_rounding_mode(mnemonic: &str) -> bool {
-    let lower = mnemonic.trim().to_ascii_lowercase();
+/// Deliberately narrow on the SSE side: `max`/`min` select an operand
+/// and the `cvtt` forms carry round-toward-zero in the opcode, so
+/// neither depends on MXCSR. Only the operations that actually round
+/// are listed.
+///
+/// The x87 side is broader, because its control word carries a second
+/// field the SSE one does not. Precision control sets the significand
+/// width of every `FADD` / `FSUB` / `FMUL` / `FDIV` / `FSQRT` result,
+/// so those depend on it *whatever* they round to — a fixed sort cannot
+/// express a narrowed significand at all. `FLD` and `FILD` are absent
+/// because neither rounds: both convert exactly into the extended
+/// format, and neither is in the SDM's list of instructions precision
+/// control affects.
+///
+/// `fst` / `fstp` are the one shape that has to consult an operand:
+/// they round only when the destination is narrower than the extended
+/// sort, so the `m80fp` and register forms are exact and stay out.
+pub(crate) fn pins_rounding_mode(insn: &Instruction) -> bool {
+    let lower = insn.mnemonic.trim().to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "fadd"
+            | "faddp"
+            | "fsub"
+            | "fsubp"
+            | "fsubr"
+            | "fsubrp"
+            | "fmul"
+            | "fmulp"
+            | "fdiv"
+            | "fdivp"
+            | "fdivr"
+            | "fdivrp"
+            | "fsqrt"
+            // The integer stores always round: no integer format holds
+            // an arbitrary extended value.
+            | "fist"
+            | "fistp"
+    ) {
+        return true;
+    }
+    // A float store rounds only when the destination is narrower than
+    // the extended sort — `fstp st(i)` copies and `fstp tbyte` writes
+    // the value it already holds.
+    if matches!(lower.as_str(), "fst" | "fstp") {
+        return insn
+            .operands
+            .first()
+            .and_then(|op| crate::effect::memory_operand_width(&op.raw))
+            .is_some_and(|width| width < X87_EXTENDED_MEMORY_BITS);
+    }
     let body = lower.strip_prefix('v').unwrap_or(&lower);
     matches!(
         body,
@@ -1113,16 +1196,32 @@ pub(crate) fn pins_rounding_mode(mnemonic: &str) -> bool {
     )
 }
 
-/// Instructions that load a new SSE control word, and so invalidate the
-/// rounding mode [`pins_rounding_mode`] assumes.
+/// Instructions that load a new floating-point control word, and so
+/// invalidate what [`pins_rounding_mode`] assumes.
 ///
-/// `fxrstor` / `xrstor` restore MXCSR wholesale as part of the extended
-/// state, so they count too.
-pub(crate) fn writes_mxcsr(mnemonic: &str) -> bool {
+/// x86 has two such words and this covers both. `ldmxcsr` loads the SSE
+/// one; `fldcw` loads the x87 one, and `fldenv` / `frstor` reload it as
+/// part of the environment they restore. `fxrstor` / `xrstor` restore
+/// *both* wholesale as part of the extended state.
+///
+/// `fldcw` is the stronger hazard of the two, because the x87 control
+/// word carries a precision-control field the SSE one does not:
+/// narrowing it changes the significand width of every subsequent
+/// arithmetic result, which no fixed sort can reflect.
+pub(crate) fn writes_fp_control(mnemonic: &str) -> bool {
     let lower = mnemonic.trim().to_ascii_lowercase();
     matches!(
         lower.as_str(),
-        "ldmxcsr" | "vldmxcsr" | "fxrstor" | "fxrstor64" | "xrstor" | "xrstor64" | "xrstors"
+        "ldmxcsr"
+            | "vldmxcsr"
+            | "fldcw"
+            | "fldenv"
+            | "frstor"
+            | "fxrstor"
+            | "fxrstor64"
+            | "xrstor"
+            | "xrstor64"
+            | "xrstors"
     )
 }
 

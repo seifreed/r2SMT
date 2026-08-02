@@ -455,10 +455,13 @@ const IEEE_DOUBLE: (u16, u16) = (11, 53);
 /// solver mode, so other sorts decline here and are left to the Z3
 /// backend, which handles them natively.
 ///
-/// x87's 80-bit extended format would fail regardless, for a reason of
-/// its own: it carries an explicit integer bit, so its pattern is 80
-/// bits wide while `ebits + sbits` is 79, and every width computation
-/// here and in the Z3 encoder assumes those coincide.
+/// x87's double-extended sort `(15, 64)` is one of the sorts this
+/// declines, which is what makes x87 a Z3-only capability. Note the
+/// reason is only cvc5's: the sort itself is well formed, and its
+/// pattern width really is `ebits + sbits` — the extra explicit integer
+/// bit of the *stored* 80-bit image is bridged in the lifter
+/// (`r2smt-slicer`'s `lift/x87.rs`), outside every width computation
+/// here and in the Z3 encoder.
 const fn is_renderable_fp_sort(ebits: u16, sbits: u16) -> bool {
     ebits >= MIN_FP_SORT_FIELD
         && sbits >= MIN_FP_SORT_FIELD

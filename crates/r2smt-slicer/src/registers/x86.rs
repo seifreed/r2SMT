@@ -105,6 +105,13 @@ pub(super) fn x86_layout(lower: &str) -> Option<RegisterLayout> {
         // slice-scoped stack instead (`lift/x87.rs`).
         "st" => full("st"),
 
+        // The x87 status word, likewise a synthetic node rather than an
+        // operand spelling: `fcom` writes it and `fnstsw` reads it, but
+        // no instruction names it. It resolves here so the slicer can
+        // canonicalise it wherever a live-set entry has to round-trip
+        // through the register table.
+        "fsw" => word("fsw"),
+
         _ => return x86_simd_layout(lower),
     };
     Some(layout)

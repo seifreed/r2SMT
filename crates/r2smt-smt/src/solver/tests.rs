@@ -2676,3 +2676,249 @@ fn aarch64_unordered_compare_does_not_satisfy_equality() {
     ]);
     assert_eq!(solve_first(&program), SmtResult::BothPossible);
 }
+
+/// `fld1 ; fstp <dst> ; mov rax, qword [rbp - 0x20] ; cmp rax, <expect>
+/// ; je` — the whole x87 path end to end, with the reload reading
+/// whichever bytes the store wrote.
+fn x87_store_one_program(dst: &str, expect: &str) -> Program {
+    one_block(vec![
+        insn(0x40_1000, 2, "fld1", vec![]),
+        insn(0x40_1002, 3, "fstp", vec![op(dst, OperandKind::Memory)]),
+        insn(
+            0x40_1005,
+            4,
+            "mov",
+            vec![
+                op("rax", OperandKind::Register),
+                op("qword [rbp - 0x20]", OperandKind::Memory),
+            ],
+        ),
+        insn(
+            0x40_1009,
+            10,
+            "cmp",
+            vec![
+                op("rax", OperandKind::Register),
+                op(expect, OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1013,
+            2,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ])
+}
+
+#[test]
+fn x87_extended_sort_stores_the_binary64_image_of_one() {
+    // Pins that `FloatingPoint(15, 64)` really denotes x87's
+    // double-extended format and that `X87_ONE` is its `+1.0` pattern:
+    // narrowing it to `m64fp` must produce binary64's own `+1.0`.
+    // Nothing here is asserted about the sort by the lifter — Z3 is
+    // computing the conversion.
+    let program = x87_store_one_program("qword [rbp - 0x20]", "0x3ff0000000000000");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_extended_sort_stores_the_explicit_integer_bit() {
+    // The 79-to-80 bit bridge, checked where it is observable: the low
+    // eight bytes of the stored `m80fp` image of `+1.0` are the
+    // explicit integer bit alone, the fraction being zero. Reading the
+    // sort's own 79-bit pattern instead would put the exponent's low
+    // bit there and this would not hold.
+    let program = x87_store_one_program("tbyte [rbp - 0x20]", "0x8000000000000000");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_extended_sort_keeps_a_free_extended_load_undecided() {
+    // The anti-fabrication direction. With the source bytes free, no
+    // definite verdict may come back — in particular the non-canonical
+    // double-extended encodings must not be silently resolved to their
+    // canonical counterparts.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            3,
+            "fld",
+            vec![op("tbyte [rbp - 0x10]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_1003,
+            3,
+            "fstp",
+            vec![op("qword [rbp - 0x20]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_1006,
+            4,
+            "mov",
+            vec![
+                op("rax", OperandKind::Register),
+                op("qword [rbp - 0x20]", OperandKind::Memory),
+            ],
+        ),
+        insn(
+            0x40_100a,
+            10,
+            "cmp",
+            vec![
+                op("rax", OperandKind::Register),
+                op("0x3ff0000000000000", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1014,
+            2,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::BothPossible);
+}
+
+/// `fld1 ; fldz` leaves `ST(0) = +0.0` above `ST(1) = +1.0`, so a
+/// compare of the two is unambiguously "less than" — the shape every
+/// x87 compare test below branches on.
+fn x87_zero_below_one(rest: Vec<Instruction>) -> Program {
+    let mut instructions = vec![
+        insn(0x40_1000, 2, "fld1", vec![]),
+        insn(0x40_1002, 2, "fldz", vec![]),
+    ];
+    instructions.extend(rest);
+    one_block(instructions)
+}
+
+#[test]
+fn x87_status_word_idiom_resolves_through_test_ah() {
+    // The ending that dominates 32-bit binaries. `fcomp` records
+    // "less than" as C0 = 1, C2 = 0, C3 = 0; `fnstsw ax` puts those at
+    // AH bits 0, 2 and 6; `test ah, 0x41` masks C0 and C3, which is
+    // non-zero, so `jz` never fires. Nothing in the `test` / `jz` half
+    // is x87-aware — it resolves through the ordinary integer path.
+    let program = x87_zero_below_one(vec![
+        insn(
+            0x40_1004,
+            2,
+            "fcomp",
+            vec![op("st(1)", OperandKind::Register)],
+        ),
+        insn(
+            0x40_1006,
+            2,
+            "fnstsw",
+            vec![op("ax", OperandKind::Register)],
+        ),
+        insn(
+            0x40_1008,
+            3,
+            "test",
+            vec![
+                op("ah", OperandKind::Register),
+                op("0x41", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_100b,
+            2,
+            "jz",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysFalse);
+}
+
+#[test]
+fn x87_status_word_idiom_resolves_through_sahf() {
+    // The other ending. `sahf` transfers AH bit 0 into CF, so the C0
+    // the compare set makes `jb` always fire. The bit positions are
+    // load-bearing on both sides and neither is asserted anywhere —
+    // Z3 is deriving this from the status word the lifter built.
+    let program = x87_zero_below_one(vec![
+        insn(
+            0x40_1004,
+            2,
+            "fcomp",
+            vec![op("st(1)", OperandKind::Register)],
+        ),
+        insn(
+            0x40_1006,
+            2,
+            "fnstsw",
+            vec![op("ax", OperandKind::Register)],
+        ),
+        insn(0x40_1008, 1, "sahf", vec![]),
+        insn(
+            0x40_1009,
+            2,
+            "jb",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_flag_compare_writes_eflags_directly() {
+    // `fcomi` skips the status word entirely, writing CF/ZF/PF in the
+    // encoding the existing `jcc` lowering already reads.
+    let program = x87_zero_below_one(vec![
+        insn(
+            0x40_1004,
+            2,
+            "fcomi",
+            vec![
+                op("st(0)", OperandKind::Register),
+                op("st(1)", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1006,
+            2,
+            "jb",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_equality_after_a_free_compare_stays_undecided() {
+    // The anti-fabrication direction, and the reason the unordered
+    // predicate is carried at all: with both operands free, NaN alone
+    // makes an equality branch false, so it can never be proven
+    // always-taken.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            3,
+            "fld",
+            vec![op("qword [rbp - 0x10]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_1003,
+            3,
+            "fld",
+            vec![op("qword [rbp - 0x18]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_1006,
+            2,
+            "fcomi",
+            vec![
+                op("st(0)", OperandKind::Register),
+                op("st(1)", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            2,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::BothPossible);
+}

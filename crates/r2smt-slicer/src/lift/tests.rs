@@ -2189,13 +2189,13 @@ fn rounding_insensitive_floating_point_survives_an_mxcsr_write() {
         "movsd",
     ] {
         assert!(
-            !crate::lift::pins_rounding_mode(m, Arch::X86_64),
+            !crate::lift::pins_rounding_mode(&insn(0, 1, m, vec![]), Arch::X86_64),
             "{m}: wrongly treated as rounding-mode dependent"
         );
     }
     for m in ["addss", "mulpd", "sqrtss", "cvtsi2ss", "cvtss2sd"] {
         assert!(
-            crate::lift::pins_rounding_mode(m, Arch::X86_64),
+            crate::lift::pins_rounding_mode(&insn(0, 1, m, vec![]), Arch::X86_64),
             "{m}: should be guarded"
         );
     }
@@ -2870,11 +2870,18 @@ fn aarch32_packed_write_preserves_the_rest_of_the_vector_register() {
 
 // --- rounding-mode pinning on ARM ---
 
+/// The guard takes the whole instruction because x87 needs the operand
+/// to tell a narrowing store from a widening one; on ARM the mnemonic
+/// carries the whole answer, so the operand list stays empty.
+fn arm_pin_probe(mnemonic: &str) -> Instruction {
+    insn(0x40_1000, 4, mnemonic, vec![])
+}
+
 #[test]
 fn aarch64_floating_point_arithmetic_pins_the_rounding_mode() {
     for mnemonic in ["fadd", "fsub", "fmul", "fdiv", "fsqrt", "fcvt", "scvtf"] {
         assert!(
-            crate::lift::pins_rounding_mode(mnemonic, Arch::Aarch64),
+            crate::lift::pins_rounding_mode(&arm_pin_probe(mnemonic), Arch::Aarch64),
             "{mnemonic}"
         );
     }
@@ -2889,7 +2896,7 @@ fn aarch64_non_rounding_floating_point_does_not_pin_the_rounding_mode() {
         "fmax", "fmin", "fcvtzs", "fcvtzu", "fmov", "fabs", "fneg", "fcmp",
     ] {
         assert!(
-            !crate::lift::pins_rounding_mode(mnemonic, Arch::Aarch64),
+            !crate::lift::pins_rounding_mode(&arm_pin_probe(mnemonic), Arch::Aarch64),
             "{mnemonic}"
         );
     }
@@ -2899,7 +2906,7 @@ fn aarch64_non_rounding_floating_point_does_not_pin_the_rounding_mode() {
 fn aarch32_floating_point_arithmetic_pins_the_rounding_mode() {
     for mnemonic in ["vadd.f32", "vsub.f64", "vmul.f32", "vdiv.f32", "vsqrt.f32"] {
         assert!(
-            crate::lift::pins_rounding_mode(mnemonic, Arch::Arm),
+            crate::lift::pins_rounding_mode(&arm_pin_probe(mnemonic), Arch::Arm),
             "{mnemonic}"
         );
     }
@@ -2911,7 +2918,7 @@ fn aarch32_non_rounding_floating_point_does_not_pin_the_rounding_mode() {
         "vmov.f32", "vcmp.f32", "vabs.f32", "vneg.f64", "vadd.i32", "vand",
     ] {
         assert!(
-            !crate::lift::pins_rounding_mode(mnemonic, Arch::Arm),
+            !crate::lift::pins_rounding_mode(&arm_pin_probe(mnemonic), Arch::Arm),
             "{mnemonic}"
         );
     }

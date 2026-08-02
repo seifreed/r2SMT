@@ -21,34 +21,78 @@
 //!
 //! ## Value model
 //!
-//! Stack slots hold **IEEE binary64 bit patterns**, keeping the
-//! pipeline-wide invariant that registers are bit-vector-typed (floats
-//! appear only inside an expression, wrapped back up by
-//! `Expr::FpToIeeeBv` before they reach a slot).
+//! Slots hold the **IEEE bit pattern of the double-extended sort**,
+//! `FloatingPoint(15, 64)`, which is what the hardware actually
+//! computes in. Keeping them bit patterns rather than floats preserves
+//! the pipeline-wide invariant that a stored value is bit-vector-typed;
+//! floats appear only inside an expression, wrapped back up by
+//! `Expr::FpToIeeeBv` before they reach a slot.
 //!
-//! The hardware computes at 80-bit double-extended precision, so this
-//! is the semantics of an FPU whose control-word precision-control
-//! field selects double rather than the architectural default of
-//! extended. Two consequences, both stated rather than hidden:
+//! That makes every rounding this module performs the same rounding the
+//! hardware performs, in the same place. `fld` of `m32fp` / `m64fp`
+//! widens exactly, arithmetic runs at the 64-bit significand, and
+//! `fstp` to a narrower format rounds exactly once — at the store,
+//! where the hardware rounds. The predecessor of this model computed at
+//! binary64 and could differ from the hardware by one ulp on a `m64fp`
+//! store, because 64 intermediate bits do not clear the 108 that a
+//! binary64 target needs for double rounding to be innocuous. A
+//! differing definite value is a fabricated verdict, not a widening,
+//! which is why this had to land before any x87 compare does.
 //!
-//! * Loads and stores of `m32fp` / `m64fp` are exact — widening
-//!   binary32 to binary64 loses nothing, and a `m64fp` store of a
-//!   value that only ever passed through binary64 arithmetic is the
-//!   value itself. For `add` and `mul` of single-precision inputs the
-//!   round-to-single at the store is also the hardware's single
-//!   rounding, because the exact product of two binary32 values fits a
-//!   binary64 significand. `div` and `sqrt` can double-round and so
-//!   differ from the hardware in the last bit.
-//! * An 80-bit operand (`tbyte`) is **declined**, not approximated:
-//!   `fp_sort_bits_checked` has no sort for it, the effect table
-//!   therefore reports [`InstructionKind::Other`](crate::effect::InstructionKind::Other),
-//!   and the slicer truncates.
+//! ### The 79-vs-80 bit bridge
 //!
-//! The rounding mode is likewise pinned to the control word's default
-//! (round to nearest, ties to even) with no guard yet on `fldcw`; that
-//! guard, the compare / status-word idiom (`fcom` / `fnstsw` / `fcomi`)
-//! and the 80-bit sort are follow-up work. Every mnemonic they involve
-//! is outside [`classify`], so today they truncate the slice.
+//! `ebits + sbits` is 79, but the stored image (`m80fp`, spelled
+//! `tbyte`) is 80 bits: x87 makes the significand's leading bit
+//! explicit at position 63, where the SMT sort leaves it implicit.
+//! Every width computation in the encoder and the renderer derives the
+//! pattern width as `ebits + sbits`, and all of them are *right* — 79
+//! is the width of this sort's pattern. So the bridge lives here,
+//! entirely outside them: [`extended_from_memory`] strips the integer
+//! bit on a load and [`extended_to_memory`] reinserts it on a store,
+//! and no `Expr::FpToIeeeBv` in the IR is ever 80 bits wide.
+//!
+//! The strip is only faithful when the explicit bit carries what IEEE
+//! would have inferred — zero exactly when the exponent field is zero.
+//! The other two combinations are the double-extended encodings the SDM
+//! calls unsupported; naming them by their canonical counterpart would
+//! be a different number, so they resolve to a free symbolic value
+//! instead.
+//!
+//! Because `(15, 64)` is outside `is_renderable_fp_sort`, cvc5 and
+//! Bitwuzla decline any slice carrying an x87 value and x87 is
+//! effectively **Z3-only**. That decline is the text backends' own,
+//! and each pins it with a contract test.
+//!
+//! The rounding mode is pinned to the control word's reset value (round
+//! to nearest, ties to even) and the precision-control field is assumed
+//! to hold its reset value too — extended, which is what this sort
+//! models. There is no guard yet on `fldcw`, which reprograms both;
+//! that is follow-up work, and until it lands the mnemonic is outside
+//! [`classify`] so it truncates the slice.
+//!
+//! ## Compares, and the two idioms
+//!
+//! x87 has two ways to report a comparison, and both are lifted.
+//!
+//! `fcomi` / `fucomi` write ZF, PF and CF directly, in the same
+//! encoding the SSE scalar compares use, so the existing `jcc` lowering
+//! reads them with no change at all.
+//!
+//! The older `fcom` family writes the status word instead, which is
+//! modelled as a second pseudo-register [`X87_STATUS_REGISTER`] with C0
+//! at bit 8, C2 at bit 10 and C3 at bit 14. Everything else in that
+//! word is free — the exception flags are sticky state this model does
+//! not carry, and TOP is the stack pointer the lift-time stack
+//! deliberately does not number.
+//!
+//! Both endings of the classic idiom then fall out of those positions
+//! rather than needing code of their own. `fnstsw ax` copies the word
+//! into AX, so status bits 15..8 land in AH and put C0 at AH bit 0, C2
+//! at bit 2 and C3 at bit 6. Those are exactly the CF, PF and ZF
+//! positions `sahf` transfers — and exactly the bits `test ah, 0x41`
+//! masks, which needs nothing from this module at all: `test` and `ah`
+//! were already modelled, so once `fnstsw` has written `ax` the chain
+//! resolves through the ordinary integer path.
 //!
 //! ## Declining
 //!
@@ -62,15 +106,14 @@
 //! read then produces a free symbolic input rather than a stale value
 //! from a slot the hardware would have overwritten.
 
-use r2smt_ir::expr::{Expr, RoundingMode};
+use r2smt_common::Arch;
+use r2smt_ir::expr::{Expr, RoundingMode, Var};
 use r2smt_ir::program::{Instruction, Operand, OperandKind};
 use r2smt_ir::stmt::IrStmt;
 
 use crate::effect::memory_operand_width;
 
-use super::{
-    FP_DOUBLE_BITS, FpArithOp, LiftCtx, fp_lane_result, fp_sort_bits_checked, x86_memory_modellable,
-};
+use super::{LiftCtx, fp_sort_bits_checked, x86_memory_modellable};
 
 /// The single canonical data-flow node the x87 register stack collapses
 /// onto in the effect tables. Recovered from the disassembler spelling
@@ -78,30 +121,78 @@ use super::{
 /// splits on non-alphanumerics and so yields the bare token `st`.
 pub(crate) const X87_STACK_REGISTER: &str = "st";
 
+/// The x87 status word, as a data-flow node of its own. The `fcom`
+/// family writes it and `fnstsw` reads it; no instruction names it as
+/// an operand, so unlike `st` it is never recovered from operand text.
+pub(crate) const X87_STATUS_REGISTER: &str = "fsw";
+
+/// Width of the status word.
+const X87_STATUS_BITS: u16 = 16;
+
+/// Status-word bit positions of the condition codes (Intel SDM Vol. 1
+/// §8.1.3). Their spacing is the whole reason the classic idiom works:
+/// `fnstsw ax` puts bits 15..8 in AH, so C0 lands at AH bit 0, C2 at
+/// bit 2 and C3 at bit 6 — exactly the CF, PF and ZF positions `sahf`
+/// transfers.
+const X87_C0_BIT: u16 = 8;
+/// C2 — the unordered indicator after a compare. C1, the bit between
+/// them, signals a stack fault, which the bounded stack model declines
+/// on rather than records, so it is written zero.
+const X87_C2_BIT: u16 = 10;
+/// C3 — the equality indicator after a compare.
+const X87_C3_BIT: u16 = 14;
+
 /// Number of x87 data registers (Intel SDM Vol. 1 §8.1.2).
 const X87_STACK_DEPTH: usize = 8;
 
-/// Width every modelled stack slot carries: IEEE binary64.
-const X87_SLOT_BITS: u16 = FP_DOUBLE_BITS;
+/// Exponent width of the x87 double-extended sort.
+const X87_EBITS: u16 = 15;
 
-/// `+1.0` as an IEEE binary64 bit pattern — what `fld1` pushes.
-const X87_ONE: u128 = 0x3ff0_0000_0000_0000;
+/// Significand width of the x87 double-extended sort, counted the
+/// SMT-LIB way — including the leading bit, which the sort keeps
+/// implicit and the stored image makes explicit.
+const X87_SBITS: u16 = 64;
 
-/// `+0.0` as an IEEE binary64 bit pattern — what `fldz` pushes.
+/// Bits of the significand that appear in either bit pattern.
+const X87_FRACTION_BITS: u16 = X87_SBITS - 1;
+
+/// Width of the sort's IEEE bit pattern: sign, exponent, fraction.
+/// Equals `X87_EBITS + X87_SBITS`, which is what every width
+/// computation downstream derives, and it is correct there.
+const X87_SLOT_BITS: u16 = 1 + X87_EBITS + X87_FRACTION_BITS;
+
+/// Width of the stored double-extended image (`m80fp` / `tbyte`), one
+/// bit wider because it carries the explicit integer bit.
+const X87_MEMORY_BITS: u16 = X87_SLOT_BITS + 1;
+
+/// Position of the explicit integer bit in the stored image: directly
+/// above the fraction.
+const X87_INTEGER_BIT: u16 = X87_FRACTION_BITS;
+
+/// `+1.0` in the sort's bit pattern: exponent at the bias
+/// (`2^(ebits-1) - 1` = 16383), zero fraction, positive sign.
+const X87_ONE: u128 = 0x1fff_8000_0000_0000_0000;
+
+/// `+0.0` in the sort's bit pattern — what `fldz` pushes.
 const X87_ZERO: u128 = 0;
 
-/// IEEE binary64 sign bit, flipped by `fchs`.
-const X87_SIGN_BIT: u128 = 0x8000_0000_0000_0000;
+/// Sign bit of the sort's bit pattern, flipped by `fchs`.
+const X87_SIGN_BIT: u128 = 1 << (X87_SLOT_BITS - 1);
 
-/// IEEE binary64 magnitude mask (every bit but the sign), which `fabs`
-/// applies. Clearing the sign bit is exact for every value including
-/// the NaNs and infinities, so it needs no float sort at all.
-const X87_MAGNITUDE_MASK: u128 = 0x7fff_ffff_ffff_ffff;
+/// Every bit of the sort's pattern but the sign, which `fabs` keeps.
+/// Clearing the sign bit is exact for every value including the NaNs
+/// and infinities, so it needs no float sort at all.
+const X87_MAGNITUDE_MASK: u128 = X87_SIGN_BIT - 1;
 
-/// Memory widths the floating-point load / store family accepts:
-/// `m32fp` and `m64fp`. `m80fp` is absent by design — see the module
-/// docs.
-const X87_FLOAT_WIDTHS: [u16; 2] = [32, 64];
+/// Memory widths `fld` and `fstp` accept: `m32fp`, `m64fp`, and the
+/// double-extended `m80fp`.
+const X87_FLOAT_WIDTHS: [u16; 3] = [32, 64, X87_MEMORY_BITS];
+
+/// Memory widths the non-popping `fst` and the arithmetic family
+/// accept. The SDM gives the double-extended form to `fld` and `fstp`
+/// alone: there is no `m80fp` arithmetic form, and no way to store one
+/// without popping.
+const X87_FLOAT_SHORT_WIDTHS: [u16; 2] = [32, 64];
 
 /// Memory widths `fild` / `fistp` accept: `m16int`, `m32int`, `m64int`.
 const X87_INT_WIDTHS: [u16; 3] = [16, 32, 64];
@@ -115,6 +206,18 @@ const X87_INT_STORE_WIDTHS: [u16; 2] = [16, 32];
 /// the control word's reset value, round to nearest with ties to even
 /// (Intel SDM Vol. 1 §8.1.5.3).
 const X87_ROUNDING: RoundingMode = RoundingMode::NearestTiesEven;
+
+/// The arithmetic x87 performs on its stack. Narrower than the SSE
+/// [`super::FpArithOp`] on purpose: x87 has no `max` / `min`, so there
+/// is no operand-selecting case and every result is a genuine rounded
+/// computation at the extended sort.
+#[derive(Clone, Copy)]
+enum X87Arith {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
 
 /// Why an x87 instruction declined at lift time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,7 +282,18 @@ impl X87Stack {
     }
 
     fn fresh_input(&mut self) -> Expr {
-        let value = Expr::var(format!("x87_in_{n}", n = self.free_inputs), X87_SLOT_BITS);
+        self.fresh(X87_SLOT_BITS)
+    }
+
+    /// A fresh free status word, for the bits of it a compare does not
+    /// define. Shares the counter with the slot inputs so no two free
+    /// values ever collide.
+    fn fresh_status(&mut self) -> Expr {
+        self.fresh(X87_STATUS_BITS)
+    }
+
+    fn fresh(&mut self, bits: u16) -> Expr {
+        let value = Expr::var(format!("x87_in_{n}", n = self.free_inputs), bits);
         self.free_inputs = self.free_inputs.saturating_add(1);
         value
     }
@@ -263,6 +377,14 @@ enum ArithSrc {
     Memory(u16),
 }
 
+/// The three IEEE predicates every x87 compare records, whichever
+/// destination it records them in.
+struct Compare {
+    unordered: Expr,
+    equal: Expr,
+    less: Expr,
+}
+
 /// In-place unary operations on `ST(0)`.
 #[derive(Clone, Copy)]
 enum UnaryOp {
@@ -276,7 +398,7 @@ enum UnaryOp {
 
 /// A recognised x87 instruction, resolved to what it does to the stack.
 enum X87Form {
-    /// Push a fixed IEEE binary64 bit pattern (`fld1`, `fldz`).
+    /// Push a fixed double-extended bit pattern (`fld1`, `fldz`).
     PushConst(u128),
     /// Push a value converted from `operands[0]` (`fld`, `fild`).
     PushMemory { width: u16, format: MemFormat },
@@ -292,12 +414,21 @@ enum X87Form {
     StoreSlot { index: usize, pop: bool },
     /// `ST(dst) := ST(dst) op src`, or its operand-reversed form.
     Arith {
-        op: FpArithOp,
+        op: X87Arith,
         dst: usize,
         src: ArithSrc,
         reversed: bool,
         pop: bool,
     },
+    /// Compare `ST(0)` against a source and record the outcome in the
+    /// status word's condition codes (`fcom` family), popping `pops`
+    /// slots afterwards.
+    CompareStatus { src: ArithSrc, pops: u8 },
+    /// Compare `ST(0)` against `ST(src)` and write EFLAGS directly
+    /// (`fcomi` family).
+    CompareFlags { src: usize, pop: bool },
+    /// Copy the status word into `operands[0]` (`fnstsw` / `fstsw`).
+    StoreStatus,
     /// Swap `ST(0)` with `ST(i)` (`fxch`).
     Exchange(usize),
     /// In-place unary on `ST(0)`.
@@ -314,6 +445,69 @@ enum X87Form {
 /// [`LiftCtx::lift_instruction_x87`] actually lowers.
 pub(crate) fn is_modelled_x87(insn: &Instruction) -> bool {
     classify(insn).is_some()
+}
+
+/// What an x87 instruction touches beyond the registers its operands
+/// name, as the effect table needs to see it.
+pub(crate) struct X87Effect {
+    /// Pseudo-registers the instruction defines.
+    pub(crate) defs: Vec<&'static str>,
+    /// Pseudo-registers the instruction reads.
+    pub(crate) uses: Vec<&'static str>,
+    /// Canonical register the instruction writes, if it writes one.
+    pub(crate) register_def: Option<&'static str>,
+    /// Whether the instruction writes EFLAGS.
+    pub(crate) defines_flags: bool,
+}
+
+/// The pseudo-register footprint of a modelled x87 instruction, or
+/// `None` when the instruction is not one.
+///
+/// Most of the family is uniform — every instruction that touches the
+/// data registers both defines and uses the whole stack. Three shapes
+/// are not: the `fcom` family also defines the status word, the `fcomi`
+/// family writes EFLAGS instead of the status word, and `fnstsw` reads
+/// the status word into a register without touching the data registers
+/// at all.
+pub(crate) fn x87_effect(insn: &Instruction) -> Option<X87Effect> {
+    let form = classify(insn)?;
+    let stack = || {
+        (
+            vec![X87_STACK_REGISTER],
+            vec![X87_STACK_REGISTER],
+            None,
+            false,
+        )
+    };
+    let (defs, uses, register_def, defines_flags) = match form {
+        X87Form::CompareStatus { .. } => (
+            vec![X87_STACK_REGISTER, X87_STATUS_REGISTER],
+            vec![X87_STACK_REGISTER],
+            None,
+            false,
+        ),
+        X87Form::CompareFlags { .. } => (
+            vec![X87_STACK_REGISTER],
+            vec![X87_STACK_REGISTER],
+            None,
+            true,
+        ),
+        X87Form::StoreStatus => (
+            Vec::new(),
+            vec![X87_STATUS_REGISTER],
+            insn.operands
+                .first()
+                .and_then(|op| crate::effect::canonical_register(&op.raw, Arch::X86_64)),
+            false,
+        ),
+        _ => stack(),
+    };
+    Some(X87Effect {
+        defs,
+        uses,
+        register_def,
+        defines_flags,
+    })
 }
 
 /// Resolve `insn` into the stack effect the lifter will apply, or
@@ -333,10 +527,22 @@ fn classify(insn: &Instruction) -> Option<X87Form> {
         "fxch" => classify_exchange(ops),
         "fld" => classify_load(ops, MemFormat::Float, &X87_FLOAT_WIDTHS),
         "fild" => classify_load(ops, MemFormat::Integer, &X87_INT_WIDTHS),
-        "fst" => classify_store(ops, MemFormat::Float, &X87_FLOAT_WIDTHS, false),
+        "fst" => classify_store(ops, MemFormat::Float, &X87_FLOAT_SHORT_WIDTHS, false),
         "fstp" => classify_store(ops, MemFormat::Float, &X87_FLOAT_WIDTHS, true),
         "fist" => classify_store(ops, MemFormat::Integer, &X87_INT_STORE_WIDTHS, false),
         "fistp" => classify_store(ops, MemFormat::Integer, &X87_INT_WIDTHS, true),
+        // The ordered and unordered compares differ only in which NaN
+        // raises the invalid-operation exception, which the value model
+        // does not track — so they lift identically, and are told apart
+        // only by the operand shapes each encoding allows.
+        "fcom" => classify_status_compare(ops, 0, MemorySource::Allowed),
+        "fcomp" => classify_status_compare(ops, 1, MemorySource::Allowed),
+        "fucom" => classify_status_compare(ops, 0, MemorySource::Forbidden),
+        "fucomp" => classify_status_compare(ops, 1, MemorySource::Forbidden),
+        "fcompp" | "fucompp" => classify_paired_compare(ops),
+        "fcomi" | "fucomi" => classify_flag_compare(ops, false),
+        "fcomip" | "fucomip" => classify_flag_compare(ops, true),
+        "fnstsw" | "fstsw" => classify_store_status(ops),
         other => classify_arith(other, ops),
     }
 }
@@ -393,6 +599,71 @@ fn classify_store(
     })
 }
 
+/// Whether a compare encoding has a memory form. `FCOM` / `FCOMP` do;
+/// the unordered `FUCOM` / `FUCOMP` are register-only.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MemorySource {
+    Allowed,
+    Forbidden,
+}
+
+/// `fcom` / `fcomp` / `fucom` / `fucomp` — compare `ST(0)` against the
+/// source. With no operand the source is `ST(1)`.
+fn classify_status_compare(ops: &[Operand], pops: u8, memory: MemorySource) -> Option<X87Form> {
+    let src = match ops {
+        [] => ArithSrc::Slot(1),
+        [op] if op.kind == OperandKind::Register => ArithSrc::Slot(slot_index(op)?),
+        [op] if memory == MemorySource::Allowed => {
+            ArithSrc::Memory(modellable_memory_width(op, &X87_FLOAT_SHORT_WIDTHS)?)
+        }
+        _ => return None,
+    };
+    Some(X87Form::CompareStatus { src, pops })
+}
+
+/// `fcompp` / `fucompp` — compare `ST(0)` against `ST(1)` and pop both.
+/// The encoding carries no operand.
+fn classify_paired_compare(ops: &[Operand]) -> Option<X87Form> {
+    no_operands(
+        ops,
+        X87Form::CompareStatus {
+            src: ArithSrc::Slot(1),
+            pops: 2,
+        },
+    )
+}
+
+/// `fcomi` / `fucomi` and their popping forms — register-only, and the
+/// destination operand is always `ST(0)`, so a one-operand spelling
+/// names the source directly.
+fn classify_flag_compare(ops: &[Operand], pop: bool) -> Option<X87Form> {
+    let src = match ops {
+        [src] => slot_index(src)?,
+        [_dst, src] => slot_index(src)?,
+        _ => return None,
+    };
+    Some(X87Form::CompareFlags { src, pop })
+}
+
+/// `fnstsw` / `fstsw` — the status word into `AX` or a 16-bit memory
+/// destination. The two mnemonics differ only in the `FWAIT` prefix,
+/// which is exception sequencing rather than value semantics.
+fn classify_store_status(ops: &[Operand]) -> Option<X87Form> {
+    let op = only_operand(ops)?;
+    match op.kind {
+        // The encoding has exactly one register form, and it names AX.
+        OperandKind::Register => op
+            .raw
+            .trim()
+            .eq_ignore_ascii_case("ax")
+            .then_some(X87Form::StoreStatus),
+        OperandKind::Memory => {
+            modellable_memory_width(op, &[X87_STATUS_BITS]).map(|_| X87Form::StoreStatus)
+        }
+        _ => None,
+    }
+}
+
 /// The arithmetic family, in Intel operand order.
 ///
 /// `FSUB ST(i), ST(0)` computes `ST(i) − ST(0)` and `FSUBR ST(i),
@@ -407,12 +678,12 @@ fn classify_arith(mnemonic: &str, ops: &[Operand]) -> Option<X87Form> {
         _ => (mnemonic, false),
     };
     let (op, reversed) = match base {
-        "fadd" => (FpArithOp::Add, false),
-        "fmul" => (FpArithOp::Mul, false),
-        "fsub" => (FpArithOp::Sub, false),
-        "fsubr" => (FpArithOp::Sub, true),
-        "fdiv" => (FpArithOp::Div, false),
-        "fdivr" => (FpArithOp::Div, true),
+        "fadd" => (X87Arith::Add, false),
+        "fmul" => (X87Arith::Mul, false),
+        "fsub" => (X87Arith::Sub, false),
+        "fsubr" => (X87Arith::Sub, true),
+        "fdiv" => (X87Arith::Div, false),
+        "fdivr" => (X87Arith::Div, true),
         _ => return None,
     };
     match ops {
@@ -432,7 +703,7 @@ fn classify_arith(mnemonic: &str, ops: &[Operand]) -> Option<X87Form> {
         [mem] if !pop => Some(X87Form::Arith {
             op,
             dst: 0,
-            src: ArithSrc::Memory(modellable_memory_width(mem, &X87_FLOAT_WIDTHS)?),
+            src: ArithSrc::Memory(modellable_memory_width(mem, &X87_FLOAT_SHORT_WIDTHS)?),
             reversed,
             pop,
         }),
@@ -477,54 +748,123 @@ fn modellable_memory_width(op: &Operand, widths: &[u16]) -> Option<u16> {
     widths.contains(&width).then_some(width)
 }
 
+/// Read a slot value as a double-extended float.
+fn as_extended(pattern: Expr) -> Expr {
+    Expr::bv_to_fp(pattern, X87_EBITS, X87_SBITS)
+}
+
+/// Write a double-extended float back as a slot value.
+fn from_extended(value: Expr) -> Expr {
+    Expr::fp_to_ieee_bv(value)
+}
+
+/// `ST(dst) := ST(dst) op src` at the extended sort — the one place x87
+/// arithmetic rounds, and it rounds exactly where the hardware does.
+fn extended_arith(op: X87Arith, lhs: Expr, rhs: Expr) -> Expr {
+    let (a, b) = (as_extended(lhs), as_extended(rhs));
+    from_extended(match op {
+        X87Arith::Add => Expr::fadd(a, b, X87_ROUNDING),
+        X87Arith::Sub => Expr::fsub(a, b, X87_ROUNDING),
+        X87Arith::Mul => Expr::fmul(a, b, X87_ROUNDING),
+        X87Arith::Div => Expr::fdiv(a, b, X87_ROUNDING),
+    })
+}
+
+/// The sort's 79-bit pattern of a value held in its 80-bit stored
+/// image, or `free` when the image is one of the double-extended
+/// encodings the SDM calls unsupported.
+///
+/// The stored image makes the significand's leading bit explicit at
+/// [`X87_INTEGER_BIT`]; the sort leaves it implicit, so the bridge drops
+/// it. That is faithful exactly when the bit carries what IEEE would
+/// have inferred — zero when the exponent field is zero, one otherwise.
+/// The other two combinations are the unnormals, pseudo-denormals,
+/// pseudo-infinities and pseudo-NaNs, whose value is *not* the one the
+/// canonical pattern names. Dropping their integer bit would hand the
+/// solver a different definite number, which fabricates rather than
+/// widens, so they resolve to a free symbolic value instead.
+fn extended_from_memory(image: &Expr, free: Expr) -> Expr {
+    let sign = Expr::extract(image.clone(), X87_MEMORY_BITS - 1, X87_MEMORY_BITS - 1);
+    let exponent = Expr::extract(image.clone(), X87_MEMORY_BITS - 2, X87_INTEGER_BIT + 1);
+    let integer = Expr::extract(image.clone(), X87_INTEGER_BIT, X87_INTEGER_BIT);
+    let fraction = Expr::extract(image.clone(), X87_FRACTION_BITS - 1, 0);
+    let zero_exponent = Expr::eq(exponent.clone(), Expr::konst(0, X87_EBITS));
+    let leading = Expr::eq(integer, Expr::konst(1, 1));
+    let canonical = Expr::bool_or(
+        Expr::bool_and(zero_exponent.clone(), Expr::bool_not(leading.clone())),
+        Expr::bool_and(Expr::bool_not(zero_exponent), leading),
+    );
+    Expr::Ite {
+        cond: Box::new(canonical),
+        then_expr: Box::new(Expr::concat(sign, Expr::concat(exponent, fraction))),
+        else_expr: Box::new(free),
+    }
+}
+
+/// The 80-bit stored image of a slot value: the sort's pattern with the
+/// implicit leading significand bit made explicit at
+/// [`X87_INTEGER_BIT`]. Always canonical by construction, which is what
+/// makes the inverse bridge exact for anything this module stored.
+fn extended_to_memory(pattern: &Expr) -> Expr {
+    let sign = Expr::extract(pattern.clone(), X87_SLOT_BITS - 1, X87_SLOT_BITS - 1);
+    let exponent = Expr::extract(pattern.clone(), X87_SLOT_BITS - 2, X87_FRACTION_BITS);
+    let fraction = Expr::extract(pattern.clone(), X87_FRACTION_BITS - 1, 0);
+    let integer = Expr::Ite {
+        cond: Box::new(Expr::eq(exponent.clone(), Expr::konst(0, X87_EBITS))),
+        then_expr: Box::new(Expr::konst(0, 1)),
+        else_expr: Box::new(Expr::konst(1, 1)),
+    };
+    Expr::concat(
+        sign,
+        Expr::concat(exponent, Expr::concat(integer, fraction)),
+    )
+}
+
 /// Convert a value read from memory into a slot value.
 ///
-/// Widening binary32 to binary64 and converting a 16- or 32-bit integer
-/// are both exact; a 64-bit integer rounds under the control word's
-/// mode, which is why the rounding mode is threaded through rather than
-/// asserted away.
+/// Every widening here is exact: binary32 and binary64 both nest inside
+/// the extended sort, and a 64-bit integer fits its 64-bit significand
+/// exactly. The rounding mode is still threaded through because the IR
+/// node carries one, not because any of these conversions round.
+///
+/// The double-extended case is absent: it needs a free symbolic value
+/// for the non-canonical encodings and so lives on [`LiftCtx`].
 fn to_slot(raw: Expr, width: u16, format: MemFormat) -> Option<Expr> {
-    let (ebits, sbits) = fp_sort_bits_checked(X87_SLOT_BITS)?;
     Some(match format {
         MemFormat::Float => {
-            if width == X87_SLOT_BITS {
-                raw
-            } else {
-                let (src_e, src_s) = fp_sort_bits_checked(width)?;
-                Expr::fp_to_ieee_bv(Expr::fp_to_fp(
-                    Expr::bv_to_fp(raw, src_e, src_s),
-                    X87_ROUNDING,
-                    ebits,
-                    sbits,
-                ))
-            }
+            let (src_e, src_s) = fp_sort_bits_checked(width)?;
+            from_extended(Expr::fp_to_fp(
+                Expr::bv_to_fp(raw, src_e, src_s),
+                X87_ROUNDING,
+                X87_EBITS,
+                X87_SBITS,
+            ))
         }
-        MemFormat::Integer => Expr::fp_to_ieee_bv(Expr::sbv_to_fp(raw, X87_ROUNDING, ebits, sbits)),
+        MemFormat::Integer => {
+            from_extended(Expr::sbv_to_fp(raw, X87_ROUNDING, X87_EBITS, X87_SBITS))
+        }
     })
 }
 
 /// Convert a slot value into the form a memory destination stores.
+///
+/// This is where the narrowing rounding happens, once, at the store —
+/// exactly where the hardware performs it.
 fn from_slot(value: Expr, width: u16, format: MemFormat) -> Option<Expr> {
-    let (ebits, sbits) = fp_sort_bits_checked(X87_SLOT_BITS)?;
     Some(match format {
+        MemFormat::Float if width == X87_MEMORY_BITS => extended_to_memory(&value),
         MemFormat::Float => {
-            if width == X87_SLOT_BITS {
-                value
-            } else {
-                let (dst_e, dst_s) = fp_sort_bits_checked(width)?;
-                Expr::fp_to_ieee_bv(Expr::fp_to_fp(
-                    Expr::bv_to_fp(value, ebits, sbits),
-                    X87_ROUNDING,
-                    dst_e,
-                    dst_s,
-                ))
-            }
+            let (dst_e, dst_s) = fp_sort_bits_checked(width)?;
+            from_extended(Expr::fp_to_fp(
+                as_extended(value),
+                X87_ROUNDING,
+                dst_e,
+                dst_s,
+            ))
         }
         // `fist` / `fistp` round per the control word, unlike SSE's
         // `cvtt*` family which truncates by opcode.
-        MemFormat::Integer => {
-            Expr::fp_to_sbv(Expr::bv_to_fp(value, ebits, sbits), X87_ROUNDING, width)
-        }
+        MemFormat::Integer => Expr::fp_to_sbv(as_extended(value), X87_ROUNDING, width),
     })
 }
 
@@ -568,16 +908,30 @@ impl LiftCtx {
                 reversed,
                 pop,
             } => self.x87_arith(insn, op, dst, src, reversed, pop),
+            X87Form::CompareStatus { src, pops } => self.x87_compare_status(insn, src, pops),
+            X87Form::CompareFlags { src, pop } => {
+                self.x87_compare_flags(src, pop);
+                Ok(())
+            }
+            X87Form::StoreStatus => self.x87_store_status(insn),
             X87Form::Exchange(index) => {
                 self.x87.exchange(index);
                 Ok(())
             }
-            X87Form::Unary(op) => self.x87_unary(op),
+            X87Form::Unary(op) => {
+                self.x87_unary(op);
+                Ok(())
+            }
         }
     }
 
     /// Load `operands[0]` through the byte-granular memory model and
     /// convert it to a slot value.
+    ///
+    /// The double-extended case takes the bridge rather than a float
+    /// conversion, and needs a fresh free value for the encodings the
+    /// bridge refuses to name — which is why this is a method and
+    /// [`to_slot`] is not.
     fn x87_memory_read(
         &mut self,
         insn: &Instruction,
@@ -590,6 +944,10 @@ impl LiftCtx {
             .ok_or(X87Error::MalformedOperands)?
             .clone();
         let raw = self.read_operand_lowered(&op, width);
+        if format == MemFormat::Float && width == X87_MEMORY_BITS {
+            let free = self.x87.fresh_input();
+            return Ok(extended_from_memory(&raw, free));
+        }
         to_slot(raw, width, format).ok_or(X87Error::UnmodelledWidth)
     }
 
@@ -617,7 +975,7 @@ impl LiftCtx {
     fn x87_arith(
         &mut self,
         insn: &Instruction,
-        op: FpArithOp,
+        op: X87Arith,
         dst: usize,
         src: ArithSrc,
         reversed: bool,
@@ -629,27 +987,139 @@ impl LiftCtx {
             ArithSrc::Memory(width) => self.x87_memory_read(insn, width, MemFormat::Float)?,
         };
         let (lhs, rhs) = if reversed { (b, a) } else { (a, b) };
-        self.x87
-            .write(dst, fp_lane_result(op, lhs, rhs, X87_SLOT_BITS));
+        self.x87.write(dst, extended_arith(op, lhs, rhs));
         if pop {
             self.x87.drop_top();
         }
         Ok(())
     }
 
-    fn x87_unary(&mut self, op: UnaryOp) -> Result<(), X87Error> {
+    /// The three predicates every x87 compare is built from, over
+    /// `ST(0)` and a source, in that order.
+    ///
+    /// Identical to the SSE scalar compare's, and for the same reason:
+    /// the comparison itself is IEEE, and what differs between the two
+    /// instruction families is only where the answer is written.
+    fn x87_compare_predicates(
+        &mut self,
+        insn: &Instruction,
+        src: ArithSrc,
+    ) -> Result<Compare, X87Error> {
+        let a = as_extended(self.x87.read(0));
+        let b = as_extended(match src {
+            ArithSrc::Slot(index) => self.x87.read(index),
+            ArithSrc::Memory(width) => self.x87_memory_read(insn, width, MemFormat::Float)?,
+        });
+        Ok(Compare {
+            unordered: Expr::bool_or(Expr::fisnan(a.clone()), Expr::fisnan(b.clone())),
+            equal: Expr::feq(a.clone(), b.clone()),
+            less: Expr::flt(a, b),
+        })
+    }
+
+    /// `fcom` / `fcomp` / `fcompp` and their unordered forms — the
+    /// outcome goes into the status word's condition codes.
+    ///
+    /// SDM Vol. 2, "FCOM": greater clears C3/C2/C0, less sets C0 alone,
+    /// equal sets C3 alone, and unordered sets all three. C1 stays zero:
+    /// after a compare it signals a stack fault, and an empty stack is
+    /// already a decline here.
+    fn x87_compare_status(
+        &mut self,
+        insn: &Instruction,
+        src: ArithSrc,
+        pops: u8,
+    ) -> Result<(), X87Error> {
+        let cmp = self.x87_compare_predicates(insn, src)?;
+        let c0 = Expr::bool_or(cmp.unordered.clone(), cmp.less);
+        let c2 = cmp.unordered.clone();
+        let c3 = Expr::bool_or(cmp.unordered, cmp.equal);
+        let status = self.x87_status_word(c0, c2, c3);
+        self.assign(Var::new(X87_STATUS_REGISTER, X87_STATUS_BITS), status);
+        for _ in 0..pops {
+            self.x87.drop_top();
+        }
+        Ok(())
+    }
+
+    /// Assemble the status word around the three condition codes a
+    /// compare defines.
+    ///
+    /// Everything else in the word is left *free*: the exception flags
+    /// are sticky state this model does not carry, and TOP is the stack
+    /// pointer, which the lift-time stack deliberately does not number.
+    /// Writing zeros there would be a definite wrong answer for any
+    /// program that read them — and the idioms that matter
+    /// (`test ah, 0x41`, `sahf`) mask or ignore every free bit.
+    fn x87_status_word(&mut self, c0: Expr, c2: Expr, c3: Expr) -> Expr {
+        let free = self.x87.fresh_status();
+        let bit = |from: &Expr, index: u16| Expr::extract(from.clone(), index, index);
+        let span = |from: &Expr, hi: u16, lo: u16| Expr::extract(from.clone(), hi, lo);
+        // Assembled most-significant first: B, C3, TOP, C2, C1, C0, and
+        // the exception-flag byte.
+        Expr::concat(
+            bit(&free, X87_STATUS_BITS - 1),
+            Expr::concat(
+                c3,
+                Expr::concat(
+                    span(&free, X87_C3_BIT - 1, X87_C2_BIT + 1),
+                    Expr::concat(
+                        c2,
+                        Expr::concat(
+                            Expr::konst(0, 1),
+                            Expr::concat(c0, span(&free, X87_C0_BIT - 1, 0)),
+                        ),
+                    ),
+                ),
+            ),
+        )
+    }
+
+    /// `fcomi` / `fucomi` and their popping forms — the outcome goes
+    /// straight into EFLAGS, in the same encoding the SSE scalar
+    /// compares use, which is what lets the existing `jcc` lowering read
+    /// it unchanged. OF and SF are cleared per the SDM.
+    fn x87_compare_flags(&mut self, src: usize, pop: bool) {
+        let a = as_extended(self.x87.read(0));
+        let b = as_extended(self.x87.read(src));
+        let unordered = Expr::bool_or(Expr::fisnan(a.clone()), Expr::fisnan(b.clone()));
+        self.set_flag("PF", unordered.clone());
+        self.set_flag(
+            "ZF",
+            Expr::bool_or(unordered.clone(), Expr::feq(a.clone(), b.clone())),
+        );
+        self.set_flag("CF", Expr::bool_or(unordered, Expr::flt(a, b)));
+        self.set_flag("OF", Expr::konst(0, 1));
+        self.set_flag("SF", Expr::konst(0, 1));
+        if pop {
+            self.x87.drop_top();
+        }
+    }
+
+    /// `fnstsw` / `fstsw` — copy the status word into AX or a 16-bit
+    /// memory destination.
+    fn x87_store_status(&mut self, insn: &Instruction) -> Result<(), X87Error> {
+        let op = insn.operands.first().ok_or(X87Error::MalformedOperands)?;
+        let status = Expr::var(X87_STATUS_REGISTER, X87_STATUS_BITS);
+        if self.write_dst(op, status, X87_STATUS_BITS) {
+            Ok(())
+        } else {
+            Err(X87Error::UnwritableDestination)
+        }
+    }
+
+    /// The in-place unaries. Total rather than fallible: `fabs` and
+    /// `fchs` are bit manipulations and `fsqrt` runs at the sort the
+    /// slot already holds, so none of them can present an unmodelled
+    /// width.
+    fn x87_unary(&mut self, op: UnaryOp) {
         let top = self.x87.read(0);
         let result = match op {
             UnaryOp::Abs => Expr::bv_and(top, Expr::konst(X87_MAGNITUDE_MASK, X87_SLOT_BITS)),
             UnaryOp::Chs => Expr::bv_xor(top, Expr::konst(X87_SIGN_BIT, X87_SLOT_BITS)),
-            UnaryOp::Sqrt => {
-                let (ebits, sbits) =
-                    fp_sort_bits_checked(X87_SLOT_BITS).ok_or(X87Error::UnmodelledWidth)?;
-                Expr::fp_to_ieee_bv(Expr::fsqrt(Expr::bv_to_fp(top, ebits, sbits), X87_ROUNDING))
-            }
+            UnaryOp::Sqrt => from_extended(Expr::fsqrt(as_extended(top), X87_ROUNDING)),
         };
         self.x87.write(0, result);
-        Ok(())
     }
 
     /// Record an x87 instruction the lifter could not lower, and forget

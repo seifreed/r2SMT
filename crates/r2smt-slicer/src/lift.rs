@@ -46,7 +46,7 @@ pub(crate) use aarch32::{VfpOp, neon_packed_op, vfp_scalar};
 use merge::lower_merge;
 pub(crate) use x86::{is_fp_compare_mnemonic, sse_scalar_move_lane};
 use x87::X87Stack;
-pub(crate) use x87::{X87_STACK_REGISTER, is_modelled_x87};
+pub(crate) use x87::{X87Effect, is_modelled_x87, x87_effect};
 
 /// IR representation of a [`Slice`] plus the branch's symbolic
 /// condition.
@@ -290,18 +290,19 @@ pub(crate) fn vector_shape(insn: &Instruction, arch: Arch) -> VectorShape {
     }
 }
 
-/// Whether `insn` reprograms the FPU control register that
+/// Whether `insn` reprograms an FPU control register that
 /// [`pins_rounding_mode`] assumes holds its architectural default.
 ///
-/// x86 names the write in the mnemonic (`ldmxcsr`, and the state
-/// restores that reload MXCSR wholesale). ARM does not: `msr` and `vmsr`
-/// write *any* system register, and only the operand says which, so the
-/// mnemonic alone would either miss the FPCR write or condemn every
-/// system-register write in the function.
+/// x86 names the write in the mnemonic — `ldmxcsr` for the SSE control
+/// word, `fldcw` for the x87 one, and the state restores that reload
+/// either wholesale. ARM does not: `msr` and `vmsr` write *any* system
+/// register, and only the operand says which, so the mnemonic alone
+/// would either miss the FPCR write or condemn every system-register
+/// write in the function.
 #[must_use]
 pub(crate) fn writes_rounding_control(insn: &Instruction, arch: Arch) -> bool {
     match arch {
-        Arch::X86 | Arch::X86_64 => x86::writes_mxcsr(&insn.mnemonic),
+        Arch::X86 | Arch::X86_64 => x86::writes_fp_control(&insn.mnemonic),
         Arch::Aarch64 | Arch::Arm => {
             let mnem = insn.mnemonic.trim().to_ascii_lowercase();
             if !matches!(mnem.as_str(), "msr" | "vmsr") {
@@ -316,17 +317,21 @@ pub(crate) fn writes_rounding_control(insn: &Instruction, arch: Arch) -> bool {
     }
 }
 
-/// Whether lifting `mnemonic` pins the architectural default rounding
-/// mode, and so depends on nothing having reprogrammed it.
+/// Whether lifting `insn` pins a floating-point control field to its
+/// architectural default, and so depends on nothing having reprogrammed
+/// it. On x87 that is the rounding mode *and* the precision control,
+/// which is why the whole instruction is needed: `fstp` pins only when
+/// its operand names a format narrower than the stack slot.
+///
 /// Deliberately narrow on every ISA: only the operations that actually
 /// round are listed. `fmax` / `fmin` select an operand, `fcvtzs` /
 /// `fcvtzu` carry round-toward-zero in the opcode, and `fmov` / `fabs` /
 /// `fneg` / `fcmp` move or inspect a bit pattern.
 #[must_use]
-pub(crate) fn pins_rounding_mode(mnemonic: &str, arch: Arch) -> bool {
-    let lower = mnemonic.trim().to_ascii_lowercase();
+pub(crate) fn pins_rounding_mode(insn: &Instruction, arch: Arch) -> bool {
+    let lower = insn.mnemonic.trim().to_ascii_lowercase();
     match arch {
-        Arch::X86 | Arch::X86_64 => x86::pins_rounding_mode(mnemonic),
+        Arch::X86 | Arch::X86_64 => x86::pins_rounding_mode(insn),
         // Same mnemonics scalar and packed, so the arrangement never
         // enters this question.
         Arch::Aarch64 => matches!(

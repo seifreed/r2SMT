@@ -393,19 +393,23 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
         _ if crate::lift::sse_scalar_move_lane(insn).is_some() => {
             simd_effect(insn, SimdShape::Bitwise)
         }
+        "sahf" => sahf_effect(),
         m if m.starts_with('j') => jcc_effect(insn),
         m if m.starts_with("set") => setcc_effect(insn),
         m if m.starts_with("cmov") => cmovcc_effect(insn),
-        // Recognised through the lifter's own predicate so the two
-        // cannot drift: an x87 shape the lifter would decline must stay
-        // `Other` here, or the slicer keeps an instruction whose stack
-        // effect the lifter then drops.
-        _ if crate::lift::is_modelled_x87(insn) => x87_effect(insn),
-        _ => other_effect(insn),
+        _ => match crate::lift::x87_effect(insn) {
+            // Recognised through the lifter's own classifier so the two
+            // cannot drift: an x87 shape the lifter would decline must
+            // stay `Other` here, or the slicer keeps an instruction
+            // whose stack effect the lifter then drops.
+            Some(shape) => x87_effect(insn, &shape),
+            None => other_effect(insn),
+        },
     }
 }
 
-/// Every x87 instruction reads and writes the whole register stack.
+/// Almost every x87 instruction reads and writes the whole register
+/// stack.
 ///
 /// TOP rotates under almost every one of them, so an instruction that
 /// merely reads `ST(0)` still renames every other slot; and the flat
@@ -417,8 +421,18 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
 /// underneath it. Slot-level precision is recovered at lift time by the
 /// slice-scoped stack in `lift/x87.rs`, which sees the chain in
 /// execution order and so needs no numbering at all.
-fn x87_effect(insn: &Instruction) -> InstructionEffect {
-    let mut uses = vec![crate::lift::X87_STACK_REGISTER];
+///
+/// The exceptions come from `lift/x87.rs` rather than being decided
+/// here, so the footprint and the lowering cannot drift: the `fcom`
+/// family also defines the status word `fsw`, the `fcomi` family writes
+/// EFLAGS in its place, and `fnstsw` reads `fsw` into a register
+/// without touching the data registers at all.
+fn x87_effect(insn: &Instruction, shape: &crate::lift::X87Effect) -> InstructionEffect {
+    let mut defs = shape.defs.clone();
+    if let Some(reg) = shape.register_def {
+        defs.push(reg);
+    }
+    let mut uses = shape.uses.clone();
     for op in &insn.operands {
         for r in registers_in_operand(op, Arch::X86_64) {
             if !uses.contains(&r) {
@@ -428,13 +442,30 @@ fn x87_effect(insn: &Instruction) -> InstructionEffect {
     }
     InstructionEffect {
         kind: InstructionKind::X87,
-        defs: vec![crate::lift::X87_STACK_REGISTER],
+        defs,
         uses,
-        // The x87 status word is a separate register file the lifter
-        // does not model; the mnemonics that write it (`fcom`, `fcomi`,
-        // `fnstsw`) are not in the modelled set and stay `Other`.
-        defines_flags: false,
+        defines_flags: shape.defines_flags,
         has_memory_access: any_memory_operand(&insn.operands),
+        is_call: false,
+        reads_flags: false,
+    }
+}
+
+/// `sahf` — load SF, ZF, AF, PF and CF from AH.
+///
+/// An integer instruction, listed here because it is the second half of
+/// the x87 compare idiom: `fnstsw ax` puts the status word's condition
+/// codes at exactly the AH positions this transfers. OF is
+/// deliberately untouched
+/// — `sahf` does not write it, so whatever defined it upstream still
+/// holds.
+fn sahf_effect() -> InstructionEffect {
+    InstructionEffect {
+        kind: InstructionKind::Sahf,
+        defs: Vec::new(),
+        uses: vec!["rax"],
+        defines_flags: true,
+        has_memory_access: false,
         is_call: false,
         reads_flags: false,
     }
