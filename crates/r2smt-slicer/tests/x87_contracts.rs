@@ -18,10 +18,21 @@ const FUNCTION_ADDRESS: u64 = 0x40_1000;
 /// Every fixture instruction is spaced by this many bytes; the exact
 /// encoding length is irrelevant to the slicer.
 const STEP: u8 = 4;
+/// IEEE binary32 `(ebits, sbits)`.
+const SINGLE: (u16, u16) = (8, 24);
 /// IEEE binary64 `(ebits, sbits)`.
 const DOUBLE: (u16, u16) = (11, 53);
-/// IEEE binary64 bit pattern of `+1.0`.
-const ONE_BITS: u128 = 0x3ff0_0000_0000_0000;
+/// x87 double-extended `(ebits, sbits)` — the sort the stack holds.
+const EXTENDED: (u16, u16) = (15, 64);
+/// Width of the extended sort's IEEE pattern, and so of a stack slot.
+const SLOT_BITS: u16 = EXTENDED.0 + EXTENDED.1;
+/// Width of the *stored* double-extended image, one bit wider because
+/// x87 makes the leading significand bit explicit.
+const MEMORY_BITS: u16 = SLOT_BITS + 1;
+/// `+1.0` in the extended sort's 79-bit pattern.
+const ONE_BITS: u128 = 0x1fff_8000_0000_0000_0000;
+/// Prefix of the free symbolic values a stack underflow mints.
+const FREE_INPUT_PREFIX: &str = "x87_in_";
 
 fn op(raw: &str, kind: OperandKind) -> Operand {
     Operand {
@@ -100,19 +111,47 @@ fn slice_of(program: &Program) -> Slice {
     slice_branch(candidate, function, &SliceLimits::default(), program.arch)
 }
 
-/// The value of the first `StoreMem` in a lifted fixture.
-fn first_stored_value(statements: &[IrStmt]) -> Expr {
+/// The first `StoreMem` in a lifted fixture, as `(value, width)`.
+fn first_store(statements: &[IrStmt]) -> (Expr, u16) {
     statements
         .iter()
         .find_map(|stmt| match stmt {
-            IrStmt::StoreMem { value, .. } => Some(value.clone()),
+            IrStmt::StoreMem { value, bits, .. } => Some((value.clone(), *bits)),
             _ => None,
         })
         .expect("fixture stores through x87")
 }
 
-fn as_double(bits: Expr) -> Expr {
-    Expr::bv_to_fp(bits, DOUBLE.0, DOUBLE.1)
+fn first_stored_value(statements: &[IrStmt]) -> Expr {
+    first_store(statements).0
+}
+
+/// Read a slot pattern as the double-extended float it denotes.
+fn as_extended(pattern: Expr) -> Expr {
+    Expr::bv_to_fp(pattern, EXTENDED.0, EXTENDED.1)
+}
+
+/// What `fld` of a `sort`-wide memory operand puts on the stack: an
+/// exact widening into the extended sort, since both interchange
+/// formats nest inside it.
+fn widened(bits: Expr, sort: (u16, u16)) -> Expr {
+    Expr::fp_to_ieee_bv(Expr::fp_to_fp(
+        Expr::bv_to_fp(bits, sort.0, sort.1),
+        RoundingMode::NearestTiesEven,
+        EXTENDED.0,
+        EXTENDED.1,
+    ))
+}
+
+/// What `fstp` to a `sort`-wide memory operand writes: the single
+/// rounding, performed at the store exactly as the hardware does.
+fn narrowed(slot: Expr, sort: (u16, u16)) -> Expr {
+    Expr::fp_to_ieee_bv(Expr::fp_to_fp(
+        as_extended(slot),
+        RoundingMode::NearestTiesEven,
+        sort.0,
+        sort.1,
+    ))
 }
 
 // ---------------------------------------------------------------
@@ -165,12 +204,21 @@ fn test_x87_load_defines_and_uses_the_stack() {
 }
 
 #[test]
-fn test_x87_extended_precision_operand_stays_unmodelled() {
-    // 80-bit `tbyte` has no renderable IEEE sort, so the effect table
-    // must fail closed to `Other` and let the slicer truncate rather
-    // than let the lifter read ten bytes as eight.
+fn test_x87_extended_precision_load_is_modelled() {
     let effect = analyze(
         &insn(FUNCTION_ADDRESS, "fld", vec![mem("tbyte [rbp - 0x10]")]),
+        Arch::X86_64,
+    );
+    assert_eq!(effect.kind, InstructionKind::X87);
+}
+
+#[test]
+fn test_x87_non_popping_store_has_no_extended_encoding() {
+    // The SDM gives `m80fp` to `fld` and `fstp` alone: there is no way
+    // to store the extended format without popping, so `fst tbyte` is
+    // not an instruction and must not be claimed.
+    let effect = analyze(
+        &insn(FUNCTION_ADDRESS, "fst", vec![mem("tbyte [rbp - 0x10]")]),
         Arch::X86_64,
     );
     assert_eq!(effect.kind, InstructionKind::Other);
@@ -228,13 +276,18 @@ fn test_x87_chain_lifts_to_a_single_store_of_the_sum() {
     );
     let lifted = lift_slice(&slice_of(&program), Arch::X86_64);
     // `fld` at -0x10 lands in ST(1) once the second push happens, so
-    // `faddp st(1), st(0)` computes first + second in that order.
-    let expected = Expr::fp_to_ieee_bv(Expr::fadd(
-        as_double(Expr::var("stk_rbp_-16", 64)),
-        as_double(Expr::var("stk_rbp_-24", 64)),
+    // `faddp st(1), st(0)` computes first + second in that order. Both
+    // loads widen exactly into the extended sort, the add rounds there,
+    // and the store performs the one narrowing rounding.
+    let sum = Expr::fp_to_ieee_bv(Expr::fadd(
+        as_extended(widened(Expr::var("stk_rbp_-16", 64), DOUBLE)),
+        as_extended(widened(Expr::var("stk_rbp_-24", 64), DOUBLE)),
         RoundingMode::NearestTiesEven,
     ));
-    assert_eq!(first_stored_value(&lifted.statements), expected);
+    assert_eq!(
+        first_stored_value(&lifted.statements),
+        narrowed(sum, DOUBLE)
+    );
 }
 
 #[test]
@@ -252,16 +305,22 @@ fn test_x87_reverse_subtract_keeps_intel_operand_order() {
         mem("qword [rbp - 0x20]"),
     );
     let lifted = lift_slice(&slice_of(&program), Arch::X86_64);
-    let expected = Expr::fp_to_ieee_bv(Expr::fsub(
-        as_double(Expr::var("stk_rbp_-16", 64)),
-        as_double(Expr::var("stk_rbp_-24", 64)),
+    let difference = Expr::fp_to_ieee_bv(Expr::fsub(
+        as_extended(widened(Expr::var("stk_rbp_-16", 64), DOUBLE)),
+        as_extended(widened(Expr::var("stk_rbp_-24", 64), DOUBLE)),
         RoundingMode::NearestTiesEven,
     ));
-    assert_eq!(first_stored_value(&lifted.statements), expected);
+    assert_eq!(
+        first_stored_value(&lifted.statements),
+        narrowed(difference, DOUBLE)
+    );
 }
 
 #[test]
-fn test_x87_single_precision_load_widens_to_double() {
+fn test_x87_load_widens_exactly_and_the_store_rounds_once() {
+    // The whole point of holding slots at the extended sort: the load
+    // is an exact widening and the *only* rounding in the chain happens
+    // at the store, which is where the hardware performs it.
     let program = program_with_tail(
         vec![
             ("fld", vec![mem("dword [rbp - 0x8]")]),
@@ -270,13 +329,46 @@ fn test_x87_single_precision_load_widens_to_double() {
         mem("qword [rbp - 0x20]"),
     );
     let lifted = lift_slice(&slice_of(&program), Arch::X86_64);
-    let expected = Expr::fp_to_ieee_bv(Expr::fp_to_fp(
-        Expr::bv_to_fp(Expr::var("stk_rbp_-8", 32), 8, 24),
-        RoundingMode::NearestTiesEven,
-        DOUBLE.0,
-        DOUBLE.1,
-    ));
-    assert_eq!(first_stored_value(&lifted.statements), expected);
+    let loaded = widened(Expr::var("stk_rbp_-8", 32), SINGLE);
+    assert_eq!(
+        first_stored_value(&lifted.statements),
+        narrowed(loaded, DOUBLE)
+    );
+}
+
+#[test]
+fn test_x87_extended_store_writes_the_eighty_bit_image() {
+    // The sort's pattern is 79 bits; the stored image is 80, because
+    // x87 makes the leading significand bit explicit. The store must
+    // widen across that bridge rather than write the sort's pattern.
+    let program = program_with_tail(
+        vec![("fld1", vec![]), ("fstp", vec![mem("tbyte [rbp - 0x20]")])],
+        mem("qword [rbp - 0x20]"),
+    );
+    let lifted = lift_slice(&slice_of(&program), Arch::X86_64);
+    assert_eq!(first_store(&lifted.statements).1, MEMORY_BITS);
+}
+
+#[test]
+fn test_x87_extended_load_declines_non_canonical_encodings() {
+    // Stripping the explicit integer bit is only faithful when it
+    // carries what IEEE would have inferred. The unsupported
+    // double-extended encodings name a different number, so they must
+    // resolve to a free value rather than to their canonical
+    // counterpart — otherwise the solver gets a definite wrong answer.
+    let program = program_with_tail(
+        vec![
+            ("fld", vec![mem("tbyte [rbp - 0x10]")]),
+            ("fstp", vec![mem("qword [rbp - 0x20]")]),
+        ],
+        mem("qword [rbp - 0x20]"),
+    );
+    let lifted = lift_slice(&slice_of(&program), Arch::X86_64);
+    let rendered = first_stored_value(&lifted.statements).to_string();
+    assert!(
+        rendered.contains(FREE_INPUT_PREFIX),
+        "non-canonical encodings must fall to a free value, got: {rendered}"
+    );
 }
 
 #[test]
@@ -308,7 +400,7 @@ fn test_fld1_is_not_lifted_through_esil() {
     }
     assert_eq!(
         first_stored_value(&lifted.statements),
-        Expr::konst(ONE_BITS, 64)
+        narrowed(Expr::konst(ONE_BITS, SLOT_BITS), DOUBLE)
     );
 }
 
@@ -324,7 +416,7 @@ fn test_x87_stack_underflow_becomes_a_free_input() {
     let lifted = lift_slice(&slice_of(&program), Arch::X86_64);
     assert_eq!(
         first_stored_value(&lifted.statements),
-        Expr::var("x87_in_0", 64)
+        narrowed(Expr::var("x87_in_0", SLOT_BITS), DOUBLE)
     );
 }
 
@@ -345,10 +437,24 @@ fn test_x87_stack_overflow_declines_and_havocs() {
         )),
         "the overflowing push must decline"
     );
-    let stored = first_stored_value(&lifted.statements);
-    assert_ne!(stored, Expr::konst(ONE_BITS, 64));
+    let rendered = first_stored_value(&lifted.statements).to_string();
     assert!(
-        matches!(&stored, Expr::Var(v) if v.name.starts_with("x87_in_")),
-        "post-havoc reads must be free inputs, got {stored}"
+        rendered.contains(FREE_INPUT_PREFIX),
+        "post-havoc reads must be free inputs, got {rendered}"
+    );
+}
+
+#[test]
+fn test_x87_stack_at_capacity_still_resolves_precisely() {
+    // Teeth for the test above: eight pushes exactly fill the data
+    // registers, so nothing declines and the store resolves to the
+    // pushed constant with no free value anywhere in it.
+    let mut body: Vec<(&str, Vec<Operand>)> = (0..8).map(|_| ("fld1", Vec::new())).collect();
+    body.push(("fstp", vec![mem("qword [rbp - 0x20]")]));
+    let program = program_with_tail(body, mem("qword [rbp - 0x20]"));
+    let lifted = lift_slice(&slice_of(&program), Arch::X86_64);
+    assert_eq!(
+        first_stored_value(&lifted.statements),
+        narrowed(Expr::konst(ONE_BITS, SLOT_BITS), DOUBLE)
     );
 }

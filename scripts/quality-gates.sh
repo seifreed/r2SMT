@@ -68,6 +68,11 @@ gate_solver_contracts() {
   # solver) and the inversion's anti-fabrication contract (a NaN
   # reinterpret must leave both polarities satisfiable — the constant
   # placeholder it replaced fabricated an always-false verdict there).
+  # The x87 filters pin the double-extended sort on all three backends:
+  # the text pair must decline it (x87 is Z3-only), Z3 must resolve its
+  # value and its 80-bit stored image, and a free extended load must
+  # stay undecided rather than resolve a non-canonical encoding to its
+  # canonical counterpart.
   cargo test -p r2smt-smt --lib -- \
     combine_table_contract_is_exhaustive_and_sound \
     truncated_slice_is_reported_unsound \
@@ -75,6 +80,11 @@ gate_solver_contracts() {
     slice_with_unknown_is_declined_without_spawning_bitwuzla \
     slice_with_unrenderable_float_is_declined_without_spawning_cvc5 \
     slice_with_unrenderable_float_is_declined_without_spawning_bitwuzla \
+    x87_extended_sort_is_declined_without_spawning_cvc5 \
+    x87_extended_sort_is_declined_without_spawning_bitwuzla \
+    x87_extended_sort_stores_the_binary64_image_of_one \
+    x87_extended_sort_stores_the_explicit_integer_bit \
+    x87_extended_sort_keeps_a_free_extended_load_undecided \
     smtlib_fp_inversion_on_nan_keeps_both_polarities_satisfiable \
     smtlib_ssa_renamed_slice_solves_to_the_same_verdict_as_the_z3_backend
 }

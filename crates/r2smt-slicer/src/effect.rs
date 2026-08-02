@@ -230,9 +230,10 @@ pub fn has_unmodellable_memory(operands: &[Operand], arch: Arch) -> bool {
 /// size keyword (e.g. `[obj.dword_table]`) must not be read as sized.
 ///
 /// `tbyte` is the x87 double-extended access (`fld tbyte [ebp - 0xc]`).
-/// Reporting its true 80 bits matters more than being able to model
-/// them: without the entry the operand looks unsized, the caller falls
-/// back to pointer width, and an 80-bit value is read as eight bytes.
+/// Its 80 bits are load-bearing twice over: without the entry the
+/// operand looks unsized and the caller falls back to pointer width,
+/// reading the value as eight bytes; and the x87 lifter selects the
+/// 79-to-80 bit bridge on exactly this width.
 #[must_use]
 pub fn memory_operand_width(raw: &str) -> Option<u16> {
     const WIDTHS: [(&str, u16); 8] = [

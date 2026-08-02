@@ -407,4 +407,57 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn x87_extended_sort_is_declined_without_spawning_bitwuzla() {
+        // x87's double-extended sort `FloatingPoint(15, 64)` is outside
+        // `is_renderable_fp_sort`, so `emit_query_strict` refuses it and
+        // the verdict path must decline *before* spawning — which is
+        // what makes x87 a Z3-only capability, and also keeps this test
+        // deterministic on a host without `bitwuzla`.
+        use r2smt_common::{Address, Arch};
+        use r2smt_ir::expr::{RoundingMode, Var};
+        use r2smt_slicer::{BranchCandidate, BranchCondition, BranchKind, SliceStatus};
+
+        let at = Address::new(0x40_1000);
+        // The narrowing an `fstp qword` performs on a stack slot.
+        let narrowed = Expr::fp_to_ieee_bv(Expr::fp_to_fp(
+            Expr::bv_to_fp(Expr::var("st_slot", 79), 15, 64),
+            RoundingMode::NearestTiesEven,
+            11,
+            53,
+        ));
+        let slice = SsaLiftedSlice {
+            branch: BranchCandidate {
+                address: at,
+                function: at,
+                block: at,
+                kind: BranchKind::Jcc,
+                mnemonic: "je".into(),
+                condition: BranchCondition::Equal,
+                formula: "x87".into(),
+                taken_target: None,
+                fallthrough_target: None,
+                compare_register: None,
+                bit_index: None,
+                upstream_resolved: None,
+                operand_raws: Vec::new(),
+                is_thumb: false,
+            },
+            statements: vec![IrStmt::Assign {
+                dst: Var::new("t0", 1),
+                src: Expr::eq(narrowed, Expr::konst(0x3ff0_0000_0000_0000, 64)),
+            }],
+            condition: Expr::var("t0", 1),
+            status: SliceStatus::Complete,
+            treat_truncation_as_inputs: false,
+            inputs: vec![Var::new("st_slot", 79)],
+            defs: Vec::new(),
+            arch: Arch::X86_64,
+        };
+        assert_eq!(
+            solve_branch_bitwuzla(&slice, SolveOptions::default()),
+            Ok(SmtResult::Unsound)
+        );
+    }
 }
