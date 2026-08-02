@@ -1205,6 +1205,161 @@ fn movsd_string_form_is_not_claimed_by_the_scalar_move_handler() {
     );
 }
 
+// ---------------------------------------------------------------
+// Sub-lane vector views.
+//
+// x86 and AArch64 put every vector view at bit 0 of its parent, so
+// nothing there can catch a helper that ignores `layout.lo`. AArch32
+// can: `d1` is the *upper* half of `v0` and `s3` its top quarter. These
+// exercise the shared SIMD helpers directly, ahead of any AArch32
+// vector handler, because a helper that indexed from bit 0 would read
+// and write the wrong part of the register without failing loudly.
+// ---------------------------------------------------------------
+
+#[test]
+fn aarch32_upper_half_register_reads_the_upper_half_of_its_parent() {
+    // `d1` is bits [127:64] of v0, not [63:0].
+    let mut ctx = LiftCtx::new(Arch::Arm);
+    let value = ctx
+        .simd_operand_value(&op("d1", OperandKind::Register), 64)
+        .expect("d1 resolves to a vector view");
+    assert_eq!(value, Expr::extract(Expr::var("v0", 128), 127, 64));
+}
+
+#[test]
+fn aarch32_top_quarter_register_reads_the_top_quarter_of_its_parent() {
+    // `s3` is bits [127:96] of v0.
+    let mut ctx = LiftCtx::new(Arch::Arm);
+    let value = ctx
+        .simd_operand_value(&op("s3", OperandKind::Register), 32)
+        .expect("s3 resolves to a vector view");
+    assert_eq!(value, Expr::extract(Expr::var("v0", 128), 127, 96));
+}
+
+#[test]
+fn aarch32_upper_half_write_preserves_the_lower_half() {
+    // Writing `d1` must leave `d0` — the bits *below* it — standing.
+    // Only a sub-lane view can catch a splice that assumes offset zero.
+    let mut ctx = LiftCtx::new(Arch::Arm);
+    assert!(ctx.write_simd_lane(&op("d1", OperandKind::Register), Expr::konst(0, 64), 64));
+    let stmts = ctx.stmts;
+    assert_eq!(
+        *simd_parent_src(&stmts, "v0"),
+        Expr::concat(
+            Expr::konst(0, 64),
+            Expr::extract(Expr::var("v0", 128), 63, 0)
+        )
+    );
+}
+
+#[test]
+fn aarch32_top_quarter_write_preserves_the_bits_on_both_sides() {
+    // `s3` has neighbours above nothing and below plenty; the splice
+    // has to reconstruct the parent from both directions.
+    let mut ctx = LiftCtx::new(Arch::Arm);
+    assert!(ctx.write_simd_lane(&op("s3", OperandKind::Register), Expr::konst(0, 32), 32));
+    let stmts = ctx.stmts;
+    assert_eq!(
+        *simd_parent_src(&stmts, "v0"),
+        Expr::concat(
+            Expr::konst(0, 32),
+            Expr::extract(Expr::var("v0", 128), 95, 0)
+        )
+    );
+}
+
+#[test]
+fn aarch32_middle_register_write_preserves_bits_above_and_below() {
+    // `s1` sits at [63:32] of v0 — bits on both sides must survive.
+    let mut ctx = LiftCtx::new(Arch::Arm);
+    assert!(ctx.write_simd_lane(&op("s1", OperandKind::Register), Expr::konst(0, 32), 32));
+    let stmts = ctx.stmts;
+    assert_eq!(
+        *simd_parent_src(&stmts, "v0"),
+        Expr::concat(
+            Expr::concat(
+                Expr::extract(Expr::var("v0", 128), 127, 64),
+                Expr::konst(0, 32)
+            ),
+            Expr::extract(Expr::var("v0", 128), 31, 0)
+        )
+    );
+}
+
+#[test]
+fn aarch32_gpr_alias_is_not_mistaken_for_a_vector_register() {
+    // `v1` on AArch32 is the AAPCS alias for the general-purpose `r4`,
+    // not a vector register. The SIMD helpers must decline it, or every
+    // ARM callee-saved register would masquerade as a vector.
+    let ctx = LiftCtx::new(Arch::Arm);
+    assert!(!ctx.is_simd_register(&op("v1", OperandKind::Register)));
+}
+
+#[test]
+fn arm_fpcr_write_is_recognised_through_its_operand() {
+    // `msr` writes any system register; only the operand says which.
+    // Matching on the mnemonic alone would either miss the FPCR write
+    // or condemn every system-register write in the function.
+    let write_fpcr = insn(
+        0x1000,
+        4,
+        "msr",
+        vec![
+            op("fpcr", OperandKind::Register),
+            op("x0", OperandKind::Register),
+        ],
+    );
+    assert!(crate::lift::writes_rounding_control(
+        &write_fpcr,
+        Arch::Aarch64
+    ));
+}
+
+#[test]
+fn arm_unrelated_system_register_write_is_not_a_rounding_control_write() {
+    let write_tpidr = insn(
+        0x1000,
+        4,
+        "msr",
+        vec![
+            op("tpidr_el0", OperandKind::Register),
+            op("x0", OperandKind::Register),
+        ],
+    );
+    assert!(!crate::lift::writes_rounding_control(
+        &write_tpidr,
+        Arch::Aarch64
+    ));
+}
+
+#[test]
+fn aarch32_fpscr_write_is_recognised() {
+    let write_fpscr = insn(
+        0x1000,
+        4,
+        "vmsr",
+        vec![
+            op("fpscr", OperandKind::Register),
+            op("r0", OperandKind::Register),
+        ],
+    );
+    assert!(crate::lift::writes_rounding_control(
+        &write_fpscr,
+        Arch::Arm
+    ));
+}
+
+/// The source of the assignment to a 128-bit vector parent.
+fn simd_parent_src<'a>(stmts: &'a [IrStmt], parent: &str) -> &'a Expr {
+    stmts
+        .iter()
+        .find_map(|s| match s {
+            IrStmt::Assign { dst, src } if dst.name == parent && dst.bits == 128 => Some(src),
+            _ => None,
+        })
+        .expect("expected a 128-bit vector parent assignment")
+}
+
 /// The `LoadMem` widths a lifting produced, in order.
 fn load_widths(stmts: &[IrStmt]) -> Vec<u16> {
     stmts
@@ -2034,12 +2189,15 @@ fn rounding_insensitive_floating_point_survives_an_mxcsr_write() {
         "movsd",
     ] {
         assert!(
-            !crate::lift::pins_rounding_mode(m),
+            !crate::lift::pins_rounding_mode(m, Arch::X86_64),
             "{m}: wrongly treated as rounding-mode dependent"
         );
     }
     for m in ["addss", "mulpd", "sqrtss", "cvtsi2ss", "cvtss2sd"] {
-        assert!(crate::lift::pins_rounding_mode(m), "{m}: should be guarded");
+        assert!(
+            crate::lift::pins_rounding_mode(m, Arch::X86_64),
+            "{m}: should be guarded"
+        );
     }
 }
 

@@ -120,6 +120,40 @@ pub fn register_layout(name: &str, arch: Arch) -> Option<RegisterLayout> {
     }
 }
 
+/// Full architectural width of a vector register parent under `arch`.
+///
+/// Every SIMD view is a slice of one synthetic parent held at this
+/// width, so a 128-bit and a 256-bit view of the same register share a
+/// data-flow node instead of colliding as two different-width variables
+/// of the same name. x86 carries `zmm<n>` at AVX-512 width; both ARM
+/// ISAs carry `v<n>` at the 128-bit architectural maximum.
+#[must_use]
+pub const fn simd_parent_bits(arch: Arch) -> Option<u16> {
+    match arch {
+        Arch::X86 | Arch::X86_64 => Some(512),
+        Arch::Aarch64 | Arch::Arm => Some(128),
+        _ => None,
+    }
+}
+
+/// Whether `parent` names a vector register parent under `arch`.
+///
+/// Checked against the *resolved* parent rather than the operand text,
+/// which matters on `AArch32`: `v1` as an operand is an AAPCS alias for
+/// the general-purpose `r4`, and [`register_layout`] resolves it there,
+/// so a parent that still spells `v1` came from the SIMD table.
+#[must_use]
+pub fn is_simd_parent(parent: &str, arch: Arch) -> bool {
+    let prefix = match arch {
+        Arch::X86 | Arch::X86_64 => "zmm",
+        Arch::Aarch64 | Arch::Arm => "v",
+        _ => return false,
+    };
+    parent
+        .strip_prefix(prefix)
+        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// Reverse lookup: given a `(parent, hi, lo)` triple, return the
 /// canonical analyst-facing alias if one exists in `arch`.
 ///

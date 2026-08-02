@@ -7,7 +7,7 @@ use r2smt_ir::expr::{Expr, RoundingMode};
 use r2smt_ir::program::{Instruction, Operand, OperandKind};
 use r2smt_ir::stmt::IrStmt;
 
-use crate::registers::register_layout;
+use crate::registers::{is_simd_parent, register_layout};
 
 use super::{BitwiseOp, ExtendKind, LiftCtx, ShiftOp, fp_sort_bits, nonzero_width};
 
@@ -1057,7 +1057,9 @@ fn same_xmm_register(a: &Operand, b: &Operand) -> bool {
         register_layout(&b.raw, Arch::X86_64),
     ) {
         (Some(la), Some(lb)) => {
-            la.parent.starts_with("zmm") && la.parent == lb.parent && la.width() == lb.width()
+            is_simd_parent(la.parent, Arch::X86_64)
+                && la.parent == lb.parent
+                && la.width() == lb.width()
         }
         _ => false,
     }
@@ -1098,7 +1100,7 @@ pub(crate) fn sse_scalar_move_lane(insn: &Instruction) -> Option<u16> {
 fn is_xmm_register(op: &Operand) -> bool {
     op.kind == OperandKind::Register
         && register_layout(&op.raw, Arch::X86_64)
-            .is_some_and(|layout| layout.parent.starts_with("zmm"))
+            .is_some_and(|layout| is_simd_parent(layout.parent, Arch::X86_64))
 }
 
 /// All-ones bit-vector at `bits` width. Constants wider than 128 bits

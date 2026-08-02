@@ -32,7 +32,7 @@ use tracing::debug;
 use crate::collector::BranchCandidate;
 use crate::condition::BranchCondition;
 use crate::effect::{memory_operand_width, stack_slot};
-use crate::registers::register_layout;
+use crate::registers::{RegisterLayout, is_simd_parent, register_layout, simd_parent_bits};
 use crate::slice::{Slice, SliceMerge, SliceStatus};
 
 mod aarch32;
@@ -40,9 +40,7 @@ mod aarch64;
 mod merge;
 mod x86;
 use merge::lower_merge;
-pub(crate) use x86::{
-    is_fp_compare_mnemonic, pins_rounding_mode, sse_scalar_move_lane, writes_mxcsr,
-};
+pub(crate) use x86::{is_fp_compare_mnemonic, sse_scalar_move_lane};
 
 /// IR representation of a [`Slice`] plus the branch's symbolic
 /// condition.
@@ -77,14 +75,6 @@ fn default_arch() -> Arch {
 
 const FLAGS: &[&str] = &["ZF", "CF", "SF", "OF", "PF"];
 
-/// Full architectural width of an x86 SIMD vector parent (`zmm<n>`).
-/// Every `xmm`/`ymm`/`zmm` view is a low slice of this one parent, so
-/// the parent variable is always declared at the widest width and reads
-/// / writes extract or reconstruct the accessed slice — a 128-bit and a
-/// 256-bit view of `zmm0` therefore share one data-flow node instead of
-/// colliding as two different-width vars of the same name.
-const SIMD_PARENT_BITS: u16 = 512;
-
 /// SSE / AVX mnemonics whose per-mnemonic handler must win over the
 /// ESIL and P-code ladders, which model an `xmm` operand at pointer
 /// width instead of canonicalising it to its vector parent.
@@ -97,6 +87,21 @@ const SIMD_PARENT_BITS: u16 = 512;
 /// Takes the whole instruction rather than the mnemonic because one
 /// member of the set cannot be recognised from its mnemonic alone: see
 /// [`x86::sse_scalar_move_lane`].
+///
+/// Arch-dispatched so the pre-empt can be extended to ARM alongside its
+/// vector handlers. It has to be: ESIL describes several ARM FP moves
+/// with tokens the mini stack machine *does* support (`fmov s0, s1`
+/// lowers as `"s1,s0,="`), so without an override those would lift into
+/// a differently-named, differently-sized node than the vector lifter
+/// uses, splitting the data-flow graph in a way no unit test would
+/// notice.
+fn is_simd_instruction(insn: &Instruction, arch: Arch) -> bool {
+    match arch {
+        Arch::X86 | Arch::X86_64 => is_x86_simd_instruction(insn),
+        _ => false,
+    }
+}
+
 fn is_x86_simd_instruction(insn: &Instruction) -> bool {
     // The compare family is 64 mnemonics once the eight predicates are
     // crossed with ps/pd/ss/sd and the VEX prefix, so it is recognised
@@ -183,6 +188,46 @@ fn is_x86_simd_instruction(insn: &Instruction) -> bool {
             | "vcvtph2ps"
             | "vcvtps2ph"
     )
+}
+
+/// Whether `insn` reprograms the FPU control register that
+/// [`pins_rounding_mode`] assumes holds its architectural default.
+///
+/// x86 names the write in the mnemonic (`ldmxcsr`, and the state
+/// restores that reload MXCSR wholesale). ARM does not: `msr` and `vmsr`
+/// write *any* system register, and only the operand says which, so the
+/// mnemonic alone would either miss the FPCR write or condemn every
+/// system-register write in the function.
+#[must_use]
+pub(crate) fn writes_rounding_control(insn: &Instruction, arch: Arch) -> bool {
+    match arch {
+        Arch::X86 | Arch::X86_64 => x86::writes_mxcsr(&insn.mnemonic),
+        Arch::Aarch64 | Arch::Arm => {
+            let mnem = insn.mnemonic.trim().to_ascii_lowercase();
+            if !matches!(mnem.as_str(), "msr" | "vmsr") {
+                return false;
+            }
+            insn.operands.first().is_some_and(|op| {
+                let target = op.raw.trim().to_ascii_lowercase();
+                target == "fpcr" || target == "fpscr"
+            })
+        }
+        _ => false,
+    }
+}
+
+/// Whether lifting `mnemonic` pins the architectural default rounding
+/// mode, and so depends on nothing having reprogrammed it.
+#[must_use]
+pub(crate) fn pins_rounding_mode(mnemonic: &str, arch: Arch) -> bool {
+    match arch {
+        Arch::X86 | Arch::X86_64 => x86::pins_rounding_mode(mnemonic),
+        // ARM floating-point arithmetic is not lifted yet. The guard is
+        // wired ahead of it deliberately: the moment a handler pins a
+        // rounding mode it has to be listed here, or the slice would
+        // report `Complete` while the hardware rounded some other way.
+        _ => false,
+    }
 }
 
 /// IEEE `(ebits, sbits)` sort for an FP lane width: 16→half `(5, 11)`,
@@ -445,7 +490,7 @@ impl LiftCtx {
         // disconnected, wrong-width value. Our per-mnemonic handlers
         // model these precisely at 128 bits — prefer them, bypassing
         // the ESIL/P-code ladder for this closed mnemonic set.
-        if matches!(self.arch, Arch::X86 | Arch::X86_64) && is_x86_simd_instruction(insn) {
+        if is_simd_instruction(insn, self.arch) {
             self.lift_instruction_x86(insn);
             return;
         }
@@ -723,11 +768,23 @@ impl LiftCtx {
         false
     }
 
-    /// Whether `op` names a view of an x86 SIMD vector register.
+    /// The vector-register layout `op` names, if it names one.
+    fn simd_layout(&self, op: &Operand) -> Option<RegisterLayout> {
+        if op.kind != OperandKind::Register {
+            return None;
+        }
+        let layout = register_layout(&op.raw, self.arch)?;
+        is_simd_parent(layout.parent, self.arch).then_some(layout)
+    }
+
+    /// Whether `op` names a view of a SIMD vector register.
     fn is_simd_register(&self, op: &Operand) -> bool {
-        op.kind == OperandKind::Register
-            && register_layout(&op.raw, self.arch)
-                .is_some_and(|layout| layout.parent.starts_with("zmm"))
+        self.simd_layout(op).is_some()
+    }
+
+    /// Architectural width of this ISA's vector parent.
+    fn simd_parent_width(&self) -> Option<u16> {
+        simd_parent_bits(self.arch)
     }
 
     /// Whether `op` is a memory operand a SIMD handler may lower through
@@ -744,12 +801,17 @@ impl LiftCtx {
     /// The full value of a SIMD operand at `view_bits`, as a single
     /// expression.
     ///
-    /// A register view is a low slice of its canonical vector parent
-    /// (`zmm<n>`). A memory operand becomes **one** `LoadMem` of
-    /// `view_bits` through [`Self::read_operand_lowered`], which also
-    /// supplies the `stk_<base>_<off>` naming so an analyst alias still
-    /// resolves. Reading the whole view once — rather than once per lane
-    /// — is what keeps a packed operand to a single load.
+    /// A register view is the slice `[layout.hi:layout.lo]` of its
+    /// canonical vector parent. The offset is load-bearing on `AArch32`,
+    /// where `d1` sits at bits `[127:64]` of `v0` and `s3` at `[127:96]`
+    /// — indexing every view from bit 0, as x86 and `AArch64` allow, would
+    /// silently read the wrong half of the register there.
+    ///
+    /// A memory operand becomes **one** `LoadMem` of `view_bits` through
+    /// [`Self::read_operand_lowered`], which also supplies the
+    /// `stk_<base>_<off>` naming so an analyst alias still resolves.
+    /// Reading the whole view once — rather than once per lane — is what
+    /// keeps a packed operand to a single load.
     ///
     /// `None` for anything else. The caller marks the instruction
     /// unsupported rather than fabricating a value.
@@ -757,19 +819,13 @@ impl LiftCtx {
         if self.is_modellable_simd_memory(op) {
             return Some(self.read_operand_lowered(op, view_bits));
         }
-        if op.kind != OperandKind::Register {
-            return None;
-        }
-        let layout = register_layout(&op.raw, self.arch)?;
-        if !layout.parent.starts_with("zmm") {
-            return None;
-        }
-        let width = layout.width();
-        let parent = Expr::var(layout.parent, SIMD_PARENT_BITS);
-        Some(if width == SIMD_PARENT_BITS {
+        let layout = self.simd_layout(op)?;
+        let parent_bits = self.simd_parent_width()?;
+        let parent = Expr::var(layout.parent, parent_bits);
+        Some(if layout.width() == parent_bits {
             parent
         } else {
-            Expr::extract(parent, width - 1, 0)
+            Expr::extract(parent, layout.hi, layout.lo)
         })
     }
 
@@ -814,34 +870,48 @@ impl LiftCtx {
     /// Write `lane_value` (an IEEE bit-vector of `lane_bits`) to the low
     /// lane of a SIMD destination.
     ///
-    /// A register destination keeps the parent bits above the lane
+    /// A register destination keeps the parent bits around the lane
     /// (legacy SSE scalar semantics). A memory destination stores exactly
-    /// `lane_bits` — there is nothing above the lane to preserve, which
+    /// `lane_bits` — there is nothing around the lane to preserve, which
     /// is why `movss [rbp - 8], xmm0` writes four bytes and leaves the
     /// rest of the slot alone.
+    ///
+    /// The lane sits at the view's own offset in the parent, so on
+    /// `AArch32` a write to `s3` preserves the bits *below* it as well as
+    /// above.
     fn write_simd_lane(&mut self, op: &Operand, lane_value: Expr, lane_bits: u16) -> bool {
         if self.is_modellable_simd_memory(op) {
             return self.write_dst(op, lane_value, lane_bits);
         }
-        if op.kind != OperandKind::Register {
-            return false;
-        }
-        let Some(layout) = register_layout(&op.raw, self.arch) else {
+        let (Some(layout), Some(parent_bits)) = (self.simd_layout(op), self.simd_parent_width())
+        else {
             return false;
         };
-        if !layout.parent.starts_with("zmm") {
+        let Some(lane_top) = layout.lo.checked_add(lane_bits) else {
+            return false;
+        };
+        if lane_top > parent_bits {
             return false;
         }
-        let preserved = Expr::extract(
-            Expr::var(layout.parent, SIMD_PARENT_BITS),
-            SIMD_PARENT_BITS - 1,
-            lane_bits,
-        );
-        self.assign(
-            Var::new(layout.parent, SIMD_PARENT_BITS),
-            Expr::concat(preserved, lane_value),
-        );
+        let parent = Expr::var(layout.parent, parent_bits);
+        let value = Self::splice_into_parent(&parent, lane_value, layout.lo, lane_top, parent_bits);
+        self.assign(Var::new(layout.parent, parent_bits), value);
         true
+    }
+
+    /// Rebuild a parent register with `value` occupying
+    /// `[top-1 : lo]` and every other bit taken from its prior contents.
+    fn splice_into_parent(parent: &Expr, value: Expr, lo: u16, top: u16, parent_bits: u16) -> Expr {
+        let with_high = if top < parent_bits {
+            Expr::concat(Expr::extract(parent.clone(), parent_bits - 1, top), value)
+        } else {
+            value
+        };
+        if lo > 0 {
+            Expr::concat(with_high, Expr::extract(parent.clone(), lo - 1, 0))
+        } else {
+            with_high
+        }
     }
 
     /// Number of `lane_bits`-wide lanes in a `view_bits`-wide vector
@@ -873,8 +943,7 @@ impl LiftCtx {
         if self.is_modellable_simd_memory(op) {
             return memory_operand_width(&op.raw);
         }
-        let layout = register_layout(&op.raw, self.arch)?;
-        layout.parent.starts_with("zmm").then(|| layout.width())
+        Some(self.simd_layout(op)?.width())
     }
 
     /// The view width an instruction operates at, given its operands.
@@ -903,29 +972,19 @@ impl LiftCtx {
             };
             return self.write_dst(op, value, width);
         }
-        if op.kind != OperandKind::Register {
-            return false;
-        }
-        let Some(layout) = register_layout(&op.raw, self.arch) else {
+        let (Some(layout), Some(parent_bits)) = (self.simd_layout(op), self.simd_parent_width())
+        else {
             return false;
         };
-        if !layout.parent.starts_with("zmm") {
-            return false;
-        }
-        let width = layout.width();
-        let full = if width == SIMD_PARENT_BITS {
+        let full = if layout.width() == parent_bits {
             value
         } else if zero_upper {
-            Expr::zero_ext(value, SIMD_PARENT_BITS)
+            Expr::zero_ext(value, parent_bits)
         } else {
-            let preserved = Expr::extract(
-                Expr::var(layout.parent, SIMD_PARENT_BITS),
-                SIMD_PARENT_BITS - 1,
-                width,
-            );
-            Expr::concat(preserved, value)
+            let parent = Expr::var(layout.parent, parent_bits);
+            Self::splice_into_parent(&parent, value, layout.lo, layout.hi + 1, parent_bits)
         };
-        self.assign(Var::new(layout.parent, SIMD_PARENT_BITS), full);
+        self.assign(Var::new(layout.parent, parent_bits), full);
         true
     }
 

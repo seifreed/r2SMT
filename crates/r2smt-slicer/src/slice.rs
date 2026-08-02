@@ -294,7 +294,7 @@ pub fn slice_branch(
     };
 
     let slice = walk_backwards(candidate, function, block, jcc_idx, limits, arch);
-    reject_unpinned_rounding_mode(slice, function, candidate)
+    reject_unpinned_rounding_mode(slice, function, candidate, arch)
 }
 
 /// Truncate a slice whose floating-point arithmetic assumes the default
@@ -308,12 +308,17 @@ pub fn slice_branch(
 /// rounding some other way.
 ///
 /// Function-scoped, so a rounding mode installed by a *caller* remains
-/// invisible; with calls disallowed by default a slice reaching one
-/// already truncates, which bounds the residue.
+/// invisible. A slice reaching a call now ends there (the call is a
+/// value barrier), which bounds the residue to the mode the function was
+/// entered with.
+///
+/// Arch-aware on both halves: x86 pins MXCSR and reprograms it with
+/// `ldmxcsr`, ARM pins FPCR / FPSCR and reprograms it with `msr` / `vmsr`.
 fn reject_unpinned_rounding_mode(
     slice: Slice,
     function: &Function,
     candidate: &BranchCandidate,
+    arch: Arch,
 ) -> Slice {
     if !matches!(slice.status, SliceStatus::Complete) {
         return slice;
@@ -321,7 +326,7 @@ fn reject_unpinned_rounding_mode(
     if !slice
         .instructions
         .iter()
-        .any(|i| crate::lift::pins_rounding_mode(&i.mnemonic))
+        .any(|i| crate::lift::pins_rounding_mode(&i.mnemonic, arch))
     {
         return slice;
     }
@@ -329,7 +334,7 @@ fn reject_unpinned_rounding_mode(
         .blocks
         .iter()
         .flat_map(|b| &b.instructions)
-        .find(|i| crate::lift::writes_mxcsr(&i.mnemonic))
+        .find(|i| crate::lift::writes_rounding_control(i, arch))
     else {
         return slice;
     };
@@ -337,7 +342,7 @@ fn reject_unpinned_rounding_mode(
         branch: candidate.clone(),
         instructions: slice.instructions,
         status: SliceStatus::truncated(format!(
-            "'{mnem}' at {addr} reprograms MXCSR; the rounding mode assumed by this slice's floating-point arithmetic is not sound",
+            "'{mnem}' at {addr} reprograms the FPU control register; the rounding mode assumed by this slice's floating-point arithmetic is not sound",
             mnem = writer.mnemonic,
             addr = writer.address
         )),
