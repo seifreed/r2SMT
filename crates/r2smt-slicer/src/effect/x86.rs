@@ -357,10 +357,16 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
         "movaps" | "movups" | "movapd" | "movupd" | "movdqa" | "movdqu" | "vmovaps" | "vmovups"
         | "vmovapd" | "vmovupd" | "vmovdqa" | "vmovdqu" | "cvtss2si" | "cvtsd2si" | "cvttss2si"
         | "cvttsd2si" => simd_effect(insn, SimdShape::Move),
+        // Everything here is a 2-operand RMW (or its 3-operand VEX
+        // form, which `simd_effect` distinguishes): the scalar and
+        // lane-writing forms preserve the bits they do not write, so
+        // the destination is a use as well as a def.
         "pxor" | "vpxor" | "pand" | "vpand" | "por" | "vpor" | "pandn" | "vpandn" | "addss"
         | "subss" | "mulss" | "divss" | "addsd" | "subsd" | "mulsd" | "divsd" | "addps"
         | "subps" | "mulps" | "divps" | "vaddps" | "vsubps" | "vmulps" | "vdivps" | "addpd"
-        | "subpd" | "mulpd" | "divpd" | "vaddpd" | "vsubpd" | "vmulpd" | "vdivpd" => {
+        | "subpd" | "mulpd" | "divpd" | "vaddpd" | "vsubpd" | "vmulpd" | "vdivpd" | "maxps"
+        | "minps" | "maxpd" | "minpd" | "vmaxps" | "vminps" | "vmaxpd" | "vminpd" | "maxss"
+        | "minss" | "maxsd" | "minsd" | "cvtsi2ss" | "cvtsi2sd" | "cvtss2sd" | "cvtsd2ss" => {
             simd_effect(insn, SimdShape::Bitwise)
         }
         // The scalar FP compares share `cmp`'s shape, not the SIMD one:
@@ -368,9 +374,6 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
         "comiss" | "ucomiss" | "comisd" | "ucomisd" => {
             cmp_or_test_effect(insn, InstructionKind::Cmp)
         }
-        // These write one lane and preserve the rest, so they read
-        // their destination as well as defining it.
-        "cvtsi2ss" | "cvtsi2sd" | "cvtss2sd" | "cvtsd2ss" => simd_effect(insn, SimdShape::Bitwise),
         m if m.starts_with('j') => jcc_effect(insn),
         m if m.starts_with("set") => setcc_effect(insn),
         m if m.starts_with("cmov") => cmovcc_effect(insn),

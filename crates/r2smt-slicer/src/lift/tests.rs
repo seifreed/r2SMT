@@ -1488,6 +1488,44 @@ fn vaddps_on_ymm_covers_eight_lanes_and_zeroes_the_upper_parent_bits() {
 }
 
 #[test]
+fn maxps_selects_the_second_operand_rather_than_computing_an_fp_max() {
+    // Intel: `IF SRC1 > SRC2 THEN DEST := SRC1 ELSE DEST := SRC2`. The
+    // comparison is false when either operand is NaN, so SRC2 wins on
+    // unordered *and* on equality. Modelling this as SMT-LIB `fp.max`
+    // would be wrong on exactly those cases, so the lifter must emit a
+    // select over the raw lane bits with a `<` guard.
+    let stmts = lift_xmm_pair("maxps");
+    let lane0 = |parent: &str| Expr::extract(Expr::var(parent, 512), 31, 0);
+    let expected = Expr::Ite {
+        cond: Box::new(Expr::flt(fp_lane("zmm1", 32, 0), fp_lane("zmm0", 32, 0))),
+        then_expr: Box::new(lane0("zmm0")),
+        else_expr: Box::new(lane0("zmm1")),
+    };
+    let rendered = format!("{:?}", simd_dst_src(&stmts, "zmm0"));
+    assert!(rendered.contains(&format!("{expected:?}")), "{rendered}");
+}
+
+#[test]
+fn minps_guards_with_the_operands_in_the_opposite_order_to_maxps() {
+    let stmts = lift_xmm_pair("minps");
+    let expected_cond = Expr::flt(fp_lane("zmm0", 32, 0), fp_lane("zmm1", 32, 0));
+    let rendered = format!("{:?}", simd_dst_src(&stmts, "zmm0"));
+    assert!(
+        rendered.contains(&format!("{expected_cond:?}")),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn maxss_writes_only_the_low_lane_and_preserves_the_rest() {
+    let stmts = lift_xmm_pair("maxss");
+    let src = simd_dst_src(&stmts, "zmm0");
+    let rendered = format!("{src:?}");
+    assert_eq!(rendered.matches("FLt").count(), 1, "{rendered}");
+    assert!(rendered.contains("hi: 511"), "{rendered}");
+}
+
+#[test]
 fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
     // Parity guard: the effect table keeps an instruction iff the lifter
     // models it. A mnemonic classified `Simd` by `analyze` but absent
@@ -1498,7 +1536,8 @@ fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
         "movaps", "movups", "movapd", "movupd", "movdqa", "movdqu", "vmovaps", "vmovups",
         "vmovapd", "vmovupd", "vmovdqa", "vmovdqu", "pxor", "vpxor", "pand", "vpand", "por",
         "vpor", "pandn", "vpandn", "addss", "subss", "mulss", "divss", "addsd", "subsd", "mulsd",
-        "divsd", "addps", "subps", "mulps", "divps", "addpd", "subpd", "mulpd", "divpd",
+        "divsd", "addps", "subps", "mulps", "divps", "addpd", "subpd", "mulpd", "divpd", "maxps",
+        "minps", "maxpd", "minpd", "maxss", "minss", "maxsd", "minsd",
     ];
     for m in mnemonics {
         assert!(

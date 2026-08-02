@@ -64,6 +64,14 @@ impl LiftCtx {
             "subpd" | "vsubpd" => self.lift_simd_packed_fp(insn, FpArithOp::Sub, 64),
             "mulpd" | "vmulpd" => self.lift_simd_packed_fp(insn, FpArithOp::Mul, 64),
             "divpd" | "vdivpd" => self.lift_simd_packed_fp(insn, FpArithOp::Div, 64),
+            "maxps" | "vmaxps" => self.lift_simd_packed_fp(insn, FpArithOp::Max, 32),
+            "minps" | "vminps" => self.lift_simd_packed_fp(insn, FpArithOp::Min, 32),
+            "maxpd" | "vmaxpd" => self.lift_simd_packed_fp(insn, FpArithOp::Max, 64),
+            "minpd" | "vminpd" => self.lift_simd_packed_fp(insn, FpArithOp::Min, 64),
+            "maxss" => self.lift_simd_scalar_fp(insn, FpArithOp::Max, 32),
+            "minss" => self.lift_simd_scalar_fp(insn, FpArithOp::Min, 32),
+            "maxsd" => self.lift_simd_scalar_fp(insn, FpArithOp::Max, 64),
+            "minsd" => self.lift_simd_scalar_fp(insn, FpArithOp::Min, 64),
             "comiss" | "ucomiss" => self.lift_simd_fp_compare(insn, 32),
             "comisd" | "ucomisd" => self.lift_simd_fp_compare(insn, 64),
             "cvtsi2ss" => self.lift_int_to_fp(insn, 32),
@@ -559,9 +567,9 @@ impl LiftCtx {
         let count = Self::packed_lane_count(view, lane_bits)?;
         let mut lanes = Vec::with_capacity(usize::from(count));
         for index in 0..count {
-            let a = self.read_simd_lane_fp_at(a_op, lane_bits, index)?;
-            let b = self.read_simd_lane_fp_at(b_op, lane_bits, index)?;
-            lanes.push(Expr::fp_to_ieee_bv(fp_lane_op(op, a, b)));
+            let a = self.read_simd_lane_bits_at(a_op, lane_bits, index)?;
+            let b = self.read_simd_lane_bits_at(b_op, lane_bits, index)?;
+            lanes.push(fp_lane_result(op, a, b, lane_bits));
         }
         Self::concat_lanes(lanes)
     }
@@ -575,14 +583,14 @@ impl LiftCtx {
             return;
         };
         let (Some(a), Some(b)) = (
-            self.read_simd_lane_fp(dst, lane),
-            self.read_simd_lane_fp(src, lane),
+            self.read_simd_lane_bits_at(dst, lane, 0),
+            self.read_simd_lane_bits_at(src, lane, 0),
         ) else {
             self.push_simd_unsupported(insn);
             return;
         };
-        let result = fp_lane_op(op, a, b);
-        if !self.write_simd_lane(dst, Expr::fp_to_ieee_bv(result), lane) {
+        let result = fp_lane_result(op, a, b, lane);
+        if !self.write_simd_lane(dst, result, lane) {
             self.push_simd_unsupported(insn);
         }
     }
@@ -709,19 +717,51 @@ enum FpArithOp {
     Sub,
     Mul,
     Div,
+    Max,
+    Min,
 }
 
-/// Apply `op` to one lane pair. The rounding mode is the architectural
-/// MXCSR default; a function that reprograms MXCSR is rejected by the
-/// slicer's guard rather than silently rounded here.
-fn fp_lane_op(op: FpArithOp, a: Expr, b: Expr) -> Expr {
+/// Apply `op` to one lane, given both operands as raw IEEE bit-vectors
+/// of `lane_bits`, and return the lane result in the same form.
+///
+/// The result is a bit-vector rather than a float because `max`/`min`
+/// *select* an operand instead of computing one, and the IR's `Ite` is
+/// bit-vector-typed — an `Ite` over float-sorted branches has no
+/// rendering.
+///
+/// The rounding mode is the architectural MXCSR default; a function
+/// that reprograms MXCSR is rejected by the slicer's guard rather than
+/// silently rounded here.
+fn fp_lane_result(op: FpArithOp, a_bits: Expr, b_bits: Expr, lane_bits: u16) -> Expr {
+    let (ebits, sbits) = fp_sort_bits(lane_bits);
+    let a = Expr::bv_to_fp(a_bits.clone(), ebits, sbits);
+    let b = Expr::bv_to_fp(b_bits.clone(), ebits, sbits);
     let rm = RoundingMode::NearestTiesEven;
-    match op {
+    let arith = match op {
         FpArithOp::Add => Expr::fadd(a, b, rm),
         FpArithOp::Sub => Expr::fsub(a, b, rm),
         FpArithOp::Mul => Expr::fmul(a, b, rm),
         FpArithOp::Div => Expr::fdiv(a, b, rm),
-    }
+        // `MAXPS: IF SRC1 > SRC2 THEN DEST := SRC1 ELSE DEST := SRC2`
+        // (and the mirror for MIN). The comparison is false when either
+        // operand is NaN, so the second operand wins on unordered *and*
+        // on equality — which is why this is an explicit select rather
+        // than `fp.max`/`fp.min`, whose NaN and signed-zero behaviour
+        // differs from x86's.
+        FpArithOp::Max | FpArithOp::Min => {
+            let cond = if matches!(op, FpArithOp::Max) {
+                Expr::flt(b, a)
+            } else {
+                Expr::flt(a, b)
+            };
+            return Expr::Ite {
+                cond: Box::new(cond),
+                then_expr: Box::new(a_bits),
+                else_expr: Box::new(b_bits),
+            };
+        }
+    };
+    Expr::fp_to_ieee_bv(arith)
 }
 
 /// Whether two operands name the same SIMD register view (same vector
