@@ -1797,3 +1797,69 @@ fn test_bounded_diamond_lift_polarity_taken_edge_is_then_branch() {
         "fallthrough (ELSE) value must drive else_expr, got: {else_expr}"
     );
 }
+
+#[test]
+fn aarch64_packed_write_over_a_live_vector_register_truncates() {
+    // The fabrication teeth. `add v0.4s, …` overwrites `v0`, which the
+    // branch reads back through `s0`. Before the arrangement guard the
+    // arranged destination canonicalised to `None`, so the instruction
+    // reported no definition: the walk stepped straight over it and
+    // bound `s0` to the *earlier* `fmov`, yielding a Complete slice and
+    // a High-confidence verdict over a value that had been replaced.
+    let program = Program {
+        arch: Arch::Aarch64,
+        bits: 64,
+        entry: Some(Address(0x40_1000)),
+        functions: vec![Function {
+            address: Address(0x40_1000),
+            name: Some("sym.main".into()),
+            blocks: vec![BasicBlock {
+                address: Address(0x40_1000),
+                instructions: vec![
+                    insn(
+                        0x40_1000,
+                        4,
+                        "fmov",
+                        vec![
+                            op("s0", OperandKind::Register),
+                            op("s3", OperandKind::Register),
+                        ],
+                    ),
+                    insn(
+                        0x40_1004,
+                        4,
+                        "add",
+                        vec![
+                            op("v0.4s", OperandKind::Unknown),
+                            op("v1.4s", OperandKind::Unknown),
+                            op("v2.4s", OperandKind::Unknown),
+                        ],
+                    ),
+                    insn(
+                        0x40_1008,
+                        4,
+                        "fcmp",
+                        vec![
+                            op("s0", OperandKind::Register),
+                            op("s1", OperandKind::Register),
+                        ],
+                    ),
+                    insn(
+                        0x40_100c,
+                        4,
+                        "b.eq",
+                        vec![op("0x401080", OperandKind::Immediate)],
+                    ),
+                ],
+                successors: vec![],
+            }],
+            is_thumb: false,
+        }],
+    };
+    let slice = slice_first(&program);
+    assert!(
+        matches!(slice.status, SliceStatus::Truncated { .. }),
+        "expected truncation at the unmodelled packed write, got {:?}",
+        slice.status
+    );
+}

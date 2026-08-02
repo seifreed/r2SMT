@@ -461,3 +461,55 @@ fn d0_disambiguates_across_aarch64_and_arm() {
     assert_eq!(arm.parent, "v0");
     assert_eq!(arm.width(), 64);
 }
+
+#[test]
+fn vector_arrangement_detects_aarch64_element_shapes() {
+    for raw in ["v0.4s", "v31.16b", "v2.2d", "v0.s[1]", "{v16.4s, v17.4s}"] {
+        assert!(
+            has_vector_arrangement(raw, Arch::Aarch64),
+            "{raw} should carry vector shape"
+        );
+    }
+}
+
+#[test]
+fn vector_arrangement_ignores_bare_register_names() {
+    for raw in ["v0", "q0", "d0", "s0", "x0", "w0", "sp", "xzr"] {
+        assert!(
+            !has_vector_arrangement(raw, Arch::Aarch64),
+            "{raw} is a bare name and carries no arrangement"
+        );
+    }
+}
+
+#[test]
+fn vector_arrangement_ignores_memory_operands() {
+    // A memory expression is not a vector shape: it neither starts with
+    // a vector register name nor opens a register list.
+    for raw in ["[x1]", "[x1, #8]", "[sp, #-16]!"] {
+        assert!(!has_vector_arrangement(raw, Arch::Aarch64), "{raw}");
+    }
+}
+
+#[test]
+fn vector_arrangement_detects_aarch32_indexed_lane() {
+    // AArch32 spells the indexed form without a dot.
+    assert!(has_vector_arrangement("d0[1]", Arch::Arm));
+    assert!(has_vector_arrangement("q1[0]", Arch::Arm));
+}
+
+#[test]
+fn vector_arrangement_leaves_aarch32_aapcs_aliases_alone() {
+    // `v1` is the AAPCS alias for `r4` on AArch32, and a bare name in
+    // any case — the remainder test is what keeps it out.
+    for raw in ["v1", "v8", "a1", "sb", "fp"] {
+        assert!(!has_vector_arrangement(raw, Arch::Arm), "{raw}");
+    }
+}
+
+#[test]
+fn vector_arrangement_never_fires_on_x86() {
+    for raw in ["xmm0", "zmm31", "eax", "st(0)"] {
+        assert!(!has_vector_arrangement(raw, Arch::X86_64), "{raw}");
+    }
+}

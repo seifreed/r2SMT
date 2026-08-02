@@ -154,6 +154,42 @@ pub fn is_simd_parent(parent: &str, arch: Arch) -> bool {
         .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
 }
 
+/// Whether an operand names an ARM vector register in a shape the
+/// single-parent register model cannot express on its own: an element
+/// arrangement (`v0.4s`), an indexed lane (`v0.s[1]`, `d0[1]`), or a
+/// multi-register list (`{v0.4s, v1.4s}`).
+///
+/// Purely syntactic, and deliberately so: it answers "does this operand
+/// carry vector shape beyond the bare register name", not "can the
+/// lifter model it". [`register_layout`] resolves only the bare name, so
+/// every shape this reports is one whose destination would otherwise
+/// canonicalise to `None` — an operand that silently contributes no def
+/// while [`crate::effect::registers_in_operand`] still recovers the
+/// parent as a *use*. That asymmetry is what the effect tables use this
+/// to fail closed on.
+///
+/// Always `false` outside the ARM ISAs: no x86 register spelling carries
+/// an arrangement, and the `AArch32` AAPCS aliases (`v1` for `r4`) are
+/// bare names that never reach the remainder test.
+#[must_use]
+pub fn has_vector_arrangement(raw: &str, arch: Arch) -> bool {
+    if !matches!(arch, Arch::Aarch64 | Arch::Arm) {
+        return false;
+    }
+    let lower = raw.trim().to_ascii_lowercase();
+    if lower.starts_with('{') {
+        return true;
+    }
+    let head_len = lower
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .unwrap_or(lower.len());
+    let (head, rest) = lower.split_at(head_len);
+    if rest.is_empty() {
+        return false;
+    }
+    register_layout(head, arch).is_some_and(|layout| is_simd_parent(layout.parent, arch))
+}
+
 /// Reverse lookup: given a `(parent, hi, lo)` triple, return the
 /// canonical analyst-facing alias if one exists in `arch`.
 ///

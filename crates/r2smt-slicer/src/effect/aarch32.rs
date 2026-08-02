@@ -32,6 +32,14 @@ pub(super) fn analyze_aarch32(insn: &Instruction) -> InstructionEffect {
 }
 
 fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> InstructionEffect {
+    // See the note in the `AArch64` table: an operand carrying vector
+    // shape resolves as a `use` but not as a `def`, so it must fail
+    // closed above the dispatch. `AArch32` NEON is `v`-prefixed with a
+    // type suffix and so collides less, but the indexed form (`d0[1]`)
+    // reaches the integer arms exactly the same way.
+    if super::has_unmodelled_vector_shape(insn, Arch::Arm) {
+        return other_effect(insn);
+    }
     match dispatch_mnemonic {
         // 2-operand `mov Rd, Rn/imm` and `mvn Rd, Op` (bitwise NOT).
         "mov" | "mvn" => aarch32_mov_effect(insn),

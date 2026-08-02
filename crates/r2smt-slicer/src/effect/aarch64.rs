@@ -8,6 +8,17 @@ use r2smt_common::Arch;
 use r2smt_ir::program::Instruction;
 
 pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
+    // NEON reuses the integer and scalar-FP mnemonics (`add v0.4s`,
+    // `fadd v0.2d`), so the arrangement guard has to sit above the
+    // dispatch rather than in arms of its own — `"add"` and `"fadd"`
+    // are already claimed below. Without it the destination's
+    // arrangement makes `canonical_register` return `None` and the
+    // instruction passes with empty `defs` while its sources still
+    // resolve as `uses`: the slicer neither truncates nor keeps it, and
+    // a later read of the destination binds to a stale definition.
+    if super::has_unmodelled_vector_shape(insn, Arch::Aarch64) {
+        return other_effect(insn);
+    }
     let mnemonic = insn.mnemonic.trim().to_ascii_lowercase();
     match mnemonic.as_str() {
         // 2-operand data movement: dst, src.

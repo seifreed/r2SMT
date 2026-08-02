@@ -511,3 +511,119 @@ fn memory_operand_width_ignores_size_keywords_inside_symbols() {
     assert_eq!(memory_operand_width("[byte_count]"), None);
     assert_eq!(memory_operand_width("[rax]"), None);
 }
+
+#[test]
+fn aarch64_packed_add_is_not_reported_as_a_register_definition() {
+    // The soundness contract: an arranged destination canonicalises to
+    // `None`, so before the guard this passed with `kind: Add` and empty
+    // `defs` while `v1`/`v2` still resolved as `uses`. The slicer then
+    // neither truncated nor kept it, and a later read of `v0` bound to a
+    // stale definition.
+    let i = insn(
+        "add",
+        vec![
+            op("v0.4s", OperandKind::Unknown),
+            op("v1.4s", OperandKind::Unknown),
+            op("v2.4s", OperandKind::Unknown),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);
+}
+
+#[test]
+fn aarch64_packed_floating_point_declines() {
+    let i = insn(
+        "fadd",
+        vec![
+            op("v0.2d", OperandKind::Unknown),
+            op("v1.2d", OperandKind::Unknown),
+            op("v2.2d", OperandKind::Unknown),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);
+}
+
+#[test]
+fn aarch64_indexed_lane_operand_declines() {
+    let i = insn(
+        "mov",
+        vec![
+            op("w0", OperandKind::Register),
+            op("v0.s[1]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);
+}
+
+#[test]
+fn aarch64_multi_register_list_operand_declines() {
+    let i = insn(
+        "ld4",
+        vec![
+            op("{v16.4s, v17.4s, v18.4s, v19.4s}", OperandKind::Unknown),
+            op("[x2]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);
+}
+
+#[test]
+fn aarch64_scalar_arithmetic_is_unaffected_by_the_arrangement_guard() {
+    let i = insn(
+        "add",
+        vec![
+            op("x0", OperandKind::Register),
+            op("x1", OperandKind::Register),
+            op("x2", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert_eq!(effect.kind, InstructionKind::Add);
+    assert_eq!(effect.defs, vec!["x0"]);
+}
+
+#[test]
+fn aarch64_scalar_floating_point_is_unaffected_by_the_arrangement_guard() {
+    let i = insn(
+        "fadd",
+        vec![
+            op("s0", OperandKind::Register),
+            op("s1", OperandKind::Register),
+            op("s2", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert_eq!(effect.kind, InstructionKind::Simd);
+    assert_eq!(effect.defs, vec!["v0"]);
+}
+
+#[test]
+fn aarch32_indexed_vector_lane_declines() {
+    // AArch32 spells the indexed form without a dot (`d0[1]`), so it
+    // reaches the integer arms by a different route than AArch64's.
+    let i = insn(
+        "vmov",
+        vec![
+            op("r0", OperandKind::Register),
+            op("d0[1]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Arm).kind, InstructionKind::Other);
+}
+
+#[test]
+fn aarch32_aapcs_vector_alias_is_still_a_general_purpose_register() {
+    // `v1` on AArch32 is the AAPCS alias for `r4`, not a vector
+    // register: a bare name carries no arrangement and must survive.
+    let i = insn(
+        "add",
+        vec![
+            op("v1", OperandKind::Register),
+            op("v2", OperandKind::Register),
+            op("v3", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Arm);
+    assert_eq!(effect.kind, InstructionKind::Add);
+    assert_eq!(effect.defs, vec!["r4"]);
+}
