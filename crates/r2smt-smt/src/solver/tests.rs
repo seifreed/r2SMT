@@ -1727,6 +1727,55 @@ fn zeroed_scalar_fp_self_compare_makes_equality_branch_always_true() {
 }
 
 #[test]
+fn value_moved_by_movsd_reaches_the_compare_and_decides_the_branch() {
+    // End-to-end teeth for the scalar move: `pxor` zeroes xmm1, `movsd`
+    // carries that 0.0 into xmm0, and the self-compare then decides.
+    //
+    // `je` is the discriminating verdict. If the move were dropped, or
+    // written to a node disjoint from the vector parent the compare
+    // reads — which is what the ESIL model of `xmm` does — then xmm0
+    // would be a free input and the branch would stay `BothPossible`.
+    // Before the scalar moves were lifted, the slice truncated on the
+    // `movsd` and the verdict was `Unsound`.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "pxor",
+            vec![
+                op("xmm1", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "movsd",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            4,
+            "comisd",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_100c,
+            6,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
 fn scalar_fp_compare_of_free_inputs_stays_both_possible() {
     // The anti-fabrication direction: with nothing pinning the lanes,
     // an ordered-compare branch must stay undecided.
