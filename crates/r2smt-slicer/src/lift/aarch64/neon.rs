@@ -493,6 +493,15 @@ fn convert_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     if source.lane_bits != source_bits || source.lanes != expected_lanes {
         return None;
     }
+    // `fcvtl2` reads the source's upper half, `fcvtn2` writes the
+    // destination's; either way that operand spans the whole register.
+    let full_width_side = match kind {
+        ConvertKind::FloatToFloat { widening: true } => source,
+        _ => destination,
+    };
+    if upper && !spans_full_register(full_width_side) {
+        return None;
+    }
     // Every one of these names an IEEE lane on at least one side.
     let float_bits = match kind {
         ConvertKind::FloatToInt { .. } => source_bits,
@@ -682,6 +691,9 @@ fn saturating_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     if written == 0 {
         return None;
     }
+    if upper && !spans_full_register(destination) {
+        return None;
+    }
     let source_bits = if narrowing {
         destination.lane_bits.checked_mul(2)?
     } else {
@@ -774,6 +786,9 @@ fn multiply_accumulate_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonS
         if arrangement.lane_bits != source_bits || arrangement.lanes != expected_lanes {
             return None;
         }
+        if upper && !spans_full_register(arrangement) {
+            return None;
+        }
     }
     Some(NeonShape {
         op: NeonOp::MultiplyAccumulate(AccumulateKind {
@@ -789,6 +804,19 @@ fn multiply_accumulate_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonS
 }
 
 // ===================== widening and narrowing =====================
+
+/// Whether a `2`-form's full-register operand really spans 128 bits.
+///
+/// The `2` suffix means "the half of the 128-bit register the base form
+/// does not touch", so the operand it halves must be a full-width
+/// arrangement. Without this an arrangement half that size would resolve
+/// to a shape the architecture does not encode.
+const fn spans_full_register(arrangement: Arrangement) -> bool {
+    arrangement.view_bits() == SIMD_REGISTER_BITS
+}
+
+/// Width of an `AArch64` vector register.
+const SIMD_REGISTER_BITS: u16 = 128;
 
 /// Peel the `2` suffix that marks the half-register forms.
 fn peel_upper(mnemonic: &str) -> (&str, bool) {
@@ -881,6 +909,12 @@ fn widen_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     if written == 0 {
         return None;
     }
+    // A narrowing `2` form writes the destination's upper half, so the
+    // destination is the full-width operand; a widening one reads its
+    // sources' upper half, which the per-operand check below sizes.
+    if upper && matches!(kind, WidenKind::Narrow) && !spans_full_register(destination) {
+        return None;
+    }
     for (index, operand) in insn.operands.iter().enumerate().skip(1) {
         let Some(arrangement) = operand_arrangement(operand) else {
             // The shift is an immediate, not an arrangement.
@@ -911,6 +945,11 @@ fn widen_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
             written
         };
         if arrangement.lanes != expected_lanes {
+            return None;
+        }
+        // A widening `2` form reads its narrow sources' upper half, so
+        // those sources span the whole register.
+        if upper && !wide_operand && !spans_full_register(arrangement) {
             return None;
         }
     }

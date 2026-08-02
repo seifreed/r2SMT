@@ -3581,3 +3581,13 @@ fn aarch64_bitwise_select_lowers_once_over_the_whole_view() {
 fn aarch64_bitwise_select_declines_a_non_byte_arrangement() {
     assert!(neon_declines("bsl", &["v0.4s", "v1.4s", "v2.4s"]));
 }
+
+#[test]
+fn aarch64_two_form_declines_a_half_width_full_register_operand() {
+    // The `2` suffix names the half of the 128-bit register the base
+    // form does not touch, so the operand it halves must span the whole
+    // register. A 64-bit arrangement there is not an encoding.
+    assert!(neon_declines("xtn2", &["v0.4h", "v1.4s"]));
+    assert!(neon_declines("uaddl2", &["v0.2s", "v1.4h", "v2.4h"]));
+    assert!(neon_declines("sqxtn2", &["v0.8b", "v1.8h"]));
+}

@@ -555,11 +555,18 @@ fn ins_preserves_the_lanes_it_does_not_write() {
 #[test]
 fn xtn2_preserves_the_destination_lower_half() {
     // The narrowed lanes land high; the low half is the destination's.
+    // The `2` form's destination is always the full register — a
+    // half-width arrangement is not an encoding and declines.
     let sources = [
-        ("v0", 0x0000_0000_1234_5678_u128),
-        ("v1", 0x0004_0003_0002_0001_u128),
+        ("v0", 0x1234_5678_9abc_def0_u128),
+        ("v1", 0x0008_0007_0006_0005_0004_0003_0002_0001_u128),
     ];
-    assert_computes("xtn2", &["v0.8b", "v1.4h"], &sources, 0x0403_0201_1234_5678);
+    assert_computes(
+        "xtn2",
+        &["v0.16b", "v1.8h"],
+        &sources,
+        (0x0807_0605_0403_0201_u128 << 64) | 0x1234_5678_9abc_def0,
+    );
 }
 
 #[test]
