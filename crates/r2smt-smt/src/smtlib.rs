@@ -432,18 +432,25 @@ fn expr_uses_fp(expr: &Expr) -> bool {
     }
 }
 
-/// IEEE-754 binary32 `(exponent, significand)` sort.
-const IEEE_SINGLE: (u16, u16) = (8, 24);
-/// IEEE-754 binary64 `(exponent, significand)` sort.
-const IEEE_DOUBLE: (u16, u16) = (11, 53);
+/// Smallest exponent and significand widths SMT-LIB admits for a
+/// `FloatingPoint` sort — the theory requires both to exceed 1.
+const MIN_FP_SORT_FIELD: u16 = 2;
 
-/// Whether a floating-point sort is one every target solver accepts
-/// without extra flags. CVC5 gates non-standard sorts behind
-/// `--fp-exp`, and the slicer's `fp_sort_bits` can only produce these
-/// two, so anything else declines rather than risking a solver error.
-const fn is_portable_fp_sort(ebits: u16, sbits: u16) -> bool {
-    let sort = (ebits, sbits);
-    matches!(sort, IEEE_SINGLE | IEEE_DOUBLE)
+/// Whether a floating-point sort is one the renderer can emit.
+///
+/// The constraint is the sort's own validity, not a solver limitation:
+/// cvc5 1.3.4, Bitwuzla 0.9.1 and Z3 were each measured accepting
+/// binary16, binary32, binary64, binary128 and even a 79-bit sort with
+/// no extra flags, so there is nothing to gate on.
+///
+/// x87's 80-bit extended format remains unrepresentable, for a reason
+/// of its own: it carries an explicit integer bit, so its bit pattern
+/// is 80 bits wide while `ebits + sbits` is 79. Every width computation
+/// here — and in the Z3 encoder — assumes those coincide, so such a
+/// value declines at a reinterpret's width check rather than rendering
+/// one bit narrower than the register it came from.
+const fn is_renderable_fp_sort(ebits: u16, sbits: u16) -> bool {
+    ebits >= MIN_FP_SORT_FIELD && sbits >= MIN_FP_SORT_FIELD && ebits.checked_add(sbits).is_some()
 }
 
 /// A rendered floating-point term together with its sort. Mirrors the
@@ -618,12 +625,10 @@ fn render_fp_to_fp(
 }
 
 /// Validate an FP sort, returning its IEEE bit-pattern width. Declines
-/// (recording the reason) for sorts outside [`is_portable_fp_sort`].
+/// (recording the reason) for sorts outside [`is_renderable_fp_sort`].
 fn fp_sort_checked(ebits: u16, sbits: u16, ctx: &mut RenderCtx) -> Option<(u16, u16)> {
-    if !is_portable_fp_sort(ebits, sbits) {
-        ctx.note_unsupported(format!(
-            "non-portable sort (_ FloatingPoint {ebits} {sbits})"
-        ));
+    if !is_renderable_fp_sort(ebits, sbits) {
+        ctx.note_unsupported(format!("invalid sort (_ FloatingPoint {ebits} {sbits})"));
         return None;
     }
     Some((ebits.saturating_add(sbits), sbits))
@@ -1246,6 +1251,45 @@ mod tests {
         assert_eq!(
             (taken, not_taken),
             (z3::SatResult::Unsat, z3::SatResult::Sat)
+        );
+    }
+
+    #[test]
+    fn smtlib_declines_a_sort_with_an_out_of_range_field_width() {
+        // The decline path had no coverage at all before this. An
+        // exponent narrower than the theory allows must fail the strict
+        // emitter rather than render an unparseable sort.
+        let slice = fp_slice(
+            Expr::fp_to_ieee_bv(Expr::FpConst {
+                bits: 0,
+                ebits: 1,
+                sbits: 24,
+            }),
+            Expr::eq(Expr::var("t0", 32), Expr::konst(0, 32)),
+        );
+        assert!(matches!(
+            emit_query_strict(&slice, &SolveOptions::default(), true),
+            Err(RenderError::UnrenderableFloat(_))
+        ));
+    }
+
+    #[test]
+    fn smtlib_renders_a_half_precision_sort() {
+        // Measured: cvc5, Bitwuzla and Z3 all accept binary16 with no
+        // extra flags, so the renderer has no reason to refuse it.
+        let slice = fp_slice(
+            Expr::fp_to_ieee_bv(Expr::FpConst {
+                bits: 0x3c00,
+                ebits: 5,
+                sbits: 11,
+            }),
+            Expr::eq(Expr::var("t0", 32), Expr::konst(0x3c00, 32)),
+        );
+        let script = emit_query(&slice, &SolveOptions::default(), true);
+        assert!(script.contains("((_ to_fp 5 11)"), "{script}");
+        assert!(
+            emit_query_strict(&slice, &SolveOptions::default(), true).is_ok(),
+            "{script}"
         );
     }
 
