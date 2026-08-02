@@ -3365,3 +3365,66 @@ fn aarch64_accumulate_declines_a_by_element_source() {
     // source; the indexed operand carries no arrangement.
     assert!(neon_declines("mla", &["v0.4s", "v1.4s", "v2.s[0]"]));
 }
+
+// --- N3f: NEON saturation ---
+
+#[test]
+fn aarch64_saturating_add_writes_the_vector_parent() {
+    let i = insn(
+        0x1000,
+        4,
+        "sqadd",
+        vec![reg("v0.4h"), reg("v1.4h"), reg("v2.4h")],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(stmts.as_slice(), [IrStmt::Assign { dst, .. }] if dst.name == "v0"),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_doubling_multiply_declines_an_unencodable_element_width() {
+    // `sqdmulh` exists only for 16- and 32-bit elements; a byte or
+    // doubleword arrangement is not an encoding.
+    assert!(neon_declines("sqdmulh", &["v0.16b", "v1.16b", "v2.16b"]));
+    assert!(neon_declines("sqdmulh", &["v0.2d", "v1.2d", "v2.2d"]));
+}
+
+#[test]
+fn aarch64_shift_narrow_declines_a_shift_past_the_element_width() {
+    // Beyond the destination's element width the surviving bits would be
+    // sign or zero fill rather than source bits, which is outside the
+    // encoding's shift range.
+    assert!(neon_declines("rshrn", &["v0.8b", "v1.8h", "#9"]));
+}
+
+#[test]
+fn aarch64_shift_narrow_declines_a_zero_shift() {
+    assert!(neon_declines("rshrn", &["v0.8b", "v1.8h", "#0"]));
+}
+
+#[test]
+fn aarch64_saturating_narrow_declines_mismatched_source_width() {
+    // `sqxtn` narrows by exactly half.
+    assert!(neon_declines("sqxtn", &["v0.8b", "v1.4s"]));
+}
+
+#[test]
+fn aarch64_same_width_saturating_has_no_two_form() {
+    assert!(neon_declines("sqadd2", &["v0.4h", "v1.4h", "v2.4h"]));
+}
+
+#[test]
+fn aarch64_saturating_narrow_two_form_preserves_the_lower_half() {
+    let i = insn(0x1000, 4, "sqxtn2", vec![reg("v0.16b"), reg("v1.8h")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(
+            stmts.as_slice(),
+            [IrStmt::Assign { src: Expr::Concat { low, .. }, .. }]
+                if matches!(&**low, Expr::Extract { hi: 63, lo: 0, .. })
+        ),
+        "the surviving lower half must read the destination: {stmts:?}"
+    );
+}

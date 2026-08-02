@@ -88,6 +88,14 @@ enum NeonOp {
     /// multiply the two sources and accumulate the product into the
     /// destination.
     MultiplyAccumulate(AccumulateKind),
+    /// A saturating or rounding element operation. `signed_sources`
+    /// selects how the narrow elements are extended into the width the
+    /// operation is computed at; `upper` is the `2` suffix.
+    Saturating {
+        kind: SaturatingKind,
+        signed_sources: bool,
+        upper: bool,
+    },
 }
 
 /// How a multiply-accumulate reads its source elements.
@@ -114,6 +122,49 @@ struct AccumulateKind {
     sources: AccumulateSources,
     /// The `2` suffix — read the sources' upper half.
     upper: bool,
+}
+
+/// Which range a computed value is clamped into.
+///
+/// The distinction that matters is not the operation's signedness but
+/// the *result's*: `uqsub` computes a value that can go negative and
+/// clamps it into the unsigned range, which is neither of the two
+/// obvious cases.
+#[derive(Debug, Clone, Copy)]
+enum SaturateTo {
+    /// Clamp into `[-2^(n-1), 2^(n-1) - 1]`, comparing signed.
+    Signed,
+    /// Clamp into `[0, 2^n - 1]` from a value that cannot be negative,
+    /// comparing unsigned.
+    Unsigned,
+    /// Clamp a value that *can* be negative into `[0, 2^n - 1]`
+    /// (`uqsub`, `sqxtun`, `sqshrun`): negatives become zero.
+    SignedToUnsigned,
+}
+
+/// The saturating and rounding element operations.
+#[derive(Debug, Clone, Copy)]
+enum SaturatingKind {
+    /// `sqadd` / `uqadd` / `sqsub` / `uqsub` — computed one bit wider so
+    /// the overflow is visible, then clamped.
+    AddSub { op: BinOp, to: SaturateTo },
+    /// `uhadd` / `shadd` / `urhadd` / `srhadd` — add one bit wider, then
+    /// halve. The extra bit makes the sum exact, so nothing saturates.
+    Halving { rounding: bool },
+    /// `sqxtn` / `uqxtn` / `sqxtun` — clamp a double-width element into
+    /// the narrow range.
+    Narrow { to: SaturateTo },
+    /// The shift-right-narrow family: shift the double-width element,
+    /// optionally rounding, then narrow — clamping when the mnemonic
+    /// says so and plain truncation (`shrn` / `rshrn`) when it does not.
+    ShiftNarrow {
+        shift: u16,
+        rounding: bool,
+        to: Option<SaturateTo>,
+    },
+    /// `sqdmulh` / `sqrdmulh` — double the product and keep its high
+    /// half.
+    DoublingMultiplyHigh { rounding: bool },
 }
 
 /// The widening and narrowing element operations.
@@ -194,6 +245,147 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| insert_shape(insn, &mnemonic))
         .or_else(|| widen_shape(insn, &mnemonic))
         .or_else(|| multiply_accumulate_shape(insn, &mnemonic))
+        .or_else(|| saturating_shape(insn, &mnemonic))
+}
+
+// ===================== saturation and rounding =====================
+
+/// The same-width saturating and halving mnemonics.
+fn saturating_same_width(base: &str) -> Option<(SaturatingKind, bool)> {
+    use SaturateTo::{Signed, SignedToUnsigned, Unsigned};
+    let add_sub = |op, to| SaturatingKind::AddSub { op, to };
+    Some(match base {
+        "sqadd" => (add_sub(BinOp::Add, Signed), true),
+        "uqadd" => (add_sub(BinOp::Add, Unsigned), false),
+        "sqsub" => (add_sub(BinOp::Sub, Signed), true),
+        // An unsigned subtract can go below zero, so its clamp is the
+        // signed-into-unsigned one rather than a plain upper bound.
+        "uqsub" => (add_sub(BinOp::Sub, SignedToUnsigned), false),
+        "shadd" => (SaturatingKind::Halving { rounding: false }, true),
+        "uhadd" => (SaturatingKind::Halving { rounding: false }, false),
+        "srhadd" => (SaturatingKind::Halving { rounding: true }, true),
+        "urhadd" => (SaturatingKind::Halving { rounding: true }, false),
+        "sqdmulh" => (
+            SaturatingKind::DoublingMultiplyHigh { rounding: false },
+            true,
+        ),
+        "sqrdmulh" => (
+            SaturatingKind::DoublingMultiplyHigh { rounding: true },
+            true,
+        ),
+        _ => return None,
+    })
+}
+
+/// The narrowing saturating mnemonics, whose destination element is half
+/// the source's.
+fn saturating_narrowing(base: &str, insn: &Instruction) -> Option<(SaturatingKind, bool)> {
+    use SaturateTo::{Signed, SignedToUnsigned, Unsigned};
+    if let Some(to) = match base {
+        "sqxtn" => Some(Signed),
+        "uqxtn" => Some(Unsigned),
+        "sqxtun" => Some(SignedToUnsigned),
+        _ => None,
+    } {
+        let signed_sources = !matches!(to, Unsigned);
+        return Some((SaturatingKind::Narrow { to }, signed_sources));
+    }
+    let (to, rounding, signed_sources) = match base {
+        "shrn" => (None, false, true),
+        "rshrn" => (None, true, true),
+        "sqshrn" => (Some(Signed), false, true),
+        "sqrshrn" => (Some(Signed), true, true),
+        "uqshrn" => (Some(Unsigned), false, false),
+        "uqrshrn" => (Some(Unsigned), true, false),
+        "sqshrun" => (Some(SignedToUnsigned), false, true),
+        "sqrshrun" => (Some(SignedToUnsigned), true, true),
+        _ => return None,
+    };
+    let shift = u16::try_from(parse_immediate(&insn.operands.get(2)?.raw)?).ok()?;
+    Some((
+        SaturatingKind::ShiftNarrow {
+            shift,
+            rounding,
+            to,
+        },
+        signed_sources,
+    ))
+}
+
+/// The saturating, halving and rounding-narrow family.
+fn saturating_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (base, upper) = peel_upper(mnemonic);
+    let (kind, signed_sources) =
+        saturating_same_width(base).or_else(|| saturating_narrowing(base, insn))?;
+    let narrowing = matches!(
+        kind,
+        SaturatingKind::Narrow { .. } | SaturatingKind::ShiftNarrow { .. }
+    );
+    let expected_operands = match kind {
+        SaturatingKind::Narrow { .. } => 2,
+        _ => 3,
+    };
+    if insn.operands.len() != expected_operands {
+        return None;
+    }
+    // Only the narrowing forms have a `2` variant.
+    if upper && !narrowing {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    // `sqdmulh` doubles a product, which the architecture only encodes
+    // for 16- and 32-bit elements.
+    if matches!(kind, SaturatingKind::DoublingMultiplyHigh { .. })
+        && !matches!(destination.lane_bits, 16 | 32)
+    {
+        return None;
+    }
+    let written = if narrowing && upper {
+        destination.lanes / 2
+    } else {
+        destination.lanes
+    };
+    if written == 0 {
+        return None;
+    }
+    let source_bits = if narrowing {
+        destination.lane_bits.checked_mul(2)?
+    } else {
+        destination.lane_bits
+    };
+    if source_bits > 64 {
+        return None;
+    }
+    // A shift has to leave the surviving bits inside the source element,
+    // which is what makes the shift direction's signedness irrelevant to
+    // the truncated result.
+    if let SaturatingKind::ShiftNarrow { shift, .. } = kind
+        && (shift == 0 || shift > destination.lane_bits)
+    {
+        return None;
+    }
+    for (index, operand) in insn.operands.iter().enumerate().skip(1) {
+        let Some(arrangement) = operand_arrangement(operand) else {
+            if matches!(kind, SaturatingKind::ShiftNarrow { .. }) && index == 2 {
+                continue;
+            }
+            return None;
+        };
+        if arrangement.lane_bits != source_bits || arrangement.lanes != written {
+            return None;
+        }
+    }
+    Some(NeonShape {
+        op: NeonOp::Saturating {
+            kind,
+            signed_sources,
+            upper,
+        },
+        lane_bits: destination.lane_bits,
+        lanes: written,
+        dest_index: 0,
+        source_index: 0,
+    })
 }
 
 // ===================== multiply-accumulate =====================
@@ -770,7 +962,72 @@ impl LiftCtx {
                 upper,
             } => self.widen_lanes(insn, shape, kind, signed, upper),
             NeonOp::MultiplyAccumulate(kind) => self.multiply_accumulate_lanes(insn, shape, kind),
+            NeonOp::Saturating {
+                kind,
+                signed_sources,
+                upper,
+            } => self.saturating_lanes(insn, shape, kind, signed_sources, upper),
         }
+    }
+
+    /// The saturating, halving and rounding-narrow family.
+    ///
+    /// Every member computes its lane at a width where the result cannot
+    /// overflow, then brings it back down — by clamping, by halving, or
+    /// by truncating. Doing the arithmetic at the destination's width
+    /// and clamping afterwards would be too late: the overflow the
+    /// instruction exists to detect would already have wrapped.
+    fn saturating_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        kind: SaturatingKind,
+        signed_sources: bool,
+        upper: bool,
+    ) -> Option<Expr> {
+        let narrowing = matches!(
+            kind,
+            SaturatingKind::Narrow { .. } | SaturatingKind::ShiftNarrow { .. }
+        );
+        let source_bits = if narrowing {
+            shape.lane_bits.checked_mul(2)?
+        } else {
+            shape.lane_bits
+        };
+        let first = self.widen_source(insn, 1)?;
+        let second = match insn.operands.get(2) {
+            Some(operand) if operand_arrangement(operand).is_some() => {
+                Some(self.widen_source(insn, 2)?)
+            }
+            _ => None,
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let a = LiftCtx::extract_lane(first.clone(), source_bits, index)?;
+            let b = match second.as_ref() {
+                Some(value) => Some(LiftCtx::extract_lane(value.clone(), source_bits, index)?),
+                None => None,
+            };
+            lanes.push(saturating_lane(
+                kind,
+                a,
+                b,
+                shape.lane_bits,
+                signed_sources,
+            )?);
+        }
+        let narrowed = Self::concat_lanes(lanes)?;
+        if !upper {
+            return Some(narrowed);
+        }
+        // A `2` form writes the destination's upper half and preserves
+        // the lower one.
+        let view = shape.lane_bits.checked_mul(shape.lanes)?;
+        let destination = self.simd_operand_value(&insn.operands.first()?.clone(), view * 2)?;
+        Some(Expr::concat(
+            narrowed,
+            Expr::extract(destination, view - 1, 0),
+        ))
     }
 
     /// The multiply-accumulate family: each destination lane is its own
@@ -1049,6 +1306,167 @@ impl LiftCtx {
             mnemonic: insn.mnemonic.clone(),
             comment: format!("unmodellable NEON operand at {addr}", addr = insn.address),
         });
+    }
+}
+
+/// Extend `value` from `from` bits to `to` bits.
+fn extend(value: Expr, to: u16, signed: bool) -> Expr {
+    if signed {
+        Expr::sign_ext(value, to)
+    } else {
+        Expr::zero_ext(value, to)
+    }
+}
+
+/// The largest value of a `bits`-wide unsigned range, or `None` when it
+/// does not fit the constant type.
+fn unsigned_max(bits: u16) -> Option<u128> {
+    if bits >= 128 {
+        return None;
+    }
+    Some((1u128 << bits) - 1)
+}
+
+/// Clamp `value`, computed at `wide` bits, into the `narrow`-bit range
+/// `to` names, returning a `narrow`-bit result.
+///
+/// The comparison's signedness follows the *value*, not the target: an
+/// unsigned sum is compared unsigned, while `uqsub`'s difference can be
+/// negative and so is compared signed even though it clamps into the
+/// unsigned range.
+fn clamp(value: Expr, wide: u16, narrow: u16, to: SaturateTo) -> Option<Expr> {
+    let konst = |v: u128| Expr::konst(v, wide);
+    let clamped = match to {
+        SaturateTo::Signed => {
+            let magnitude = 1u128.checked_shl(u32::from(narrow.checked_sub(1)?))?;
+            let high = konst(magnitude - 1);
+            // The lower bound is `-2^(narrow-1)` in `wide`-bit two's
+            // complement.
+            let low = konst(unsigned_max(wide)?.checked_add(1)?.checked_sub(magnitude)?);
+            let above = Expr::Ite {
+                cond: Box::new(Expr::slt(high.clone(), value.clone())),
+                then_expr: Box::new(high),
+                else_expr: Box::new(value.clone()),
+            };
+            Expr::Ite {
+                cond: Box::new(Expr::slt(value, low.clone())),
+                then_expr: Box::new(low),
+                else_expr: Box::new(above),
+            }
+        }
+        SaturateTo::Unsigned => {
+            let high = konst(unsigned_max(narrow)?);
+            Expr::Ite {
+                cond: Box::new(Expr::ult(high.clone(), value.clone())),
+                then_expr: Box::new(high),
+                else_expr: Box::new(value),
+            }
+        }
+        SaturateTo::SignedToUnsigned => {
+            let high = konst(unsigned_max(narrow)?);
+            let above = Expr::Ite {
+                cond: Box::new(Expr::slt(high.clone(), value.clone())),
+                then_expr: Box::new(high),
+                else_expr: Box::new(value.clone()),
+            };
+            Expr::Ite {
+                cond: Box::new(Expr::slt(value, konst(0))),
+                then_expr: Box::new(konst(0)),
+                else_expr: Box::new(above),
+            }
+        }
+    };
+    Some(Expr::extract(clamped, narrow - 1, 0))
+}
+
+/// One destination lane of a saturating, halving or rounding-narrow
+/// operation.
+///
+/// `a` and `b` arrive at the *source* width, which for the narrowing
+/// members is twice `lane_bits`.
+fn saturating_lane(
+    kind: SaturatingKind,
+    a: Expr,
+    b: Option<Expr>,
+    lane_bits: u16,
+    signed_sources: bool,
+) -> Option<Expr> {
+    match kind {
+        SaturatingKind::AddSub { op, to } => {
+            // One extra bit makes the sum or difference exact, so the
+            // clamp sees the true value rather than a wrapped one.
+            let wide = lane_bits.checked_add(1)?;
+            let value = op.apply(
+                extend(a, wide, signed_sources),
+                extend(b?, wide, signed_sources),
+            );
+            clamp(value, wide, lane_bits, to)
+        }
+        SaturatingKind::Halving { rounding } => {
+            let wide = lane_bits.checked_add(1)?;
+            let mut sum = Expr::add(
+                extend(a, wide, signed_sources),
+                extend(b?, wide, signed_sources),
+            );
+            if rounding {
+                sum = Expr::add(sum, Expr::konst(1, wide));
+            }
+            // The exact sum needs no clamp — halving it always fits.
+            let halved = if signed_sources {
+                Expr::ashr(sum, Expr::konst(1, wide))
+            } else {
+                Expr::lshr(sum, Expr::konst(1, wide))
+            };
+            Some(Expr::extract(halved, lane_bits - 1, 0))
+        }
+        SaturatingKind::Narrow { to } => clamp(a, lane_bits.checked_mul(2)?, lane_bits, to),
+        SaturatingKind::ShiftNarrow {
+            shift,
+            rounding,
+            to,
+        } => {
+            // One bit above the source width. The rounding term is added
+            // *before* the shift, and at the source's own width that
+            // addition can carry into the sign bit — `0x7fff + 8` in
+            // sixteen bits is negative, which would turn a saturation at
+            // the top of the range into one at the bottom. ARM defines
+            // the rounding on the unbounded integer, and this is the
+            // narrowest width that reproduces it.
+            let wide = lane_bits.checked_mul(2)?.checked_add(1)?;
+            let mut value = extend(a, wide, signed_sources);
+            if rounding {
+                // Half an ulp of the shift, added before the low bits
+                // are discarded.
+                let half = 1u128.checked_shl(u32::from(shift - 1))?;
+                value = Expr::add(value, Expr::konst(half, wide));
+            }
+            let shifted = if signed_sources {
+                Expr::ashr(value, Expr::konst(u128::from(shift), wide))
+            } else {
+                Expr::lshr(value, Expr::konst(u128::from(shift), wide))
+            };
+            match to {
+                Some(target) => clamp(shifted, wide, lane_bits, target),
+                // `shrn` / `rshrn` truncate: with the shift bounded by
+                // the destination's element width, every surviving bit
+                // is a real bit of the source rather than fill.
+                None => Some(Expr::extract(shifted, lane_bits - 1, 0)),
+            }
+        }
+        SaturatingKind::DoublingMultiplyHigh { rounding } => {
+            // The product needs `2 * lane_bits`, and doubling it needs
+            // one more — which is exactly the `INT_MIN * INT_MIN` corner
+            // where this instruction saturates.
+            let wide = lane_bits.checked_mul(2)?.checked_add(1)?;
+            let product = Expr::mul(extend(a, wide, true), extend(b?, wide, true));
+            let mut doubled = Expr::shl(product, Expr::konst(1, wide));
+            if rounding {
+                let half = 1u128.checked_shl(u32::from(lane_bits - 1))?;
+                doubled = Expr::add(doubled, Expr::konst(half, wide));
+            }
+            let high = Expr::ashr(doubled, Expr::konst(u128::from(lane_bits), wide));
+            clamp(high, wide, lane_bits, SaturateTo::Signed)
+        }
     }
 }
 
