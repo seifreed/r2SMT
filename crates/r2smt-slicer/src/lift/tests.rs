@@ -1554,6 +1554,61 @@ fn sqrtss_roots_only_the_low_lane_and_preserves_the_rest() {
 }
 
 #[test]
+fn cmpeqps_writes_an_all_ones_mask_per_lane() {
+    let stmts = lift_xmm_pair("cmpeqps");
+    let rendered = format!("{:?}", simd_dst_src(&stmts, "zmm0"));
+    // One predicate and one mask select per 32-bit lane of the view.
+    assert_eq!(rendered.matches("FEq").count(), 4, "{rendered}");
+    assert_eq!(rendered.matches("4294967295").count(), 4, "{rendered}");
+}
+
+#[test]
+fn cmpneqps_is_the_negation_of_the_equality_predicate() {
+    // The `n`-prefixed predicates are the unordered variants precisely
+    // because they negate a comparison that is false on NaN.
+    let stmts = lift_xmm_pair("cmpneqps");
+    let rendered = format!("{:?}", simd_dst_src(&stmts, "zmm0"));
+    assert_eq!(rendered.matches("BoolNot").count(), 4, "{rendered}");
+    assert_eq!(rendered.matches("FEq").count(), 4, "{rendered}");
+}
+
+#[test]
+fn cmpunordpd_tests_both_operands_for_nan_over_two_lanes() {
+    let stmts = lift_xmm_pair("cmpunordpd");
+    let rendered = format!("{:?}", simd_dst_src(&stmts, "zmm0"));
+    assert_eq!(rendered.matches("FIsNaN").count(), 4, "{rendered}");
+    assert!(!rendered.contains("BoolNot"), "{rendered}");
+}
+
+#[test]
+fn cmpordps_negates_the_unordered_predicate() {
+    let stmts = lift_xmm_pair("cmpordps");
+    let rendered = format!("{:?}", simd_dst_src(&stmts, "zmm0"));
+    assert_eq!(rendered.matches("BoolNot").count(), 4, "{rendered}");
+    assert_eq!(rendered.matches("FIsNaN").count(), 8, "{rendered}");
+}
+
+#[test]
+fn cmpltss_masks_only_the_low_lane() {
+    let stmts = lift_xmm_pair("cmpltss");
+    let rendered = format!("{:?}", simd_dst_src(&stmts, "zmm0"));
+    assert_eq!(rendered.matches("FLt").count(), 1, "{rendered}");
+    assert!(rendered.contains("hi: 511"), "{rendered}");
+}
+
+#[test]
+fn plain_integer_cmp_is_not_parsed_as_a_float_compare() {
+    // `cmp` and the string-compare mnemonics share the prefix but carry
+    // no predicate, so they must not be captured by the compare family.
+    for m in ["cmp", "cmpsd", "cmpsb", "cmpxchg"] {
+        assert!(
+            !crate::lift::is_fp_compare_mnemonic(m),
+            "{m}: wrongly parsed as a floating-point compare"
+        );
+    }
+}
+
+#[test]
 fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
     // Parity guard: the effect table keeps an instruction iff the lifter
     // models it. A mnemonic classified `Simd` by `analyze` but absent

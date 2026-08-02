@@ -76,6 +76,11 @@ impl LiftCtx {
             "sqrtpd" | "vsqrtpd" => self.lift_simd_sqrt(insn, 64, true),
             "sqrtss" => self.lift_simd_sqrt(insn, 32, false),
             "sqrtsd" => self.lift_simd_sqrt(insn, 64, false),
+            m if parse_fp_compare(m).is_some() => {
+                if let Some(cmp) = parse_fp_compare(m) {
+                    self.lift_simd_fp_mask_compare(insn, &cmp);
+                }
+            }
             "comiss" | "ucomiss" => self.lift_simd_fp_compare(insn, 32),
             "comisd" | "ucomisd" => self.lift_simd_fp_compare(insn, 64),
             "cvtsi2ss" => self.lift_int_to_fp(insn, 32),
@@ -578,6 +583,56 @@ impl LiftCtx {
         Self::concat_lanes(lanes)
     }
 
+    /// The SSE/AVX compares, which write a per-lane mask of all-ones
+    /// (predicate true) or all-zeros rather than a float.
+    fn lift_simd_fp_mask_compare(&mut self, insn: &Instruction, cmp: &FpCompare) {
+        let ops = &insn.operands;
+        let Some(dst) = ops.first() else {
+            return;
+        };
+        let (a_op, b_op) = match ops.len() {
+            2 => (dst, &ops[1]),
+            3 => (&ops[1], &ops[2]),
+            _ => {
+                self.push_simd_unsupported(insn);
+                return;
+            }
+        };
+        let Some(result) = self.fp_mask_result(dst, a_op, b_op, cmp) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let written = if cmp.packed {
+            self.write_xmm_dst(dst, result, is_vex(insn))
+        } else {
+            self.write_simd_lane(dst, result, cmp.lane_bits)
+        };
+        if !written {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
+    fn fp_mask_result(
+        &self,
+        dst: &Operand,
+        a_op: &Operand,
+        b_op: &Operand,
+        cmp: &FpCompare,
+    ) -> Option<Expr> {
+        let count = if cmp.packed {
+            Self::packed_lane_count(self.simd_view_bits(dst)?, cmp.lane_bits)?
+        } else {
+            1
+        };
+        let mut lanes = Vec::with_capacity(usize::from(count));
+        for index in 0..count {
+            let a = self.read_simd_lane_bits_at(a_op, cmp.lane_bits, index)?;
+            let b = self.read_simd_lane_bits_at(b_op, cmp.lane_bits, index)?;
+            lanes.push(fp_mask_lane(cmp, a, b));
+        }
+        Self::concat_lanes(lanes)
+    }
+
     /// `sqrtps`/`sqrtpd` (every lane) and `sqrtss`/`sqrtsd` (low lane
     /// only, upper bits of the destination preserved).
     ///
@@ -855,4 +910,103 @@ fn simd_all_ones(bits: u16) -> Expr {
     } else {
         Expr::concat(simd_all_ones(bits - 128), Expr::konst(u128::MAX, 128))
     }
+}
+
+/// Predicate of an SSE/AVX compare, as radare2 spells it: the immediate
+/// is baked into the mnemonic (`cmpeqps`, `cmpltsd`, …) rather than
+/// appearing as an operand.
+#[derive(Clone, Copy)]
+enum FpCmpPred {
+    Eq,
+    Lt,
+    Le,
+    Unord,
+}
+
+/// A parsed compare mnemonic: predicate, lane width, whether it is
+/// packed, and whether the result is the negation of the base
+/// predicate.
+struct FpCompare {
+    pred: FpCmpPred,
+    lane_bits: u16,
+    packed: bool,
+    negated: bool,
+}
+
+/// Whether `mnemonic` is one of the SSE/AVX compare pseudo-mnemonics.
+///
+/// Parse `cmp<pred><ps|pd|ss|sd>` and its VEX `v`-prefixed form.
+///
+/// The four negated predicates (`neq`, `nlt`, `nle`, `ord`) are exactly
+/// the boolean negations of the four base ones — which is also why they
+/// are the "unordered" variants: negating a comparison that is false on
+/// NaN yields one that is true on NaN.
+pub(crate) fn is_fp_compare_mnemonic(mnemonic: &str) -> bool {
+    parse_fp_compare(mnemonic).is_some()
+}
+
+fn parse_fp_compare(mnemonic: &str) -> Option<FpCompare> {
+    let lower = mnemonic.trim().to_ascii_lowercase();
+    let body = lower.strip_prefix('v').unwrap_or(&lower);
+    let rest = body.strip_prefix("cmp")?;
+    let (pred_part, suffix) = rest.split_at(rest.len().checked_sub(2)?);
+    let (lane_bits, packed) = match suffix {
+        "ps" => (32, true),
+        "pd" => (64, true),
+        "ss" => (32, false),
+        "sd" => (64, false),
+        _ => return None,
+    };
+    let (pred, negated) = match pred_part {
+        "eq" => (FpCmpPred::Eq, false),
+        "lt" => (FpCmpPred::Lt, false),
+        "le" => (FpCmpPred::Le, false),
+        "unord" => (FpCmpPred::Unord, false),
+        "neq" => (FpCmpPred::Eq, true),
+        "nlt" => (FpCmpPred::Lt, true),
+        "nle" => (FpCmpPred::Le, true),
+        "ord" => (FpCmpPred::Unord, true),
+        _ => return None,
+    };
+    Some(FpCompare {
+        pred,
+        lane_bits,
+        packed,
+        negated,
+    })
+}
+
+/// One lane of a compare: the predicate as a 1-bit value, widened to a
+/// full-lane mask of all-ones or all-zeros.
+fn fp_mask_lane(cmp: &FpCompare, a_bits: Expr, b_bits: Expr) -> Expr {
+    let (ebits, sbits) = fp_sort_bits(cmp.lane_bits);
+    let a = Expr::bv_to_fp(a_bits, ebits, sbits);
+    let b = Expr::bv_to_fp(b_bits, ebits, sbits);
+    let base = match cmp.pred {
+        FpCmpPred::Eq => Expr::feq(a, b),
+        FpCmpPred::Lt => Expr::flt(a, b),
+        FpCmpPred::Le => Expr::fle(a, b),
+        FpCmpPred::Unord => Expr::bool_or(Expr::fisnan(a), Expr::fisnan(b)),
+    };
+    let cond = if cmp.negated {
+        Expr::BoolNot(Box::new(base))
+    } else {
+        base
+    };
+    Expr::Ite {
+        cond: Box::new(cond),
+        then_expr: Box::new(lane_all_ones(cmp.lane_bits)),
+        else_expr: Box::new(Expr::konst(0, cmp.lane_bits)),
+    }
+}
+
+/// All-ones at a scalar lane width. Lanes are at most 64 bits, so this
+/// always fits the `u128` constant payload.
+fn lane_all_ones(lane_bits: u16) -> Expr {
+    let value = if lane_bits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << lane_bits) - 1
+    };
+    Expr::konst(value, lane_bits)
 }

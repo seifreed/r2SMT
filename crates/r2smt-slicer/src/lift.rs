@@ -40,6 +40,7 @@ mod aarch64;
 mod merge;
 mod x86;
 use merge::lower_merge;
+pub(crate) use x86::is_fp_compare_mnemonic;
 
 /// IR representation of a [`Slice`] plus the branch's symbolic
 /// condition.
@@ -91,6 +92,12 @@ const SIMD_PARENT_BITS: u16 = 512;
 /// for the same reason — their operands are vector-register lanes.
 /// Kept in sync with the dispatch in `effect/x86.rs`.
 fn is_x86_simd_mnemonic(mnemonic: &str) -> bool {
+    // The compare family is 64 mnemonics once the eight predicates are
+    // crossed with ps/pd/ss/sd and the VEX prefix, so it is recognised
+    // structurally rather than listed.
+    if x86::is_fp_compare_mnemonic(mnemonic) {
+        return true;
+    }
     matches!(
         mnemonic.trim().to_ascii_lowercase().as_str(),
         "movaps"
