@@ -2332,3 +2332,155 @@ fn vpxor_ymm_lifts_to_256bit_xor_with_upper_bits_zeroed() {
         )
     );
 }
+
+// ---------------------------------------------------------------
+// AArch64 scalar floating point.
+// ---------------------------------------------------------------
+
+/// Lift one `AArch64` instruction through the per-mnemonic dispatch.
+fn lift_aarch64(mnemonic: &str, operands: Vec<Operand>) -> Vec<IrStmt> {
+    lift_per_mnemonic(&insn(0x1000, 4, mnemonic, operands), Arch::Aarch64)
+}
+
+fn reg(name: &str) -> Operand {
+    op(name, OperandKind::Register)
+}
+
+#[test]
+fn aarch64_fadd_single_operates_on_the_32bit_lane_of_the_vector_parent() {
+    let stmts = lift_aarch64("fadd", vec![reg("s0"), reg("s1"), reg("s2")]);
+    let lane = |p: &str| Expr::bv_to_fp(Expr::extract(Expr::var(p, 128), 31, 0), 8, 24);
+    let result = Expr::fp_to_ieee_bv(Expr::fadd(
+        lane("v1"),
+        lane("v2"),
+        r2smt_ir::expr::RoundingMode::NearestTiesEven,
+    ));
+    assert_eq!(
+        *simd_parent_src(&stmts, "v0"),
+        Expr::zero_ext(result, 128),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_fadd_double_uses_the_64bit_sort() {
+    let stmts = lift_aarch64("fadd", vec![reg("d0"), reg("d1"), reg("d2")]);
+    let rendered = format!("{:?}", simd_parent_src(&stmts, "v0"));
+    assert!(rendered.contains("ebits: 11"), "{rendered}");
+}
+
+#[test]
+fn aarch64_scalar_write_zeroes_the_rest_of_the_vector_register() {
+    // Unlike legacy SSE, which merges, an AArch64 scalar write clears
+    // everything above the lane it writes.
+    let stmts = lift_aarch64("fmul", vec![reg("s0"), reg("s1"), reg("s2")]);
+    assert!(
+        matches!(simd_parent_src(&stmts, "v0"), Expr::ZeroExtend { .. }),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_fneg_flips_only_the_sign_bit() {
+    let stmts = lift_aarch64("fneg", vec![reg("s0"), reg("s1")]);
+    let expected = Expr::bv_xor(
+        Expr::extract(Expr::var("v1", 128), 31, 0),
+        Expr::konst(1 << 31, 32),
+    );
+    assert_eq!(
+        *simd_parent_src(&stmts, "v0"),
+        Expr::zero_ext(expected, 128),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_fcmp_marks_unordered_in_the_overflow_flag() {
+    // `b.vs` after a compare means "unordered" on AArch64, and it
+    // lowers to `OF == 1`, so the unordered predicate has to land
+    // there rather than being zeroed.
+    let stmts = lift_aarch64("fcmp", vec![reg("s0"), reg("s1")]);
+    let rendered = format!("{:?}", flag_src(&stmts, "OF").expect("OF defined"));
+    assert!(rendered.contains("FIsNaN"), "{rendered}");
+}
+
+#[test]
+fn aarch64_fcmp_equality_flag_is_false_when_unordered() {
+    // ZF is *ordered* equality: `b.eq` must not fire on NaN.
+    let stmts = lift_aarch64("fcmp", vec![reg("s0"), reg("s1")]);
+    let rendered = format!("{:?}", flag_src(&stmts, "ZF").expect("ZF defined"));
+    assert!(rendered.starts_with("FEq"), "{rendered}");
+}
+
+#[test]
+fn aarch64_fcmp_against_the_zero_immediate_is_supported() {
+    // `fcmp s0, #0.0` is the ISA's only immediate form.
+    let stmts = lift_aarch64("fcmp", vec![reg("s0"), op("#0.0", OperandKind::Immediate)]);
+    assert!(
+        !stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_fmov_between_general_and_vector_registers_moves_raw_bits() {
+    // `fmov w0, s0` reinterprets rather than converts, so no rounding
+    // node may appear.
+    let stmts = lift_aarch64("fmov", vec![reg("w0"), reg("s0")]);
+    let rendered = format!("{stmts:?}");
+    assert!(!rendered.contains("FpToFp"), "{rendered}");
+}
+
+#[test]
+fn aarch64_ucvtf_converts_the_unsigned_range_exactly() {
+    // The IR carries only the signed conversion; an unsigned source is
+    // zero-extended by one bit so the signed node covers its whole
+    // range without approximating.
+    let stmts = lift_aarch64("ucvtf", vec![reg("s0"), reg("w0")]);
+    let rendered = format!("{:?}", simd_parent_src(&stmts, "v0"));
+    assert!(rendered.contains("ZeroExtend"), "{rendered}");
+    assert!(rendered.contains("SbvToFp"), "{rendered}");
+}
+
+#[test]
+fn aarch64_fp_effect_defines_the_vector_parent_without_reading_it() {
+    let i = insn(0x1000, 4, "fadd", vec![reg("s0"), reg("s1"), reg("s2")]);
+    let e = crate::effect::analyze(&i, Arch::Aarch64);
+    assert_eq!(e.defs, vec!["v0"], "{e:?}");
+}
+
+#[test]
+fn aarch64_fp_mnemonics_are_covered_by_both_effect_and_lifter() {
+    // The same parity guard the x86 SIMD family carries: an effect
+    // table that keeps an instruction the lifter declines would leave
+    // the vector parent undefined and let a stale value stand in.
+    for m in [
+        "fadd", "fsub", "fmul", "fdiv", "fmax", "fmin", "fsqrt", "fabs", "fneg", "fmov", "fcvt",
+    ] {
+        let operands = match m {
+            "fsqrt" | "fabs" | "fneg" | "fmov" | "fcvt" => vec![reg("s0"), reg("s1")],
+            _ => vec![reg("s0"), reg("s1"), reg("s2")],
+        };
+        let i = insn(0x1000, 4, m, operands);
+        assert_eq!(
+            crate::effect::analyze(&i, Arch::Aarch64).kind,
+            crate::effect::InstructionKind::Simd,
+            "{m}: effect table does not classify it as Simd"
+        );
+        let stmts = lift_per_mnemonic(&i, Arch::Aarch64);
+        assert!(
+            !stmts
+                .iter()
+                .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+            "{m}: lifter emitted Unsupported"
+        );
+        assert!(
+            stmts
+                .iter()
+                .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name.starts_with('v'))),
+            "{m}: lifter did not define the vector parent"
+        );
+    }
+}

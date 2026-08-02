@@ -23,7 +23,7 @@
 //! right-hand side of the assignment.
 
 use r2smt_common::{Address, Arch};
-use r2smt_ir::expr::{Expr, Var};
+use r2smt_ir::expr::{Expr, RoundingMode, Var};
 use r2smt_ir::program::{Instruction, Operand, OperandKind};
 use r2smt_ir::stmt::IrStmt;
 use serde::{Deserialize, Serialize};
@@ -98,8 +98,39 @@ const FLAGS: &[&str] = &["ZF", "CF", "SF", "OF", "PF"];
 fn is_simd_instruction(insn: &Instruction, arch: Arch) -> bool {
     match arch {
         Arch::X86 | Arch::X86_64 => is_x86_simd_instruction(insn),
+        Arch::Aarch64 => is_aarch64_fp_instruction(insn),
         _ => false,
     }
+}
+
+/// `AArch64` scalar floating-point mnemonics whose per-mnemonic handler
+/// must win over the ESIL and P-code ladders.
+///
+/// `fmov s0, s1` is the reason this cannot wait: ESIL describes it as
+/// `"s1,s0,="`, which the mini stack machine evaluates happily, into a
+/// register node named and sized unlike anything the vector lifter
+/// produces.
+fn is_aarch64_fp_instruction(insn: &Instruction) -> bool {
+    matches!(
+        insn.mnemonic.trim().to_ascii_lowercase().as_str(),
+        "fadd"
+            | "fsub"
+            | "fmul"
+            | "fdiv"
+            | "fmax"
+            | "fmin"
+            | "fsqrt"
+            | "fabs"
+            | "fneg"
+            | "fmov"
+            | "fcmp"
+            | "fcmpe"
+            | "fcvt"
+            | "scvtf"
+            | "ucvtf"
+            | "fcvtzs"
+            | "fcvtzu"
+    )
 }
 
 fn is_x86_simd_instruction(insn: &Instruction) -> bool {
@@ -228,6 +259,61 @@ pub(crate) fn pins_rounding_mode(mnemonic: &str, arch: Arch) -> bool {
         // report `Complete` while the hardware rounded some other way.
         _ => false,
     }
+}
+
+/// Floating-point operation applied to one lane, shared by the scalar
+/// (`addss`) and packed (`addps`) handlers.
+#[derive(Clone, Copy)]
+pub(crate) enum FpArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Max,
+    Min,
+}
+
+/// Apply `op` to one lane, given both operands as raw IEEE bit-vectors
+/// of `lane_bits`, and return the lane result in the same form.
+///
+/// The result is a bit-vector rather than a float because `max`/`min`
+/// *select* an operand instead of computing one, and the IR's `Ite` is
+/// bit-vector-typed — an `Ite` over float-sorted branches has no
+/// rendering.
+///
+/// The rounding mode is the architectural MXCSR default; a function
+/// that reprograms MXCSR is rejected by the slicer's guard rather than
+/// silently rounded here.
+pub(crate) fn fp_lane_result(op: FpArithOp, a_bits: Expr, b_bits: Expr, lane_bits: u16) -> Expr {
+    let (ebits, sbits) = fp_sort_bits(lane_bits);
+    let a = Expr::bv_to_fp(a_bits.clone(), ebits, sbits);
+    let b = Expr::bv_to_fp(b_bits.clone(), ebits, sbits);
+    let rm = RoundingMode::NearestTiesEven;
+    let arith = match op {
+        FpArithOp::Add => Expr::fadd(a, b, rm),
+        FpArithOp::Sub => Expr::fsub(a, b, rm),
+        FpArithOp::Mul => Expr::fmul(a, b, rm),
+        FpArithOp::Div => Expr::fdiv(a, b, rm),
+        // `MAXPS: IF SRC1 > SRC2 THEN DEST := SRC1 ELSE DEST := SRC2`
+        // (and the mirror for MIN). The comparison is false when either
+        // operand is NaN, so the second operand wins on unordered *and*
+        // on equality — which is why this is an explicit select rather
+        // than `fp.max`/`fp.min`, whose NaN and signed-zero behaviour
+        // differs from x86's.
+        FpArithOp::Max | FpArithOp::Min => {
+            let cond = if matches!(op, FpArithOp::Max) {
+                Expr::flt(b, a)
+            } else {
+                Expr::flt(a, b)
+            };
+            return Expr::Ite {
+                cond: Box::new(cond),
+                then_expr: Box::new(a_bits),
+                else_expr: Box::new(b_bits),
+            };
+        }
+    };
+    Expr::fp_to_ieee_bv(arith)
 }
 
 /// IEEE `(ebits, sbits)` sort for an FP lane width: 16→half `(5, 11)`,
@@ -491,7 +577,10 @@ impl LiftCtx {
         // model these precisely at 128 bits — prefer them, bypassing
         // the ESIL/P-code ladder for this closed mnemonic set.
         if is_simd_instruction(insn, self.arch) {
-            self.lift_instruction_x86(insn);
+            match self.arch {
+                Arch::Aarch64 => self.lift_instruction_aarch64(insn),
+                _ => self.lift_instruction_x86(insn),
+            }
             return;
         }
         // ESIL-first path: when radare2 has attached an ESIL string

@@ -31,7 +31,19 @@ pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
         "lsr" => aarch64_arith3_effect(insn, InstructionKind::Shr, false),
         "asr" => aarch64_arith3_effect(insn, InstructionKind::Sar, false),
         // 2-operand compare / test: flags only, no destination.
-        "cmp" => aarch64_cmp_test_effect(insn, InstructionKind::Cmp),
+        // Scalar floating point. The destination is written whole (a
+        // scalar write zeroes the rest of the vector register), so it
+        // is a def and not also a use — the 3-operand shape, not x86's
+        // read-modify-write one. `canonical_register` already resolves
+        // `s0` / `d0` / `h0` to their `v<n>` parent, so the register
+        // family is shared with the rest of the vector file and the
+        // slicer sees the aliasing.
+        "fadd" | "fsub" | "fmul" | "fdiv" | "fmax" | "fmin" | "fsqrt" | "fabs" | "fneg"
+        | "fmov" | "fcvt" | "scvtf" | "ucvtf" | "fcvtzs" | "fcvtzu" => {
+            aarch64_arith3_effect(insn, InstructionKind::Simd, false)
+        }
+        // `fcmp` writes NZCV and defines no register — `cmp`'s shape.
+        "cmp" | "fcmp" | "fcmpe" => aarch64_cmp_test_effect(insn, InstructionKind::Cmp),
         "tst" => aarch64_cmp_test_effect(insn, InstructionKind::Test),
         // Control flow.
         "b" => InstructionEffect {

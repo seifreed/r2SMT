@@ -2594,3 +2594,85 @@ fn determinism_verdict_is_invariant_across_random_seeds() {
         );
     }
 }
+
+#[test]
+fn aarch64_float_moved_between_registers_decides_the_compare() {
+    // End-to-end through the real AArch64 pipeline: `scvtf` turns a
+    // zeroed integer register into 0.0, `fmov` carries it, and the
+    // compare then resolves.
+    //
+    // `b.eq` is the discriminating verdict. If the move landed on a
+    // node disjoint from the vector parent the compare reads — the
+    // failure mode the ESIL model of `s0` would produce — `s1` would be
+    // a free input and this would stay `BothPossible`.
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "mov",
+            vec![
+                op("w0", OperandKind::Register),
+                op("0", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "scvtf",
+            vec![
+                op("s0", OperandKind::Register),
+                op("w0", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            4,
+            "fmov",
+            vec![
+                op("s1", OperandKind::Register),
+                op("s0", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_100c,
+            4,
+            "fcmp",
+            vec![
+                op("s0", OperandKind::Register),
+                op("s1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1010,
+            4,
+            "b.eq",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn aarch64_unordered_compare_does_not_satisfy_equality() {
+    // The anti-fabrication direction: with the operands free, an
+    // equality branch after `fcmp` must stay undecided — NaN alone
+    // makes it false, so it can never be proven always-taken.
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "fcmp",
+            vec![
+                op("s0", OperandKind::Register),
+                op("s1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "b.eq",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::BothPossible);
+}

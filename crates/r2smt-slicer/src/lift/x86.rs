@@ -9,7 +9,9 @@ use r2smt_ir::stmt::IrStmt;
 
 use crate::registers::{is_simd_parent, register_layout};
 
-use super::{BitwiseOp, ExtendKind, LiftCtx, ShiftOp, fp_sort_bits, nonzero_width};
+use super::{
+    BitwiseOp, ExtendKind, FpArithOp, LiftCtx, ShiftOp, fp_lane_result, fp_sort_bits, nonzero_width,
+};
 
 /// x86 SHL/SHR/SAR/SAL mask the shift count before shifting: 5 bits
 /// for 8/16/32-bit operands, 6 bits for 64-bit operands (Intel SDM
@@ -991,61 +993,6 @@ enum SimdBitOp {
     Or,
     /// `pandn`/`vpandn`: `(~a) & b`.
     AndNot,
-}
-
-/// Floating-point operation applied to one lane, shared by the scalar
-/// (`addss`) and packed (`addps`) handlers.
-#[derive(Clone, Copy)]
-enum FpArithOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Max,
-    Min,
-}
-
-/// Apply `op` to one lane, given both operands as raw IEEE bit-vectors
-/// of `lane_bits`, and return the lane result in the same form.
-///
-/// The result is a bit-vector rather than a float because `max`/`min`
-/// *select* an operand instead of computing one, and the IR's `Ite` is
-/// bit-vector-typed — an `Ite` over float-sorted branches has no
-/// rendering.
-///
-/// The rounding mode is the architectural MXCSR default; a function
-/// that reprograms MXCSR is rejected by the slicer's guard rather than
-/// silently rounded here.
-fn fp_lane_result(op: FpArithOp, a_bits: Expr, b_bits: Expr, lane_bits: u16) -> Expr {
-    let (ebits, sbits) = fp_sort_bits(lane_bits);
-    let a = Expr::bv_to_fp(a_bits.clone(), ebits, sbits);
-    let b = Expr::bv_to_fp(b_bits.clone(), ebits, sbits);
-    let rm = RoundingMode::NearestTiesEven;
-    let arith = match op {
-        FpArithOp::Add => Expr::fadd(a, b, rm),
-        FpArithOp::Sub => Expr::fsub(a, b, rm),
-        FpArithOp::Mul => Expr::fmul(a, b, rm),
-        FpArithOp::Div => Expr::fdiv(a, b, rm),
-        // `MAXPS: IF SRC1 > SRC2 THEN DEST := SRC1 ELSE DEST := SRC2`
-        // (and the mirror for MIN). The comparison is false when either
-        // operand is NaN, so the second operand wins on unordered *and*
-        // on equality — which is why this is an explicit select rather
-        // than `fp.max`/`fp.min`, whose NaN and signed-zero behaviour
-        // differs from x86's.
-        FpArithOp::Max | FpArithOp::Min => {
-            let cond = if matches!(op, FpArithOp::Max) {
-                Expr::flt(b, a)
-            } else {
-                Expr::flt(a, b)
-            };
-            return Expr::Ite {
-                cond: Box::new(cond),
-                then_expr: Box::new(a_bits),
-                else_expr: Box::new(b_bits),
-            };
-        }
-    };
-    Expr::fp_to_ieee_bv(arith)
 }
 
 /// Whether two operands name the same SIMD register view (same vector
