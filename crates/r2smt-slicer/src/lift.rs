@@ -235,18 +235,19 @@ fn is_x86_simd_instruction(insn: &Instruction) -> bool {
     )
 }
 
-/// Whether `insn` reprograms the FPU control register that
+/// Whether `insn` reprograms an FPU control register that
 /// [`pins_rounding_mode`] assumes holds its architectural default.
 ///
-/// x86 names the write in the mnemonic (`ldmxcsr`, and the state
-/// restores that reload MXCSR wholesale). ARM does not: `msr` and `vmsr`
-/// write *any* system register, and only the operand says which, so the
-/// mnemonic alone would either miss the FPCR write or condemn every
-/// system-register write in the function.
+/// x86 names the write in the mnemonic — `ldmxcsr` for the SSE control
+/// word, `fldcw` for the x87 one, and the state restores that reload
+/// either wholesale. ARM does not: `msr` and `vmsr` write *any* system
+/// register, and only the operand says which, so the mnemonic alone
+/// would either miss the FPCR write or condemn every system-register
+/// write in the function.
 #[must_use]
 pub(crate) fn writes_rounding_control(insn: &Instruction, arch: Arch) -> bool {
     match arch {
-        Arch::X86 | Arch::X86_64 => x86::writes_mxcsr(&insn.mnemonic),
+        Arch::X86 | Arch::X86_64 => x86::writes_fp_control(&insn.mnemonic),
         Arch::Aarch64 | Arch::Arm => {
             let mnem = insn.mnemonic.trim().to_ascii_lowercase();
             if !matches!(mnem.as_str(), "msr" | "vmsr") {
@@ -261,12 +262,14 @@ pub(crate) fn writes_rounding_control(insn: &Instruction, arch: Arch) -> bool {
     }
 }
 
-/// Whether lifting `mnemonic` pins the architectural default rounding
-/// mode, and so depends on nothing having reprogrammed it.
+/// Whether lifting `insn` pins a floating-point control field to
+/// its architectural default, and so depends on nothing having
+/// reprogrammed it. On x87 that is the rounding mode *and* the
+/// precision control.
 #[must_use]
-pub(crate) fn pins_rounding_mode(mnemonic: &str, arch: Arch) -> bool {
+pub(crate) fn pins_rounding_mode(insn: &Instruction, arch: Arch) -> bool {
     match arch {
-        Arch::X86 | Arch::X86_64 => x86::pins_rounding_mode(mnemonic),
+        Arch::X86 | Arch::X86_64 => x86::pins_rounding_mode(insn),
         // ARM floating-point arithmetic is not lifted yet. The guard is
         // wired ahead of it deliberately: the moment a handler pins a
         // rounding mode it has to be listed here, or the slice would

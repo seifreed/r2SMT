@@ -2189,13 +2189,13 @@ fn rounding_insensitive_floating_point_survives_an_mxcsr_write() {
         "movsd",
     ] {
         assert!(
-            !crate::lift::pins_rounding_mode(m, Arch::X86_64),
+            !crate::lift::pins_rounding_mode(&insn(0, 1, m, vec![]), Arch::X86_64),
             "{m}: wrongly treated as rounding-mode dependent"
         );
     }
     for m in ["addss", "mulpd", "sqrtss", "cvtsi2ss", "cvtss2sd"] {
         assert!(
-            crate::lift::pins_rounding_mode(m, Arch::X86_64),
+            crate::lift::pins_rounding_mode(&insn(0, 1, m, vec![]), Arch::X86_64),
             "{m}: should be guarded"
         );
     }

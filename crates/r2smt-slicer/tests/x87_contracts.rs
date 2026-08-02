@@ -560,3 +560,90 @@ fn test_x87_stack_at_capacity_still_resolves_precisely() {
         narrowed(Expr::konst(ONE_BITS, SLOT_BITS), DOUBLE)
     );
 }
+// ---------------------------------------------------------------
+// Control-word guard
+// ---------------------------------------------------------------
+
+/// `body`, the `mov` / `cmp` / `je` tail, and then `trailer` — placed
+/// *after* the branch on purpose. The backward walk starts at the
+/// branch and never visits it, which is exactly the blind spot the
+/// function-scoped guard exists to cover: a control word has no
+/// register name, so it defines nothing the live set can require.
+fn program_with_trailer(
+    body: Vec<(&str, Vec<Operand>)>,
+    probe: Operand,
+    trailer: Vec<(&str, Vec<Operand>)>,
+) -> Program {
+    let mut all = body;
+    all.push(("mov", vec![reg("rax"), probe]));
+    all.push(("cmp", vec![reg("rax"), op("0", OperandKind::Immediate)]));
+    all.push(("je", vec![op("0x402000", OperandKind::Immediate)]));
+    all.extend(trailer);
+    program(all)
+}
+
+/// The rounding-dependent chain the guard has to protect: an add at the
+/// extended sort, narrowed at the store.
+fn rounding_chain() -> Vec<(&'static str, Vec<Operand>)> {
+    vec![
+        ("fld1", vec![]),
+        ("fld1", vec![]),
+        ("faddp", vec![reg("st(1)"), reg("st(0)")]),
+        ("fstp", vec![mem("qword [rbp - 0x20]")]),
+    ]
+}
+
+#[test]
+fn test_x87_arithmetic_is_complete_without_a_control_word_write() {
+    // Teeth for the guard below: untouched, the same chain resolves.
+    let program = program_with_trailer(rounding_chain(), mem("qword [rbp - 0x20]"), Vec::new());
+    assert_eq!(slice_of(&program).status, SliceStatus::Complete);
+}
+
+#[test]
+fn test_x87_arithmetic_truncates_when_a_control_word_is_reloaded() {
+    // `fldcw` reprograms the rounding mode *and* the precision control,
+    // the latter being the one no fixed sort can express: it sets the
+    // significand width of every subsequent arithmetic result. The
+    // writer sits past the branch, so nothing but the function-scoped
+    // guard can catch it.
+    for writer in ["fldcw", "fldenv", "frstor", "fxrstor", "ldmxcsr"] {
+        let program = program_with_trailer(
+            rounding_chain(),
+            mem("qword [rbp - 0x20]"),
+            vec![(writer, vec![mem("word [rbp - 0x40]")])],
+        );
+        assert!(
+            matches!(slice_of(&program).status, SliceStatus::Truncated { .. }),
+            "`{writer}` must invalidate the pinned control fields"
+        );
+    }
+}
+
+#[test]
+fn test_x87_exact_chain_is_unaffected_by_a_control_word_write() {
+    // The guard fires on what *computes*, not on anything x87. A load
+    // and an extended store neither round nor depend on the significand
+    // width, so this chain survives an `fldcw` in the same function.
+    let program = program_with_trailer(
+        vec![
+            ("fld", vec![mem("tbyte [rbp - 0x10]")]),
+            ("fstp", vec![mem("tbyte [rbp - 0x30]")]),
+        ],
+        mem("qword [rbp - 0x30]"),
+        vec![("fldcw", vec![mem("word [rbp - 0x40]")])],
+    );
+    assert_eq!(slice_of(&program).status, SliceStatus::Complete);
+}
+
+#[test]
+fn test_x87_control_word_read_stays_unmodelled() {
+    // `fnstcw` takes the same posture as `stmxcsr`: it is not in the
+    // modelled set, so it stays `Other` and truncates a pending slice
+    // rather than being stepped over as if it had no effect.
+    let effect = analyze(
+        &insn(FUNCTION_ADDRESS, "fnstcw", vec![mem("word [rbp - 0x40]")]),
+        Arch::X86_64,
+    );
+    assert_eq!(effect.kind, InstructionKind::Other);
+}

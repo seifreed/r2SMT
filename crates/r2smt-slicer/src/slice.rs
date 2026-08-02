@@ -297,23 +297,32 @@ pub fn slice_branch(
     reject_unpinned_rounding_mode(slice, function, candidate, arch)
 }
 
-/// Truncate a slice whose floating-point arithmetic assumes the default
-/// MXCSR rounding mode while the containing function reprograms it.
+/// Truncate a slice whose floating-point arithmetic assumes a control
+/// field holds its architectural default while the containing function
+/// reprograms it.
 ///
-/// This cannot be caught by the backward walk. MXCSR has no register
-/// name, so `ldmxcsr` defines nothing the live set can require, and the
-/// walk stops as soon as the live set is satisfied — an `ldmxcsr` ahead
-/// of the arithmetic is simply never visited. Without this guard such a
-/// slice reports `Complete` at high confidence while the hardware was
-/// rounding some other way.
+/// This cannot be caught by the backward walk. A control word has no
+/// register name, so `ldmxcsr` / `fldcw` define nothing the live set can
+/// require, and the walk stops as soon as the live set is satisfied — a
+/// write ahead of the arithmetic is simply never visited. Without this
+/// guard such a slice reports `Complete` at high confidence while the
+/// hardware computed some other way.
 ///
-/// Function-scoped, so a rounding mode installed by a *caller* remains
+/// x87 makes the hazard strictly worse than SSE's. Its control word
+/// carries a *precision-control* field alongside the rounding mode, and
+/// narrowing it changes the significand width of every subsequent
+/// arithmetic result — which a fixed floating-point sort cannot express
+/// at all, only decline. So the truncation here is the whole remedy
+/// rather than a fallback for one that models it.
+///
+/// Function-scoped, so a control word installed by a *caller* remains
 /// invisible. A slice reaching a call now ends there (the call is a
-/// value barrier), which bounds the residue to the mode the function was
-/// entered with.
+/// value barrier), which bounds the residue to the state the function
+/// was entered with.
 ///
-/// Arch-aware on both halves: x86 pins MXCSR and reprograms it with
-/// `ldmxcsr`, ARM pins FPCR / FPSCR and reprograms it with `msr` / `vmsr`.
+/// Arch-aware on both halves: x86 pins MXCSR and the x87 control word,
+/// reprogrammed by `ldmxcsr` / `fldcw` and the state restores; ARM pins
+/// FPCR / FPSCR and reprograms them with `msr` / `vmsr`.
 fn reject_unpinned_rounding_mode(
     slice: Slice,
     function: &Function,
@@ -326,7 +335,7 @@ fn reject_unpinned_rounding_mode(
     if !slice
         .instructions
         .iter()
-        .any(|i| crate::lift::pins_rounding_mode(&i.mnemonic, arch))
+        .any(|i| crate::lift::pins_rounding_mode(i, arch))
     {
         return slice;
     }
@@ -342,7 +351,7 @@ fn reject_unpinned_rounding_mode(
         branch: candidate.clone(),
         instructions: slice.instructions,
         status: SliceStatus::truncated(format!(
-            "'{mnem}' at {addr} reprograms the FPU control register; the rounding mode assumed by this slice's floating-point arithmetic is not sound",
+            "'{mnem}' at {addr} reprograms an FPU control word; the rounding mode and precision this slice's floating-point arithmetic assumes are not sound",
             mnem = writer.mnemonic,
             addr = writer.address
         )),
