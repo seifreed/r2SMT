@@ -9,11 +9,27 @@ use crate::registers::register_layout;
 
 use super::{
     BinOp, CsArithOp, FpArithOp, LiftCtx, MemAccess, aarch64_cond_suffix_to_predicate,
-    fp_lane_result, fp_sort_bits, nonzero_width, width_mask,
+    declines_vector_shape, fp_lane_result, fp_sort_bits, nonzero_width, width_mask,
 };
+use r2smt_common::Arch;
 
 impl LiftCtx {
     pub(super) fn lift_instruction_aarch64(&mut self, insn: &Instruction) {
+        // NEON reuses the integer and scalar-FP mnemonics, so the shape
+        // guard has to sit above the dispatch rather than in arms of its
+        // own — `"add"` and `"fadd"` are already claimed below, and the
+        // register table resolves `v0.4s` to the same `v0` parent a
+        // scalar handler would happily add as one 128-bit value.
+        if declines_vector_shape(insn, Arch::Aarch64) {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: format!(
+                    "unmodelled vector shape at {addr} (aarch64)",
+                    addr = insn.address
+                ),
+            });
+            return;
+        }
         let mnem = insn.mnemonic.trim().to_ascii_lowercase();
         match mnem.as_str() {
             // Data movement: `mov Rd, Rn/imm`, `movz Rd, #imm`. AArch64

@@ -513,3 +513,116 @@ fn vector_arrangement_never_fires_on_x86() {
         assert!(!has_vector_arrangement(raw, Arch::X86_64), "{raw}");
     }
 }
+
+// --- ARM vector arrangements and indexed lanes ---
+
+#[test]
+fn aarch64_full_width_arrangement_resolves_to_the_whole_vector_parent() {
+    let layout = register_layout("v0.4s", Arch::Aarch64).unwrap();
+    assert_eq!(
+        layout,
+        RegisterLayout {
+            parent: "v0",
+            lo: 0,
+            hi: 127,
+            zero_extends_parent_64: false,
+        }
+    );
+}
+
+#[test]
+fn aarch64_half_width_arrangement_resolves_to_the_low_64_bits() {
+    let layout = register_layout("v3.8b", Arch::Aarch64).unwrap();
+    assert_eq!(layout.parent, "v3");
+    assert_eq!(layout.lo, 0);
+    assert_eq!(layout.width(), 64);
+}
+
+#[test]
+fn aarch64_arrangement_lane_geometry_is_parsed_separately_from_the_layout() {
+    assert_eq!(
+        parse_arrangement("4s"),
+        Some(Arrangement {
+            lanes: 4,
+            lane_bits: 32,
+        })
+    );
+    assert_eq!(
+        parse_arrangement("16b"),
+        Some(Arrangement {
+            lanes: 16,
+            lane_bits: 8,
+        })
+    );
+}
+
+#[test]
+fn aarch64_arrangement_rejects_a_view_that_is_neither_half_nor_full_width() {
+    // `3s` would be 96 bits — no such vector format exists, and guessing
+    // one would silently cut the register the wrong way.
+    assert_eq!(parse_arrangement("3s"), None);
+    assert!(register_layout("v0.3s", Arch::Aarch64).is_none());
+}
+
+#[test]
+fn aarch64_indexed_lane_addresses_the_whole_register() {
+    // The lane index deliberately does not narrow the slice: `alias_for`
+    // reverse-maps `(hi, lo)` pairs, and a lane offset would collide with
+    // the legitimate `dN` / `sN` views.
+    let layout = register_layout("v0.s[1]", Arch::Aarch64).unwrap();
+    assert_eq!(layout.parent, "v0");
+    assert_eq!(layout.lo, 0);
+    assert_eq!(layout.width(), 128);
+}
+
+#[test]
+fn aarch64_indexed_lane_rejects_an_out_of_range_index() {
+    // `v0.d[2]` names a third 64-bit element of a 128-bit register.
+    assert!(register_layout("v0.d[2]", Arch::Aarch64).is_none());
+}
+
+#[test]
+fn aarch64_arrangement_still_rejects_out_of_range_register_numbers() {
+    for raw in ["v32.4s", "q40", "d99"] {
+        assert!(register_layout(raw, Arch::Aarch64).is_none(), "{raw}");
+    }
+}
+
+#[test]
+fn aarch32_indexed_lane_resolves_to_the_bare_view() {
+    let bare = register_layout("d0", Arch::Arm).unwrap();
+    let indexed = register_layout("d0[1]", Arch::Arm).unwrap();
+    assert_eq!(indexed, bare);
+}
+
+#[test]
+fn aarch32_v1_is_still_the_aapcs_alias_for_r4() {
+    // The AAPCS table is consulted ahead of the SIMD one, so widening the
+    // SIMD parser must not capture `v1` — and a shaped `v1.2d` must not
+    // resolve as a GPR either.
+    assert_eq!(register_layout("v1", Arch::Arm).unwrap().parent, "r4");
+    assert!(register_layout("v1.2d", Arch::Arm).is_none());
+}
+
+#[test]
+fn arrangements_never_resolve_under_x86() {
+    for raw in ["v1.2d", "v0.4s", "xmm0.4s"] {
+        assert!(register_layout(raw, Arch::X86_64).is_none(), "{raw}");
+    }
+}
+
+#[test]
+fn aarch32_general_purpose_register_list_is_not_a_vector_shape() {
+    // `push {r4, r5, lr}` is ordinary data movement the lifter models.
+    // Judging a list by its braces alone would fail it closed and
+    // truncate every AArch32 stack-frame setup.
+    for raw in ["{r4, r5, lr}", "{r0}", "{r4-r7, pc}"] {
+        assert!(!has_vector_arrangement(raw, Arch::Arm), "{raw}");
+    }
+}
+
+#[test]
+fn aarch32_vector_register_list_is_a_vector_shape() {
+    assert!(has_vector_arrangement("{d0, d1}", Arch::Arm));
+    assert!(has_vector_arrangement("{q0}", Arch::Arm));
+}

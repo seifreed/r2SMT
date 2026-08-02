@@ -16,7 +16,7 @@ pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
     // instruction passes with empty `defs` while its sources still
     // resolve as `uses`: the slicer neither truncates nor keeps it, and
     // a later read of the destination binds to a stale definition.
-    if super::has_unmodelled_vector_shape(insn, Arch::Aarch64) {
+    if crate::lift::declines_vector_shape(insn, Arch::Aarch64) {
         return other_effect(insn);
     }
     let mnemonic = insn.mnemonic.trim().to_ascii_lowercase();

@@ -1,7 +1,10 @@
 //! `AArch64` register layout + alias tables, extracted from
 //! `registers.rs`.
 
-use super::{RegisterLayout, aarch64_dword, aarch64_full, aarch64_vector};
+use super::{
+    RegisterLayout, aarch64_dword, aarch64_full, aarch64_vector, element_type_bits,
+    parse_arrangement, parse_lane_index,
+};
 
 pub(super) fn aarch64_layout(lower: &str) -> Option<RegisterLayout> {
     // x0..x30 / w0..w30
@@ -43,7 +46,7 @@ pub(super) fn aarch64_layout(lower: &str) -> Option<RegisterLayout> {
 
 fn aarch64_simd_layout(lower: &str) -> Option<RegisterLayout> {
     let prefix = lower.chars().next()?;
-    let hi = match prefix {
+    let bare_hi = match prefix {
         'v' | 'q' => 127u16,
         'd' => 63,
         's' => 31,
@@ -51,12 +54,50 @@ fn aarch64_simd_layout(lower: &str) -> Option<RegisterLayout> {
         'b' => 7,
         _ => return None,
     };
-    let stripped = &lower[prefix.len_utf8()..];
-    let n: u8 = stripped.parse().ok()?;
+    let rest = &lower[prefix.len_utf8()..];
+    let digits_len = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let (digits, suffix) = rest.split_at(digits_len);
+    let n: u8 = digits.parse().ok()?;
     if n > 31 {
         return None;
     }
+    let hi = aarch64_vector_suffix_hi(prefix, suffix, bare_hi)?;
     Some(aarch64_vector(aarch64_v_name(n), 0, hi))
+}
+
+/// High bit of the slice an `AArch64` vector spelling addresses, given
+/// the shape suffix after the register number.
+///
+/// A bare name addresses the view its letter implies. An arrangement
+/// (`.4s`) addresses `lanes * lane_bits` from bit 0 — 128 bits for the
+/// full-width arrangements, 64 for the halved ones, whose write zeroes
+/// the upper half. An indexed element (`.s[1]`) addresses the whole
+/// register: the lane index deliberately does **not** narrow the slice,
+/// because [`super::alias_for`] reverse-maps `(hi, lo)` pairs and a
+/// lane-offset slice would collide with the legitimate `dN`/`sN` views;
+/// callers that need the index parse it with
+/// [`super::parse_lane_index`].
+fn aarch64_vector_suffix_hi(prefix: char, suffix: &str, bare_hi: u16) -> Option<u16> {
+    if suffix.is_empty() {
+        return Some(bare_hi);
+    }
+    // Arrangements and indexed elements are spelled on the `v` form
+    // only (`v0.4s`, `v0.s[1]`); a suffix on `q`/`d`/`s`/`h`/`b` is not
+    // a register name.
+    if prefix != 'v' {
+        return None;
+    }
+    let body = suffix.strip_prefix('.')?;
+    if let Some(arrangement) = parse_arrangement(body) {
+        return Some(arrangement.view_bits() - 1);
+    }
+    let mut chars = body.chars();
+    let lane_bits = element_type_bits(chars.next()?)?;
+    let index = parse_lane_index(chars.as_str())?;
+    let lane_count = 128 / lane_bits;
+    (index < lane_count).then_some(bare_hi)
 }
 
 pub(super) fn aarch64_alias(parent: &str, hi: u16, lo: u16) -> Option<&'static str> {

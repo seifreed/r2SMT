@@ -159,22 +159,6 @@ pub fn registers_in_operand(op: &Operand, arch: Arch) -> Vec<&'static str> {
     out
 }
 
-/// Whether any operand carries ARM vector shape the lifter does not
-/// model, so the effect table must report [`InstructionKind::Other`]
-/// and let the slicer truncate.
-///
-/// Single source of truth for the effect tables and the lifter: the two
-/// must agree about which instructions are retained, or the slicer keeps
-/// an instruction whose definition the lifter drops. Today nothing with
-/// an arrangement is lifted, so this is exactly
-/// [`crate::registers::has_vector_arrangement`] over the operand list;
-/// as packed families land it narrows to the shapes still unmodelled.
-fn has_unmodelled_vector_shape(insn: &Instruction, arch: Arch) -> bool {
-    insn.operands
-        .iter()
-        .any(|op| crate::registers::has_vector_arrangement(&op.raw, arch))
-}
-
 fn first_register(operands: &[Operand]) -> Option<&'static str> {
     operands
         .first()

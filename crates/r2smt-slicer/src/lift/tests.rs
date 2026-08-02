@@ -2534,3 +2534,58 @@ fn aarch32_vfp_arithmetic_reads_its_destination() {
     let e = crate::effect::analyze(&i, Arch::Arm);
     assert!(e.uses.contains(&"v0"), "{e:?}");
 }
+
+#[test]
+fn aarch64_arranged_operand_declines_at_the_lifter_not_the_scalar_handler() {
+    // `add` has a scalar arm claimed above any vector one, and the
+    // register table now resolves `v0.4s` to the same `v0` parent that
+    // arm would write — so without the shape guard this would lower as a
+    // single 128-bit addition instead of four independent lanes.
+    let i = insn(
+        0x1000,
+        4,
+        "add",
+        vec![reg("v0.4s"), reg("v1.4s"), reg("v2.4s")],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(stmts.as_slice(), [IrStmt::Unsupported { .. }]),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_scalar_arithmetic_is_unaffected_by_the_shape_guard() {
+    let i = insn(0x1000, 4, "add", vec![reg("x0"), reg("x1"), reg("x2")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == "x0")),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_indexed_lane_operand_declines_at_the_lifter() {
+    let i = insn(0x1000, 4, "vmov", vec![reg("r0"), reg("d0[1]")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Arm);
+    assert!(
+        matches!(stmts.as_slice(), [IrStmt::Unsupported { .. }]),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_aapcs_vector_alias_is_unaffected_by_the_shape_guard() {
+    // `v1` on AArch32 is the AAPCS alias for `r4`, a bare GPR name that
+    // the shape guard must leave alone.
+    let i = insn(0x1000, 4, "add", vec![reg("v1"), reg("v2"), reg("v3")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Arm);
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == "r4")),
+        "{stmts:?}"
+    );
+}

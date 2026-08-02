@@ -37,7 +37,7 @@ fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> Instruct
     // closed above the dispatch. `AArch32` NEON is `v`-prefixed with a
     // type suffix and so collides less, but the indexed form (`d0[1]`)
     // reaches the integer arms exactly the same way.
-    if super::has_unmodelled_vector_shape(insn, Arch::Arm) {
+    if crate::lift::declines_vector_shape(insn, Arch::Arm) {
         return other_effect(insn);
     }
     match dispatch_mnemonic {

@@ -32,7 +32,9 @@ use tracing::debug;
 use crate::collector::BranchCandidate;
 use crate::condition::BranchCondition;
 use crate::effect::{memory_operand_width, stack_slot};
-use crate::registers::{RegisterLayout, is_simd_parent, register_layout, simd_parent_bits};
+use crate::registers::{
+    RegisterLayout, has_vector_arrangement, is_simd_parent, register_layout, simd_parent_bits,
+};
 use crate::slice::{Slice, SliceMerge, SliceStatus};
 
 mod aarch32;
@@ -221,6 +223,25 @@ fn is_x86_simd_instruction(insn: &Instruction) -> bool {
             | "vcvtph2ps"
             | "vcvtps2ph"
     )
+}
+
+/// Whether `insn` carries ARM vector shape — an element arrangement
+/// (`v0.4s`), an indexed lane (`v0.s[1]`, `d0[1]`), or a multi-register
+/// list (`{v0.4s, v1.4s}`) — that no handler models.
+///
+/// The single source of truth for the effect tables and the
+/// per-mnemonic dispatchers, which have to agree: the register table now
+/// resolves an arranged name to its vector parent, so a mnemonic like
+/// `add` that has both a scalar and a NEON form would otherwise be
+/// retained by the slicer as a definition of `v0` and then lowered by
+/// the scalar handler as a single 128-bit addition — wrong values, not a
+/// decline. Both consumers call this and both fail closed on it: the
+/// effect table reports [`crate::effect::InstructionKind::Other`] so the
+/// slice truncates, the dispatcher emits [`IrStmt::Unsupported`].
+pub(crate) fn declines_vector_shape(insn: &Instruction, arch: Arch) -> bool {
+    insn.operands
+        .iter()
+        .any(|op| has_vector_arrangement(&op.raw, arch))
 }
 
 /// Whether `insn` reprograms the FPU control register that

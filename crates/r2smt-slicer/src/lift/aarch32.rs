@@ -10,8 +10,9 @@ use r2smt_ir::stmt::IrStmt;
 use crate::registers::register_layout;
 
 use super::{
-    BinOp, FpArithOp, LiftCtx, MemAccess, aarch64_cond_suffix_to_predicate, fp_lane_result,
-    fp_sort_bits, is_aarch32_base_supported, nonzero_width, strip_aarch32_cond_suffix, width_mask,
+    BinOp, FpArithOp, LiftCtx, MemAccess, aarch64_cond_suffix_to_predicate, declines_vector_shape,
+    fp_lane_result, fp_sort_bits, is_aarch32_base_supported, nonzero_width,
+    strip_aarch32_cond_suffix, width_mask,
 };
 
 impl LiftCtx {
@@ -21,6 +22,20 @@ impl LiftCtx {
         // AArch64 handler family — register reads / writes flow
         // through `register_layout(name, self.arch)` which respects
         // `Arch::Arm` and produces `r0..r15` parents.
+        // `AArch32` NEON is spelled with a typed mnemonic and bare
+        // register operands, so the operand-shape collision is narrower
+        // than on `AArch64` — but the indexed form (`vmov r0, d0[1]`)
+        // reaches the integer arms by exactly the same route.
+        if declines_vector_shape(insn, Arch::Arm) {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: format!(
+                    "unmodelled vector shape at {addr} (aarch32)",
+                    addr = insn.address
+                ),
+            });
+            return;
+        }
         let mnem = insn.mnemonic.trim().to_ascii_lowercase();
         // Conditional execution suffix: `<base><cond>` such as `addeq`
         // or `subne`. Strip the recognised tail, look up the cond
