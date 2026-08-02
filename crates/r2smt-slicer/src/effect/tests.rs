@@ -845,3 +845,44 @@ fn aarch64_structured_load_still_declines() {
     );
     assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);
 }
+
+#[test]
+fn aarch64_narrowing_two_form_reads_its_destination() {
+    // `xtn2` writes only the destination's upper half, so the lower half
+    // survives and its prior definition is still live.
+    let i = insn(
+        "xtn2",
+        vec![
+            op("v0.8h", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+        ],
+    );
+    assert!(analyze(&i, Arch::Aarch64).uses.contains(&"v0"));
+}
+
+#[test]
+fn aarch64_narrowing_base_form_does_not_read_its_destination() {
+    let i = insn(
+        "xtn",
+        vec![
+            op("v0.4h", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+        ],
+    );
+    assert!(!analyze(&i, Arch::Aarch64).uses.contains(&"v0"));
+}
+
+#[test]
+fn aarch64_widening_long_defines_its_destination() {
+    let i = insn(
+        "umull",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4h", OperandKind::Register),
+            op("v2.4h", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert_eq!(effect.defs, vec!["v0"]);
+    assert_eq!(effect.kind, InstructionKind::Simd);
+}

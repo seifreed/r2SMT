@@ -75,6 +75,29 @@ enum NeonOp {
     /// `ins` — insert a general-purpose register or another vector's
     /// element into one lane of the destination.
     Insert { from_element: bool },
+    /// A widening or narrowing element operation. `signed` selects the
+    /// extension; `upper` is the `2` suffix, which reads the top half of
+    /// its sources and, when narrowing, writes the top half of its
+    /// destination.
+    Widen {
+        kind: WidenKind,
+        signed: bool,
+        upper: bool,
+    },
+}
+
+/// The widening and narrowing element operations.
+#[derive(Debug, Clone, Copy)]
+enum WidenKind {
+    /// `ushll` / `sshll` and their `uxtl` / `sxtl` zero-shift aliases:
+    /// extend each element to double width, then shift left.
+    ShiftLong { shift: u16 },
+    /// `xtn` — truncate each element to half its width.
+    Narrow,
+    /// The long and wide arithmetic: extend the narrow sources to the
+    /// destination's element width and operate there. `wide_first` marks
+    /// the `w`-suffixed forms, whose first source is already wide.
+    Arith { op: BinOp, wide_first: bool },
 }
 
 /// A resolved NEON instruction: what to compute, and at what geometry.
@@ -97,12 +120,22 @@ impl NeonShape {
     /// Whether the lowering reads the destination register as well as
     /// writing it.
     ///
-    /// True only for the element inserts, which preserve every lane they
-    /// do not write. Everything else here writes the destination whole —
-    /// an `AArch64` SIMD write has no merging form, so even a 64-bit
-    /// arrangement replaces the register by zeroing its upper half.
+    /// True for the element inserts, which preserve every lane they do
+    /// not write, and for the narrowing `2` forms, which write only the
+    /// destination's upper half. Everything else here writes the
+    /// destination whole — an `AArch64` SIMD write has no merging form,
+    /// so even a 64-bit arrangement replaces the register by zeroing its
+    /// upper half.
     pub(crate) const fn reads_destination(&self) -> bool {
-        matches!(self.op, NeonOp::Insert { .. })
+        matches!(
+            self.op,
+            NeonOp::Insert { .. }
+                | NeonOp::Widen {
+                    kind: WidenKind::Narrow,
+                    upper: true,
+                    ..
+                }
+        )
     }
 
     /// Whether the destination is a general-purpose register rather than
@@ -128,6 +161,146 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| permute_shape(insn, &mnemonic))
         .or_else(|| element_to_gpr_shape(insn, &mnemonic))
         .or_else(|| insert_shape(insn, &mnemonic))
+        .or_else(|| widen_shape(insn, &mnemonic))
+}
+
+// ===================== widening and narrowing =====================
+
+/// Peel the `2` suffix that marks the half-register forms.
+fn peel_upper(mnemonic: &str) -> (&str, bool) {
+    mnemonic
+        .strip_suffix('2')
+        .map_or((mnemonic, false), |base| (base, true))
+}
+
+/// The widening / narrowing operation a mnemonic names, with the
+/// signedness its leading letter spells.
+fn widen_kind(base: &str) -> Option<(WidenKind, bool)> {
+    // The zero-shift aliases carry no immediate operand of their own.
+    let arith = |op, wide_first| WidenKind::Arith { op, wide_first };
+    Some(match base {
+        "xtn" => (WidenKind::Narrow, false),
+        "uaddl" => (arith(BinOp::Add, false), false),
+        "saddl" => (arith(BinOp::Add, false), true),
+        "usubl" => (arith(BinOp::Sub, false), false),
+        "ssubl" => (arith(BinOp::Sub, false), true),
+        "umull" => (arith(BinOp::Mul, false), false),
+        "smull" => (arith(BinOp::Mul, false), true),
+        "uaddw" => (arith(BinOp::Add, true), false),
+        "saddw" => (arith(BinOp::Add, true), true),
+        "usubw" => (arith(BinOp::Sub, true), false),
+        "ssubw" => (arith(BinOp::Sub, true), true),
+        _ => return None,
+    })
+}
+
+/// `ushll` / `sshll` and their `uxtl` / `sxtl` aliases, whose shift is
+/// an operand in the first spelling and zero in the second.
+fn shift_long_kind(base: &str, insn: &Instruction) -> Option<(WidenKind, bool)> {
+    let (signed, has_immediate) = match base {
+        "ushll" => (false, true),
+        "sshll" => (true, true),
+        "uxtl" => (false, false),
+        "sxtl" => (true, false),
+        _ => return None,
+    };
+    let shift = if has_immediate {
+        u16::try_from(parse_immediate(&insn.operands.get(2)?.raw)?).ok()?
+    } else {
+        if insn.operands.len() != 2 {
+            return None;
+        }
+        0
+    };
+    Some((WidenKind::ShiftLong { shift }, signed))
+}
+
+/// The widening and narrowing family.
+///
+/// The destination's arrangement gives the geometry; the sources are
+/// checked against it rather than trusted, because the whole family is
+/// distinguished from the lane-wise one precisely by its operands having
+/// *different* arrangements. A `2` form reads sources that span the full
+/// register and takes their upper half.
+fn widen_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (base, upper) = peel_upper(mnemonic);
+    let (kind, signed) = widen_kind(base).or_else(|| shift_long_kind(base, insn))?;
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    let expected_operands = match kind {
+        WidenKind::Narrow => 2,
+        WidenKind::ShiftLong { .. } => {
+            if matches!(base, "uxtl" | "sxtl") {
+                2
+            } else {
+                3
+            }
+        }
+        WidenKind::Arith { .. } => 3,
+    };
+    if insn.operands.len() != expected_operands {
+        return None;
+    }
+    let narrow_bits = match kind {
+        // The destination is the narrow side; the source is wide.
+        WidenKind::Narrow => destination.lane_bits.checked_mul(2)?,
+        _ => destination.lane_bits / 2,
+    };
+    if narrow_bits == 0 || !matches!(narrow_bits, 8 | 16 | 32 | 64) {
+        return None;
+    }
+    // Written lanes: for a narrowing `2` form the destination holds
+    // twice as many as the instruction produces, the low half surviving.
+    let written = match kind {
+        WidenKind::Narrow if upper => destination.lanes / 2,
+        _ => destination.lanes,
+    };
+    if written == 0 {
+        return None;
+    }
+    for (index, operand) in insn.operands.iter().enumerate().skip(1) {
+        let Some(arrangement) = operand_arrangement(operand) else {
+            // The shift is an immediate, not an arrangement.
+            if matches!(kind, WidenKind::ShiftLong { .. }) && index == 2 {
+                continue;
+            }
+            return None;
+        };
+        let wide_operand = matches!(kind, WidenKind::Narrow)
+            || matches!(kind, WidenKind::Arith { wide_first: true, .. } if index == 1);
+        let expected_bits = if wide_operand {
+            match kind {
+                WidenKind::Narrow => narrow_bits,
+                _ => destination.lane_bits,
+            }
+        } else {
+            narrow_bits
+        };
+        if arrangement.lane_bits != expected_bits {
+            return None;
+        }
+        // A `2` form's narrow operands span the whole register, so they
+        // carry twice the lanes the instruction consumes; a wide operand
+        // is never halved.
+        let expected_lanes = if upper && !wide_operand {
+            written.checked_mul(2)?
+        } else {
+            written
+        };
+        if arrangement.lanes != expected_lanes {
+            return None;
+        }
+    }
+    Some(NeonShape {
+        op: NeonOp::Widen {
+            kind,
+            signed,
+            upper,
+        },
+        lane_bits: destination.lane_bits,
+        lanes: written,
+        dest_index: 0,
+        source_index: 0,
+    })
 }
 
 // ===================== lane-wise arithmetic and logic =====================
@@ -493,6 +666,130 @@ impl LiftCtx {
             NeonOp::Permute(kind) => self.permute_lanes(insn, shape, kind),
             NeonOp::ElementToGpr { signed } => self.element_to_gpr(insn, shape, signed),
             NeonOp::Insert { from_element } => self.insert_source(insn, shape, from_element),
+            NeonOp::Widen {
+                kind,
+                signed,
+                upper,
+            } => self.widen_lanes(insn, shape, kind, signed, upper),
+        }
+    }
+
+    /// The widening and narrowing family: read each source element,
+    /// extend or truncate it to the destination's width, and operate
+    /// there.
+    ///
+    /// Extending *before* operating is the whole point of the family —
+    /// it is what stops the result overflowing the element, which is
+    /// exactly what the same-width lane-wise form would do.
+    fn widen_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        kind: WidenKind,
+        signed: bool,
+        upper: bool,
+    ) -> Option<Expr> {
+        let first = self.widen_source(insn, 1)?;
+        let second = match insn.operands.get(2) {
+            Some(operand) if operand_arrangement(operand).is_some() => {
+                Some(self.widen_source(insn, 2)?)
+            }
+            _ => None,
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            lanes.push(Self::widen_lane(
+                &first,
+                second.as_ref(),
+                shape,
+                kind,
+                signed,
+                index,
+                upper,
+            )?);
+        }
+        let narrowed = Self::concat_lanes(lanes)?;
+        if !matches!(kind, WidenKind::Narrow) || !upper {
+            return Some(narrowed);
+        }
+        // `xtn2` writes the destination's upper half and preserves the
+        // lower one.
+        let view = shape.lane_bits.checked_mul(shape.lanes)?;
+        let destination = self.simd_operand_value(&insn.operands.first()?.clone(), view * 2)?;
+        Some(Expr::concat(
+            narrowed,
+            Expr::extract(destination, view - 1, 0),
+        ))
+    }
+
+    /// One source operand, materialised once at its own view width.
+    fn widen_source(&mut self, insn: &Instruction, position: usize) -> Option<Expr> {
+        let operand = insn.operands.get(position)?.clone();
+        let arrangement = operand_arrangement(&operand)?;
+        self.simd_operand_value(&operand, arrangement.view_bits())
+    }
+
+    /// One destination lane of a widening or narrowing operation.
+    ///
+    /// `upper` shifts the lane read out of a *narrow* source by half a
+    /// register, which is what the `2` suffix means. A wide source is
+    /// never halved — `uaddw2 v0.4s, v1.4s, v2.8h` takes `v1`'s lane `i`
+    /// and `v2`'s lane `i + 4`.
+    fn widen_lane(
+        first: &Expr,
+        second: Option<&Expr>,
+        shape: NeonShape,
+        kind: WidenKind,
+        signed: bool,
+        index: u16,
+        upper: bool,
+    ) -> Option<Expr> {
+        let extend = |value: Expr| {
+            if signed {
+                Expr::sign_ext(value, shape.lane_bits)
+            } else {
+                Expr::zero_ext(value, shape.lane_bits)
+            }
+        };
+        let narrow_lane = if upper {
+            index.checked_add(shape.lanes)?
+        } else {
+            index
+        };
+        let narrow = shape.lane_bits / 2;
+        match kind {
+            WidenKind::Narrow => {
+                // Truncation needs no signedness: the low half of a
+                // two's-complement value is the same bits either way.
+                // The source is wide, so it is never halved — `xtn2`
+                // narrows the same lanes `xtn` does and only the
+                // *destination* half differs.
+                let wide = shape.lane_bits.checked_mul(2)?;
+                let element = LiftCtx::extract_lane(first.clone(), wide, index)?;
+                Some(Expr::extract(element, shape.lane_bits - 1, 0))
+            }
+            WidenKind::ShiftLong { shift } => {
+                let element = LiftCtx::extract_lane(first.clone(), narrow, narrow_lane)?;
+                let widened = extend(element);
+                if shift == 0 {
+                    return Some(widened);
+                }
+                Some(Expr::shl(
+                    widened,
+                    Expr::konst(u128::from(shift), shape.lane_bits),
+                ))
+            }
+            WidenKind::Arith { op, wide_first } => {
+                // A `w`-form's first source is already at the
+                // destination's width and is read at its own lane index.
+                let lhs = if wide_first {
+                    LiftCtx::extract_lane(first.clone(), shape.lane_bits, index)?
+                } else {
+                    extend(LiftCtx::extract_lane(first.clone(), narrow, narrow_lane)?)
+                };
+                let rhs = extend(LiftCtx::extract_lane(second?.clone(), narrow, narrow_lane)?);
+                Some(op.apply(lhs, rhs))
+            }
         }
     }
 

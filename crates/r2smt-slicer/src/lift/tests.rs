@@ -3147,3 +3147,151 @@ fn aarch64_mov_alias_routes_by_operand_shape() {
         "x0 := zext(v1[63:32], 64)"
     );
 }
+
+// --- N3b: NEON widening and narrowing ---
+
+#[test]
+fn aarch64_ushll_extends_each_element_before_shifting() {
+    // Extending first is the point of the family: shifting at the
+    // source width would drop the bits the long form exists to keep.
+    assert_eq!(
+        neon_lowering("ushll", &["v0.4s", "v1.4h", "#3"]),
+        "v0 := concat((zext(v1[63:48], 32) << 0x3:32), concat((zext(v1[47:32], 32) << 0x3:32), \
+concat((zext(v1[31:16], 32) << 0x3:32), (zext(v1[15:0], 32) << 0x3:32))))"
+    );
+}
+
+#[test]
+fn aarch64_ushll2_reads_the_upper_half_of_its_source() {
+    assert_eq!(
+        neon_lowering("ushll2", &["v0.4s", "v1.8h", "#3"]),
+        "v0 := concat((zext(v1[127:112], 32) << 0x3:32), concat((zext(v1[111:96], 32) << 0x3:32), \
+concat((zext(v1[95:80], 32) << 0x3:32), (zext(v1[79:64], 32) << 0x3:32))))"
+    );
+}
+
+#[test]
+fn aarch64_uxtl_is_the_zero_shift_alias() {
+    assert_eq!(
+        neon_lowering("uxtl", &["v0.4s", "v1.4h"]),
+        "v0 := concat(zext(v1[63:48], 32), concat(zext(v1[47:32], 32), \
+concat(zext(v1[31:16], 32), zext(v1[15:0], 32))))"
+    );
+}
+
+#[test]
+fn aarch64_sxtl_sign_extends() {
+    assert_eq!(
+        neon_lowering("sxtl", &["v0.4s", "v1.4h"]),
+        "v0 := concat(sext(v1[63:48], 32), concat(sext(v1[47:32], 32), \
+concat(sext(v1[31:16], 32), sext(v1[15:0], 32))))"
+    );
+}
+
+#[test]
+fn aarch64_xtn_zeroes_the_destination_upper_half() {
+    // A 64-bit arrangement is still a whole-register write on AArch64.
+    assert_eq!(
+        neon_lowering("xtn", &["v0.4h", "v1.4s"]),
+        "v0 := zext(concat(v1[127:96][15:0], concat(v1[95:64][15:0], \
+concat(v1[63:32][15:0], v1[31:0][15:0]))), 128)"
+    );
+}
+
+#[test]
+fn aarch64_xtn2_preserves_the_destination_lower_half() {
+    assert_eq!(
+        neon_lowering("xtn2", &["v0.8h", "v1.4s"]),
+        "v0 := concat(concat(v1[127:96][15:0], concat(v1[95:64][15:0], \
+concat(v1[63:32][15:0], v1[31:0][15:0]))), v0[63:0])"
+    );
+}
+
+#[test]
+fn aarch64_uaddl_widens_both_sources_before_adding() {
+    assert_eq!(
+        neon_lowering("uaddl", &["v0.4s", "v1.4h", "v2.4h"]),
+        "v0 := concat((zext(v1[63:48], 32) + zext(v2[63:48], 32)), \
+concat((zext(v1[47:32], 32) + zext(v2[47:32], 32)), \
+concat((zext(v1[31:16], 32) + zext(v2[31:16], 32)), \
+(zext(v1[15:0], 32) + zext(v2[15:0], 32)))))"
+    );
+}
+
+#[test]
+fn aarch64_saddl_sign_extends_both_sources() {
+    assert_eq!(
+        neon_lowering("saddl", &["v0.4s", "v1.4h", "v2.4h"]),
+        "v0 := concat((sext(v1[63:48], 32) + sext(v2[63:48], 32)), \
+concat((sext(v1[47:32], 32) + sext(v2[47:32], 32)), \
+concat((sext(v1[31:16], 32) + sext(v2[31:16], 32)), \
+(sext(v1[15:0], 32) + sext(v2[15:0], 32)))))"
+    );
+}
+
+#[test]
+fn aarch64_uaddw_reads_its_first_source_at_the_destination_width() {
+    // The `w` form's first operand is already wide and is not extended.
+    assert_eq!(
+        neon_lowering("uaddw", &["v0.4s", "v1.4s", "v2.4h"]),
+        "v0 := concat((v1[127:96] + zext(v2[63:48], 32)), \
+concat((v1[95:64] + zext(v2[47:32], 32)), \
+concat((v1[63:32] + zext(v2[31:16], 32)), \
+(v1[31:0] + zext(v2[15:0], 32)))))"
+    );
+}
+
+#[test]
+fn aarch64_uaddw2_halves_only_the_narrow_source() {
+    // The wide source keeps lane `i`; only the narrow one is read from
+    // the register's upper half.
+    assert_eq!(
+        neon_lowering("uaddw2", &["v0.4s", "v1.4s", "v2.8h"]),
+        "v0 := concat((v1[127:96] + zext(v2[127:112], 32)), \
+concat((v1[95:64] + zext(v2[111:96], 32)), \
+concat((v1[63:32] + zext(v2[95:80], 32)), \
+(v1[31:0] + zext(v2[79:64], 32)))))"
+    );
+}
+
+#[test]
+fn aarch64_umull_multiplies_at_the_widened_width() {
+    // A same-width multiply would discard exactly the high half the
+    // long form exists to compute.
+    assert_eq!(
+        neon_lowering("umull", &["v0.4s", "v1.4h", "v2.4h"]),
+        "v0 := concat((zext(v1[63:48], 32) * zext(v2[63:48], 32)), \
+concat((zext(v1[47:32], 32) * zext(v2[47:32], 32)), \
+concat((zext(v1[31:16], 32) * zext(v2[31:16], 32)), \
+(zext(v1[15:0], 32) * zext(v2[15:0], 32)))))"
+    );
+}
+
+#[test]
+fn aarch64_ssubl_subtracts_at_the_widened_width() {
+    assert_eq!(
+        neon_lowering("ssubl", &["v0.4s", "v1.4h", "v2.4h"]),
+        "v0 := concat((sext(v1[63:48], 32) - sext(v2[63:48], 32)), \
+concat((sext(v1[47:32], 32) - sext(v2[47:32], 32)), \
+concat((sext(v1[31:16], 32) - sext(v2[31:16], 32)), \
+(sext(v1[15:0], 32) - sext(v2[15:0], 32)))))"
+    );
+}
+
+#[test]
+fn aarch64_widening_declines_a_source_of_the_wrong_width() {
+    // `uaddl` needs sources half the destination's element width.
+    assert!(neon_declines("uaddl", &["v0.4s", "v1.4s", "v2.4s"]));
+}
+
+#[test]
+fn aarch64_widening_declines_a_non_two_form_reading_a_full_register() {
+    // `uaddl v0.4s, v1.8h, v2.8h` is the `uaddl2` shape without the
+    // suffix that says to take the upper half.
+    assert!(neon_declines("uaddl", &["v0.4s", "v1.8h", "v2.8h"]));
+}
+
+#[test]
+fn aarch64_two_form_declines_a_half_register_source() {
+    assert!(neon_declines("uaddl2", &["v0.4s", "v1.4h", "v2.4h"]));
+}
