@@ -378,6 +378,15 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
         // The compare family writes a mask into its destination, so it
         // is a SIMD def like the arithmetic — not a flag-setting `cmp`.
         m if crate::lift::is_fp_compare_mnemonic(m) => simd_effect(insn, SimdShape::Bitwise),
+        // The scalar moves merge one lane and leave the rest of the
+        // destination standing, so the destination is a use as well as a
+        // def — the `Bitwise` shape, not `Move`. The 3-operand VEX form
+        // does overwrite the whole register, which `simd_effect` already
+        // distinguishes. Recognised through the lifter's predicate
+        // because `movsd` also names the string instruction.
+        _ if crate::lift::sse_scalar_move_lane(insn).is_some() => {
+            simd_effect(insn, SimdShape::Bitwise)
+        }
         m if m.starts_with('j') => jcc_effect(insn),
         m if m.starts_with("set") => setcc_effect(insn),
         m if m.starts_with("cmov") => cmovcc_effect(insn),

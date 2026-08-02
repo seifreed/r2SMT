@@ -40,7 +40,9 @@ mod aarch64;
 mod merge;
 mod x86;
 use merge::lower_merge;
-pub(crate) use x86::{is_fp_compare_mnemonic, pins_rounding_mode, writes_mxcsr};
+pub(crate) use x86::{
+    is_fp_compare_mnemonic, pins_rounding_mode, sse_scalar_move_lane, writes_mxcsr,
+};
 
 /// IR representation of a [`Slice`] plus the branch's symbolic
 /// condition.
@@ -91,15 +93,19 @@ const SIMD_PARENT_BITS: u16 = 512;
 /// (`comiss` and friends) define only flags, but need the same override
 /// for the same reason — their operands are vector-register lanes.
 /// Kept in sync with the dispatch in `effect/x86.rs`.
-fn is_x86_simd_mnemonic(mnemonic: &str) -> bool {
+///
+/// Takes the whole instruction rather than the mnemonic because one
+/// member of the set cannot be recognised from its mnemonic alone: see
+/// [`x86::sse_scalar_move_lane`].
+fn is_x86_simd_instruction(insn: &Instruction) -> bool {
     // The compare family is 64 mnemonics once the eight predicates are
     // crossed with ps/pd/ss/sd and the VEX prefix, so it is recognised
     // structurally rather than listed.
-    if x86::is_fp_compare_mnemonic(mnemonic) {
+    if x86::is_fp_compare_mnemonic(&insn.mnemonic) || x86::sse_scalar_move_lane(insn).is_some() {
         return true;
     }
     matches!(
-        mnemonic.trim().to_ascii_lowercase().as_str(),
+        insn.mnemonic.trim().to_ascii_lowercase().as_str(),
         "movaps"
             | "movups"
             | "movapd"
@@ -417,7 +423,7 @@ impl LiftCtx {
         // disconnected, wrong-width value. Our per-mnemonic handlers
         // model these precisely at 128 bits — prefer them, bypassing
         // the ESIL/P-code ladder for this closed mnemonic set.
-        if matches!(self.arch, Arch::X86 | Arch::X86_64) && is_x86_simd_mnemonic(&insn.mnemonic) {
+        if matches!(self.arch, Arch::X86 | Arch::X86_64) && is_x86_simd_instruction(insn) {
             self.lift_instruction_x86(insn);
             return;
         }

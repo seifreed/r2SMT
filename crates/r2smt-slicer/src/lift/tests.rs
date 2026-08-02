@@ -1080,6 +1080,156 @@ fn movaps_copies_xmm_view_preserving_upper_parent_bits() {
 }
 
 #[test]
+fn movss_reg_reg_merges_the_low_lane_preserving_upper_parent_bits() {
+    // `movss xmm0, xmm1` — a *scalar* move: only the low 32-bit lane is
+    // written, every bit above it keeps its prior value. Copying the
+    // whole 128-bit view (as `movaps` does) would clobber three lanes.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "movss",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    assert_eq!(
+        *simd_dst_src(&stmts, "zmm0"),
+        preserve_upper("zmm0", 32, Expr::extract(Expr::var("zmm1", 512), 31, 0))
+    );
+}
+
+#[test]
+fn movsd_reg_reg_merges_the_low_64_bits() {
+    // `movsd xmm0, xmm1` — the double-precision lane width.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "movsd",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    assert_eq!(
+        *simd_dst_src(&stmts, "zmm0"),
+        preserve_upper("zmm0", 64, Expr::extract(Expr::var("zmm1", 512), 63, 0))
+    );
+}
+
+#[test]
+fn vmovss_three_operand_takes_the_upper_lanes_from_src1_and_zeroes_above_the_view() {
+    // `vmovss xmm0, xmm1, xmm2` — the low lane comes from `xmm2`, the
+    // rest of the 128-bit view from `xmm1`, and the VEX encoding zeroes
+    // everything above the view.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "vmovss",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+                op("xmm2", OperandKind::Register),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    let merged = Expr::concat(
+        Expr::extract(simd_read("zmm1", 128), 127, 32),
+        Expr::extract(Expr::var("zmm2", 512), 31, 0),
+    );
+    assert_eq!(*simd_dst_src(&stmts, "zmm0"), Expr::zero_ext(merged, 512));
+}
+
+#[test]
+fn vmovsd_three_operand_effect_does_not_read_its_destination() {
+    // The VEX form overwrites the whole register, so the destination is
+    // a def only — unlike the legacy 2-operand merge below.
+    let i = insn(
+        0x1000,
+        4,
+        "vmovsd",
+        vec![
+            op("xmm0", OperandKind::Register),
+            op("xmm1", OperandKind::Register),
+            op("xmm2", OperandKind::Register),
+        ],
+    );
+    let e = crate::effect::analyze(&i, Arch::X86_64);
+    assert_eq!(e.uses, vec!["zmm1", "zmm2"]);
+}
+
+#[test]
+fn movsd_reg_reg_effect_reads_its_destination() {
+    // The legacy scalar move preserves the lanes above the one it
+    // writes, so dropping the destination use would let the slicer
+    // treat the prior vector value as dead.
+    let i = insn(
+        0x1000,
+        4,
+        "movsd",
+        vec![
+            op("xmm0", OperandKind::Register),
+            op("xmm1", OperandKind::Register),
+        ],
+    );
+    let e = crate::effect::analyze(&i, Arch::X86_64);
+    assert!(e.uses.contains(&"zmm0"), "{:?}", e.uses);
+}
+
+#[test]
+fn movsd_string_form_is_not_claimed_by_the_scalar_move_handler() {
+    // `movsd` also names the string instruction (opcode `A5`), which
+    // radare2 spells `movsd dword [rdi], dword [rsi]`. It shares nothing
+    // with the SSE scalar move, so it must keep falling through to the
+    // ESIL ladder rather than being routed into the SIMD handlers.
+    let i = insn(
+        0x1000,
+        1,
+        "movsd",
+        vec![
+            op("dword [rdi]", OperandKind::Memory),
+            op("dword [rsi]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(
+        crate::effect::analyze(&i, Arch::X86_64).kind,
+        crate::effect::InstructionKind::Other
+    );
+}
+
+#[test]
+fn movss_memory_operand_is_declined_rather_than_lifted() {
+    // `movss xmm0, dword [rbp - 8]` — SIMD memory operands are deferred,
+    // so the handler declines instead of fabricating a value.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            5,
+            "movss",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("dword [rbp - 8]", OperandKind::Memory),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+        "{stmts:?}"
+    );
+}
+
+#[test]
 fn pxor_distinct_registers_lifts_to_xor_preserving_upper() {
     // `pxor xmm0, xmm1` (2-operand RMW) — low 128 = `xmm0 ^ xmm1`,
     // upper parent bits preserved (legacy SSE).
@@ -1683,10 +1833,19 @@ fn floating_point_slice_stays_complete_without_an_mxcsr_write() {
 
 #[test]
 fn rounding_insensitive_floating_point_survives_an_mxcsr_write() {
-    // `maxss` selects an operand and `cvttss2si` carries its rounding
-    // mode in the opcode, so neither depends on MXCSR — guarding them
-    // would cost precision for nothing.
-    for m in ["maxss", "minps", "cvttss2si", "cmpeqps", "ucomiss"] {
+    // `maxss` selects an operand, `cvttss2si` carries its rounding mode
+    // in the opcode, and the scalar moves transfer a bit pattern without
+    // computing anything, so none of them depends on MXCSR — guarding
+    // them would cost precision for nothing.
+    for m in [
+        "maxss",
+        "minps",
+        "cvttss2si",
+        "cmpeqps",
+        "ucomiss",
+        "movss",
+        "movsd",
+    ] {
         assert!(
             !crate::lift::pins_rounding_mode(m),
             "{m}: wrongly treated as rounding-mode dependent"
@@ -1766,13 +1925,9 @@ fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
         "vpor", "pandn", "vpandn", "addss", "subss", "mulss", "divss", "addsd", "subsd", "mulsd",
         "divsd", "addps", "subps", "mulps", "divps", "addpd", "subpd", "mulpd", "divpd", "maxps",
         "minps", "maxpd", "minpd", "maxss", "minss", "maxsd", "minsd", "sqrtps", "sqrtpd",
-        "sqrtss", "sqrtsd",
+        "sqrtss", "sqrtsd", "movss", "movsd",
     ];
     for m in mnemonics {
-        assert!(
-            is_x86_simd_mnemonic(m),
-            "{m}: not recognised by is_x86_simd_mnemonic"
-        );
         let i = insn(
             0x1000,
             4,
@@ -1781,6 +1936,10 @@ fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
                 op("xmm0", OperandKind::Register),
                 op("xmm1", OperandKind::Register),
             ],
+        );
+        assert!(
+            is_x86_simd_instruction(&i),
+            "{m}: not recognised by is_x86_simd_instruction"
         );
         assert_eq!(
             crate::effect::analyze(&i, Arch::X86_64).kind,

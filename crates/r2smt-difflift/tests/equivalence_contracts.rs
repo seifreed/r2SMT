@@ -208,6 +208,31 @@ fn test_lower_all_produces_per_mnemonic_and_esil_bodies() {
 }
 
 #[test]
+fn test_scalar_move_against_the_esil_xmm_model_is_not_a_disagreement() {
+    // The per-mnemonic lowering of `movsd xmm0, xmm1` canonicalises the
+    // operands to the 512-bit `zmm0` parent; ESIL models `xmm0` as a
+    // register of pointer width. The two describe different machine
+    // state, not different semantics, so the harness must report them
+    // as not-comparable rather than manufacture a disagreement.
+    let mut i = insn(
+        0x1000,
+        "movsd",
+        vec![
+            op("xmm0", OperandKind::Register),
+            op("xmm1", OperandKind::Register),
+        ],
+    );
+    i.esil = Some("xmm1,xmm0,=".to_string());
+    let lowerings = lower_all(&i, Arch::X86_64);
+    let esil = lowerings.esil.unwrap_or_default();
+    assert!(
+        !esil.is_empty(),
+        "the ESIL lowering is the point of the test"
+    );
+    assert_ne!(diff(&lowerings.mnemonic, &esil), DiffVerdict::Disagree);
+}
+
+#[test]
 fn test_agreement_rate_ignores_inconclusive() {
     let mut stats = r2smt_difflift::AgreementStats::default();
     stats.record(DiffVerdict::Agree);

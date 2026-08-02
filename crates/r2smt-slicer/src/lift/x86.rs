@@ -81,6 +81,11 @@ impl LiftCtx {
                     self.lift_simd_fp_mask_compare(insn, &cmp);
                 }
             }
+            _ if sse_scalar_move_lane(insn).is_some() => {
+                if let Some(lane) = sse_scalar_move_lane(insn) {
+                    self.lift_sse_scalar_move(insn, lane);
+                }
+            }
             "vcvtph2ps" => self.lift_f16c_widen(insn),
             "vcvtps2ph" => self.lift_f16c_narrow(insn),
             "comiss" | "ucomiss" => self.lift_simd_fp_compare(insn, 32),
@@ -483,6 +488,64 @@ impl LiftCtx {
         if !self.write_xmm_dst(dst, value, zero_upper) {
             self.push_simd_unsupported(insn);
         }
+    }
+
+    /// `movss`/`movsd` (and their VEX forms) — a *scalar* move, which
+    /// merges one lane instead of copying a whole view.
+    ///
+    /// Legacy `movss xmm0, xmm1` writes the low lane and preserves every
+    /// bit above it. The VEX 3-operand form `vmovss xmm0, xmm1, xmm2`
+    /// takes the low lane from `src2`, the rest of the view from `src1`,
+    /// and zeroes the register above the view.
+    ///
+    /// Every other shape is declined: the load / store forms carry a
+    /// memory operand (deferred with the rest of SIMD memory), and a
+    /// 2-operand VEX form only exists with a memory source, so a
+    /// register one has no architectural meaning to model.
+    fn lift_sse_scalar_move(&mut self, insn: &Instruction, lane: u16) {
+        let ops = &insn.operands;
+        let Some(dst) = ops.first() else {
+            return;
+        };
+        match (ops.len(), is_vex(insn)) {
+            (2, false) => {
+                let Some(value) = self.read_simd_lane_bits_at(&ops[1], lane, 0) else {
+                    self.push_simd_unsupported(insn);
+                    return;
+                };
+                if !self.write_simd_lane(dst, value, lane) {
+                    self.push_simd_unsupported(insn);
+                }
+            }
+            (3, true) => {
+                let Some(merged) = self.vex_scalar_move_value(dst, &ops[1], &ops[2], lane) else {
+                    self.push_simd_unsupported(insn);
+                    return;
+                };
+                if !self.write_xmm_dst(dst, merged, true) {
+                    self.push_simd_unsupported(insn);
+                }
+            }
+            _ => self.push_simd_unsupported(insn),
+        }
+    }
+
+    /// The full-view value written by a VEX 3-operand scalar move: the
+    /// low lane from `src2`, the lanes above it from `src1`.
+    fn vex_scalar_move_value(
+        &self,
+        dst: &Operand,
+        src1: &Operand,
+        src2: &Operand,
+        lane: u16,
+    ) -> Option<Expr> {
+        let view = self.simd_view_bits(dst)?;
+        if view <= lane || self.simd_view_bits(src1)? != view {
+            return None;
+        }
+        let low = self.read_simd_lane_bits_at(src2, lane, 0)?;
+        let upper = Expr::extract(self.read_xmm_operand(src1)?, view - 1, lane);
+        Some(Expr::concat(upper, low))
     }
 
     /// `pxor`/`pand`/`por`/`pandn` (2-operand RMW) and their `v`-prefixed
@@ -971,6 +1034,37 @@ fn same_xmm_register(a: &Operand, b: &Operand) -> bool {
 /// Legacy SSE forms preserve those bits.
 fn is_vex(insn: &Instruction) -> bool {
     insn.mnemonic.trim().to_ascii_lowercase().starts_with('v')
+}
+
+/// The lane width of an SSE **scalar move** (`movss` → 32, `movsd` → 64,
+/// and their VEX forms), or `None` if `insn` is not one.
+///
+/// `movsd` names two unrelated instructions: the scalar double move
+/// (SDM Vol. 2, "MOVSD—Move or Merge Scalar Double Precision
+/// Floating-Point Value") and the string move (opcode `A5`,
+/// "MOVS/MOVSB/MOVSW/MOVSD/MOVSQ—Move Data from String to String").
+/// They are told apart by operand shape, not by the mnemonic: the SSE
+/// form always names an XMM register, while the string form's operands
+/// are only the implicit `[rdi]` / `[rsi]` pair. Claiming the string
+/// form here would route it away from the ESIL ladder that models it
+/// correctly, so the discriminator has to be exact in that direction.
+pub(crate) fn sse_scalar_move_lane(insn: &Instruction) -> Option<u16> {
+    let lower = insn.mnemonic.trim().to_ascii_lowercase();
+    let body = lower.strip_prefix('v').unwrap_or(&lower);
+    let lane = match body {
+        "movss" => 32,
+        "movsd" => 64,
+        _ => return None,
+    };
+    insn.operands.iter().any(is_xmm_register).then_some(lane)
+}
+
+/// Whether `op` is a register operand naming a view of an x86 vector
+/// register (the synthetic `zmm<n>` parent).
+fn is_xmm_register(op: &Operand) -> bool {
+    op.kind == OperandKind::Register
+        && register_layout(&op.raw, Arch::X86_64)
+            .is_some_and(|layout| layout.parent.starts_with("zmm"))
 }
 
 /// All-ones bit-vector at `bits` width. Constants wider than 128 bits
