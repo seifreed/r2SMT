@@ -736,3 +736,26 @@ fn aarch32_general_purpose_push_list_is_still_data_movement() {
     let i = insn("push", vec![op("{r4, r5, lr}", OperandKind::Unknown)]);
     assert_eq!(analyze(&i, Arch::Arm).kind, InstructionKind::Mov);
 }
+
+#[test]
+fn aarch32_general_purpose_register_list_is_not_a_vector_shape() {
+    // AArch32 spells push / pop / ldm operands with the same braces as
+    // an AArch64 vector list, so an arrangement guard that keys on the
+    // brace alone fails every stack-frame setup closed. The corpus
+    // cannot catch this: it holds no 32-bit ARM sample at all.
+    let i = insn("push", vec![op("{r4, r5, lr}", OperandKind::Unknown)]);
+    let effect = analyze(&i, Arch::Arm);
+    assert_eq!(effect.kind, InstructionKind::Mov);
+}
+
+#[test]
+fn aarch64_vector_register_list_is_still_a_vector_shape() {
+    let i = insn(
+        "st4",
+        vec![
+            op("{v16.4s, v17.4s, v18.4s, v19.4s}", OperandKind::Unknown),
+            op("[x8]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);
+}
