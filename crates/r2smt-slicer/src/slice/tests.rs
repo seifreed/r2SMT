@@ -1874,7 +1874,7 @@ fn aarch64_packed_write_supersedes_the_earlier_definition_it_overwrites() {
     // The other half of the same contract: once the packed write is
     // recognised as a definition of `v0`, the `fmov` upstream of it is
     // dead and must not enter the slice.
-    let program = packed_over_live_vector_program("add", "v1.4s", "v2.4s");
+    let program = packed_over_live_vector_program("add", "v0.4s", "v1.4s", "v2.4s");
     let slice = slice_first(&program);
     assert!(
         !slice
@@ -1888,11 +1888,11 @@ fn aarch64_packed_write_supersedes_the_earlier_definition_it_overwrites() {
 
 #[test]
 fn aarch64_unmodelled_packed_write_over_a_live_vector_register_truncates() {
-    // The teeth for the shapes still outside the packed handler.
-    // `umlal` accumulates half-width lanes into full-width ones; nothing
-    // models it, so the slice must truncate rather than step over a
-    // write to the register the branch reads.
-    let program = packed_over_live_vector_program("umlal", "v1.4h", "v2.4h");
+    // The teeth for the shapes still outside the NEON handlers.
+    // `pmull` is a carry-less polynomial multiply; no combination of the
+    // integer primitives expresses it, so the slice must truncate rather
+    // than step over a write to the register the branch reads.
+    let program = packed_over_live_vector_program("pmull", "v0.8h", "v1.8b", "v2.8b");
     let slice = slice_first(&program);
     assert!(
         matches!(slice.status, SliceStatus::Truncated { .. }),
@@ -1904,7 +1904,7 @@ fn aarch64_unmodelled_packed_write_over_a_live_vector_register_truncates() {
 /// `fmov s0, s3` / `<mnemonic> v0.4s, <a>, <b>` / `fcmp s0, s1` /
 /// `b.eq`: a vector write sitting between a definition of `v0` and a
 /// branch that reads it back.
-fn packed_over_live_vector_program(mnemonic: &str, a: &str, b: &str) -> Program {
+fn packed_over_live_vector_program(mnemonic: &str, dst: &str, a: &str, b: &str) -> Program {
     Program {
         arch: Arch::Aarch64,
         bits: 64,
@@ -1929,7 +1929,7 @@ fn packed_over_live_vector_program(mnemonic: &str, a: &str, b: &str) -> Program 
                         4,
                         mnemonic,
                         vec![
-                            op("v0.4s", OperandKind::Register),
+                            op(dst, OperandKind::Register),
                             op(a, OperandKind::Register),
                             op(b, OperandKind::Register),
                         ],

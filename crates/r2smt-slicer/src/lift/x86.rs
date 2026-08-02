@@ -533,7 +533,7 @@ impl LiftCtx {
                     self.push_simd_unsupported(insn);
                     return;
                 }
-                let Some(value) = self.read_simd_lane_bits(src, lane) else {
+                let Some(value) = self.read_simd_lane_bits(src, lane, 0) else {
                     self.push_simd_unsupported(insn);
                     return;
                 };
@@ -542,7 +542,7 @@ impl LiftCtx {
                 let ok = if self.is_modellable_simd_memory(src) && self.is_simd_register(dst) {
                     self.write_xmm_dst(dst, value, true)
                 } else {
-                    self.write_simd_lane(dst, value, lane)
+                    self.write_simd_lane(dst, value, lane, 0)
                 };
                 if !ok {
                     self.push_simd_unsupported(insn);
@@ -574,7 +574,7 @@ impl LiftCtx {
         if view <= lane || self.simd_view_bits(src1)? != view {
             return None;
         }
-        let low = self.read_simd_lane_bits(src2, lane)?;
+        let low = self.read_simd_lane_bits(src2, lane, 0)?;
         let upper = Expr::extract(self.read_xmm_operand(src1)?, view - 1, lane);
         Some(Expr::concat(upper, low))
     }
@@ -762,7 +762,7 @@ impl LiftCtx {
         let written = if cmp.packed {
             self.write_xmm_dst(dst, result, is_vex(insn))
         } else {
-            self.write_simd_lane(dst, result, cmp.lane_bits)
+            self.write_simd_lane(dst, result, cmp.lane_bits, 0)
         };
         if !written {
             self.push_simd_unsupported(insn);
@@ -777,8 +777,8 @@ impl LiftCtx {
         cmp: &FpCompare,
     ) -> Option<Expr> {
         if !cmp.packed {
-            let a = self.read_simd_lane_bits(a_op, cmp.lane_bits)?;
-            let b = self.read_simd_lane_bits(b_op, cmp.lane_bits)?;
+            let a = self.read_simd_lane_bits(a_op, cmp.lane_bits, 0)?;
+            let b = self.read_simd_lane_bits(b_op, cmp.lane_bits, 0)?;
             return Some(fp_mask_lane(cmp, a, b));
         }
         let view = self.simd_instruction_view_bits(&[dst, a_op, b_op])?;
@@ -812,7 +812,7 @@ impl LiftCtx {
         let written = if packed {
             self.write_xmm_dst(dst, result, is_vex(insn))
         } else {
-            self.write_simd_lane(dst, result, lane_bits)
+            self.write_simd_lane(dst, result, lane_bits, 0)
         };
         if !written {
             self.push_simd_unsupported(insn);
@@ -834,7 +834,7 @@ impl LiftCtx {
             ))
         };
         if !packed {
-            let low = self.read_simd_lane_bits(src, lane_bits)?;
+            let low = self.read_simd_lane_bits(src, lane_bits, 0)?;
             return Some(root(low));
         }
         let view = self.simd_instruction_view_bits(&[dst, src])?;
@@ -856,14 +856,14 @@ impl LiftCtx {
             return;
         };
         let (Some(a), Some(b)) = (
-            self.read_simd_lane_bits(dst, lane),
-            self.read_simd_lane_bits(src, lane),
+            self.read_simd_lane_bits(dst, lane, 0),
+            self.read_simd_lane_bits(src, lane, 0),
         ) else {
             self.push_simd_unsupported(insn);
             return;
         };
         let result = fp_lane_result(op, a, b, lane);
-        if !self.write_simd_lane(dst, result, lane) {
+        if !self.write_simd_lane(dst, result, lane, 0) {
             self.push_simd_unsupported(insn);
         }
     }
@@ -886,8 +886,8 @@ impl LiftCtx {
             return;
         };
         let (Some(a), Some(b)) = (
-            self.read_simd_lane_fp(dst, lane),
-            self.read_simd_lane_fp(src, lane),
+            self.read_simd_lane_fp(dst, lane, 0),
+            self.read_simd_lane_fp(src, lane, 0),
         ) else {
             self.push_simd_unsupported(insn);
             return;
@@ -919,7 +919,7 @@ impl LiftCtx {
         };
         let (ebits, sbits) = fp_sort_bits(lane);
         let converted = Expr::sbv_to_fp(int, RoundingMode::NearestTiesEven, ebits, sbits);
-        if !self.write_simd_lane(dst, Expr::fp_to_ieee_bv(converted), lane) {
+        if !self.write_simd_lane(dst, Expr::fp_to_ieee_bv(converted), lane, 0) {
             self.push_simd_unsupported(insn);
         }
     }
@@ -933,7 +933,7 @@ impl LiftCtx {
         let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
             return;
         };
-        let Some(f) = self.read_simd_lane_fp(src, lane) else {
+        let Some(f) = self.read_simd_lane_fp(src, lane, 0) else {
             self.push_simd_unsupported(insn);
             return;
         };
@@ -953,13 +953,13 @@ impl LiftCtx {
         let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
             return;
         };
-        let Some(f) = self.read_simd_lane_fp(src, src_lane) else {
+        let Some(f) = self.read_simd_lane_fp(src, src_lane, 0) else {
             self.push_simd_unsupported(insn);
             return;
         };
         let (ebits, sbits) = fp_sort_bits(dst_lane);
         let converted = Expr::fp_to_fp(f, RoundingMode::NearestTiesEven, ebits, sbits);
-        if !self.write_simd_lane(dst, Expr::fp_to_ieee_bv(converted), dst_lane) {
+        if !self.write_simd_lane(dst, Expr::fp_to_ieee_bv(converted), dst_lane, 0) {
             self.push_simd_unsupported(insn);
         }
     }

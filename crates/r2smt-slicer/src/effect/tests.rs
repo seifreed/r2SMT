@@ -589,15 +589,15 @@ fn aarch64_packed_vector_instruction_sets_no_flags() {
 }
 
 #[test]
-fn aarch64_widening_arrangement_declines() {
+fn aarch64_unmodelled_vector_mnemonic_declines() {
     // Not modelled, so the effect table has to fail closed — otherwise
     // the slicer retains a definition the lifter drops.
     let i = insn(
-        "umlal",
+        "pmull",
         vec![
-            op("v0.4s", OperandKind::Register),
-            op("v1.4h", OperandKind::Register),
-            op("v2.4h", OperandKind::Register),
+            op("v0.8h", OperandKind::Register),
+            op("v1.8b", OperandKind::Register),
+            op("v2.8b", OperandKind::Register),
         ],
     );
     assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);
@@ -758,4 +758,178 @@ fn aarch64_vector_register_list_is_still_a_vector_shape() {
         ],
     );
     assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);
+}
+
+// --- N3a: NEON broadcast and permutation ---
+
+#[test]
+fn aarch64_element_insert_reads_its_destination() {
+    // `ins` preserves every lane it does not write, so the register's
+    // prior definition is still live and the slicer must keep it.
+    let i = insn(
+        "ins",
+        vec![
+            op("v0.s[1]", OperandKind::Register),
+            op("w1", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert!(effect.uses.contains(&"v0"), "{effect:?}");
+}
+
+#[test]
+fn aarch64_element_insert_still_defines_its_destination() {
+    let i = insn(
+        "ins",
+        vec![
+            op("v0.s[1]", OperandKind::Register),
+            op("w1", OperandKind::Register),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).defs, vec!["v0"]);
+}
+
+#[test]
+fn aarch64_permutation_does_not_read_its_destination() {
+    // A permutation writes every lane, so the prior value is dead.
+    let i = insn(
+        "zip1",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+            op("v2.4s", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert!(!effect.uses.contains(&"v0"), "{effect:?}");
+}
+
+#[test]
+fn aarch64_element_to_general_register_defines_the_general_register() {
+    let i = insn(
+        "umov",
+        vec![
+            op("w0", OperandKind::Register),
+            op("v1.s[1]", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert_eq!(effect.defs, vec!["x0"]);
+    assert_eq!(effect.uses, vec!["v1"]);
+}
+
+#[test]
+fn aarch64_broadcast_immediate_reads_no_register() {
+    let i = insn(
+        "movi",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("0x1", OperandKind::Immediate),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert_eq!(effect.defs, vec!["v0"]);
+    assert!(effect.uses.is_empty(), "{effect:?}");
+}
+
+#[test]
+fn aarch64_structured_load_still_declines() {
+    // `ld1`/`ld2`/`ld4` are multi-register lists with interleaving that
+    // the single-parent register model cannot express.
+    let i = insn(
+        "ld2",
+        vec![
+            op("{v0.4s, v1.4s}", OperandKind::Unknown),
+            op("[x2]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);
+}
+
+#[test]
+fn aarch64_narrowing_two_form_reads_its_destination() {
+    // `xtn2` writes only the destination's upper half, so the lower half
+    // survives and its prior definition is still live.
+    let i = insn(
+        "xtn2",
+        vec![
+            op("v0.8h", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+        ],
+    );
+    assert!(analyze(&i, Arch::Aarch64).uses.contains(&"v0"));
+}
+
+#[test]
+fn aarch64_narrowing_base_form_does_not_read_its_destination() {
+    let i = insn(
+        "xtn",
+        vec![
+            op("v0.4h", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+        ],
+    );
+    assert!(!analyze(&i, Arch::Aarch64).uses.contains(&"v0"));
+}
+
+#[test]
+fn aarch64_widening_long_defines_its_destination() {
+    let i = insn(
+        "umull",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4h", OperandKind::Register),
+            op("v2.4h", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert_eq!(effect.defs, vec!["v0"]);
+    assert_eq!(effect.kind, InstructionKind::Simd);
+}
+
+#[test]
+fn aarch64_multiply_accumulate_reads_its_destination() {
+    // The accumulator's prior definition is live; without this the
+    // slicer drops it and the accumulation reads a free input.
+    let i = insn(
+        "mla",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+            op("v2.4s", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert!(effect.uses.contains(&"v0"), "{effect:?}");
+}
+
+#[test]
+fn aarch64_long_multiply_accumulate_reads_its_destination() {
+    let i = insn(
+        "umlal",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4h", OperandKind::Register),
+            op("v2.4h", OperandKind::Register),
+        ],
+    );
+    assert!(analyze(&i, Arch::Aarch64).uses.contains(&"v0"));
+}
+
+#[test]
+fn aarch64_bitwise_select_reads_its_destination() {
+    // All three selects use the destination as an input — as the mask
+    // for `bsl`, as the surviving value for `bit` / `bif`.
+    for mnemonic in ["bsl", "bit", "bif"] {
+        let i = insn(
+            mnemonic,
+            vec![
+                op("v0.16b", OperandKind::Register),
+                op("v1.16b", OperandKind::Register),
+                op("v2.16b", OperandKind::Register),
+            ],
+        );
+        let effect = analyze(&i, Arch::Aarch64);
+        assert!(effect.uses.contains(&"v0"), "{mnemonic}: {effect:?}");
+    }
 }

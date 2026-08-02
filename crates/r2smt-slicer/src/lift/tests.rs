@@ -1241,7 +1241,7 @@ fn aarch32_upper_half_write_preserves_the_lower_half() {
     // Writing `d1` must leave `d0` — the bits *below* it — standing.
     // Only a sub-lane view can catch a splice that assumes offset zero.
     let mut ctx = LiftCtx::new(Arch::Arm);
-    assert!(ctx.write_simd_lane(&op("d1", OperandKind::Register), Expr::konst(0, 64), 64));
+    assert!(ctx.write_simd_lane(&op("d1", OperandKind::Register), Expr::konst(0, 64), 64, 0));
     let stmts = ctx.stmts;
     assert_eq!(
         *simd_parent_src(&stmts, "v0"),
@@ -1257,7 +1257,7 @@ fn aarch32_top_quarter_write_preserves_the_bits_on_both_sides() {
     // `s3` has neighbours above nothing and below plenty; the splice
     // has to reconstruct the parent from both directions.
     let mut ctx = LiftCtx::new(Arch::Arm);
-    assert!(ctx.write_simd_lane(&op("s3", OperandKind::Register), Expr::konst(0, 32), 32));
+    assert!(ctx.write_simd_lane(&op("s3", OperandKind::Register), Expr::konst(0, 32), 32, 0));
     let stmts = ctx.stmts;
     assert_eq!(
         *simd_parent_src(&stmts, "v0"),
@@ -1272,7 +1272,7 @@ fn aarch32_top_quarter_write_preserves_the_bits_on_both_sides() {
 fn aarch32_middle_register_write_preserves_bits_above_and_below() {
     // `s1` sits at [63:32] of v0 — bits on both sides must survive.
     let mut ctx = LiftCtx::new(Arch::Arm);
-    assert!(ctx.write_simd_lane(&op("s1", OperandKind::Register), Expr::konst(0, 32), 32));
+    assert!(ctx.write_simd_lane(&op("s1", OperandKind::Register), Expr::konst(0, 32), 32, 0));
     let stmts = ctx.stmts;
     assert_eq!(
         *simd_parent_src(&stmts, "v0"),
@@ -2735,15 +2735,15 @@ fn aarch64_half_width_arrangement_write_zeroes_the_upper_half() {
 }
 
 #[test]
-fn aarch64_widening_arrangement_declines() {
-    // `umlal` reads half-width lanes and accumulates into full-width
-    // ones. Requiring every operand to share the destination's
-    // arrangement rejects it without naming it.
+fn aarch64_unmodelled_vector_mnemonic_declines() {
+    // `pmull` is a polynomial multiply — carry-less, so no combination
+    // of the integer primitives expresses it. A mnemonic no family
+    // claims must decline rather than fall into a same-width handler.
     let i = insn(
         0x1000,
         4,
-        "umlal",
-        vec![reg("v0.4s"), reg("v1.4h"), reg("v2.4h")],
+        "pmull",
+        vec![reg("v0.8h"), reg("v1.8b"), reg("v2.8b")],
     );
     let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
     assert!(
@@ -2922,4 +2922,679 @@ fn aarch32_non_rounding_floating_point_does_not_pin_the_rounding_mode() {
             "{mnemonic}"
         );
     }
+}
+
+// --- N3a: NEON broadcast and permutation ---
+
+/// The single assignment a NEON lowering emits, rendered.
+fn neon_lowering(mnemonic: &str, operands: &[&str]) -> String {
+    let i = insn(
+        0x1000,
+        4,
+        mnemonic,
+        operands.iter().map(|o| reg(o)).collect(),
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert_eq!(stmts.len(), 1, "expected one statement: {stmts:?}");
+    stmts[0].to_string()
+}
+
+/// Whether a NEON mnemonic + operand shape declines.
+fn neon_declines(mnemonic: &str, operands: &[&str]) -> bool {
+    let i = insn(
+        0x1000,
+        4,
+        mnemonic,
+        operands.iter().map(|o| reg(o)).collect(),
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    matches!(stmts.as_slice(), [IrStmt::Unsupported { .. }])
+}
+
+#[test]
+fn aarch64_movi_replicates_the_immediate_to_every_lane() {
+    assert_eq!(
+        neon_lowering("movi", &["v0.4s", "#1"]),
+        "v0 := concat(0x1:32, concat(0x1:32, concat(0x1:32, 0x1:32)))"
+    );
+}
+
+#[test]
+fn aarch64_mvni_replicates_the_inverted_immediate() {
+    // The inversion is per lane and masked to the lane width, so a `4s`
+    // arrangement gives `~1` at 32 bits rather than at 64.
+    assert_eq!(
+        neon_lowering("mvni", &["v0.4s", "#1"]),
+        "v0 := concat(0xfffffffe:32, concat(0xfffffffe:32, concat(0xfffffffe:32, 0xfffffffe:32)))"
+    );
+}
+
+#[test]
+fn aarch64_movi_shifts_the_immediate_before_replicating() {
+    assert_eq!(
+        neon_lowering("movi", &["v0.4s", "#1", "lsl #8"]),
+        "v0 := concat(0x100:32, concat(0x100:32, concat(0x100:32, 0x100:32)))"
+    );
+}
+
+#[test]
+fn aarch64_movi_declines_the_mask_shift_form() {
+    // `msl` shifts ones in, not zeroes — a different operation.
+    assert!(neon_declines("movi", &["v0.4s", "#1", "msl #8"]));
+}
+
+#[test]
+fn aarch64_dup_from_a_general_register_replicates_the_low_element() {
+    assert_eq!(
+        neon_lowering("dup", &["v0.4s", "w1"]),
+        "v0 := concat(x1[31:0], concat(x1[31:0], concat(x1[31:0], x1[31:0])))"
+    );
+}
+
+#[test]
+fn aarch64_dup_from_an_element_reads_the_indexed_lane() {
+    // `v1.s[2]` is bits 95:64 — the lane index has to reach the read,
+    // which is why the lane helpers take one.
+    assert_eq!(
+        neon_lowering("dup", &["v0.4s", "v1.s[2]"]),
+        "v0 := concat(v1[95:64], concat(v1[95:64], concat(v1[95:64], v1[95:64])))"
+    );
+}
+
+#[test]
+fn aarch64_ext_windows_the_two_sources_with_the_first_at_the_low_end() {
+    // ARM concatenates Vm:Vn with Vn low, then takes `index` bytes up.
+    assert_eq!(
+        neon_lowering("ext", &["v0.16b", "v1.16b", "v2.16b", "#4"]),
+        "v0 := concat(v2, v1)[159:32]"
+    );
+}
+
+#[test]
+fn aarch64_ext_declines_a_non_byte_arrangement() {
+    // Only `.8b` and `.16b` are architecturally valid for `ext`.
+    assert!(neon_declines("ext", &["v0.4s", "v1.4s", "v2.4s", "#1"]));
+}
+
+#[test]
+fn aarch64_ext_declines_an_out_of_range_byte_index() {
+    assert!(neon_declines("ext", &["v0.16b", "v1.16b", "v2.16b", "#16"]));
+}
+
+#[test]
+fn aarch64_zip1_interleaves_the_lower_halves() {
+    // result[0]=Vn[0], result[1]=Vm[0], result[2]=Vn[1], result[3]=Vm[1].
+    assert_eq!(
+        neon_lowering("zip1", &["v0.4s", "v1.4s", "v2.4s"]),
+        "v0 := concat(v2[63:32], concat(v1[63:32], concat(v2[31:0], v1[31:0])))"
+    );
+}
+
+#[test]
+fn aarch64_zip2_interleaves_the_upper_halves() {
+    assert_eq!(
+        neon_lowering("zip2", &["v0.4s", "v1.4s", "v2.4s"]),
+        "v0 := concat(v2[127:96], concat(v1[127:96], concat(v2[95:64], v1[95:64])))"
+    );
+}
+
+#[test]
+fn aarch64_uzp1_takes_the_even_lanes_of_each_source_in_turn() {
+    // The low half of the destination walks Vn's even lanes, the high
+    // half Vm's.
+    assert_eq!(
+        neon_lowering("uzp1", &["v0.4s", "v1.4s", "v2.4s"]),
+        "v0 := concat(v2[95:64], concat(v2[31:0], concat(v1[95:64], v1[31:0])))"
+    );
+}
+
+#[test]
+fn aarch64_uzp2_takes_the_odd_lanes() {
+    assert_eq!(
+        neon_lowering("uzp2", &["v0.4s", "v1.4s", "v2.4s"]),
+        "v0 := concat(v2[127:96], concat(v2[63:32], concat(v1[127:96], v1[63:32])))"
+    );
+}
+
+#[test]
+fn aarch64_trn1_transposes_the_even_lanes() {
+    assert_eq!(
+        neon_lowering("trn1", &["v0.4s", "v1.4s", "v2.4s"]),
+        "v0 := concat(v2[95:64], concat(v1[95:64], concat(v2[31:0], v1[31:0])))"
+    );
+}
+
+#[test]
+fn aarch64_trn2_transposes_the_odd_lanes() {
+    assert_eq!(
+        neon_lowering("trn2", &["v0.4s", "v1.4s", "v2.4s"]),
+        "v0 := concat(v2[127:96], concat(v1[127:96], concat(v2[63:32], v1[63:32])))"
+    );
+}
+
+#[test]
+fn aarch64_rev64_reverses_elements_within_each_doubleword() {
+    // Two `s` elements per 64-bit container, so each pair swaps.
+    assert_eq!(
+        neon_lowering("rev64", &["v0.4s", "v1.4s"]),
+        "v0 := concat(v1[95:64], concat(v1[127:96], concat(v1[31:0], v1[63:32])))"
+    );
+}
+
+#[test]
+fn aarch64_rev16_reverses_bytes_within_each_halfword() {
+    assert_eq!(
+        neon_lowering("rev16", &["v0.8b", "v1.8b"]),
+        "v0 := zext(concat(v1[55:48], concat(v1[63:56], concat(v1[39:32], \
+concat(v1[47:40], concat(v1[23:16], concat(v1[31:24], concat(v1[7:0], v1[15:8]))))))), 128)"
+    );
+}
+
+#[test]
+fn aarch64_rev_declines_a_container_no_wider_than_its_element() {
+    // `rev32 v0.4s` would reverse a single element inside its own
+    // container, which the encoding does not admit.
+    assert!(neon_declines("rev32", &["v0.4s", "v1.4s"]));
+}
+
+#[test]
+fn aarch64_umov_zero_extends_the_element_into_the_general_register() {
+    assert_eq!(
+        neon_lowering("umov", &["w0", "v1.s[1]"]),
+        "x0 := zext(v1[63:32], 64)"
+    );
+}
+
+#[test]
+fn aarch64_smov_sign_extends_the_element() {
+    assert_eq!(
+        neon_lowering("smov", &["x0", "v1.h[3]"]),
+        "x0 := sext(v1[63:48], 64)"
+    );
+}
+
+#[test]
+fn aarch64_ins_from_a_general_register_preserves_the_other_lanes() {
+    assert_eq!(
+        neon_lowering("ins", &["v0.s[1]", "w0"]),
+        "v0 := concat(concat(v0[127:64], x0[31:0]), v0[31:0])"
+    );
+}
+
+#[test]
+fn aarch64_ins_from_an_element_moves_between_lanes() {
+    assert_eq!(
+        neon_lowering("ins", &["v0.s[1]", "v1.s[3]"]),
+        "v0 := concat(concat(v0[127:64], v1[127:96]), v0[31:0])"
+    );
+}
+
+#[test]
+fn aarch64_ins_declines_a_source_element_of_a_different_width() {
+    assert!(neon_declines("ins", &["v0.s[1]", "v1.h[3]"]));
+}
+
+#[test]
+fn aarch64_indexed_element_declines_an_out_of_range_index() {
+    // `v1.s[4]` names a fifth 32-bit element of a 128-bit register.
+    assert!(neon_declines("umov", &["w0", "v1.s[4]"]));
+}
+
+#[test]
+fn aarch64_mov_alias_routes_by_operand_shape() {
+    // `mov` is a lane-wise copy, an element insert and an element read
+    // depending only on its operands.
+    assert_eq!(neon_lowering("mov", &["v0.16b", "v1.16b"]), "v0 := v1");
+    assert_eq!(
+        neon_lowering("mov", &["v0.s[1]", "w0"]),
+        "v0 := concat(concat(v0[127:64], x0[31:0]), v0[31:0])"
+    );
+    assert_eq!(
+        neon_lowering("mov", &["w0", "v1.s[1]"]),
+        "x0 := zext(v1[63:32], 64)"
+    );
+}
+
+// --- N3b: NEON widening and narrowing ---
+
+#[test]
+fn aarch64_ushll_extends_each_element_before_shifting() {
+    // Extending first is the point of the family: shifting at the
+    // source width would drop the bits the long form exists to keep.
+    assert_eq!(
+        neon_lowering("ushll", &["v0.4s", "v1.4h", "#3"]),
+        "v0 := concat((zext(v1[63:48], 32) << 0x3:32), concat((zext(v1[47:32], 32) << 0x3:32), \
+concat((zext(v1[31:16], 32) << 0x3:32), (zext(v1[15:0], 32) << 0x3:32))))"
+    );
+}
+
+#[test]
+fn aarch64_ushll2_reads_the_upper_half_of_its_source() {
+    assert_eq!(
+        neon_lowering("ushll2", &["v0.4s", "v1.8h", "#3"]),
+        "v0 := concat((zext(v1[127:112], 32) << 0x3:32), concat((zext(v1[111:96], 32) << 0x3:32), \
+concat((zext(v1[95:80], 32) << 0x3:32), (zext(v1[79:64], 32) << 0x3:32))))"
+    );
+}
+
+#[test]
+fn aarch64_uxtl_is_the_zero_shift_alias() {
+    assert_eq!(
+        neon_lowering("uxtl", &["v0.4s", "v1.4h"]),
+        "v0 := concat(zext(v1[63:48], 32), concat(zext(v1[47:32], 32), \
+concat(zext(v1[31:16], 32), zext(v1[15:0], 32))))"
+    );
+}
+
+#[test]
+fn aarch64_sxtl_sign_extends() {
+    assert_eq!(
+        neon_lowering("sxtl", &["v0.4s", "v1.4h"]),
+        "v0 := concat(sext(v1[63:48], 32), concat(sext(v1[47:32], 32), \
+concat(sext(v1[31:16], 32), sext(v1[15:0], 32))))"
+    );
+}
+
+#[test]
+fn aarch64_xtn_zeroes_the_destination_upper_half() {
+    // A 64-bit arrangement is still a whole-register write on AArch64.
+    assert_eq!(
+        neon_lowering("xtn", &["v0.4h", "v1.4s"]),
+        "v0 := zext(concat(v1[127:96][15:0], concat(v1[95:64][15:0], \
+concat(v1[63:32][15:0], v1[31:0][15:0]))), 128)"
+    );
+}
+
+#[test]
+fn aarch64_xtn2_preserves_the_destination_lower_half() {
+    assert_eq!(
+        neon_lowering("xtn2", &["v0.8h", "v1.4s"]),
+        "v0 := concat(concat(v1[127:96][15:0], concat(v1[95:64][15:0], \
+concat(v1[63:32][15:0], v1[31:0][15:0]))), v0[63:0])"
+    );
+}
+
+#[test]
+fn aarch64_uaddl_widens_both_sources_before_adding() {
+    assert_eq!(
+        neon_lowering("uaddl", &["v0.4s", "v1.4h", "v2.4h"]),
+        "v0 := concat((zext(v1[63:48], 32) + zext(v2[63:48], 32)), \
+concat((zext(v1[47:32], 32) + zext(v2[47:32], 32)), \
+concat((zext(v1[31:16], 32) + zext(v2[31:16], 32)), \
+(zext(v1[15:0], 32) + zext(v2[15:0], 32)))))"
+    );
+}
+
+#[test]
+fn aarch64_saddl_sign_extends_both_sources() {
+    assert_eq!(
+        neon_lowering("saddl", &["v0.4s", "v1.4h", "v2.4h"]),
+        "v0 := concat((sext(v1[63:48], 32) + sext(v2[63:48], 32)), \
+concat((sext(v1[47:32], 32) + sext(v2[47:32], 32)), \
+concat((sext(v1[31:16], 32) + sext(v2[31:16], 32)), \
+(sext(v1[15:0], 32) + sext(v2[15:0], 32)))))"
+    );
+}
+
+#[test]
+fn aarch64_uaddw_reads_its_first_source_at_the_destination_width() {
+    // The `w` form's first operand is already wide and is not extended.
+    assert_eq!(
+        neon_lowering("uaddw", &["v0.4s", "v1.4s", "v2.4h"]),
+        "v0 := concat((v1[127:96] + zext(v2[63:48], 32)), \
+concat((v1[95:64] + zext(v2[47:32], 32)), \
+concat((v1[63:32] + zext(v2[31:16], 32)), \
+(v1[31:0] + zext(v2[15:0], 32)))))"
+    );
+}
+
+#[test]
+fn aarch64_uaddw2_halves_only_the_narrow_source() {
+    // The wide source keeps lane `i`; only the narrow one is read from
+    // the register's upper half.
+    assert_eq!(
+        neon_lowering("uaddw2", &["v0.4s", "v1.4s", "v2.8h"]),
+        "v0 := concat((v1[127:96] + zext(v2[127:112], 32)), \
+concat((v1[95:64] + zext(v2[111:96], 32)), \
+concat((v1[63:32] + zext(v2[95:80], 32)), \
+(v1[31:0] + zext(v2[79:64], 32)))))"
+    );
+}
+
+#[test]
+fn aarch64_umull_multiplies_at_the_widened_width() {
+    // A same-width multiply would discard exactly the high half the
+    // long form exists to compute.
+    assert_eq!(
+        neon_lowering("umull", &["v0.4s", "v1.4h", "v2.4h"]),
+        "v0 := concat((zext(v1[63:48], 32) * zext(v2[63:48], 32)), \
+concat((zext(v1[47:32], 32) * zext(v2[47:32], 32)), \
+concat((zext(v1[31:16], 32) * zext(v2[31:16], 32)), \
+(zext(v1[15:0], 32) * zext(v2[15:0], 32)))))"
+    );
+}
+
+#[test]
+fn aarch64_ssubl_subtracts_at_the_widened_width() {
+    assert_eq!(
+        neon_lowering("ssubl", &["v0.4s", "v1.4h", "v2.4h"]),
+        "v0 := concat((sext(v1[63:48], 32) - sext(v2[63:48], 32)), \
+concat((sext(v1[47:32], 32) - sext(v2[47:32], 32)), \
+concat((sext(v1[31:16], 32) - sext(v2[31:16], 32)), \
+(sext(v1[15:0], 32) - sext(v2[15:0], 32)))))"
+    );
+}
+
+#[test]
+fn aarch64_widening_declines_a_source_of_the_wrong_width() {
+    // `uaddl` needs sources half the destination's element width.
+    assert!(neon_declines("uaddl", &["v0.4s", "v1.4s", "v2.4s"]));
+}
+
+#[test]
+fn aarch64_widening_declines_a_non_two_form_reading_a_full_register() {
+    // `uaddl v0.4s, v1.8h, v2.8h` is the `uaddl2` shape without the
+    // suffix that says to take the upper half.
+    assert!(neon_declines("uaddl", &["v0.4s", "v1.8h", "v2.8h"]));
+}
+
+#[test]
+fn aarch64_two_form_declines_a_half_register_source() {
+    assert!(neon_declines("uaddl2", &["v0.4s", "v1.4h", "v2.4h"]));
+}
+
+// --- N3c: NEON multiply-accumulate ---
+
+#[test]
+fn aarch64_mla_accumulates_the_product_into_the_destination() {
+    assert_eq!(
+        neon_lowering("mla", &["v0.4s", "v1.4s", "v2.4s"]),
+        "v0 := concat((v0[127:96] + (v1[127:96] * v2[127:96])), \
+concat((v0[95:64] + (v1[95:64] * v2[95:64])), \
+concat((v0[63:32] + (v1[63:32] * v2[63:32])), \
+(v0[31:0] + (v1[31:0] * v2[31:0])))))"
+    );
+}
+
+#[test]
+fn aarch64_mls_subtracts_the_product_from_the_destination() {
+    assert_eq!(
+        neon_lowering("mls", &["v0.4s", "v1.4s", "v2.4s"]),
+        "v0 := concat((v0[127:96] - (v1[127:96] * v2[127:96])), \
+concat((v0[95:64] - (v1[95:64] * v2[95:64])), \
+concat((v0[63:32] - (v1[63:32] * v2[63:32])), \
+(v0[31:0] - (v1[31:0] * v2[31:0])))))"
+    );
+}
+
+#[test]
+fn aarch64_umlal_multiplies_at_the_accumulator_width() {
+    assert_eq!(
+        neon_lowering("umlal", &["v0.4s", "v1.4h", "v2.4h"]),
+        "v0 := concat((v0[127:96] + (zext(v1[63:48], 32) * zext(v2[63:48], 32))), \
+concat((v0[95:64] + (zext(v1[47:32], 32) * zext(v2[47:32], 32))), \
+concat((v0[63:32] + (zext(v1[31:16], 32) * zext(v2[31:16], 32))), \
+(v0[31:0] + (zext(v1[15:0], 32) * zext(v2[15:0], 32))))))"
+    );
+}
+
+#[test]
+fn aarch64_smlal2_reads_the_upper_half_of_its_sources() {
+    assert_eq!(
+        neon_lowering("smlal2", &["v0.4s", "v1.8h", "v2.8h"]),
+        "v0 := concat((v0[127:96] + (sext(v1[127:112], 32) * sext(v2[127:112], 32))), \
+concat((v0[95:64] + (sext(v1[111:96], 32) * sext(v2[111:96], 32))), \
+concat((v0[63:32] + (sext(v1[95:80], 32) * sext(v2[95:80], 32))), \
+(v0[31:0] + (sext(v1[79:64], 32) * sext(v2[79:64], 32))))))"
+    );
+}
+
+#[test]
+fn aarch64_umlsl_subtracts_the_widened_product() {
+    assert_eq!(
+        neon_lowering("umlsl", &["v0.4s", "v1.4h", "v2.4h"]),
+        "v0 := concat((v0[127:96] - (zext(v1[63:48], 32) * zext(v2[63:48], 32))), \
+concat((v0[95:64] - (zext(v1[47:32], 32) * zext(v2[47:32], 32))), \
+concat((v0[63:32] - (zext(v1[31:16], 32) * zext(v2[31:16], 32))), \
+(v0[31:0] - (zext(v1[15:0], 32) * zext(v2[15:0], 32))))))"
+    );
+}
+
+#[test]
+fn aarch64_same_width_accumulate_has_no_two_form() {
+    // `mla2` is not an encoding; only the long forms have one.
+    assert!(neon_declines("mla2", &["v0.4s", "v1.4s", "v2.4s"]));
+}
+
+#[test]
+fn aarch64_accumulate_declines_a_by_element_source() {
+    // `mla v0.4s, v1.4s, v2.s[0]` broadcasts one lane of the second
+    // source; the indexed operand carries no arrangement.
+    assert!(neon_declines("mla", &["v0.4s", "v1.4s", "v2.s[0]"]));
+}
+
+// --- N3f: NEON saturation ---
+
+#[test]
+fn aarch64_saturating_add_writes_the_vector_parent() {
+    let i = insn(
+        0x1000,
+        4,
+        "sqadd",
+        vec![reg("v0.4h"), reg("v1.4h"), reg("v2.4h")],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(stmts.as_slice(), [IrStmt::Assign { dst, .. }] if dst.name == "v0"),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_doubling_multiply_declines_an_unencodable_element_width() {
+    // `sqdmulh` exists only for 16- and 32-bit elements; a byte or
+    // doubleword arrangement is not an encoding.
+    assert!(neon_declines("sqdmulh", &["v0.16b", "v1.16b", "v2.16b"]));
+    assert!(neon_declines("sqdmulh", &["v0.2d", "v1.2d", "v2.2d"]));
+}
+
+#[test]
+fn aarch64_shift_narrow_declines_a_shift_past_the_element_width() {
+    // Beyond the destination's element width the surviving bits would be
+    // sign or zero fill rather than source bits, which is outside the
+    // encoding's shift range.
+    assert!(neon_declines("rshrn", &["v0.8b", "v1.8h", "#9"]));
+}
+
+#[test]
+fn aarch64_shift_narrow_declines_a_zero_shift() {
+    assert!(neon_declines("rshrn", &["v0.8b", "v1.8h", "#0"]));
+}
+
+#[test]
+fn aarch64_saturating_narrow_declines_mismatched_source_width() {
+    // `sqxtn` narrows by exactly half.
+    assert!(neon_declines("sqxtn", &["v0.8b", "v1.4s"]));
+}
+
+#[test]
+fn aarch64_same_width_saturating_has_no_two_form() {
+    assert!(neon_declines("sqadd2", &["v0.4h", "v1.4h", "v2.4h"]));
+}
+
+#[test]
+fn aarch64_saturating_narrow_two_form_preserves_the_lower_half() {
+    let i = insn(0x1000, 4, "sqxtn2", vec![reg("v0.16b"), reg("v1.8h")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(
+            stmts.as_slice(),
+            [IrStmt::Assign { src: Expr::Concat { low, .. }, .. }]
+                if matches!(&**low, Expr::Extract { hi: 63, lo: 0, .. })
+        ),
+        "the surviving lower half must read the destination: {stmts:?}"
+    );
+}
+
+// --- N3d: NEON same-width shifts ---
+
+#[test]
+fn aarch64_left_shift_declines_an_amount_at_the_element_width() {
+    // `shl` encodes shifts in `0 .. esize-1`; the element width itself
+    // is not an encoding.
+    assert!(neon_declines("shl", &["v0.4h", "v1.4h", "#16"]));
+}
+
+#[test]
+fn aarch64_right_shift_declines_a_zero_amount() {
+    // `ushr` encodes shifts in `1 .. esize`.
+    assert!(neon_declines("ushr", &["v0.4h", "v1.4h", "#0"]));
+}
+
+#[test]
+fn aarch64_right_shift_declines_an_amount_past_the_element_width() {
+    assert!(neon_declines("ushr", &["v0.4h", "v1.4h", "#17"]));
+}
+
+#[test]
+fn aarch64_register_shift_declines_an_immediate_amount() {
+    // `ushl` takes a vector of per-lane amounts, not an immediate.
+    assert!(neon_declines("ushl", &["v0.4h", "v1.4h", "#4"]));
+}
+
+#[test]
+fn aarch64_immediate_shift_declines_a_vector_amount() {
+    assert!(neon_declines("ushr", &["v0.4h", "v1.4h", "v2.4h"]));
+}
+
+#[test]
+fn aarch64_register_shift_builds_both_directions() {
+    // The per-lane amount's sign chooses the direction at run time, so
+    // the lowering selects between a left and a right shift rather than
+    // committing to one.
+    let i = insn(
+        0x1000,
+        4,
+        "ushl",
+        vec![reg("v0.4h"), reg("v1.4h"), reg("v2.4h")],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    let rendered = stmts
+        .first()
+        .map(std::string::ToString::to_string)
+        .unwrap_or_default();
+    assert!(rendered.contains("ite"), "{rendered}");
+}
+
+// --- N3e: NEON conversions and compares ---
+
+#[test]
+fn aarch64_vector_compare_writes_a_mask_not_a_flag() {
+    // The scalar compare path writes NZCV; a vector compare writes the
+    // destination register, because its result feeds another vector op.
+    let i = insn(
+        0x1000,
+        4,
+        "cmgt",
+        vec![reg("v0.4h"), reg("v1.4h"), reg("v2.4h")],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(stmts.as_slice(), [IrStmt::Assign { dst, .. }] if dst.name == "v0"),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_vector_compare_sets_no_flags() {
+    let i = insn(
+        0x1000,
+        4,
+        "cmgt",
+        vec![reg("v0.4h"), reg("v1.4h"), reg("v2.4h")],
+    );
+    let effect = crate::effect::analyze(&i, Arch::Aarch64);
+    assert!(!effect.defines_flags, "{effect:?}");
+}
+
+#[test]
+fn aarch64_float_compare_declines_a_byte_arrangement() {
+    // `.16b` names an 8-bit element, which is not an IEEE sort.
+    assert!(neon_declines("fcmgt", &["v0.16b", "v1.16b", "v2.16b"]));
+}
+
+#[test]
+fn aarch64_test_bits_has_no_compare_with_zero_form() {
+    // `cmtst v0.4h, v1.4h, #0` is not an encoding — the AND against zero
+    // would be constant.
+    assert!(neon_declines("cmtst", &["v0.4h", "v1.4h", "#0"]));
+}
+
+#[test]
+fn aarch64_compare_declines_a_non_zero_immediate() {
+    // The immediate form compares against zero only.
+    assert!(neon_declines("cmgt", &["v0.4h", "v1.4h", "#1"]));
+}
+
+#[test]
+fn aarch64_fixed_point_convert_declines() {
+    // The three-operand form scales by a fractional-bit count, which is
+    // a different operation from the plain conversion.
+    assert!(neon_declines("scvtf", &["v0.2s", "v1.2s", "#4"]));
+}
+
+#[test]
+fn aarch64_convert_declines_mismatched_lane_geometry() {
+    // `scvtf` converts element-for-element.
+    assert!(neon_declines("scvtf", &["v0.2d", "v1.2s"]));
+}
+
+#[test]
+fn aarch64_float_widen_two_form_reads_the_upper_half() {
+    let i = insn(0x1000, 4, "fcvtl2", vec![reg("v0.2d"), reg("v1.4s")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    let rendered = stmts
+        .first()
+        .map(std::string::ToString::to_string)
+        .unwrap_or_default();
+    assert!(rendered.contains("127:96"), "{rendered}");
+}
+
+// --- N3g: NEON bitwise select ---
+
+#[test]
+fn aarch64_bitwise_select_lowers_once_over_the_whole_view() {
+    // Bit-granular, so there is nothing to do per lane.
+    let i = insn(
+        0x1000,
+        4,
+        "bsl",
+        vec![reg("v0.16b"), reg("v1.16b"), reg("v2.16b")],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(
+            stmts.as_slice(),
+            [IrStmt::Assign {
+                src: Expr::Or(..),
+                ..
+            }]
+        ),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_bitwise_select_declines_a_non_byte_arrangement() {
+    assert!(neon_declines("bsl", &["v0.4s", "v1.4s", "v2.4s"]));
+}
+
+#[test]
+fn aarch64_two_form_declines_a_half_width_full_register_operand() {
+    // The `2` suffix names the half of the 128-bit register the base
+    // form does not touch, so the operand it halves must span the whole
+    // register. A 64-bit arrangement there is not an encoding.
+    assert!(neon_declines("xtn2", &["v0.4h", "v1.4s"]));
+    assert!(neon_declines("uaddl2", &["v0.2s", "v1.4h", "v2.4h"]));
+    assert!(neon_declines("sqxtn2", &["v0.8b", "v1.8h"]));
 }

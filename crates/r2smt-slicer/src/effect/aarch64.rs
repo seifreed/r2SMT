@@ -25,8 +25,20 @@ pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
         // integer arms so that the mnemonics with no scalar `AArch64`
         // form (`mvn`, `bic`) are classified too, without those arms
         // newly claiming the scalar spellings the lifter does not model.
-        crate::lift::VectorShape::Lifted => {
-            return aarch64_arith3_effect(insn, InstructionKind::Simd, false);
+        //
+        // An element insert is the exception: it preserves every lane it
+        // does not write, so its destination is a use as well, and the
+        // slicer has to keep whatever defined the register before it.
+        crate::lift::VectorShape::Lifted { reads_destination } => {
+            let mut effect = aarch64_arith3_effect(insn, InstructionKind::Simd, false);
+            if reads_destination {
+                for def in effect.defs.clone() {
+                    if !effect.uses.contains(&def) {
+                        effect.uses.push(def);
+                    }
+                }
+            }
+            return effect;
         }
         crate::lift::VectorShape::Declined => return other_effect(insn),
     }

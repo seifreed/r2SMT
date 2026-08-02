@@ -260,8 +260,15 @@ fn is_x86_simd_instruction(insn: &Instruction) -> bool {
 pub(crate) enum VectorShape {
     /// No operand carries vector shape; the scalar dispatch applies.
     None,
-    /// Vector-shaped and lowered by the packed handler.
-    Lifted,
+    /// Vector-shaped and lowered by a NEON handler.
+    Lifted {
+        /// Whether the lowering reads the destination register as well
+        /// as writing it — true for the element inserts, which preserve
+        /// every lane they do not write. The effect table has to know:
+        /// a destination that is only a def lets the slicer drop the
+        /// accumulator's prior definition.
+        reads_destination: bool,
+    },
     /// Vector-shaped and not modelled. The effect table reports
     /// [`crate::effect::InstructionKind::Other`] so the slice truncates,
     /// and the dispatcher emits [`IrStmt::Unsupported`].
@@ -285,7 +292,11 @@ pub(crate) fn vector_shape(insn: &Instruction, arch: Arch) -> VectorShape {
         return VectorShape::None;
     }
     match arch {
-        Arch::Aarch64 if aarch64::packed_shape(insn).is_some() => VectorShape::Lifted,
+        Arch::Aarch64 => {
+            aarch64::neon::shape(insn).map_or(VectorShape::Declined, |shape| VectorShape::Lifted {
+                reads_destination: shape.reads_destination(),
+            })
+        }
         _ => VectorShape::Declined,
     }
 }
@@ -357,7 +368,7 @@ pub(crate) fn pins_rounding_mode(insn: &Instruction, arch: Arch) -> bool {
 
 /// Integer operation a packed ARM vector instruction applies to each
 /// lane.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum PackedIntOp {
     /// A lane-wise binary operation over two sources.
     Bin(BinOp),
@@ -370,7 +381,7 @@ pub(crate) enum PackedIntOp {
 }
 
 /// What a packed ARM vector data-processing instruction computes.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum PackedOp {
     /// Integer lanes.
     Int(PackedIntOp),
@@ -412,7 +423,7 @@ impl PackedOp {
 
 /// Floating-point operation applied to one lane, shared by the scalar
 /// (`addss`) and packed (`addps`) handlers.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum FpArithOp {
     Add,
     Sub,
@@ -1124,28 +1135,33 @@ impl LiftCtx {
         self.simd_operand_value(op, view)
     }
 
-    /// Read the low `lane_bits`-wide lane of a SIMD operand and
-    /// reinterpret it as an IEEE float of the matching sort (32→single,
-    /// 64→double). Used by the scalar SSE FP handlers.
-    fn read_simd_lane_fp(&mut self, op: &Operand, lane_bits: u16) -> Option<Expr> {
-        let raw = self.read_simd_lane_bits(op, lane_bits)?;
+    /// Read lane `index` of a SIMD operand and reinterpret it as an IEEE
+    /// float of the matching sort (32→single, 64→double). Used by the
+    /// scalar SSE FP handlers, which always read lane 0.
+    fn read_simd_lane_fp(&mut self, op: &Operand, lane_bits: u16, index: u16) -> Option<Expr> {
+        let raw = self.read_simd_lane_bits(op, lane_bits, index)?;
         let (ebits, sbits) = fp_sort_bits_checked(lane_bits)?;
         Some(Expr::bv_to_fp(raw, ebits, sbits))
     }
 
-    /// The raw bit-vector of the low lane, before any float
+    /// The raw bit-vector of lane `index`, before any float
     /// reinterpretation. Kept separate so the compare handlers can build
     /// a mask without a pointless round trip through the float sort.
     ///
     /// A scalar memory operand is loaded at the *lane* width, not the
-    /// vector view: `movss xmm0, dword [rbp - 8]` reads four bytes.
-    fn read_simd_lane_bits(&mut self, op: &Operand, lane_bits: u16) -> Option<Expr> {
+    /// vector view: `movss xmm0, dword [rbp - 8]` reads four bytes. Only
+    /// lane 0 can be read that way — a lane index addresses a register's
+    /// element, and no ISA spells an indexed element of a memory operand.
+    fn read_simd_lane_bits(&mut self, op: &Operand, lane_bits: u16, index: u16) -> Option<Expr> {
         if self.is_modellable_simd_memory(op) {
+            if index != 0 {
+                return None;
+            }
             return Some(self.read_operand_lowered(op, lane_bits));
         }
         let view = self.simd_view_bits(op)?;
         let value = self.simd_operand_value(op, view)?;
-        Self::extract_lane(value, lane_bits, 0)
+        Self::extract_lane(value, lane_bits, index)
     }
 
     /// Extract lane `index` (counting from the least-significant) out of
@@ -1156,34 +1172,47 @@ impl LiftCtx {
         Some(extract_collapsing(value, hi, lo))
     }
 
-    /// Write `lane_value` (an IEEE bit-vector of `lane_bits`) to the low
-    /// lane of a SIMD destination.
+    /// Write `lane_value` (a bit-vector of `lane_bits`) to lane `index`
+    /// of a SIMD destination, preserving every other bit of the parent.
     ///
     /// A register destination keeps the parent bits around the lane
-    /// (legacy SSE scalar semantics). A memory destination stores exactly
-    /// `lane_bits` — there is nothing around the lane to preserve, which
-    /// is why `movss [rbp - 8], xmm0` writes four bytes and leaves the
-    /// rest of the slot alone.
+    /// (legacy SSE scalar semantics, and every ARM element insert). A
+    /// memory destination stores exactly `lane_bits` — there is nothing
+    /// around the lane to preserve, which is why `movss [rbp - 8], xmm0`
+    /// writes four bytes and leaves the rest of the slot alone; only lane
+    /// 0 is addressable that way.
     ///
-    /// The lane sits at the view's own offset in the parent, so on
-    /// `AArch32` a write to `s3` preserves the bits *below* it as well as
-    /// above.
-    fn write_simd_lane(&mut self, op: &Operand, lane_value: Expr, lane_bits: u16) -> bool {
+    /// The lane sits at `index` elements above the view's own offset in
+    /// the parent, so on `AArch32` a write to `s3` preserves the bits
+    /// *below* it as well as above.
+    fn write_simd_lane(
+        &mut self,
+        op: &Operand,
+        lane_value: Expr,
+        lane_bits: u16,
+        index: u16,
+    ) -> bool {
         if self.is_modellable_simd_memory(op) {
-            return self.write_dst(op, lane_value, lane_bits);
+            return index == 0 && self.write_dst(op, lane_value, lane_bits);
         }
         let (Some(layout), Some(parent_bits)) = (self.simd_layout(op), self.simd_parent_width())
         else {
             return false;
         };
-        let Some(lane_top) = layout.lo.checked_add(lane_bits) else {
+        let Some(lane_lo) = lane_bits
+            .checked_mul(index)
+            .and_then(|offset| layout.lo.checked_add(offset))
+        else {
+            return false;
+        };
+        let Some(lane_top) = lane_lo.checked_add(lane_bits) else {
             return false;
         };
         if lane_top > parent_bits {
             return false;
         }
         let parent = Expr::var(layout.parent, parent_bits);
-        let value = Self::splice_into_parent(&parent, lane_value, layout.lo, lane_top, parent_bits);
+        let value = Self::splice_into_parent(&parent, lane_value, lane_lo, lane_top, parent_bits);
         self.assign(Var::new(layout.parent, parent_bits), value);
         true
     }
