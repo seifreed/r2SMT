@@ -10,8 +10,8 @@ use r2smt_ir::stmt::IrStmt;
 use crate::registers::register_layout;
 
 use super::{
-    BinOp, LiftCtx, MemAccess, aarch64_cond_suffix_to_predicate, is_aarch32_base_supported,
-    nonzero_width, strip_aarch32_cond_suffix, width_mask,
+    BinOp, FpArithOp, LiftCtx, MemAccess, aarch64_cond_suffix_to_predicate, fp_lane_result,
+    fp_sort_bits, is_aarch32_base_supported, nonzero_width, strip_aarch32_cond_suffix, width_mask,
 };
 
 impl LiftCtx {
@@ -96,6 +96,16 @@ impl LiftCtx {
             "pop" => self.lift_aarch32_pop(insn),
             "ldm" | "ldmia" => self.lift_aarch32_ldm(insn),
             "stm" | "stmia" => self.lift_aarch32_stm(insn),
+            // VFP scalar floating point. Unlike AArch64, the lane
+            // width is spelled in the mnemonic (`vadd.f32` /
+            // `vadd.f64`), not in the operand, and every mnemonic is
+            // `v`-prefixed so none of them can collide with the
+            // integer handlers above.
+            _ if vfp_scalar(&mnem).is_some() => {
+                if let Some((op, lane)) = vfp_scalar(&mnem) {
+                    self.lift_aarch32_vfp(insn, op, lane);
+                }
+            }
             _ => self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("at {addr} (aarch32)", addr = insn.address),
@@ -616,4 +626,153 @@ fn parse_aarch32_immediate(raw: &str) -> Option<i64> {
         return i64::from_str_radix(hex, 16).ok().map(|v| -v);
     }
     s.parse::<i64>().ok()
+}
+
+/// What a VFP scalar mnemonic does, and at what precision.
+#[derive(Clone, Copy)]
+pub(crate) enum VfpOp {
+    /// Binary arithmetic on two source registers.
+    Arith(FpArithOp),
+    /// `vcmp` / `vcmpe` — compare into FPSCR.
+    Compare,
+    /// `vmov` — move a bit pattern without interpreting it.
+    Move,
+    /// `vneg` / `vabs` — sign-bit manipulation.
+    Sign { negate: bool },
+    /// `vsqrt`.
+    Sqrt,
+}
+
+/// Parse `v<op>.f<width>` — the `AArch32` spelling that carries the
+/// precision in the mnemonic. Integer-typed vector forms (`vadd.i32`)
+/// are not scalar floating point and decline here.
+pub(crate) fn vfp_scalar(mnemonic: &str) -> Option<(VfpOp, u16)> {
+    let (base, ty) = mnemonic.split_once('.')?;
+    let lane = match ty {
+        "f32" => 32,
+        "f64" => 64,
+        "f16" => 16,
+        _ => return None,
+    };
+    let op = match base {
+        "vadd" => VfpOp::Arith(FpArithOp::Add),
+        "vsub" => VfpOp::Arith(FpArithOp::Sub),
+        "vmul" => VfpOp::Arith(FpArithOp::Mul),
+        "vdiv" => VfpOp::Arith(FpArithOp::Div),
+        "vmax" => VfpOp::Arith(FpArithOp::Max),
+        "vmin" => VfpOp::Arith(FpArithOp::Min),
+        "vcmp" | "vcmpe" => VfpOp::Compare,
+        "vmov" => VfpOp::Move,
+        "vneg" => VfpOp::Sign { negate: true },
+        "vabs" => VfpOp::Sign { negate: false },
+        "vsqrt" => VfpOp::Sqrt,
+        _ => return None,
+    };
+    Some((op, lane))
+}
+
+impl LiftCtx {
+    /// The VFP scalar family. Operand shapes mirror `AArch64`, so the
+    /// lane helpers are shared; only the flag write differs, because
+    /// `AArch32` compares land in FPSCR and are copied to the
+    /// condition flags by a subsequent `vmrs`.
+    fn lift_aarch32_vfp(&mut self, insn: &Instruction, op: VfpOp, lane: u16) {
+        let Some(dst) = insn.operands.first().cloned() else {
+            self.push_aarch32_vfp_unsupported(insn);
+            return;
+        };
+        let result = match op {
+            VfpOp::Arith(arith) => self.vfp_arith_value(insn, arith, lane),
+            VfpOp::Sqrt => self.vfp_sqrt_value(insn, lane),
+            VfpOp::Sign { negate } => self.vfp_sign_value(insn, lane, negate),
+            VfpOp::Move => insn
+                .operands
+                .get(1)
+                .cloned()
+                .and_then(|src| self.read_simd_lane_bits(&src, lane)),
+            VfpOp::Compare => {
+                self.lift_aarch32_vcmp(insn, lane);
+                return;
+            }
+        };
+        let Some(value) = result else {
+            self.push_aarch32_vfp_unsupported(insn);
+            return;
+        };
+        // `AArch32` VFP writes the addressed slice and preserves the
+        // rest of the register file — the opposite of `AArch64`, and
+        // the reason `write_simd_lane` has to honour the view's offset.
+        if !self.write_simd_lane(&dst, value, lane) {
+            self.push_aarch32_vfp_unsupported(insn);
+        }
+    }
+
+    fn vfp_arith_value(&mut self, insn: &Instruction, arith: FpArithOp, lane: u16) -> Option<Expr> {
+        let lhs = insn.operands.get(1)?.clone();
+        let rhs = insn.operands.get(2)?.clone();
+        let a = self.read_simd_lane_bits(&lhs, lane)?;
+        let b = self.read_simd_lane_bits(&rhs, lane)?;
+        Some(fp_lane_result(arith, a, b, lane))
+    }
+
+    fn vfp_sqrt_value(&mut self, insn: &Instruction, lane: u16) -> Option<Expr> {
+        let src = insn.operands.get(1)?.clone();
+        let value = self.read_simd_lane_fp(&src, lane)?;
+        Some(Expr::fp_to_ieee_bv(Expr::fsqrt(
+            value,
+            r2smt_ir::expr::RoundingMode::NearestTiesEven,
+        )))
+    }
+
+    fn vfp_sign_value(&mut self, insn: &Instruction, lane: u16, negate: bool) -> Option<Expr> {
+        let src = insn.operands.get(1)?.clone();
+        let bits = self.read_simd_lane_bits(&src, lane)?;
+        let sign = super::aarch64::sign_bit_mask(lane)?;
+        Some(if negate {
+            Expr::bv_xor(bits, sign)
+        } else {
+            Expr::bv_and(bits, Expr::bv_xor(sign, super::aarch64::all_ones(lane)))
+        })
+    }
+
+    /// `vcmp` / `vcmpe` — same flag mapping as the `AArch64` compare:
+    /// ordered equality in ZF, ordered less-than in SF, the unordered
+    /// predicate in OF so `lt` covers less-than and unordered exactly
+    /// as the architecture defines after a floating-point compare.
+    fn lift_aarch32_vcmp(&mut self, insn: &Instruction, lane: u16) {
+        let (Some(lhs), Some(rhs)) = (
+            insn.operands.first().cloned(),
+            insn.operands.get(1).cloned(),
+        ) else {
+            self.push_aarch32_vfp_unsupported(insn);
+            return;
+        };
+        let Some(a) = self.read_simd_lane_fp(&lhs, lane) else {
+            self.push_aarch32_vfp_unsupported(insn);
+            return;
+        };
+        let b = if self.is_simd_register(&rhs) {
+            let Some(value) = self.read_simd_lane_fp(&rhs, lane) else {
+                self.push_aarch32_vfp_unsupported(insn);
+                return;
+            };
+            value
+        } else {
+            let (ebits, sbits) = fp_sort_bits(lane);
+            Expr::bv_to_fp(Expr::konst(0, lane), ebits, sbits)
+        };
+        let unordered = Expr::bool_or(Expr::fisnan(a.clone()), Expr::fisnan(b.clone()));
+        self.set_flag("ZF", Expr::feq(a.clone(), b.clone()));
+        self.set_flag("SF", Expr::flt(a.clone(), b.clone()));
+        self.set_flag("CF", Expr::flt(a, b));
+        self.set_flag("OF", unordered.clone());
+        self.set_flag("PF", unordered);
+    }
+
+    fn push_aarch32_vfp_unsupported(&mut self, insn: &Instruction) {
+        self.stmts.push(IrStmt::Unsupported {
+            mnemonic: insn.mnemonic.clone(),
+            comment: format!("unmodellable VFP operand at {addr}", addr = insn.address),
+        });
+    }
 }

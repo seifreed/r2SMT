@@ -39,6 +39,7 @@ mod aarch32;
 mod aarch64;
 mod merge;
 mod x86;
+pub(crate) use aarch32::{VfpOp, vfp_scalar};
 use merge::lower_merge;
 pub(crate) use x86::{is_fp_compare_mnemonic, sse_scalar_move_lane};
 
@@ -99,6 +100,7 @@ fn is_simd_instruction(insn: &Instruction, arch: Arch) -> bool {
     match arch {
         Arch::X86 | Arch::X86_64 => is_x86_simd_instruction(insn),
         Arch::Aarch64 => is_aarch64_fp_instruction(insn),
+        Arch::Arm => vfp_scalar(&insn.mnemonic.trim().to_ascii_lowercase()).is_some(),
         _ => false,
     }
 }
@@ -579,6 +581,7 @@ impl LiftCtx {
         if is_simd_instruction(insn, self.arch) {
             match self.arch {
                 Arch::Aarch64 => self.lift_instruction_aarch64(insn),
+                Arch::Arm => self.lift_instruction_aarch32(insn),
                 _ => self.lift_instruction_x86(insn),
             }
             return;

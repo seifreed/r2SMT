@@ -130,6 +130,11 @@ fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> Instruct
         "pop" => aarch32_push_pop_effect(insn, true),
         "ldm" | "ldmia" => aarch32_ldm_stm_effect(insn, true),
         "stm" | "stmia" => aarch32_ldm_stm_effect(insn, false),
+        // VFP scalar floating point. `vcmp` writes the flags and
+        // defines no register; everything else defines its destination.
+        // Unlike AArch64, a VFP write preserves the rest of the
+        // register file, so the destination is a use as well as a def.
+        m if crate::lift::vfp_scalar(m).is_some() => aarch32_vfp_effect(insn),
         _ => other_effect(insn),
     }
 }
@@ -305,6 +310,42 @@ fn aarch32_arith_effect(
         defs,
         uses,
         defines_flags: sets_flags,
+        has_memory_access: any_memory_operand(&insn.operands),
+        is_call: false,
+        reads_flags: false,
+    }
+}
+
+fn aarch32_vfp_effect(insn: &Instruction) -> InstructionEffect {
+    let mnemonic = insn.mnemonic.trim().to_ascii_lowercase();
+    if matches!(
+        crate::lift::vfp_scalar(&mnemonic),
+        Some((crate::lift::VfpOp::Compare, _))
+    ) {
+        return aarch32_cmp_test_effect(insn, InstructionKind::Cmp);
+    }
+    let mut defs = Vec::new();
+    let mut uses = Vec::new();
+    if let Some(dst) = insn.operands.first()
+        && let Some(reg) = canonical_register(&dst.raw, Arch::Arm)
+    {
+        defs.push(reg);
+        // The write only covers the addressed slice, so the rest of
+        // the vector register survives and the prior value stays live.
+        uses.push(reg);
+    }
+    for src in insn.operands.iter().skip(1) {
+        for r in registers_in_operand(src, Arch::Arm) {
+            if !uses.contains(&r) {
+                uses.push(r);
+            }
+        }
+    }
+    InstructionEffect {
+        kind: InstructionKind::Simd,
+        defs,
+        uses,
+        defines_flags: false,
         has_memory_access: any_memory_operand(&insn.operands),
         is_call: false,
         reads_flags: false,

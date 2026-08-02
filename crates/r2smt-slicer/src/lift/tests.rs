@@ -2484,3 +2484,53 @@ fn aarch64_fp_mnemonics_are_covered_by_both_effect_and_lifter() {
         );
     }
 }
+
+// ---------------------------------------------------------------
+// AArch32 VFP scalar floating point.
+// ---------------------------------------------------------------
+
+fn lift_aarch32(mnemonic: &str, operands: Vec<Operand>) -> Vec<IrStmt> {
+    lift_per_mnemonic(&insn(0x1000, 4, mnemonic, operands), Arch::Arm)
+}
+
+#[test]
+fn aarch32_vadd_takes_its_precision_from_the_mnemonic() {
+    // Unlike `AArch64`, the lane width is spelled `.f32` / `.f64` in
+    // the mnemonic rather than in the register letter.
+    let stmts = lift_aarch32("vadd.f64", vec![reg("d0"), reg("d1"), reg("d2")]);
+    let rendered = format!("{:?}", simd_parent_src(&stmts, "v0"));
+    assert!(rendered.contains("ebits: 11"), "{rendered}");
+}
+
+#[test]
+fn aarch32_vfp_write_preserves_the_rest_of_the_register_file() {
+    // `AArch32` VFP writes only the addressed slice — the opposite of
+    // `AArch64`, which zeroes the rest. `d1` is the upper half of `v0`,
+    // so the lower half must survive.
+    let stmts = lift_aarch32("vadd.f64", vec![reg("d1"), reg("d1"), reg("d1")]);
+    let rendered = format!("{:?}", simd_parent_src(&stmts, "v0"));
+    assert!(rendered.contains("hi: 63"), "{rendered}");
+}
+
+#[test]
+fn aarch32_integer_typed_vector_mnemonic_is_not_scalar_floating_point() {
+    // `vadd.i32` is packed integer, not scalar float — claiming it
+    // would lift integer lanes as IEEE values.
+    assert!(crate::lift::vfp_scalar("vadd.i32").is_none());
+}
+
+#[test]
+fn aarch32_vcmp_writes_flags_and_defines_no_register() {
+    let i = insn(0x1000, 4, "vcmp.f32", vec![reg("s0"), reg("s1")]);
+    let e = crate::effect::analyze(&i, Arch::Arm);
+    assert!(e.defines_flags && e.defs.is_empty(), "{e:?}");
+}
+
+#[test]
+fn aarch32_vfp_arithmetic_reads_its_destination() {
+    // The write preserves the surrounding register file, so the prior
+    // value stays live and the destination is a use as well as a def.
+    let i = insn(0x1000, 4, "vadd.f32", vec![reg("s0"), reg("s1"), reg("s2")]);
+    let e = crate::effect::analyze(&i, Arch::Arm);
+    assert!(e.uses.contains(&"v0"), "{e:?}");
+}

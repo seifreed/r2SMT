@@ -1146,14 +1146,14 @@ impl LiftCtx {
 }
 
 /// A bit-vector of `bits` with only the sign bit set.
-fn sign_bit_mask(bits: u16) -> Option<Expr> {
+pub(super) fn sign_bit_mask(bits: u16) -> Option<Expr> {
     let shift = u32::from(bits.checked_sub(1)?);
     let value = 1u128.checked_shl(shift)?;
     Some(Expr::konst(value, bits))
 }
 
 /// An all-ones bit-vector of `bits`.
-fn all_ones(bits: u16) -> Expr {
+pub(super) fn all_ones(bits: u16) -> Expr {
     if bits >= 128 {
         return Expr::konst(u128::MAX, bits);
     }
