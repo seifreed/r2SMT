@@ -17,9 +17,11 @@ use r2smt_common::{Address, Arch};
 use r2smt_ir::expr::{Expr, Var};
 use r2smt_ir::program::{Instruction, Operand, OperandKind};
 use r2smt_ir::stmt::IrStmt;
-use r2smt_slicer::{BranchCandidate, BranchCondition, BranchKind, SliceStatus, lift_per_mnemonic};
+use r2smt_slicer::{
+    BranchCandidate, BranchCondition, BranchKind, LiftedSlice, SliceStatus, lift_per_mnemonic,
+};
 use r2smt_smt::solve_branch;
-use r2smt_ssa::SsaLiftedSlice;
+use r2smt_ssa::ssa_convert;
 
 const TEST_SOLVE_TIMEOUT_MS: u32 = 10_000;
 const VECTOR_BITS: u16 = 128;
@@ -51,12 +53,15 @@ fn branch() -> BranchCandidate {
     }
 }
 
-/// Lift `mnemonic operands`, bind every source register to a concrete
+/// Lift `mnemonic operands`, bind every named register to a concrete
 /// vector value, and ask the solver whether the destination is
 /// necessarily `expected`.
 ///
-/// `sources` pairs a register name with the whole 128-bit value it
-/// holds, so a lane is placed by shifting it into position.
+/// The binding assignments are prepended to the lifted statements and
+/// the whole thing is run through the real SSA pass, so an instruction
+/// that *reads* its destination (`bsl`, `mla`, `ins`) sees the bound
+/// value rather than contradicting it — the read and the write end up
+/// as different versions, exactly as they would in the pipeline.
 fn solve_lowering(
     mnemonic: &str,
     operands: &[&str],
@@ -88,14 +93,9 @@ fn solve_lowering(
             src: Expr::konst(*value, VECTOR_BITS),
         })
         .collect();
-    let mut defs: Vec<Var> = sources
-        .iter()
-        .map(|(name, _)| Var::new(*name, VECTOR_BITS))
-        .collect();
     statements.extend(lifted);
-    defs.push(Var::new("v0", VECTOR_BITS));
 
-    let slice = SsaLiftedSlice {
+    let slice = LiftedSlice {
         branch: branch(),
         statements,
         condition: Expr::eq(
@@ -104,12 +104,10 @@ fn solve_lowering(
         ),
         status: SliceStatus::Complete,
         treat_truncation_as_inputs: false,
-        inputs: Vec::new(),
-        defs,
         arch: Arch::Aarch64,
     };
     solve_branch(
-        &slice,
+        &ssa_convert(&slice),
         SolveOptions {
             timeout_ms: TEST_SOLVE_TIMEOUT_MS,
             ..SolveOptions::default()
@@ -128,6 +126,7 @@ fn assert_computes(mnemonic: &str, operands: &[&str], sources: &[(&str, u128)], 
 
 const HALF: [&str; 3] = ["v0.4h", "v1.4h", "v2.4h"];
 const NARROW_FROM_HALF: [&str; 2] = ["v0.8b", "v1.8h"];
+const BYTES: [&str; 3] = ["v0.8b", "v1.8b", "v2.8b"];
 
 #[test]
 fn sqadd_clamps_at_the_signed_maximum() {
@@ -467,5 +466,116 @@ fn fcvtn_narrows_double_to_single() {
         &["v0.2s", "v1.2d"],
         &[("v1", 0x3ff0_0000_0000_0000)],
         0x3f80_0000,
+    );
+}
+
+// --- bitwise select ---
+
+#[test]
+fn bsl_selects_per_bit_using_the_destination_as_the_mask() {
+    // Mask 0xff00 in lane 0: the high byte comes from the first source,
+    // the low byte from the second.
+    let sources = [
+        ("v0", 0xff00_u128),
+        ("v1", 0xaaaa_u128),
+        ("v2", 0x5555_u128),
+    ];
+    assert_computes("bsl", &BYTES, &sources, 0xaa55);
+}
+
+#[test]
+fn bit_inserts_where_the_second_source_has_set_bits() {
+    // v0 starts as 0x1234; v2's set bits select v1's bits and the rest
+    // of the destination survives.
+    let sources = [
+        ("v0", 0x1234_u128),
+        ("v1", 0xaaaa_u128),
+        ("v2", 0x00ff_u128),
+    ];
+    assert_computes("bit", &BYTES, &sources, 0x12aa);
+}
+
+#[test]
+fn bif_inserts_where_the_second_source_has_clear_bits() {
+    let sources = [
+        ("v0", 0x1234_u128),
+        ("v1", 0xaaaa_u128),
+        ("v2", 0x00ff_u128),
+    ];
+    assert_computes("bif", &BYTES, &sources, 0xaa34);
+}
+
+#[test]
+fn bitwise_select_declines_a_non_byte_arrangement() {
+    // The architecture spells these only with `.8b` / `.16b`.
+    let insn = Instruction {
+        address: Address::new(0x1000),
+        size: 4,
+        bytes: vec![],
+        mnemonic: "bsl".into(),
+        operands: ["v0.4s", "v1.4s", "v2.4s"]
+            .iter()
+            .map(|o| operand(o))
+            .collect(),
+        esil: None,
+        pcode: None,
+        is_thumb: false,
+    };
+    let lifted = lift_per_mnemonic(&insn, Arch::Aarch64);
+    assert!(matches!(lifted.as_slice(), [IrStmt::Unsupported { .. }]));
+}
+
+#[test]
+fn mla_accumulates_onto_the_destination_value() {
+    // The accumulator's prior contents are part of the result, which is
+    // only visible once the destination is bound.
+    let sources = [("v0", 0x000a_u128), ("v1", 0x3_u128), ("v2", 0x4_u128)];
+    assert_computes("mla", &HALF, &sources, 0x0016);
+}
+
+#[test]
+fn mls_subtracts_from_the_destination_value() {
+    let sources = [("v0", 0x000a_u128), ("v1", 0x3_u128), ("v2", 0x4_u128)];
+    assert_computes("mls", &HALF, &sources, 0xfffe);
+}
+
+#[test]
+fn ins_preserves_the_lanes_it_does_not_write() {
+    // Lane 1 is replaced; lanes 0, 2 and 3 survive from the
+    // destination's prior value.
+    let sources = [("v0", 0x0004_0003_0002_0001_u128), ("v1", 0x00ab_u128)];
+    assert_computes(
+        "ins",
+        &["v0.h[1]", "v1.h[0]"],
+        &sources,
+        0x0004_0003_00ab_0001,
+    );
+}
+
+#[test]
+fn xtn2_preserves_the_destination_lower_half() {
+    // The narrowed lanes land high; the low half is the destination's.
+    let sources = [
+        ("v0", 0x0000_0000_1234_5678_u128),
+        ("v1", 0x0004_0003_0002_0001_u128),
+    ];
+    assert_computes("xtn2", &["v0.8b", "v1.4h"], &sources, 0x0403_0201_1234_5678);
+}
+
+#[test]
+fn bitwise_select_masks_at_the_full_vector_width() {
+    // The 128-bit arrangement is the one whose all-ones mask sits at the
+    // edge of the constant type; getting that bound wrong makes the
+    // whole family decline rather than compute a wrong answer.
+    let sources = [
+        ("v0", u128::MAX >> 64),
+        ("v1", 0xaaaa_aaaa_aaaa_aaaa_u128),
+        ("v2", 0x5555_5555_5555_5555_u128 << 64),
+    ];
+    assert_computes(
+        "bsl",
+        &["v0.16b", "v1.16b", "v2.16b"],
+        &sources,
+        (0x5555_5555_5555_5555_u128 << 64) | 0xaaaa_aaaa_aaaa_aaaa,
     );
 }

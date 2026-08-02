@@ -915,3 +915,21 @@ fn aarch64_long_multiply_accumulate_reads_its_destination() {
     );
     assert!(analyze(&i, Arch::Aarch64).uses.contains(&"v0"));
 }
+
+#[test]
+fn aarch64_bitwise_select_reads_its_destination() {
+    // All three selects use the destination as an input — as the mask
+    // for `bsl`, as the surviving value for `bit` / `bif`.
+    for mnemonic in ["bsl", "bit", "bif"] {
+        let i = insn(
+            mnemonic,
+            vec![
+                op("v0.16b", OperandKind::Register),
+                op("v1.16b", OperandKind::Register),
+                op("v2.16b", OperandKind::Register),
+            ],
+        );
+        let effect = analyze(&i, Arch::Aarch64);
+        assert!(effect.uses.contains(&"v0"), "{mnemonic}: {effect:?}");
+    }
+}

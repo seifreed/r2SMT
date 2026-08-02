@@ -104,6 +104,28 @@ enum NeonOp {
     /// A lane-wise conversion between integer and floating point, or
     /// between float widths.
     Convert(ConvertKind),
+    /// `bsl` / `bit` / `bif` — bitwise select, where one of the three
+    /// registers supplies the mask and the destination is always one of
+    /// the three.
+    BitwiseSelect(SelectRole),
+}
+
+/// Which role the destination register plays in a bitwise select.
+///
+/// All three mnemonics compute `(a & mask) | (b & ~mask)`; they differ
+/// only in which operand is the mask and which is selected when the mask
+/// bit is set. Every one of them reads the destination.
+#[derive(Debug, Clone, Copy)]
+enum SelectRole {
+    /// `bsl` — the destination is the mask; the sources supply the two
+    /// candidate values.
+    DestinationIsMask,
+    /// `bit` — insert the first source where the second's bits are set,
+    /// keeping the destination elsewhere.
+    InsertWhereSet,
+    /// `bif` — insert the first source where the second's bits are
+    /// *clear*.
+    InsertWhereClear,
 }
 
 /// The lane-wise compares.
@@ -262,8 +284,9 @@ impl NeonShape {
     /// writing it.
     ///
     /// True for the element inserts, which preserve every lane they do
-    /// not write, and for the narrowing `2` forms, which write only the
-    /// destination's upper half. Everything else here writes the
+    /// not write; for the accumulators and the bitwise selects, whose
+    /// destination is an input; and for the narrowing `2` forms, which
+    /// write only the destination's upper half. Everything else here writes the
     /// destination whole — an `AArch64` SIMD write has no merging form,
     /// so even a 64-bit arrangement replaces the register by zeroing its
     /// upper half.
@@ -272,6 +295,7 @@ impl NeonShape {
             self.op,
             NeonOp::Insert { .. }
                 | NeonOp::MultiplyAccumulate { .. }
+                | NeonOp::BitwiseSelect(_)
                 | NeonOp::Widen {
                     kind: WidenKind::Narrow,
                     upper: true,
@@ -309,6 +333,42 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| shift_shape(insn, &mnemonic))
         .or_else(|| compare_shape(insn, &mnemonic))
         .or_else(|| convert_shape(insn, &mnemonic))
+        .or_else(|| bitwise_select_shape(insn, &mnemonic))
+}
+
+// ===================== bitwise select =====================
+
+/// `bsl` / `bit` / `bif`, the three-register bitwise selects.
+///
+/// All three read the destination, and the architecture spells them only
+/// with the byte arrangements — the operation is bit-granular, so the
+/// element width carries no meaning beyond the view's total size.
+fn bitwise_select_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let role = match mnemonic {
+        "bsl" => SelectRole::DestinationIsMask,
+        "bit" => SelectRole::InsertWhereSet,
+        "bif" => SelectRole::InsertWhereClear,
+        _ => return None,
+    };
+    if insn.operands.len() != 3 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    if destination.lane_bits != BITS_PER_BYTE {
+        return None;
+    }
+    for operand in insn.operands.iter().skip(1) {
+        if operand_arrangement(operand)? != destination {
+            return None;
+        }
+    }
+    Some(NeonShape {
+        op: NeonOp::BitwiseSelect(role),
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
 }
 
 // ===================== lane-wise compares =====================
@@ -1244,7 +1304,37 @@ impl LiftCtx {
             NeonOp::Shift { kind, signed } => self.shift_lanes(insn, shape, kind, signed),
             NeonOp::Compare { kind, zero } => self.compare_lanes(insn, shape, kind, zero),
             NeonOp::Convert(kind) => self.convert_lanes(insn, shape, kind),
+            NeonOp::BitwiseSelect(role) => self.bitwise_select(insn, shape, role),
         }
+    }
+
+    /// `bsl` / `bit` / `bif` — one bitwise select over the whole view.
+    ///
+    /// Bit-granular, so there is nothing to do per lane: the mask, the
+    /// selected value and the alternative are each read whole and
+    /// combined once.
+    fn bitwise_select(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        role: SelectRole,
+    ) -> Option<Expr> {
+        let view = shape.lane_bits.checked_mul(shape.lanes)?;
+        let destination = self.simd_operand_value(&insn.operands.first()?.clone(), view)?;
+        let first = self.widen_source(insn, 1)?;
+        let second = self.widen_source(insn, 2)?;
+        // `(selected & mask) | (other & ~mask)` in every case; only the
+        // assignment of the three registers to those roles differs.
+        let (mask, selected, other) = match role {
+            SelectRole::DestinationIsMask => (destination, first, second),
+            SelectRole::InsertWhereSet => (second, first, destination),
+            SelectRole::InsertWhereClear => (second, destination, first),
+        };
+        let ones = all_ones(view)?;
+        Some(Expr::bv_or(
+            Expr::bv_and(selected, mask.clone()),
+            Expr::bv_and(other, Expr::bv_xor(mask, ones)),
+        ))
     }
 
     /// The lane-wise compares, each writing an all-ones or all-zeros
@@ -1692,11 +1782,17 @@ fn extend(value: Expr, to: u16, signed: bool) -> Expr {
 
 /// The largest value of a `bits`-wide unsigned range, or `None` when it
 /// does not fit the constant type.
+///
+/// A full 128-bit vector view is representable and is the width the
+/// bitwise selects mask at, so only *wider* than the constant type
+/// declines.
 fn unsigned_max(bits: u16) -> Option<u128> {
-    if bits >= 128 {
-        return None;
+    match bits {
+        0 => None,
+        128 => Some(u128::MAX),
+        bits if bits < 128 => Some((1u128 << bits) - 1),
+        _ => None,
     }
-    Some((1u128 << bits) - 1)
 }
 
 /// Clamp `value`, computed at `wide` bits, into the `narrow`-bit range

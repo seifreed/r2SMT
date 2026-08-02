@@ -3552,3 +3552,32 @@ fn aarch64_float_widen_two_form_reads_the_upper_half() {
         .unwrap_or_default();
     assert!(rendered.contains("127:96"), "{rendered}");
 }
+
+// --- N3g: NEON bitwise select ---
+
+#[test]
+fn aarch64_bitwise_select_lowers_once_over_the_whole_view() {
+    // Bit-granular, so there is nothing to do per lane.
+    let i = insn(
+        0x1000,
+        4,
+        "bsl",
+        vec![reg("v0.16b"), reg("v1.16b"), reg("v2.16b")],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(
+            stmts.as_slice(),
+            [IrStmt::Assign {
+                src: Expr::Or(..),
+                ..
+            }]
+        ),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_bitwise_select_declines_a_non_byte_arrangement() {
+    assert!(neon_declines("bsl", &["v0.4s", "v1.4s", "v2.4s"]));
+}
