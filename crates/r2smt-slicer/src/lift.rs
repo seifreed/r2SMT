@@ -40,7 +40,7 @@ mod aarch64;
 mod merge;
 mod x86;
 use merge::lower_merge;
-pub(crate) use x86::is_fp_compare_mnemonic;
+pub(crate) use x86::{is_fp_compare_mnemonic, pins_rounding_mode, writes_mxcsr};
 
 /// IR representation of a [`Slice`] plus the branch's symbolic
 /// condition.

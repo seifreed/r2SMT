@@ -293,7 +293,58 @@ pub fn slice_branch(
         };
     };
 
-    walk_backwards(candidate, function, block, jcc_idx, limits, arch)
+    let slice = walk_backwards(candidate, function, block, jcc_idx, limits, arch);
+    reject_unpinned_rounding_mode(slice, function, candidate)
+}
+
+/// Truncate a slice whose floating-point arithmetic assumes the default
+/// MXCSR rounding mode while the containing function reprograms it.
+///
+/// This cannot be caught by the backward walk. MXCSR has no register
+/// name, so `ldmxcsr` defines nothing the live set can require, and the
+/// walk stops as soon as the live set is satisfied — an `ldmxcsr` ahead
+/// of the arithmetic is simply never visited. Without this guard such a
+/// slice reports `Complete` at high confidence while the hardware was
+/// rounding some other way.
+///
+/// Function-scoped, so a rounding mode installed by a *caller* remains
+/// invisible; with calls disallowed by default a slice reaching one
+/// already truncates, which bounds the residue.
+fn reject_unpinned_rounding_mode(
+    slice: Slice,
+    function: &Function,
+    candidate: &BranchCandidate,
+) -> Slice {
+    if !matches!(slice.status, SliceStatus::Complete) {
+        return slice;
+    }
+    if !slice
+        .instructions
+        .iter()
+        .any(|i| crate::lift::pins_rounding_mode(&i.mnemonic))
+    {
+        return slice;
+    }
+    let Some(writer) = function
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .find(|i| crate::lift::writes_mxcsr(&i.mnemonic))
+    else {
+        return slice;
+    };
+    Slice {
+        branch: candidate.clone(),
+        instructions: slice.instructions,
+        status: SliceStatus::truncated(format!(
+            "'{mnem}' at {addr} reprograms MXCSR; the rounding mode assumed by this slice's floating-point arithmetic is not sound",
+            mnem = writer.mnemonic,
+            addr = writer.address
+        )),
+        roots: slice.roots,
+        treat_truncation_as_inputs: slice.treat_truncation_as_inputs,
+        merges: slice.merges,
+    }
 }
 
 /// Mutable state shared across single- and multi-block walks.

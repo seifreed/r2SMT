@@ -1608,6 +1608,95 @@ fn plain_integer_cmp_is_not_parsed_as_a_float_compare() {
     }
 }
 
+/// `[ldmxcsr] ; addss ; ucomiss ; jp` — the shape where a reprogrammed
+/// rounding mode is invisible to the backward walk.
+fn rounding_program(with_ldmxcsr: bool) -> Program {
+    let mut insns = Vec::new();
+    if with_ldmxcsr {
+        insns.push(insn(
+            0x40_0ff8,
+            7,
+            "ldmxcsr",
+            vec![op("[rip + 0x1000]", OperandKind::Memory)],
+        ));
+    }
+    insns.push(insn(
+        0x40_1000,
+        4,
+        "addss",
+        vec![
+            op("xmm0", OperandKind::Register),
+            op("xmm1", OperandKind::Register),
+        ],
+    ));
+    insns.push(insn(
+        0x40_1004,
+        4,
+        "ucomiss",
+        vec![
+            op("xmm0", OperandKind::Register),
+            op("xmm2", OperandKind::Register),
+        ],
+    ));
+    insns.push(insn(
+        0x40_1008,
+        6,
+        "jp",
+        vec![op("0x401080", OperandKind::Immediate)],
+    ));
+    one_block_program(insns)
+}
+
+fn first_slice_status(program: &Program) -> crate::slice::SliceStatus {
+    let candidates = collect_branches(program);
+    let cand = candidates.first().expect("a branch");
+    slice_branch(
+        cand,
+        &program.functions[0],
+        &SliceLimits::default(),
+        program.arch,
+    )
+    .status
+}
+
+#[test]
+fn floating_point_slice_truncates_when_the_function_reprograms_mxcsr() {
+    // The backward walk stops once the live set is satisfied, so it
+    // never reaches the `ldmxcsr`. Without the guard this slice would
+    // report Complete while assuming a rounding mode the program had
+    // replaced.
+    let status = first_slice_status(&rounding_program(true));
+    assert!(
+        matches!(status, crate::slice::SliceStatus::Truncated { .. }),
+        "{status:?}"
+    );
+}
+
+#[test]
+fn floating_point_slice_stays_complete_without_an_mxcsr_write() {
+    let status = first_slice_status(&rounding_program(false));
+    assert!(
+        matches!(status, crate::slice::SliceStatus::Complete),
+        "{status:?}"
+    );
+}
+
+#[test]
+fn rounding_insensitive_floating_point_survives_an_mxcsr_write() {
+    // `maxss` selects an operand and `cvttss2si` carries its rounding
+    // mode in the opcode, so neither depends on MXCSR — guarding them
+    // would cost precision for nothing.
+    for m in ["maxss", "minps", "cvttss2si", "cmpeqps", "ucomiss"] {
+        assert!(
+            !crate::lift::pins_rounding_mode(m),
+            "{m}: wrongly treated as rounding-mode dependent"
+        );
+    }
+    for m in ["addss", "mulpd", "sqrtss", "cvtsi2ss", "cvtss2sd"] {
+        assert!(crate::lift::pins_rounding_mode(m), "{m}: should be guarded");
+    }
+}
+
 #[test]
 fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
     // Parity guard: the effect table keeps an instruction iff the lifter

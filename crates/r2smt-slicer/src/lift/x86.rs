@@ -941,6 +941,59 @@ struct FpCompare {
 /// the boolean negations of the four base ones — which is also why they
 /// are the "unordered" variants: negating a comparison that is false on
 /// NaN yields one that is true on NaN.
+/// Mnemonics whose lifting pins the MXCSR rounding mode to the
+/// architectural default.
+///
+/// Deliberately narrow: `max`/`min` select an operand and the `cvtt`
+/// forms carry round-toward-zero in the opcode, so neither depends on
+/// MXCSR. Only the operations that actually round are listed.
+pub(crate) fn pins_rounding_mode(mnemonic: &str) -> bool {
+    let lower = mnemonic.trim().to_ascii_lowercase();
+    let body = lower.strip_prefix('v').unwrap_or(&lower);
+    matches!(
+        body,
+        "addss"
+            | "subss"
+            | "mulss"
+            | "divss"
+            | "addsd"
+            | "subsd"
+            | "mulsd"
+            | "divsd"
+            | "addps"
+            | "subps"
+            | "mulps"
+            | "divps"
+            | "addpd"
+            | "subpd"
+            | "mulpd"
+            | "divpd"
+            | "sqrtss"
+            | "sqrtsd"
+            | "sqrtps"
+            | "sqrtpd"
+            | "cvtsi2ss"
+            | "cvtsi2sd"
+            | "cvtss2si"
+            | "cvtsd2si"
+            | "cvtss2sd"
+            | "cvtsd2ss"
+    )
+}
+
+/// Instructions that load a new SSE control word, and so invalidate the
+/// rounding mode [`pins_rounding_mode`] assumes.
+///
+/// `fxrstor` / `xrstor` restore MXCSR wholesale as part of the extended
+/// state, so they count too.
+pub(crate) fn writes_mxcsr(mnemonic: &str) -> bool {
+    let lower = mnemonic.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "ldmxcsr" | "vldmxcsr" | "fxrstor" | "fxrstor64" | "xrstor" | "xrstor64" | "xrstors"
+    )
+}
+
 pub(crate) fn is_fp_compare_mnemonic(mnemonic: &str) -> bool {
     parse_fp_compare(mnemonic).is_some()
 }
