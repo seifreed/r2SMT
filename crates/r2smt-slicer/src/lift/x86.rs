@@ -72,6 +72,10 @@ impl LiftCtx {
             "minss" => self.lift_simd_scalar_fp(insn, FpArithOp::Min, 32),
             "maxsd" => self.lift_simd_scalar_fp(insn, FpArithOp::Max, 64),
             "minsd" => self.lift_simd_scalar_fp(insn, FpArithOp::Min, 64),
+            "sqrtps" | "vsqrtps" => self.lift_simd_sqrt(insn, 32, true),
+            "sqrtpd" | "vsqrtpd" => self.lift_simd_sqrt(insn, 64, true),
+            "sqrtss" => self.lift_simd_sqrt(insn, 32, false),
+            "sqrtsd" => self.lift_simd_sqrt(insn, 64, false),
             "comiss" | "ucomiss" => self.lift_simd_fp_compare(insn, 32),
             "comisd" | "ucomisd" => self.lift_simd_fp_compare(insn, 64),
             "cvtsi2ss" => self.lift_int_to_fp(insn, 32),
@@ -570,6 +574,56 @@ impl LiftCtx {
             let a = self.read_simd_lane_bits_at(a_op, lane_bits, index)?;
             let b = self.read_simd_lane_bits_at(b_op, lane_bits, index)?;
             lanes.push(fp_lane_result(op, a, b, lane_bits));
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// `sqrtps`/`sqrtpd` (every lane) and `sqrtss`/`sqrtsd` (low lane
+    /// only, upper bits of the destination preserved).
+    ///
+    /// Unary, so the source is the *second* operand in both the SSE and
+    /// the VEX form — unlike the binary handlers there is no RMW read of
+    /// the destination.
+    fn lift_simd_sqrt(&mut self, insn: &Instruction, lane_bits: u16, packed: bool) {
+        let ops = &insn.operands;
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let Some(result) = self.sqrt_result(dst, src, lane_bits, packed) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let written = if packed {
+            self.write_xmm_dst(dst, result, is_vex(insn))
+        } else {
+            self.write_simd_lane(dst, result, lane_bits)
+        };
+        if !written {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
+    fn sqrt_result(
+        &self,
+        dst: &Operand,
+        src: &Operand,
+        lane_bits: u16,
+        packed: bool,
+    ) -> Option<Expr> {
+        let (ebits, sbits) = fp_sort_bits(lane_bits);
+        let root = |bits: Expr| {
+            Expr::fp_to_ieee_bv(Expr::fsqrt(
+                Expr::bv_to_fp(bits, ebits, sbits),
+                RoundingMode::NearestTiesEven,
+            ))
+        };
+        if !packed {
+            return Some(root(self.read_simd_lane_bits_at(src, lane_bits, 0)?));
+        }
+        let count = Self::packed_lane_count(self.simd_view_bits(dst)?, lane_bits)?;
+        let mut lanes = Vec::with_capacity(usize::from(count));
+        for index in 0..count {
+            lanes.push(root(self.read_simd_lane_bits_at(src, lane_bits, index)?));
         }
         Self::concat_lanes(lanes)
     }

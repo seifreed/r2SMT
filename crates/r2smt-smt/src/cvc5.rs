@@ -150,6 +150,7 @@ fn expr_has_unknown(expr: &Expr) -> bool {
         | Expr::FLt(a, b)
         | Expr::FLe(a, b) => expr_has_unknown(a) || expr_has_unknown(b),
         Expr::FIsNaN(s)
+        | Expr::FSqrt(s, _)
         | Expr::FpToIeeeBv(s)
         | Expr::BvToFp { src: s, .. }
         | Expr::FpToSbv { src: s, .. }

@@ -1751,6 +1751,24 @@ fn scalar_fp_compare_of_free_inputs_stays_both_possible() {
 }
 
 #[test]
+fn float_square_root_is_encoded_precisely() {
+    // sqrt(4.0f) is exactly 2.0f, so the predicate must fold rather
+    // than stay undecided — the encoding is the real `fp.sqrt`, not an
+    // uninterpreted stand-in.
+    let four = r2smt_ir::expr::Expr::FpConst {
+        bits: 0x4080_0000,
+        ebits: 8,
+        sbits: 24,
+    };
+    let root = r2smt_ir::expr::Expr::fsqrt(four, r2smt_ir::expr::RoundingMode::NearestTiesEven);
+    let cond = r2smt_ir::expr::Expr::eq(
+        r2smt_ir::expr::Expr::fp_to_ieee_bv(root),
+        r2smt_ir::expr::Expr::konst(0x4000_0000, 32),
+    );
+    assert_eq!(solve_fp_condition(cond, Vec::new()), SmtResult::AlwaysTrue);
+}
+
+#[test]
 fn float_to_float_widening_is_encoded_exactly() {
     // Widening single to double loses nothing, so `(float)1.0f` as a
     // double must equal the double bit pattern of 1.0 exactly. An

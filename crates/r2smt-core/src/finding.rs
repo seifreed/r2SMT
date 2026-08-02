@@ -525,6 +525,7 @@ fn count_unknowns(expr: &Expr) -> usize {
         | Expr::FLt(a, b)
         | Expr::FLe(a, b) => count_unknowns(a) + count_unknowns(b),
         Expr::FIsNaN(s)
+        | Expr::FSqrt(s, _)
         | Expr::FpToIeeeBv(s)
         | Expr::BvToFp { src: s, .. }
         | Expr::FpToSbv { src: s, .. }

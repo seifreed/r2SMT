@@ -1526,6 +1526,34 @@ fn maxss_writes_only_the_low_lane_and_preserves_the_rest() {
 }
 
 #[test]
+fn sqrtps_takes_the_root_of_every_lane() {
+    let stmts = lift_xmm_pair("sqrtps");
+    let rendered = format!("{:?}", simd_dst_src(&stmts, "zmm0"));
+    assert_eq!(rendered.matches("FSqrt").count(), 4, "{rendered}");
+    // Unary: all four roots read the source. The destination appears
+    // exactly once, in the preserved-upper slice of the legacy-SSE
+    // write — never as an operand of a root.
+    assert_eq!(rendered.matches("\"zmm1\"").count(), 4, "{rendered}");
+    assert_eq!(rendered.matches("\"zmm0\"").count(), 1, "{rendered}");
+}
+
+#[test]
+fn sqrtss_roots_only_the_low_lane_and_preserves_the_rest() {
+    let stmts = lift_xmm_pair("sqrtss");
+    assert_eq!(
+        *simd_dst_src(&stmts, "zmm0"),
+        preserve_upper(
+            "zmm0",
+            32,
+            Expr::fp_to_ieee_bv(Expr::fsqrt(
+                fp_lane("zmm1", 32, 0),
+                r2smt_ir::expr::RoundingMode::NearestTiesEven
+            ))
+        )
+    );
+}
+
+#[test]
 fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
     // Parity guard: the effect table keeps an instruction iff the lifter
     // models it. A mnemonic classified `Simd` by `analyze` but absent
@@ -1537,7 +1565,8 @@ fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
         "vmovapd", "vmovupd", "vmovdqa", "vmovdqu", "pxor", "vpxor", "pand", "vpand", "por",
         "vpor", "pandn", "vpandn", "addss", "subss", "mulss", "divss", "addsd", "subsd", "mulsd",
         "divsd", "addps", "subps", "mulps", "divps", "addpd", "subpd", "mulpd", "divpd", "maxps",
-        "minps", "maxpd", "minpd", "maxss", "minss", "maxsd", "minsd",
+        "minps", "maxpd", "minpd", "maxss", "minss", "maxsd", "minsd", "sqrtps", "sqrtpd",
+        "sqrtss", "sqrtsd",
     ];
     for m in mnemonics {
         assert!(

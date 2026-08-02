@@ -182,6 +182,8 @@ pub enum Expr {
     FLe(Box<Expr>, Box<Expr>),
     /// `true` (1-bit) when the operand is a `NaN`.
     FIsNaN(Box<Expr>),
+    /// Floating-point square root under a rounding mode.
+    FSqrt(Box<Expr>, RoundingMode),
     /// Floating-point constant, as its IEEE bit pattern under the sort.
     FpConst {
         /// IEEE bit pattern (width `ebits + sbits`).
@@ -509,6 +511,12 @@ impl Expr {
         }
     }
 
+    /// Construct a [`Expr::FSqrt`].
+    #[must_use]
+    pub fn fsqrt(a: Self, rm: RoundingMode) -> Self {
+        Self::FSqrt(Box::new(a), rm)
+    }
+
     /// Construct a [`Expr::FpToFp`].
     #[must_use]
     pub fn fp_to_fp(src: Self, rm: RoundingMode, ebits: u16, sbits: u16) -> Self {
@@ -569,6 +577,7 @@ impl fmt::Display for Expr {
             Self::FLt(a, b) => write!(f, "flt({a}, {b})"),
             Self::FLe(a, b) => write!(f, "fle({a}, {b})"),
             Self::FIsNaN(a) => write!(f, "fisnan({a})"),
+            Self::FSqrt(a, rm) => write!(f, "fsqrt({a}, {rm:?})"),
             Self::FpConst { bits, ebits, sbits } => write!(f, "fp{ebits}_{sbits}({bits:#x})"),
             Self::BvToFp { src, ebits, sbits } => write!(f, "bv_to_fp({src}, {ebits}, {sbits})"),
             Self::FpToIeeeBv(src) => write!(f, "fp_to_bv({src})"),

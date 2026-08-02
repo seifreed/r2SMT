@@ -281,6 +281,7 @@ fn expr_is_tainted(expr: &Expr, tainted: &BTreeSet<String>, depth: u32) -> Optio
             expr_is_tainted(a, tainted, next)? || expr_is_tainted(b, tainted, next)?
         }
         Expr::FIsNaN(s)
+        | Expr::FSqrt(s, _)
         | Expr::FpToIeeeBv(s)
         | Expr::BvToFp { src: s, .. }
         | Expr::FpToSbv { src: s, .. }
@@ -434,6 +435,7 @@ fn namespace_expr(expr: &Expr, pfx: &str, depth: u32) -> Option<Expr> {
         Expr::FLt(a, b) => Expr::flt(namespace_expr(a, pfx, next)?, namespace_expr(b, pfx, next)?),
         Expr::FLe(a, b) => Expr::fle(namespace_expr(a, pfx, next)?, namespace_expr(b, pfx, next)?),
         Expr::FIsNaN(a) => Expr::fisnan(namespace_expr(a, pfx, next)?),
+        Expr::FSqrt(a, rm) => Expr::fsqrt(namespace_expr(a, pfx, next)?, *rm),
         Expr::FpConst { .. } => expr.clone(),
         Expr::BvToFp { src, ebits, sbits } => {
             Expr::bv_to_fp(namespace_expr(src, pfx, next)?, *ebits, *sbits)

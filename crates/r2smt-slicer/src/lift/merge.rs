@@ -244,7 +244,7 @@ fn expr_has_unknown(expr: &Expr) -> bool {
         Expr::FEq(a, b) | Expr::FLt(a, b) | Expr::FLe(a, b) => {
             expr_has_unknown(a) || expr_has_unknown(b)
         }
-        Expr::FIsNaN(a) | Expr::FpToIeeeBv(a) => expr_has_unknown(a),
+        Expr::FIsNaN(a) | Expr::FpToIeeeBv(a) | Expr::FSqrt(a, _) => expr_has_unknown(a),
         Expr::FpConst { .. } => false,
         Expr::BvToFp { src, .. }
         | Expr::FpToSbv { src, .. }
@@ -329,6 +329,7 @@ fn subst_expr(expr: &Expr, env: &HashMap<String, Expr>) -> Expr {
         Expr::FLt(a, b) => Expr::FLt(Box::new(subst_expr(a, env)), Box::new(subst_expr(b, env))),
         Expr::FLe(a, b) => Expr::FLe(Box::new(subst_expr(a, env)), Box::new(subst_expr(b, env))),
         Expr::FIsNaN(a) => Expr::FIsNaN(Box::new(subst_expr(a, env))),
+        Expr::FSqrt(a, rm) => Expr::FSqrt(Box::new(subst_expr(a, env)), *rm),
         Expr::FpConst { .. } => expr.clone(),
         Expr::BvToFp { src, ebits, sbits } => Expr::BvToFp {
             src: Box::new(subst_expr(src, env)),

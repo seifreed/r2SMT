@@ -198,6 +198,7 @@ fn substitute(expr: &Expr, map: &HashMap<String, Expr>, depth: usize) -> Expr {
         Expr::FLt(a, b) => Expr::flt(substitute(a, map, d), substitute(b, map, d)),
         Expr::FLe(a, b) => Expr::fle(substitute(a, map, d), substitute(b, map, d)),
         Expr::FIsNaN(a) => Expr::fisnan(substitute(a, map, d)),
+        Expr::FSqrt(a, rm) => Expr::fsqrt(substitute(a, map, d), *rm),
         Expr::FpConst { .. } => expr.clone(),
         Expr::BvToFp { src, ebits, sbits } => {
             Expr::bv_to_fp(substitute(src, map, d), *ebits, *sbits)
@@ -334,6 +335,7 @@ fn collect_var_names(expr: &Expr, out: &mut HashSet<String>) {
             collect_var_names(b, out);
         }
         Expr::FIsNaN(s)
+        | Expr::FSqrt(s, _)
         | Expr::FpToIeeeBv(s)
         | Expr::BvToFp { src: s, .. }
         | Expr::FpToSbv { src: s, .. }
@@ -438,6 +440,7 @@ fn collect_vars(expr: &Expr, out: &mut Vec<Var>) {
             collect_vars(b, out);
         }
         Expr::FIsNaN(s)
+        | Expr::FSqrt(s, _)
         | Expr::FpToIeeeBv(s)
         | Expr::BvToFp { src: s, .. }
         | Expr::FpToSbv { src: s, .. }

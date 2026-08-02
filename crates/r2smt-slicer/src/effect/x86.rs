@@ -356,7 +356,9 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
         // a def and not also a use.
         "movaps" | "movups" | "movapd" | "movupd" | "movdqa" | "movdqu" | "vmovaps" | "vmovups"
         | "vmovapd" | "vmovupd" | "vmovdqa" | "vmovdqu" | "cvtss2si" | "cvtsd2si" | "cvttss2si"
-        | "cvttsd2si" => simd_effect(insn, SimdShape::Move),
+        | "cvttsd2si" | "sqrtps" | "sqrtpd" | "vsqrtps" | "vsqrtpd" => {
+            simd_effect(insn, SimdShape::Move)
+        }
         // Everything here is a 2-operand RMW (or its 3-operand VEX
         // form, which `simd_effect` distinguishes): the scalar and
         // lane-writing forms preserve the bits they do not write, so
@@ -366,9 +368,8 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
         | "subps" | "mulps" | "divps" | "vaddps" | "vsubps" | "vmulps" | "vdivps" | "addpd"
         | "subpd" | "mulpd" | "divpd" | "vaddpd" | "vsubpd" | "vmulpd" | "vdivpd" | "maxps"
         | "minps" | "maxpd" | "minpd" | "vmaxps" | "vminps" | "vmaxpd" | "vminpd" | "maxss"
-        | "minss" | "maxsd" | "minsd" | "cvtsi2ss" | "cvtsi2sd" | "cvtss2sd" | "cvtsd2ss" => {
-            simd_effect(insn, SimdShape::Bitwise)
-        }
+        | "minss" | "maxsd" | "minsd" | "cvtsi2ss" | "cvtsi2sd" | "cvtss2sd" | "cvtsd2ss"
+        | "sqrtss" | "sqrtsd" => simd_effect(insn, SimdShape::Bitwise),
         // The scalar FP compares share `cmp`'s shape, not the SIMD one:
         // they read both operands, define no register, and write flags.
         "comiss" | "ucomiss" | "comisd" | "ucomisd" => {

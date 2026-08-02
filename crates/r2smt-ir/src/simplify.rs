@@ -79,6 +79,7 @@ pub fn simplify_expr(expr: &Expr) -> Expr {
         Expr::FLt(a, b) => Expr::FLt(Box::new(simplify_expr(a)), Box::new(simplify_expr(b))),
         Expr::FLe(a, b) => Expr::FLe(Box::new(simplify_expr(a)), Box::new(simplify_expr(b))),
         Expr::FIsNaN(a) => Expr::FIsNaN(Box::new(simplify_expr(a))),
+        Expr::FSqrt(a, rm) => Expr::FSqrt(Box::new(simplify_expr(a)), *rm),
         Expr::BvToFp { src, ebits, sbits } => Expr::BvToFp {
             src: Box::new(simplify_expr(src)),
             ebits: *ebits,
@@ -170,7 +171,8 @@ fn expr_bits(expr: &Expr) -> Option<u16> {
         | Expr::BvToFp { ebits, sbits, .. }
         | Expr::SbvToFp { ebits, sbits, .. }
         | Expr::FpToFp { ebits, sbits, .. } => ebits.checked_add(*sbits),
-        Expr::FpToIeeeBv(src) => expr_bits(src),
+        // Square root stays in its operand's sort.
+        Expr::FpToIeeeBv(src) | Expr::FSqrt(src, _) => expr_bits(src),
     }
 }
 

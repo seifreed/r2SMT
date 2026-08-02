@@ -390,6 +390,7 @@ fn expr_uses_fp(expr: &Expr) -> bool {
         | Expr::FLt(..)
         | Expr::FLe(..)
         | Expr::FIsNaN(_)
+        | Expr::FSqrt(..)
         | Expr::FpConst { .. }
         | Expr::BvToFp { .. }
         | Expr::FpToIeeeBv(_)
@@ -532,6 +533,7 @@ fn render_fp(expr: &Expr, ctx: &mut RenderCtx) -> Option<FpTerm> {
             ebits,
             sbits,
         } => render_fp_to_fp(src, *rm, (*ebits, *sbits), ctx),
+        Expr::FSqrt(a, rm) => render_fp_sqrt(a, *rm, ctx),
         Expr::FAdd(a, b, rm) => fp_arith("fp.add", a, b, *rm, ctx),
         Expr::FSub(a, b, rm) => fp_arith("fp.sub", a, b, *rm, ctx),
         Expr::FMul(a, b, rm) => fp_arith("fp.mul", a, b, *rm, ctx),
@@ -576,6 +578,20 @@ fn render_fp(expr: &Expr, ctx: &mut RenderCtx) -> Option<FpTerm> {
         | Expr::FpToIeeeBv(_)
         | Expr::FpToSbv { .. } => None,
     }
+}
+
+/// Square root, which stays in its operand's sort.
+fn render_fp_sqrt(src: &Expr, rm: RoundingMode, ctx: &mut RenderCtx) -> Option<FpTerm> {
+    let inner = render_fp(src, ctx)?;
+    Some(FpTerm {
+        text: format!(
+            "(fp.sqrt {rm} {inner})",
+            rm = rm_smtlib(rm),
+            inner = inner.text
+        ),
+        ebits: inner.ebits,
+        sbits: inner.sbits,
+    })
 }
 
 /// Convert a float to another float sort. Shares SMT-LIB's `to_fp`
@@ -835,7 +851,8 @@ fn render_expr(expr: &Expr, ctx: &mut RenderCtx) -> (String, u16) {
         | Expr::FpConst { .. }
         | Expr::BvToFp { .. }
         | Expr::SbvToFp { .. }
-        | Expr::FpToFp { .. } => fp_bridge_to_bv(expr, ctx),
+        | Expr::FpToFp { .. }
+        | Expr::FSqrt(..) => fp_bridge_to_bv(expr, ctx),
         Expr::FpToSbv { src, rm, bits } => {
             let Some(f) = render_fp(src, ctx) else {
                 ctx.note_unsupported("float-to-signed conversion of a term with no float sort");
