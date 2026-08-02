@@ -5,7 +5,7 @@ use super::{
     other_effect, registers_in_operand,
 };
 use r2smt_common::Arch;
-use r2smt_ir::program::Instruction;
+use r2smt_ir::program::{Instruction, OperandKind};
 
 fn arith_effect(insn: &Instruction, kind: InstructionKind) -> InstructionEffect {
     // Two-operand RMW arithmetic / logical: `op dst, src` —
@@ -255,12 +255,18 @@ fn xor_zero_idiom(insn: &Instruction) -> bool {
 }
 
 fn simd_effect(insn: &Instruction, shape: SimdShape) -> InstructionEffect {
-    // Register-only SIMD is modelled at vector width. A SIMD op with a
-    // memory operand is deferred (a follow-up): fall back to `Other` so
-    // the slicer truncates on it exactly as before, rather than keeping
-    // an instruction whose store the lifter would drop — which could
-    // let a later load read a stale prior store (unsound).
-    if any_memory_operand(&insn.operands) {
+    // SIMD memory resolves through the byte-granular model, but only
+    // where the lifter can build the address. An operand it would
+    // decline must fall back to `Other` so the slicer truncates instead
+    // of keeping an instruction whose store the lifter then drops —
+    // that would let a later load read a stale prior store, which is
+    // unsound. This condition and the lifter's own memory guard have to
+    // stay the same condition; both are `x86_memory_modellable`.
+    if insn
+        .operands
+        .iter()
+        .any(|op| op.kind == OperandKind::Memory && !crate::lift::x86_memory_modellable(op))
+    {
         return other_effect(insn);
     }
     let mnem = insn.mnemonic.trim().to_ascii_lowercase();

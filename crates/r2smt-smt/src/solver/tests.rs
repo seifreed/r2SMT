@@ -1776,6 +1776,62 @@ fn value_moved_by_movsd_reaches_the_compare_and_decides_the_branch() {
 }
 
 #[test]
+fn float_spilled_to_the_stack_and_reloaded_still_decides_the_branch() {
+    // The shape every compiler emits around a float: spill it, reload
+    // it, compare. Before SIMD memory operands were modelled the slice
+    // truncated at the store and the verdict was `Unsound`.
+    //
+    // `pxor` gives xmm1 a known 0.0 without needing a constant in
+    // memory; the store and the reload then have to round-trip through
+    // the byte-granular model for the compare to resolve.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "pxor",
+            vec![
+                op("xmm1", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            5,
+            "movsd",
+            vec![
+                op("qword [rbp - 8]", OperandKind::Memory),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1009,
+            5,
+            "movsd",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("qword [rbp - 8]", OperandKind::Memory),
+            ],
+        ),
+        insn(
+            0x40_100e,
+            4,
+            "comisd",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1012,
+            6,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
 fn scalar_fp_compare_of_free_inputs_stays_both_possible() {
     // The anti-fabrication direction: with nothing pinning the lanes,
     // an ordered-compare branch must stay undecided.

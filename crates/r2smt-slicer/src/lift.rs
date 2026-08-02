@@ -195,6 +195,28 @@ fn fp_sort_bits(lane_bits: u16) -> (u16, u16) {
     }
 }
 
+/// `Extract(Extract(x, inner_hi, 0), hi, lo)` denotes the same bits as
+/// `Extract(x, hi, lo)` whenever the outer slice fits inside the inner
+/// one, which it always does when the inner slice is an operand's
+/// vector view and the outer one is a lane of that view.
+///
+/// Collapsing matters beyond tidiness: a lane read used to go straight
+/// to the vector parent, and materialising the operand's view first
+/// would otherwise nest one extract inside every lane of every packed
+/// operation, growing the formula the solver sees for no gain.
+fn extract_collapsing(value: Expr, hi: u16, lo: u16) -> Expr {
+    if let Expr::Extract {
+        src,
+        hi: inner_hi,
+        lo: 0,
+    } = &value
+        && hi <= *inner_hi
+    {
+        return Expr::extract((**src).clone(), hi, lo);
+    }
+    Expr::extract(value, hi, lo)
+}
+
 /// Lift `slice` under `arch`. The lifter still only handles x86
 /// mnemonics; passing a non-x86 arch results in every instruction
 /// falling through to `IrStmt::Unsupported`. The arch flows into
@@ -701,15 +723,40 @@ impl LiftCtx {
         false
     }
 
-    /// Read an x86 SIMD **register** operand as a low slice of its
-    /// canonical vector parent (`zmm<n>`), sized to the operand's view
-    /// width (128 / 256 / 512). Returns `None` for anything else,
-    /// including memory operands: SIMD memory loads/stores are deferred
-    /// (a follow-up) so this step introduces no byte-store-list
-    /// interaction, keeping it a strict widening. The caller marks the
-    /// instruction unsupported on `None` rather than fabricating a
-    /// narrow free value the encoder would range-cap.
-    fn read_xmm_operand(&self, op: &Operand) -> Option<Expr> {
+    /// Whether `op` names a view of an x86 SIMD vector register.
+    fn is_simd_register(&self, op: &Operand) -> bool {
+        op.kind == OperandKind::Register
+            && register_layout(&op.raw, self.arch)
+                .is_some_and(|layout| layout.parent.starts_with("zmm"))
+    }
+
+    /// Whether `op` is a memory operand a SIMD handler may lower through
+    /// the byte-granular model: x86 memory whose address expression the
+    /// lifter can build. Segment-prefixed, rip-relative and
+    /// subtracted-register forms stay out, matching the slicer's own
+    /// memory gate — those truncate before ever reaching a handler.
+    fn is_modellable_simd_memory(&self, op: &Operand) -> bool {
+        matches!(self.arch, Arch::X86 | Arch::X86_64)
+            && op.kind == OperandKind::Memory
+            && x86_memory_modellable(op)
+    }
+
+    /// The full value of a SIMD operand at `view_bits`, as a single
+    /// expression.
+    ///
+    /// A register view is a low slice of its canonical vector parent
+    /// (`zmm<n>`). A memory operand becomes **one** `LoadMem` of
+    /// `view_bits` through [`Self::read_operand_lowered`], which also
+    /// supplies the `stk_<base>_<off>` naming so an analyst alias still
+    /// resolves. Reading the whole view once — rather than once per lane
+    /// — is what keeps a packed operand to a single load.
+    ///
+    /// `None` for anything else. The caller marks the instruction
+    /// unsupported rather than fabricating a value.
+    fn simd_operand_value(&mut self, op: &Operand, view_bits: u16) -> Option<Expr> {
+        if self.is_modellable_simd_memory(op) {
+            return Some(self.read_operand_lowered(op, view_bits));
+        }
         if op.kind != OperandKind::Register {
             return None;
         }
@@ -726,50 +773,56 @@ impl LiftCtx {
         })
     }
 
-    /// Read the low `lane_bits`-wide lane of an x86 SIMD register
-    /// operand and reinterpret it as an IEEE float of the matching sort
-    /// (32→single, 64→double). Used by the scalar SSE FP handlers.
-    fn read_simd_lane_fp(&self, op: &Operand, lane_bits: u16) -> Option<Expr> {
-        self.read_simd_lane_fp_at(op, lane_bits, 0)
+    /// The value of a SIMD operand at its own view width.
+    fn read_xmm_operand(&mut self, op: &Operand) -> Option<Expr> {
+        let view = self.simd_view_bits(op)?;
+        self.simd_operand_value(op, view)
     }
 
-    /// Read lane `index` (counting from the least-significant lane) of an
-    /// x86 SIMD register operand as an IEEE float. The packed handlers
-    /// walk every lane of the operand's view; the scalar ones read lane
-    /// 0 through [`Self::read_simd_lane_fp`].
-    fn read_simd_lane_fp_at(&self, op: &Operand, lane_bits: u16, index: u16) -> Option<Expr> {
-        let raw = self.read_simd_lane_bits_at(op, lane_bits, index)?;
+    /// Read the low `lane_bits`-wide lane of a SIMD operand and
+    /// reinterpret it as an IEEE float of the matching sort (32→single,
+    /// 64→double). Used by the scalar SSE FP handlers.
+    fn read_simd_lane_fp(&mut self, op: &Operand, lane_bits: u16) -> Option<Expr> {
+        let raw = self.read_simd_lane_bits(op, lane_bits)?;
         let (ebits, sbits) = fp_sort_bits(lane_bits);
         Some(Expr::bv_to_fp(raw, ebits, sbits))
     }
 
-    /// The raw bit-vector of lane `index`, before any float
+    /// The raw bit-vector of the low lane, before any float
     /// reinterpretation. Kept separate so the compare handlers can build
     /// a mask without a pointless round trip through the float sort.
-    fn read_simd_lane_bits_at(&self, op: &Operand, lane_bits: u16, index: u16) -> Option<Expr> {
-        if op.kind != OperandKind::Register {
-            return None;
+    ///
+    /// A scalar memory operand is loaded at the *lane* width, not the
+    /// vector view: `movss xmm0, dword [rbp - 8]` reads four bytes.
+    fn read_simd_lane_bits(&mut self, op: &Operand, lane_bits: u16) -> Option<Expr> {
+        if self.is_modellable_simd_memory(op) {
+            return Some(self.read_operand_lowered(op, lane_bits));
         }
-        let layout = register_layout(&op.raw, self.arch)?;
-        if !layout.parent.starts_with("zmm") {
-            return None;
-        }
+        let view = self.simd_view_bits(op)?;
+        let value = self.simd_operand_value(op, view)?;
+        Self::extract_lane(value, lane_bits, 0)
+    }
+
+    /// Extract lane `index` (counting from the least-significant) out of
+    /// an already-materialised operand value.
+    fn extract_lane(value: Expr, lane_bits: u16, index: u16) -> Option<Expr> {
         let lo = lane_bits.checked_mul(index)?;
         let hi = lo.checked_add(lane_bits)?.checked_sub(1)?;
-        if hi >= SIMD_PARENT_BITS {
-            return None;
-        }
-        Some(Expr::extract(
-            Expr::var(layout.parent, SIMD_PARENT_BITS),
-            hi,
-            lo,
-        ))
+        Some(extract_collapsing(value, hi, lo))
     }
 
     /// Write `lane_value` (an IEEE bit-vector of `lane_bits`) to the low
-    /// lane of an x86 SIMD register destination, preserving the parent
-    /// bits above the lane (legacy SSE scalar semantics).
+    /// lane of a SIMD destination.
+    ///
+    /// A register destination keeps the parent bits above the lane
+    /// (legacy SSE scalar semantics). A memory destination stores exactly
+    /// `lane_bits` — there is nothing above the lane to preserve, which
+    /// is why `movss [rbp - 8], xmm0` writes four bytes and leaves the
+    /// rest of the slot alone.
     fn write_simd_lane(&mut self, op: &Operand, lane_value: Expr, lane_bits: u16) -> bool {
+        if self.is_modellable_simd_memory(op) {
+            return self.write_dst(op, lane_value, lane_bits);
+        }
         if op.kind != OperandKind::Register {
             return false;
         }
@@ -811,11 +864,29 @@ impl LiftCtx {
         Some(acc)
     }
 
-    /// Width of an x86 SIMD **register** view (128 / 256 / 512), or
-    /// `None` if `op` is not a SIMD register.
+    /// Width of a SIMD operand's view: 128 / 256 / 512 for a register,
+    /// and for memory whatever size prefix radare2 attached
+    /// (`xmmword [rsi]` → 128). `None` if `op` is neither, or is a
+    /// memory operand with no size prefix — guessing a width there would
+    /// silently load the wrong number of bytes.
     fn simd_view_bits(&self, op: &Operand) -> Option<u16> {
+        if self.is_modellable_simd_memory(op) {
+            return memory_operand_width(&op.raw);
+        }
         let layout = register_layout(&op.raw, self.arch)?;
         layout.parent.starts_with("zmm").then(|| layout.width())
+    }
+
+    /// The view width an instruction operates at, given its operands.
+    ///
+    /// A memory operand carries its own size prefix, but a register one
+    /// is the more reliable source (r2 always spells the register), so
+    /// the first operand that resolves wins.
+    fn simd_instruction_view_bits(&self, ops: &[&Operand]) -> Option<u16> {
+        ops.iter()
+            .find(|op| self.is_simd_register(op))
+            .or_else(|| ops.first())
+            .and_then(|op| self.simd_view_bits(op))
     }
 
     /// Write a `value` (already sized to the operand's view width) to an
@@ -823,9 +894,15 @@ impl LiftCtx {
     /// parent per the write's upper-bits rule: `zero_upper` (VEX-encoded
     /// `v*` forms) zeroes bits above the view; otherwise (legacy SSE)
     /// the bits above the view are preserved from the parent's prior
-    /// value. Returns `false` for non-register destinations (memory
-    /// deferred).
+    /// value. A memory destination stores the view width verbatim —
+    /// there are no parent bits to reconstruct.
     fn write_xmm_dst(&mut self, op: &Operand, value: Expr, zero_upper: bool) -> bool {
+        if self.is_modellable_simd_memory(op) {
+            let Some(width) = self.simd_view_bits(op) else {
+                return false;
+            };
+            return self.write_dst(op, value, width);
+        }
         if op.kind != OperandKind::Register {
             return false;
         }

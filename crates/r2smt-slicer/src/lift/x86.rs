@@ -498,22 +498,37 @@ impl LiftCtx {
     /// takes the low lane from `src2`, the rest of the view from `src1`,
     /// and zeroes the register above the view.
     ///
-    /// Every other shape is declined: the load / store forms carry a
-    /// memory operand (deferred with the rest of SIMD memory), and a
-    /// 2-operand VEX form only exists with a memory source, so a
-    /// register one has no architectural meaning to model.
+    /// A load form (`movss xmm0, dword [rbp - 8]`) zeroes everything
+    /// above the lane instead of merging, per the SDM — there is no
+    /// prior register value to merge with. A store form writes just the
+    /// lane. Both go through the byte-granular memory model.
+    ///
+    /// The 2-operand VEX shape with a register source is declined: it
+    /// does not exist in the ISA, so there is nothing to model.
     fn lift_sse_scalar_move(&mut self, insn: &Instruction, lane: u16) {
         let ops = &insn.operands;
         let Some(dst) = ops.first() else {
             return;
         };
         match (ops.len(), is_vex(insn)) {
-            (2, false) => {
-                let Some(value) = self.read_simd_lane_bits_at(&ops[1], lane, 0) else {
+            (2, vex) => {
+                let src = &ops[1];
+                if vex && !self.is_modellable_simd_memory(src) {
+                    self.push_simd_unsupported(insn);
+                    return;
+                }
+                let Some(value) = self.read_simd_lane_bits(src, lane) else {
                     self.push_simd_unsupported(insn);
                     return;
                 };
-                if !self.write_simd_lane(dst, value, lane) {
+                // Loading from memory zeroes above the lane; a
+                // register-to-register move merges.
+                let ok = if self.is_modellable_simd_memory(src) && self.is_simd_register(dst) {
+                    self.write_xmm_dst(dst, value, true)
+                } else {
+                    self.write_simd_lane(dst, value, lane)
+                };
+                if !ok {
                     self.push_simd_unsupported(insn);
                 }
             }
@@ -533,7 +548,7 @@ impl LiftCtx {
     /// The full-view value written by a VEX 3-operand scalar move: the
     /// low lane from `src2`, the lanes above it from `src1`.
     fn vex_scalar_move_value(
-        &self,
+        &mut self,
         dst: &Operand,
         src1: &Operand,
         src2: &Operand,
@@ -543,7 +558,7 @@ impl LiftCtx {
         if view <= lane || self.simd_view_bits(src1)? != view {
             return None;
         }
-        let low = self.read_simd_lane_bits_at(src2, lane, 0)?;
+        let low = self.read_simd_lane_bits(src2, lane)?;
         let upper = Expr::extract(self.read_xmm_operand(src1)?, view - 1, lane);
         Some(Expr::concat(upper, low))
     }
@@ -558,7 +573,8 @@ impl LiftCtx {
             return;
         };
         let zero_upper = is_vex(insn);
-        let Some(width) = self.simd_view_bits(dst) else {
+        let operand_refs: Vec<&Operand> = ops.iter().collect();
+        let Some(width) = self.simd_instruction_view_bits(&operand_refs) else {
             self.push_simd_unsupported(insn);
             return;
         };
@@ -579,7 +595,11 @@ impl LiftCtx {
             }
             return;
         }
-        let (Some(a), Some(b)) = (self.read_xmm_operand(a_op), self.read_xmm_operand(b_op)) else {
+        let Some(a) = self.simd_operand_value(a_op, width) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let Some(b) = self.simd_operand_value(b_op, width) else {
             self.push_simd_unsupported(insn);
             return;
         };
@@ -629,20 +649,26 @@ impl LiftCtx {
 
     /// Build the full-view result of a packed lane operation, or `None`
     /// when any operand is unmodellable.
+    ///
+    /// Each operand is materialised **once** and the lanes are extracted
+    /// from that value, so a memory operand costs one load rather than
+    /// one per lane.
     fn packed_fp_result(
-        &self,
+        &mut self,
         dst: &Operand,
         a_op: &Operand,
         b_op: &Operand,
         op: FpArithOp,
         lane_bits: u16,
     ) -> Option<Expr> {
-        let view = self.simd_view_bits(dst)?;
+        let view = self.simd_instruction_view_bits(&[dst, a_op, b_op])?;
         let count = Self::packed_lane_count(view, lane_bits)?;
+        let a_val = self.simd_operand_value(a_op, view)?;
+        let b_val = self.simd_operand_value(b_op, view)?;
         let mut lanes = Vec::with_capacity(usize::from(count));
         for index in 0..count {
-            let a = self.read_simd_lane_bits_at(a_op, lane_bits, index)?;
-            let b = self.read_simd_lane_bits_at(b_op, lane_bits, index)?;
+            let a = Self::extract_lane(a_val.clone(), lane_bits, index)?;
+            let b = Self::extract_lane(b_val.clone(), lane_bits, index)?;
             lanes.push(fp_lane_result(op, a, b, lane_bits));
         }
         Self::concat_lanes(lanes)
@@ -701,19 +727,20 @@ impl LiftCtx {
     /// the lane count taken from `count_from`'s view divided by the
     /// wider of the two lane widths.
     fn f16c_lanes(
-        &self,
+        &mut self,
         count_from: &Operand,
         src: &Operand,
         from_bits: u16,
         to_bits: u16,
     ) -> Option<Expr> {
-        let count =
-            Self::packed_lane_count(self.simd_view_bits(count_from)?, from_bits.max(to_bits))?;
+        let view = self.simd_instruction_view_bits(&[count_from, src])?;
+        let count = Self::packed_lane_count(view, from_bits.max(to_bits))?;
         let (from_e, from_s) = fp_sort_bits(from_bits);
         let (to_e, to_s) = fp_sort_bits(to_bits);
+        let src_val = self.simd_operand_value(src, view)?;
         let mut lanes = Vec::with_capacity(usize::from(count));
         for index in 0..count {
-            let raw = self.read_simd_lane_bits_at(src, from_bits, index)?;
+            let raw = Self::extract_lane(src_val.clone(), from_bits, index)?;
             lanes.push(Expr::fp_to_ieee_bv(Expr::fp_to_fp(
                 Expr::bv_to_fp(raw, from_e, from_s),
                 RoundingMode::NearestTiesEven,
@@ -754,21 +781,25 @@ impl LiftCtx {
     }
 
     fn fp_mask_result(
-        &self,
+        &mut self,
         dst: &Operand,
         a_op: &Operand,
         b_op: &Operand,
         cmp: &FpCompare,
     ) -> Option<Expr> {
-        let count = if cmp.packed {
-            Self::packed_lane_count(self.simd_view_bits(dst)?, cmp.lane_bits)?
-        } else {
-            1
-        };
+        if !cmp.packed {
+            let a = self.read_simd_lane_bits(a_op, cmp.lane_bits)?;
+            let b = self.read_simd_lane_bits(b_op, cmp.lane_bits)?;
+            return Some(fp_mask_lane(cmp, a, b));
+        }
+        let view = self.simd_instruction_view_bits(&[dst, a_op, b_op])?;
+        let count = Self::packed_lane_count(view, cmp.lane_bits)?;
+        let a_val = self.simd_operand_value(a_op, view)?;
+        let b_val = self.simd_operand_value(b_op, view)?;
         let mut lanes = Vec::with_capacity(usize::from(count));
         for index in 0..count {
-            let a = self.read_simd_lane_bits_at(a_op, cmp.lane_bits, index)?;
-            let b = self.read_simd_lane_bits_at(b_op, cmp.lane_bits, index)?;
+            let a = Self::extract_lane(a_val.clone(), cmp.lane_bits, index)?;
+            let b = Self::extract_lane(b_val.clone(), cmp.lane_bits, index)?;
             lanes.push(fp_mask_lane(cmp, a, b));
         }
         Self::concat_lanes(lanes)
@@ -800,7 +831,7 @@ impl LiftCtx {
     }
 
     fn sqrt_result(
-        &self,
+        &mut self,
         dst: &Operand,
         src: &Operand,
         lane_bits: u16,
@@ -814,12 +845,15 @@ impl LiftCtx {
             ))
         };
         if !packed {
-            return Some(root(self.read_simd_lane_bits_at(src, lane_bits, 0)?));
+            let low = self.read_simd_lane_bits(src, lane_bits)?;
+            return Some(root(low));
         }
-        let count = Self::packed_lane_count(self.simd_view_bits(dst)?, lane_bits)?;
+        let view = self.simd_instruction_view_bits(&[dst, src])?;
+        let count = Self::packed_lane_count(view, lane_bits)?;
+        let src_val = self.simd_operand_value(src, view)?;
         let mut lanes = Vec::with_capacity(usize::from(count));
         for index in 0..count {
-            lanes.push(root(self.read_simd_lane_bits_at(src, lane_bits, index)?));
+            lanes.push(root(Self::extract_lane(src_val.clone(), lane_bits, index)?));
         }
         Self::concat_lanes(lanes)
     }
@@ -833,8 +867,8 @@ impl LiftCtx {
             return;
         };
         let (Some(a), Some(b)) = (
-            self.read_simd_lane_bits_at(dst, lane, 0),
-            self.read_simd_lane_bits_at(src, lane, 0),
+            self.read_simd_lane_bits(dst, lane),
+            self.read_simd_lane_bits(src, lane),
         ) else {
             self.push_simd_unsupported(insn);
             return;

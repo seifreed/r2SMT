@@ -1205,10 +1205,32 @@ fn movsd_string_form_is_not_claimed_by_the_scalar_move_handler() {
     );
 }
 
+/// The `LoadMem` widths a lifting produced, in order.
+fn load_widths(stmts: &[IrStmt]) -> Vec<u16> {
+    stmts
+        .iter()
+        .filter_map(|s| match s {
+            IrStmt::LoadMem { bits, .. } => Some(*bits),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `StoreMem` widths a lifting produced, in order.
+fn store_widths(stmts: &[IrStmt]) -> Vec<u16> {
+    stmts
+        .iter()
+        .filter_map(|s| match s {
+            IrStmt::StoreMem { bits, .. } => Some(*bits),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
-fn movss_memory_operand_is_declined_rather_than_lifted() {
-    // `movss xmm0, dword [rbp - 8]` — SIMD memory operands are deferred,
-    // so the handler declines instead of fabricating a value.
+fn movss_load_names_its_temp_after_the_stack_slot() {
+    // The load temp keeps the `stk_<base>_<off>` name so the analyst
+    // alias (`var_4h`) still resolves downstream.
     let stmts = lift_per_mnemonic(
         &insn(
             0x1000,
@@ -1217,6 +1239,171 @@ fn movss_memory_operand_is_declined_rather_than_lifted() {
             vec![
                 op("xmm0", OperandKind::Register),
                 op("dword [rbp - 8]", OperandKind::Memory),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    let names: Vec<&str> = stmts
+        .iter()
+        .filter_map(|s| match s {
+            IrStmt::LoadMem { dst, .. } => Some(dst.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, vec!["stk_rbp_-8"], "{stmts:?}");
+}
+
+#[test]
+fn movss_load_reads_the_lane_width_not_the_vector_view() {
+    // `movss xmm0, dword [rbp - 8]` reads four bytes, not sixteen.
+    // Loading the whole view would pull in three neighbouring lanes
+    // that the instruction never touches.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            5,
+            "movss",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("dword [rbp - 8]", OperandKind::Memory),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    assert_eq!(load_widths(&stmts), vec![32], "{stmts:?}");
+}
+
+#[test]
+fn movss_load_from_memory_zeroes_everything_above_the_lane() {
+    // Per the SDM the load form zeroes the rest of the register, unlike
+    // the register-to-register form, which merges. There is no prior
+    // value to merge with.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            5,
+            "movss",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("dword [rbp - 8]", OperandKind::Memory),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    assert!(
+        matches!(simd_dst_src(&stmts, "zmm0"), Expr::ZeroExtend { .. }),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn movss_store_writes_only_the_lane() {
+    // `movss dword [rbp - 8], xmm0` writes four bytes and leaves the
+    // rest of the stack slot alone.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            5,
+            "movss",
+            vec![
+                op("dword [rbp - 8]", OperandKind::Memory),
+                op("xmm0", OperandKind::Register),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    assert_eq!(store_widths(&stmts), vec![32], "{stmts:?}");
+}
+
+#[test]
+fn movaps_load_reads_the_whole_vector_view_in_one_load() {
+    // `movaps xmm1, xmmword [rbp - 0x10]` is a single 16-byte load; the
+    // size prefix radare2 attaches is what supplies the width.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "movaps",
+            vec![
+                op("xmm1", OperandKind::Register),
+                op("xmmword [rbp - 0x10]", OperandKind::Memory),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    assert_eq!(load_widths(&stmts), vec![128], "{stmts:?}");
+}
+
+#[test]
+fn movaps_store_writes_the_whole_vector_view() {
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "movaps",
+            vec![
+                op("xmmword [rbp - 0x10]", OperandKind::Memory),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    assert_eq!(store_widths(&stmts), vec![128], "{stmts:?}");
+}
+
+#[test]
+fn packed_arithmetic_against_memory_loads_the_operand_once() {
+    // `addps xmm0, xmmword [rsi]` applies four lane additions but must
+    // read memory a single time — one load per lane would quadruple the
+    // byte-store chain the encoder walks for no gain.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "addps",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmmword [rsi]", OperandKind::Memory),
+            ],
+        ),
+        Arch::X86_64,
+    );
+    assert_eq!(load_widths(&stmts), vec![128], "{stmts:?}");
+}
+
+#[test]
+fn simd_memory_the_lifter_cannot_address_still_analyzes_as_other() {
+    // A segment-prefixed operand has no address expression, so the
+    // effect table must keep demoting it — otherwise the slicer would
+    // retain an instruction whose store the lifter drops, and a later
+    // load would read a stale value.
+    let i = insn(
+        0x1000,
+        9,
+        "movaps",
+        vec![
+            op("xmm0", OperandKind::Register),
+            op("xmmword fs:[0x30]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(
+        crate::effect::analyze(&i, Arch::X86_64).kind,
+        crate::effect::InstructionKind::Other
+    );
+}
+
+#[test]
+fn simd_memory_without_a_size_prefix_is_declined() {
+    // Nothing says how many bytes to read, and guessing would silently
+    // load the wrong width.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "movaps",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("[rsi]", OperandKind::Memory),
             ],
         ),
         Arch::X86_64,
