@@ -37,7 +37,7 @@ fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> Instruct
     // closed above the dispatch. `AArch32` NEON is `v`-prefixed with a
     // type suffix and so collides less, but the indexed form (`d0[1]`)
     // reaches the integer arms exactly the same way.
-    if super::has_unmodelled_vector_shape(insn, Arch::Arm) {
+    if crate::lift::vector_shape(insn, Arch::Arm) == crate::lift::VectorShape::Declined {
         return other_effect(insn);
     }
     match dispatch_mnemonic {
@@ -138,11 +138,15 @@ fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> Instruct
         "pop" => aarch32_push_pop_effect(insn, true),
         "ldm" | "ldmia" => aarch32_ldm_stm_effect(insn, true),
         "stm" | "stmia" => aarch32_ldm_stm_effect(insn, false),
-        // VFP scalar floating point. `vcmp` writes the flags and
-        // defines no register; everything else defines its destination.
-        // Unlike AArch64, a VFP write preserves the rest of the
-        // register file, so the destination is a use as well as a def.
-        m if crate::lift::vfp_scalar(m).is_some() => aarch32_vfp_effect(insn),
+        // VFP scalar floating point and NEON packed data processing.
+        // `vcmp` writes the flags and defines no register; everything
+        // else defines its destination. Unlike AArch64, an AArch32
+        // vector write preserves the rest of the register file (`d1`
+        // survives a write to `d0`, both halves of `q0`), so the
+        // destination is a use as well as a def.
+        m if crate::lift::vfp_scalar(m).is_some() || crate::lift::neon_packed_op(m).is_some() => {
+            aarch32_vfp_effect(insn)
+        }
         _ => other_effect(insn),
     }
 }

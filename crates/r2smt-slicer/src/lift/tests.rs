@@ -2534,3 +2534,385 @@ fn aarch32_vfp_arithmetic_reads_its_destination() {
     let e = crate::effect::analyze(&i, Arch::Arm);
     assert!(e.uses.contains(&"v0"), "{e:?}");
 }
+
+#[test]
+fn aarch64_scalar_arithmetic_is_unaffected_by_the_shape_guard() {
+    let i = insn(0x1000, 4, "add", vec![reg("x0"), reg("x1"), reg("x2")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == "x0")),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_indexed_lane_operand_declines_at_the_lifter() {
+    let i = insn(0x1000, 4, "vmov", vec![reg("r0"), reg("d0[1]")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Arm);
+    assert!(
+        matches!(stmts.as_slice(), [IrStmt::Unsupported { .. }]),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_aapcs_vector_alias_is_unaffected_by_the_shape_guard() {
+    // `v1` on AArch32 is the AAPCS alias for `r4`, a bare GPR name that
+    // the shape guard must leave alone.
+    let i = insn(0x1000, 4, "add", vec![reg("v1"), reg("v2"), reg("v3")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Arm);
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == "r4")),
+        "{stmts:?}"
+    );
+}
+
+// --- ARM NEON packed data processing ---
+
+/// The lane-width `Add` nodes in a lowered packed integer result.
+fn packed_add_lane_widths(stmts: &[IrStmt]) -> Vec<u16> {
+    fn walk(expr: &Expr, out: &mut Vec<u16>) {
+        match expr {
+            Expr::Add(a, b) => {
+                out.push(expr_bits(a).max(expr_bits(b)));
+                walk(a, out);
+                walk(b, out);
+            }
+            Expr::Concat { high, low } => {
+                walk(high, out);
+                walk(low, out);
+            }
+            Expr::ZeroExtend { src, .. } | Expr::Extract { src, .. } => walk(src, out),
+            _ => {}
+        }
+    }
+    fn expr_bits(expr: &Expr) -> u16 {
+        match expr {
+            Expr::Extract { hi, lo, .. } => hi - lo + 1,
+            Expr::Var(v) => v.bits,
+            _ => 0,
+        }
+    }
+    let mut out = Vec::new();
+    for stmt in stmts {
+        if let IrStmt::Assign { src, .. } = stmt {
+            walk(src, &mut out);
+        }
+    }
+    out
+}
+
+/// How many floating-point additions a lowering contains, and at what
+/// significand width.
+fn packed_fadd_sorts(stmts: &[IrStmt]) -> Vec<u16> {
+    fn walk(expr: &Expr, out: &mut Vec<u16>) {
+        if let Expr::FAdd(a, b, _) = expr {
+            if let Expr::BvToFp { sbits, .. } = &**a {
+                out.push(*sbits);
+            }
+            walk(a, out);
+            walk(b, out);
+            return;
+        }
+        match expr {
+            Expr::Concat { high, low } => {
+                walk(high, out);
+                walk(low, out);
+            }
+            Expr::FpToIeeeBv(s)
+            | Expr::BvToFp { src: s, .. }
+            | Expr::ZeroExtend { src: s, .. }
+            | Expr::Extract { src: s, .. } => walk(s, out),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for stmt in stmts {
+        if let IrStmt::Assign { src, .. } = stmt {
+            walk(src, &mut out);
+        }
+    }
+    out
+}
+
+#[test]
+fn aarch64_packed_integer_add_lifts_one_addition_per_lane() {
+    // The whole point of the arrangement: `v0.4s` is four independent
+    // 32-bit lanes, not one 128-bit value. A single wide `Add` would
+    // propagate carries across every lane boundary.
+    let i = insn(
+        0x1000,
+        4,
+        "add",
+        vec![reg("v0.4s"), reg("v1.4s"), reg("v2.4s")],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert_eq!(packed_add_lane_widths(&stmts), vec![32, 32, 32, 32]);
+}
+
+#[test]
+fn aarch64_packed_integer_add_writes_the_vector_parent() {
+    let i = insn(
+        0x1000,
+        4,
+        "add",
+        vec![reg("v0.4s"), reg("v1.4s"), reg("v2.4s")],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(stmts.as_slice(), [IrStmt::Assign { dst, .. }] if dst.name == "v0" && dst.bits == 128),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_packed_double_precision_add_lifts_one_addition_per_lane() {
+    let i = insn(
+        0x1000,
+        4,
+        "fadd",
+        vec![reg("v0.2d"), reg("v1.2d"), reg("v2.2d")],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    // Two lanes, each an IEEE double (significand 53).
+    assert_eq!(packed_fadd_sorts(&stmts), vec![53, 53]);
+}
+
+#[test]
+fn aarch64_packed_single_precision_add_lifts_four_lanes() {
+    let i = insn(
+        0x1000,
+        4,
+        "fadd",
+        vec![reg("v0.4s"), reg("v1.4s"), reg("v2.4s")],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert_eq!(packed_fadd_sorts(&stmts), vec![24, 24, 24, 24]);
+}
+
+#[test]
+fn aarch64_packed_bitwise_and_lowers_once_over_the_whole_view() {
+    // No carry crosses a lane boundary in a bitwise operation, so
+    // sixteen byte lanes would grow the formula for an identical result.
+    let i = insn(
+        0x1000,
+        4,
+        "and",
+        vec![reg("v0.16b"), reg("v1.16b"), reg("v2.16b")],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(
+            stmts.as_slice(),
+            [IrStmt::Assign { src: Expr::And(a, b), .. }]
+                if matches!(&**a, Expr::Var(v) if v.bits == 128)
+                    && matches!(&**b, Expr::Var(v) if v.bits == 128)
+        ),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_half_width_arrangement_write_zeroes_the_upper_half() {
+    // An `AArch64` SIMD write has no merging form: writing `v0.8b`
+    // zeroes bits 127:64 of `v0`.
+    let i = insn(0x1000, 4, "mvn", vec![reg("v0.8b"), reg("v1.8b")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(
+            stmts.as_slice(),
+            [IrStmt::Assign {
+                src: Expr::ZeroExtend { to_bits: 128, .. },
+                ..
+            }]
+        ),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_widening_arrangement_declines() {
+    // `umlal` reads half-width lanes and accumulates into full-width
+    // ones. Requiring every operand to share the destination's
+    // arrangement rejects it without naming it.
+    let i = insn(
+        0x1000,
+        4,
+        "umlal",
+        vec![reg("v0.4s"), reg("v1.4h"), reg("v2.4h")],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(stmts.as_slice(), [IrStmt::Unsupported { .. }]),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_mismatched_arrangement_on_a_modelled_mnemonic_declines() {
+    let i = insn(
+        0x1000,
+        4,
+        "add",
+        vec![reg("v0.4s"), reg("v1.4s"), reg("v2.2d")],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(stmts.as_slice(), [IrStmt::Unsupported { .. }]),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_by_element_operand_declines() {
+    // `mul v0.4s, v1.4s, v2.s[0]` broadcasts one lane of `v2`; the
+    // indexed operand carries no arrangement, so the shape resolver
+    // refuses it.
+    let i = insn(
+        0x1000,
+        4,
+        "mul",
+        vec![reg("v0.4s"), reg("v1.4s"), reg("v2.s[0]")],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(stmts.as_slice(), [IrStmt::Unsupported { .. }]),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_byte_arrangement_floating_point_declines() {
+    // `.16b` names an 8-bit element, which is not an IEEE sort.
+    let i = insn(
+        0x1000,
+        4,
+        "fadd",
+        vec![reg("v0.16b"), reg("v1.16b"), reg("v2.16b")],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(stmts.as_slice(), [IrStmt::Unsupported { .. }]),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_packed_integer_add_lifts_one_addition_per_lane() {
+    let i = insn(0x1000, 4, "vadd.i32", vec![reg("q0"), reg("q1"), reg("q2")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Arm);
+    assert_eq!(packed_add_lane_widths(&stmts), vec![32, 32, 32, 32]);
+}
+
+#[test]
+fn aarch32_single_precision_on_a_d_register_covers_both_lanes() {
+    // `AArch32` puts only the element type in the mnemonic, so the lane
+    // count comes from the destination: a `d` register holds two
+    // single-precision elements. The scalar VFP handler would compute
+    // only the low one and leave the high one at its stale value.
+    let i = insn(0x1000, 4, "vadd.f32", vec![reg("d0"), reg("d1"), reg("d2")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Arm);
+    assert_eq!(packed_fadd_sorts(&stmts), vec![24, 24]);
+}
+
+#[test]
+fn aarch32_single_precision_on_an_s_register_stays_scalar() {
+    // One element in the destination view is the scalar VFP form, which
+    // the packed dispatch must leave to the existing handler.
+    let i = insn(0x1000, 4, "vadd.f32", vec![reg("s0"), reg("s1"), reg("s2")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Arm);
+    assert_eq!(packed_fadd_sorts(&stmts), vec![24]);
+}
+
+#[test]
+fn aarch32_double_precision_on_a_d_register_stays_scalar() {
+    let i = insn(0x1000, 4, "vadd.f64", vec![reg("d0"), reg("d1"), reg("d2")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Arm);
+    assert_eq!(packed_fadd_sorts(&stmts), vec![53]);
+}
+
+#[test]
+fn aarch32_untyped_bitwise_neon_lowers_over_the_whole_view() {
+    // The bitwise NEON mnemonics make the element type optional, so
+    // disassemblers emit them bare.
+    let i = insn(0x1000, 4, "vand", vec![reg("q0"), reg("q1"), reg("q2")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Arm);
+    assert!(
+        matches!(
+            stmts.as_slice(),
+            [IrStmt::Assign { src: Expr::And(a, b), .. }]
+                if matches!(&**a, Expr::Var(v) if v.bits == 128)
+                    && matches!(&**b, Expr::Var(v) if v.bits == 128)
+        ),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_packed_write_preserves_the_rest_of_the_vector_register() {
+    // Unlike `AArch64`, an `AArch32` vector write merges: `d1` survives
+    // a write to `d0`, both being halves of `q0`.
+    let i = insn(0x1000, 4, "vadd.i32", vec![reg("d0"), reg("d1"), reg("d2")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Arm);
+    assert!(
+        matches!(
+            stmts.as_slice(),
+            [IrStmt::Assign { src: Expr::Concat { high, .. }, .. }]
+                if matches!(&**high, Expr::Extract { hi: 127, lo: 64, .. })
+        ),
+        "{stmts:?}"
+    );
+}
+
+// --- rounding-mode pinning on ARM ---
+
+#[test]
+fn aarch64_floating_point_arithmetic_pins_the_rounding_mode() {
+    for mnemonic in ["fadd", "fsub", "fmul", "fdiv", "fsqrt", "fcvt", "scvtf"] {
+        assert!(
+            crate::lift::pins_rounding_mode(mnemonic, Arch::Aarch64),
+            "{mnemonic}"
+        );
+    }
+}
+
+#[test]
+fn aarch64_non_rounding_floating_point_does_not_pin_the_rounding_mode() {
+    // `fmax` / `fmin` select an operand, `fcvtzs` / `fcvtzu` carry
+    // round-toward-zero in the opcode, and `fmov` / `fabs` / `fneg` /
+    // `fcmp` move or inspect a bit pattern.
+    for mnemonic in [
+        "fmax", "fmin", "fcvtzs", "fcvtzu", "fmov", "fabs", "fneg", "fcmp",
+    ] {
+        assert!(
+            !crate::lift::pins_rounding_mode(mnemonic, Arch::Aarch64),
+            "{mnemonic}"
+        );
+    }
+}
+
+#[test]
+fn aarch32_floating_point_arithmetic_pins_the_rounding_mode() {
+    for mnemonic in ["vadd.f32", "vsub.f64", "vmul.f32", "vdiv.f32", "vsqrt.f32"] {
+        assert!(
+            crate::lift::pins_rounding_mode(mnemonic, Arch::Arm),
+            "{mnemonic}"
+        );
+    }
+}
+
+#[test]
+fn aarch32_non_rounding_floating_point_does_not_pin_the_rounding_mode() {
+    for mnemonic in [
+        "vmov.f32", "vcmp.f32", "vabs.f32", "vneg.f64", "vadd.i32", "vand",
+    ] {
+        assert!(
+            !crate::lift::pins_rounding_mode(mnemonic, Arch::Arm),
+            "{mnemonic}"
+        );
+    }
+}

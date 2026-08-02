@@ -167,12 +167,17 @@ pub fn is_simd_parent(parent: &str, arch: Arch) -> bool {
 ///
 /// Purely syntactic, and deliberately so: it answers "does this operand
 /// carry vector shape beyond the bare register name", not "can the
-/// lifter model it". [`register_layout`] resolves only the bare name, so
-/// every shape this reports is one whose destination would otherwise
-/// canonicalise to `None` — an operand that silently contributes no def
-/// while [`crate::effect::registers_in_operand`] still recovers the
-/// parent as a *use*. That asymmetry is what the effect tables use this
-/// to fail closed on.
+/// lifter model it". [`register_layout`] now resolves the arranged and
+/// indexed spellings to their parent slice, so this detector — which
+/// inspects only the leading register token — is what keeps the effect
+/// tables and the lifter dispatchers routing vector-shaped operands
+/// through the vector seams instead of letting a scalar handler treat
+/// `v0.4s` as one wide register.
+///
+/// A register list is judged by what it lists, not by its braces:
+/// `AArch32` spells its GPR push / pop / ldm lists the same way
+/// (`{r4, r5, lr}`), and those are ordinary data movement the lifter
+/// models. Only a list of vector registers carries vector shape.
 ///
 /// Always `false` outside the ARM ISAs: no x86 register spelling carries
 /// an arrangement, and the `AArch32` AAPCS aliases (`v1` for `r4`) are
@@ -183,17 +188,91 @@ pub fn has_vector_arrangement(raw: &str, arch: Arch) -> bool {
         return false;
     }
     let lower = raw.trim().to_ascii_lowercase();
-    if lower.starts_with('{') {
-        return true;
+    if let Some(body) = lower.strip_prefix('{') {
+        let first = body.split([',', '}']).next().unwrap_or_default().trim();
+        return names_vector_register(first, arch);
     }
     let head_len = lower
         .find(|c: char| !c.is_ascii_alphanumeric())
         .unwrap_or(lower.len());
     let (head, rest) = lower.split_at(head_len);
-    if rest.is_empty() {
-        return false;
+    !rest.is_empty() && names_vector_register(head, arch)
+}
+
+/// Whether `name` resolves to a slice of a vector register parent under
+/// `arch`.
+fn names_vector_register(name: &str, arch: Arch) -> bool {
+    register_layout(name, arch).is_some_and(|layout| is_simd_parent(layout.parent, arch))
+}
+
+/// Element arrangement of an ARM vector operand: the `4s` in `v0.4s`.
+///
+/// Kept outside [`RegisterLayout`] deliberately — the layout describes
+/// *which bits* of the parent a name addresses, while the arrangement
+/// describes *how the lifter must cut* those bits into lanes. Folding
+/// lane geometry into the layout would also break [`alias_for`], whose
+/// reverse lookup assumes plain `(hi, lo)` slices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Arrangement {
+    /// Number of elements in the view.
+    pub lanes: u16,
+    /// Width of one element in bits.
+    pub lane_bits: u16,
+}
+
+impl Arrangement {
+    /// Total width of the arranged view in bits (`lanes * lane_bits`).
+    #[must_use]
+    pub const fn view_bits(&self) -> u16 {
+        self.lanes * self.lane_bits
     }
-    register_layout(head, arch).is_some_and(|layout| is_simd_parent(layout.parent, arch))
+}
+
+/// Width in bits of an ARM vector element-type letter (`b`/`h`/`s`/`d`).
+const fn element_type_bits(letter: char) -> Option<u16> {
+    match letter {
+        'b' => Some(8),
+        'h' => Some(16),
+        's' => Some(32),
+        'd' => Some(64),
+        _ => None,
+    }
+}
+
+/// Parse the `<lanes><type>` body of an `AArch64` element arrangement
+/// (`4s`, `16b`, `2d`, `1d` — ARM ARM C1.2.4, "Vector formats").
+///
+/// Valid arrangements cover exactly half or all of the 128-bit vector
+/// register, so any `<lanes><type>` whose product is neither 64 nor 128
+/// is rejected rather than guessed at.
+#[must_use]
+pub fn parse_arrangement(body: &str) -> Option<Arrangement> {
+    let split = body.find(|c: char| !c.is_ascii_digit())?;
+    let (digits, letter) = body.split_at(split);
+    let lanes: u16 = digits.parse().ok()?;
+    let mut letters = letter.chars();
+    let lane_bits = element_type_bits(letters.next()?)?;
+    if letters.next().is_some() {
+        return None;
+    }
+    let arrangement = Arrangement { lanes, lane_bits };
+    matches!(arrangement.view_bits(), 64 | 128).then_some(arrangement)
+}
+
+/// Parse the `[N]` lane index of an indexed vector operand (`v0.s[1]`,
+/// `d0[1]`).
+///
+/// The bound is architectural, not per-type: 128-bit vector registers
+/// with a minimum 8-bit element admit indices `0..=15`, so anything
+/// larger is a malformed spelling regardless of the element width the
+/// caller knows about. Callers with a concrete element type tighten the
+/// check further.
+#[must_use]
+pub fn parse_lane_index(body: &str) -> Option<u16> {
+    const MAX_VECTOR_LANE_INDEX: u16 = 15;
+    let digits = body.strip_prefix('[')?.strip_suffix(']')?;
+    let index: u16 = digits.parse().ok()?;
+    (index <= MAX_VECTOR_LANE_INDEX).then_some(index)
 }
 
 /// Reverse lookup: given a `(parent, hi, lo)` triple, return the

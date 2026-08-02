@@ -16,8 +16,19 @@ pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
     // instruction passes with empty `defs` while its sources still
     // resolve as `uses`: the slicer neither truncates nor keeps it, and
     // a later read of the destination binds to a stale definition.
-    if super::has_unmodelled_vector_shape(insn, Arch::Aarch64) {
-        return other_effect(insn);
+    match crate::lift::vector_shape(insn, Arch::Aarch64) {
+        crate::lift::VectorShape::None => {}
+        // A packed write covers the destination's whole arrangement and
+        // zeroes the vector register above it, so the destination is a
+        // pure def — the 3-operand shape, not x86's read-modify-write
+        // one. Handled here rather than by falling through to the
+        // integer arms so that the mnemonics with no scalar `AArch64`
+        // form (`mvn`, `bic`) are classified too, without those arms
+        // newly claiming the scalar spellings the lifter does not model.
+        crate::lift::VectorShape::Lifted => {
+            return aarch64_arith3_effect(insn, InstructionKind::Simd, false);
+        }
+        crate::lift::VectorShape::Declined => return other_effect(insn),
     }
     let mnemonic = insn.mnemonic.trim().to_ascii_lowercase();
     match mnemonic.as_str() {

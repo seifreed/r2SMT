@@ -1,7 +1,7 @@
 //! `AArch32` register layout + alias tables, extracted from
 //! `registers.rs`.
 
-use super::{RegisterLayout, arm32_full, arm32_vector};
+use super::{RegisterLayout, arm32_full, arm32_vector, element_type_bits, parse_lane_index};
 
 pub(super) fn arm32_layout(lower: &str) -> Option<RegisterLayout> {
     // r0..r15
@@ -57,8 +57,15 @@ fn arm32_aapcs_alias(lower: &str) -> Option<&'static str> {
 
 fn arm32_simd_layout(lower: &str) -> Option<RegisterLayout> {
     let prefix = lower.chars().next()?;
-    let stripped = &lower[prefix.len_utf8()..];
-    let n: u8 = stripped.parse().ok()?;
+    let rest = &lower[prefix.len_utf8()..];
+    let digits_len = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let (digits, suffix) = rest.split_at(digits_len);
+    let n: u8 = digits.parse().ok()?;
+    if !arm32_vector_suffix_addresses_whole_view(suffix) {
+        return None;
+    }
     match prefix {
         'q' if n <= 15 => Some(arm32_vector(arm32_v_name(n), 0, 127)),
         'd' if n <= 31 => {
@@ -73,6 +80,30 @@ fn arm32_simd_layout(lower: &str) -> Option<RegisterLayout> {
         }
         _ => None,
     }
+}
+
+/// Whether an `AArch32` vector shape suffix leaves the register's whole
+/// view addressed.
+///
+/// `AArch32` NEON spells the element type on the *mnemonic*
+/// (`vadd.i32 d0, d1, d2`), so the only shape an operand carries is the
+/// indexed element — `d0[1]`, `q1[0]`, and the typed `d0.8b` form some
+/// disassemblers emit. Like the `AArch64` case the index does not narrow
+/// the slice, because [`arm32_alias`] reverse-maps `(hi, lo)` pairs onto
+/// the `qN`/`dN`/`sN` names and a lane offset would collide with them.
+fn arm32_vector_suffix_addresses_whole_view(suffix: &str) -> bool {
+    if suffix.is_empty() {
+        return true;
+    }
+    if let Some(body) = suffix.strip_prefix('.') {
+        let mut chars = body.chars();
+        let Some(letter) = chars.next() else {
+            return false;
+        };
+        return element_type_bits(letter).is_some()
+            && (chars.as_str().is_empty() || parse_lane_index(chars.as_str()).is_some());
+    }
+    parse_lane_index(suffix).is_some()
 }
 
 pub(super) fn arm32_alias(parent: &str, hi: u16, lo: u16) -> Option<&'static str> {
