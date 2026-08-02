@@ -14,6 +14,10 @@ use r2smt_slicer::{
     register_layout, slice_branch,
 };
 
+/// Bit of AH the `fnstsw` / `test` idiom masks: C0 and C3, i.e. "not
+/// greater than".
+const NOT_GREATER_MASK: &str = "0x41";
+
 const FUNCTION_ADDRESS: u64 = 0x40_1000;
 /// Every fixture instruction is spaced by this many bytes; the exact
 /// encoding length is irrelevant to the slicer.
@@ -62,29 +66,15 @@ fn insn(addr: u64, mnemonic: &str, operands: Vec<Operand>) -> Instruction {
     }
 }
 
-/// Lay a straight-line body out at consecutive addresses and append the
-/// `cmp` / `je` tail every fixture branches on, so the slicer has a
-/// candidate to walk backwards from.
-fn program_with_tail(body: Vec<(&str, Vec<Operand>)>, probe: Operand) -> Program {
+/// Lay a straight-line body out at consecutive addresses. The last
+/// entry must be the conditional branch the slicer walks back from.
+fn program(body: Vec<(&str, Vec<Operand>)>) -> Program {
     let mut instructions = Vec::new();
     let mut addr = FUNCTION_ADDRESS;
     for (mnemonic, operands) in body {
         instructions.push(insn(addr, mnemonic, operands));
         addr += u64::from(STEP);
     }
-    instructions.push(insn(addr, "mov", vec![reg("rax"), probe]));
-    addr += u64::from(STEP);
-    instructions.push(insn(
-        addr,
-        "cmp",
-        vec![reg("rax"), op("0", OperandKind::Immediate)],
-    ));
-    addr += u64::from(STEP);
-    instructions.push(insn(
-        addr,
-        "je",
-        vec![op("0x402000", OperandKind::Immediate)],
-    ));
     Program {
         arch: Arch::X86_64,
         bits: 64,
@@ -100,6 +90,15 @@ fn program_with_tail(body: Vec<(&str, Vec<Operand>)>, probe: Operand) -> Program
             is_thumb: false,
         }],
     }
+}
+
+/// `body`, then the `mov` / `cmp` / `je` tail that reads `probe` back
+/// out of memory and gives the slicer a branch to walk from.
+fn program_with_tail(mut body: Vec<(&str, Vec<Operand>)>, probe: Operand) -> Program {
+    body.push(("mov", vec![reg("rax"), probe]));
+    body.push(("cmp", vec![reg("rax"), op("0", OperandKind::Immediate)]));
+    body.push(("je", vec![op("0x402000", OperandKind::Immediate)]));
+    program(body)
 }
 
 fn slice_of(program: &Program) -> Slice {
@@ -225,13 +224,88 @@ fn test_x87_non_popping_store_has_no_extended_encoding() {
 }
 
 #[test]
-fn test_x87_status_word_family_stays_unmodelled() {
-    // The compare / status-word idiom is not lifted, so it must not be
-    // claimed by the effect table either.
-    for mnemonic in ["fcom", "fcomp", "fnstsw", "fldcw"] {
+fn test_x87_control_word_family_stays_unmodelled() {
+    // `fldcw` reprograms the rounding mode *and* the precision control,
+    // neither of which any fixed sort reflects. Until the guard lands it
+    // must fail closed.
+    for mnemonic in ["fldcw", "fnstcw", "fldenv"] {
         let effect = analyze(&insn(FUNCTION_ADDRESS, mnemonic, vec![]), Arch::X86_64);
         assert_eq!(effect.kind, InstructionKind::Other, "{mnemonic}");
     }
+}
+
+#[test]
+fn test_x87_status_compare_defines_the_status_word_not_eflags() {
+    // `fcom` reports through C0/C2/C3, so the slicer must see it as a
+    // definition of `fsw` — and must *not* see it as the flag definer a
+    // following `jcc` is looking for.
+    let effect = analyze(
+        &insn(FUNCTION_ADDRESS, "fcomp", vec![reg("st(1)")]),
+        Arch::X86_64,
+    );
+    assert_eq!(effect.kind, InstructionKind::X87);
+    assert!(effect.defs.contains(&"fsw"));
+    assert!(!effect.defines_flags);
+}
+
+#[test]
+fn test_x87_flag_compare_defines_eflags() {
+    // `fcomi` writes ZF/PF/CF directly, so it *is* the flag definer.
+    let effect = analyze(
+        &insn(FUNCTION_ADDRESS, "fcomi", vec![reg("st(0)"), reg("st(1)")]),
+        Arch::X86_64,
+    );
+    assert!(effect.defines_flags);
+    assert!(!effect.defs.contains(&"fsw"));
+}
+
+#[test]
+fn test_fnstsw_reads_the_status_word_without_touching_the_stack() {
+    // `fnstsw` is the one x87 shape that leaves the data registers
+    // alone: it reads `fsw` and writes AX.
+    let effect = analyze(
+        &insn(FUNCTION_ADDRESS, "fnstsw", vec![reg("ax")]),
+        Arch::X86_64,
+    );
+    assert_eq!(effect.kind, InstructionKind::X87);
+    assert!(effect.uses.contains(&"fsw"));
+    assert!(effect.defs.contains(&"rax"));
+    assert!(!effect.defs.contains(&"st"));
+}
+
+#[test]
+fn test_fnstsw_only_has_a_register_form_naming_ax() {
+    // The encoding stores to AX and nothing else; claiming another
+    // register would model an instruction that does not exist.
+    let effect = analyze(
+        &insn(FUNCTION_ADDRESS, "fnstsw", vec![reg("bx")]),
+        Arch::X86_64,
+    );
+    assert_eq!(effect.kind, InstructionKind::Other);
+}
+
+#[test]
+fn test_sahf_is_a_flag_definer_reading_rax() {
+    let effect = analyze(&insn(FUNCTION_ADDRESS, "sahf", vec![]), Arch::X86_64);
+    assert_eq!(effect.kind, InstructionKind::Sahf);
+    assert!(effect.defines_flags);
+    assert_eq!(effect.uses, vec!["rax"]);
+}
+
+#[test]
+fn test_unordered_compare_has_no_memory_form() {
+    // `FUCOM` / `FUCOMP` are register-only; only the ordered compares
+    // take an `m32fp` / `m64fp` source.
+    let ordered = analyze(
+        &insn(FUNCTION_ADDRESS, "fcom", vec![mem("qword [rbp - 0x10]")]),
+        Arch::X86_64,
+    );
+    assert_eq!(ordered.kind, InstructionKind::X87);
+    let unordered = analyze(
+        &insn(FUNCTION_ADDRESS, "fucom", vec![mem("qword [rbp - 0x10]")]),
+        Arch::X86_64,
+    );
+    assert_eq!(unordered.kind, InstructionKind::Other);
 }
 
 // ---------------------------------------------------------------
@@ -257,6 +331,34 @@ fn test_x87_chain_is_kept_whole_by_the_slicer() {
         .map(|i| i.mnemonic.as_str())
         .collect();
     assert_eq!(kept, vec!["fld", "fld", "faddp", "fstp", "mov", "cmp"]);
+}
+
+#[test]
+fn test_status_word_idiom_is_kept_whole_by_the_slicer() {
+    // The chain that dominates 32-bit binaries, end to end at the
+    // slicer: the branch reads ZF from `test`, which reads AH from
+    // `fnstsw`, which reads the status word from `fcomp`, which reads
+    // the stack the two loads filled. Every link has to be kept, and
+    // the two pseudo-registers are what carry the last two.
+    let fixture = program(vec![
+        ("fld1", vec![]),
+        ("fldz", vec![]),
+        ("fcomp", vec![reg("st(1)")]),
+        ("fnstsw", vec![reg("ax")]),
+        (
+            "test",
+            vec![reg("ah"), op(NOT_GREATER_MASK, OperandKind::Immediate)],
+        ),
+        ("jz", vec![op("0x402000", OperandKind::Immediate)]),
+    ]);
+    let slice = slice_of(&fixture);
+    assert_eq!(slice.status, SliceStatus::Complete);
+    let kept: Vec<&str> = slice
+        .instructions
+        .iter()
+        .map(|i| i.mnemonic.as_str())
+        .collect();
+    assert_eq!(kept, vec!["fld1", "fldz", "fcomp", "fnstsw", "test"]);
 }
 
 // ---------------------------------------------------------------

@@ -23,6 +23,11 @@ const X86_SHIFT_COUNT_MASK_NARROW: u64 = 0x1F;
 const X86_SHIFT_COUNT_MASK_64: u64 = 0x3F;
 const X86_WIDTH_64: u16 = 64;
 
+/// Which bit of AH each flag `sahf` transfers comes from (Intel SDM
+/// Vol. 2, "SAHF"). AF is omitted because the flag model does not carry
+/// it, and OF because `sahf` does not write it.
+const SAHF_FLAG_BITS: [(&str, u16); 4] = [("CF", 0), ("PF", 2), ("ZF", 6), ("SF", 7)];
+
 impl LiftCtx {
     pub(super) fn lift_instruction_x86(&mut self, insn: &Instruction) {
         let mnem = insn.mnemonic.trim().to_ascii_lowercase();
@@ -100,6 +105,7 @@ impl LiftCtx {
             "cvttsd2si" => self.lift_fp_to_int(insn, 64, RoundingMode::TowardZero),
             "cvtss2sd" => self.lift_fp_to_fp(insn, 32, 64),
             "cvtsd2ss" => self.lift_fp_to_fp(insn, 64, 32),
+            "sahf" => self.lift_sahf(),
             // x87 keeps its own slice-scoped stack rather than a
             // register model, so it is recognised by shape rather than
             // by mnemonic alone — see `lift/x87.rs`.
@@ -978,6 +984,32 @@ impl LiftCtx {
         let converted = Expr::fp_to_fp(f, RoundingMode::NearestTiesEven, ebits, sbits);
         if !self.write_simd_lane(dst, Expr::fp_to_ieee_bv(converted), dst_lane) {
             self.push_simd_unsupported(insn);
+        }
+    }
+
+    /// `sahf` — load SF, ZF, AF and PF and CF from the bits of AH.
+    ///
+    /// The bit positions are the point rather than an implementation
+    /// detail: they are why `fnstsw ax ; sahf` transfers an x87 compare
+    /// into the integer flags at all. `fnstsw` puts status-word bits
+    /// 15..8 into AH, which lands C0 at bit 0, C2 at bit 2 and C3 at
+    /// bit 6 — the CF, PF and ZF positions this reads.
+    ///
+    /// OF is deliberately absent: `sahf` does not write it, so whatever
+    /// defined it upstream still holds. AF is not modelled at all.
+    fn lift_sahf(&mut self) {
+        let Some(ah) = self.read_register(&Operand {
+            raw: "ah".into(),
+            kind: OperandKind::Register,
+        }) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: "sahf".into(),
+                comment: "no ah in this register model".into(),
+            });
+            return;
+        };
+        for (flag, bit) in SAHF_FLAG_BITS {
+            self.set_flag(flag, Expr::extract(ah.clone(), bit, bit));
         }
     }
 

@@ -44,7 +44,7 @@ pub(crate) use aarch32::{VfpOp, vfp_scalar};
 use merge::lower_merge;
 pub(crate) use x86::{is_fp_compare_mnemonic, sse_scalar_move_lane};
 use x87::X87Stack;
-pub(crate) use x87::{X87_STACK_REGISTER, is_modelled_x87};
+pub(crate) use x87::{X87Effect, is_modelled_x87, x87_effect};
 
 /// IR representation of a [`Slice`] plus the branch's symbolic
 /// condition.

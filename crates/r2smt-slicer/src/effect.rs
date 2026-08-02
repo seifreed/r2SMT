@@ -52,11 +52,16 @@ pub enum InstructionKind {
     /// `pxor`/`vpxor`, `pand`/`por`/`pandn`). Defines a vector
     /// register, sets no flags.
     Simd,
-    /// x87 floating-point op (`fld`, `faddp`, `fstp`, …). Defines and
-    /// uses the single canonical stack pseudo-register `st`, sets no
-    /// EFLAGS bit — the compare family that writes the status word is
-    /// not modelled and stays [`InstructionKind::Other`].
+    /// x87 floating-point op (`fld`, `faddp`, `fstp`, `fcom`, …).
+    /// Defines and uses the canonical stack pseudo-register `st`,
+    /// except for the three shapes that also touch the status word
+    /// `fsw` or EFLAGS — see `lift/x87.rs`.
     X87,
+    /// `sahf` — loads SF/ZF/AF/PF/CF from AH. An integer instruction,
+    /// recognised because it is the second half of the x87 compare
+    /// idiom: `fnstsw ax` lands the status word's condition codes at
+    /// exactly the AH positions `sahf` transfers.
+    Sahf,
     /// Conditional jump (`jcc`).
     Jcc,
     /// `setcc`.

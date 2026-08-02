@@ -85,6 +85,7 @@ gate_solver_contracts() {
     x87_extended_sort_stores_the_binary64_image_of_one \
     x87_extended_sort_stores_the_explicit_integer_bit \
     x87_extended_sort_keeps_a_free_extended_load_undecided \
+    x87_equality_after_a_free_compare_stays_undecided \
     smtlib_fp_inversion_on_nan_keeps_both_polarities_satisfiable \
     smtlib_ssa_renamed_slice_solves_to_the_same_verdict_as_the_z3_backend
 }

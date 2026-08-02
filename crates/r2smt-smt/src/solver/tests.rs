@@ -2779,3 +2779,146 @@ fn x87_extended_sort_keeps_a_free_extended_load_undecided() {
     ]);
     assert_eq!(solve_first(&program), SmtResult::BothPossible);
 }
+
+/// `fld1 ; fldz` leaves `ST(0) = +0.0` above `ST(1) = +1.0`, so a
+/// compare of the two is unambiguously "less than" — the shape every
+/// x87 compare test below branches on.
+fn x87_zero_below_one(rest: Vec<Instruction>) -> Program {
+    let mut instructions = vec![
+        insn(0x40_1000, 2, "fld1", vec![]),
+        insn(0x40_1002, 2, "fldz", vec![]),
+    ];
+    instructions.extend(rest);
+    one_block(instructions)
+}
+
+#[test]
+fn x87_status_word_idiom_resolves_through_test_ah() {
+    // The ending that dominates 32-bit binaries. `fcomp` records
+    // "less than" as C0 = 1, C2 = 0, C3 = 0; `fnstsw ax` puts those at
+    // AH bits 0, 2 and 6; `test ah, 0x41` masks C0 and C3, which is
+    // non-zero, so `jz` never fires. Nothing in the `test` / `jz` half
+    // is x87-aware — it resolves through the ordinary integer path.
+    let program = x87_zero_below_one(vec![
+        insn(
+            0x40_1004,
+            2,
+            "fcomp",
+            vec![op("st(1)", OperandKind::Register)],
+        ),
+        insn(
+            0x40_1006,
+            2,
+            "fnstsw",
+            vec![op("ax", OperandKind::Register)],
+        ),
+        insn(
+            0x40_1008,
+            3,
+            "test",
+            vec![
+                op("ah", OperandKind::Register),
+                op("0x41", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_100b,
+            2,
+            "jz",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysFalse);
+}
+
+#[test]
+fn x87_status_word_idiom_resolves_through_sahf() {
+    // The other ending. `sahf` transfers AH bit 0 into CF, so the C0
+    // the compare set makes `jb` always fire. The bit positions are
+    // load-bearing on both sides and neither is asserted anywhere —
+    // Z3 is deriving this from the status word the lifter built.
+    let program = x87_zero_below_one(vec![
+        insn(
+            0x40_1004,
+            2,
+            "fcomp",
+            vec![op("st(1)", OperandKind::Register)],
+        ),
+        insn(
+            0x40_1006,
+            2,
+            "fnstsw",
+            vec![op("ax", OperandKind::Register)],
+        ),
+        insn(0x40_1008, 1, "sahf", vec![]),
+        insn(
+            0x40_1009,
+            2,
+            "jb",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_flag_compare_writes_eflags_directly() {
+    // `fcomi` skips the status word entirely, writing CF/ZF/PF in the
+    // encoding the existing `jcc` lowering already reads.
+    let program = x87_zero_below_one(vec![
+        insn(
+            0x40_1004,
+            2,
+            "fcomi",
+            vec![
+                op("st(0)", OperandKind::Register),
+                op("st(1)", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1006,
+            2,
+            "jb",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_equality_after_a_free_compare_stays_undecided() {
+    // The anti-fabrication direction, and the reason the unordered
+    // predicate is carried at all: with both operands free, NaN alone
+    // makes an equality branch false, so it can never be proven
+    // always-taken.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            3,
+            "fld",
+            vec![op("qword [rbp - 0x10]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_1003,
+            3,
+            "fld",
+            vec![op("qword [rbp - 0x18]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_1006,
+            2,
+            "fcomi",
+            vec![
+                op("st(0)", OperandKind::Register),
+                op("st(1)", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            2,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::BothPossible);
+}

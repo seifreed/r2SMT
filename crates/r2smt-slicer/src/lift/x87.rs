@@ -66,10 +66,33 @@
 //! The rounding mode is pinned to the control word's reset value (round
 //! to nearest, ties to even) and the precision-control field is assumed
 //! to hold its reset value too — extended, which is what this sort
-//! models. There is no guard yet on `fldcw`; that, and the compare /
-//! status-word idiom (`fcom` / `fnstsw` / `fcomi`), are follow-up work.
-//! Every mnemonic they involve is outside [`classify`], so today they
-//! truncate the slice.
+//! models. There is no guard yet on `fldcw`, which reprograms both;
+//! that is follow-up work, and until it lands the mnemonic is outside
+//! [`classify`] so it truncates the slice.
+//!
+//! ## Compares, and the two idioms
+//!
+//! x87 has two ways to report a comparison, and both are lifted.
+//!
+//! `fcomi` / `fucomi` write ZF, PF and CF directly, in the same
+//! encoding the SSE scalar compares use, so the existing `jcc` lowering
+//! reads them with no change at all.
+//!
+//! The older `fcom` family writes the status word instead, which is
+//! modelled as a second pseudo-register [`X87_STATUS_REGISTER`] with C0
+//! at bit 8, C2 at bit 10 and C3 at bit 14. Everything else in that
+//! word is free — the exception flags are sticky state this model does
+//! not carry, and TOP is the stack pointer the lift-time stack
+//! deliberately does not number.
+//!
+//! Both endings of the classic idiom then fall out of those positions
+//! rather than needing code of their own. `fnstsw ax` copies the word
+//! into AX, so status bits 15..8 land in AH and put C0 at AH bit 0, C2
+//! at bit 2 and C3 at bit 6. Those are exactly the CF, PF and ZF
+//! positions `sahf` transfers — and exactly the bits `test ah, 0x41`
+//! masks, which needs nothing from this module at all: `test` and `ah`
+//! were already modelled, so once `fnstsw` has written `ax` the chain
+//! resolves through the ordinary integer path.
 //!
 //! ## Declining
 //!
@@ -83,7 +106,8 @@
 //! read then produces a free symbolic input rather than a stale value
 //! from a slot the hardware would have overwritten.
 
-use r2smt_ir::expr::{Expr, RoundingMode};
+use r2smt_common::Arch;
+use r2smt_ir::expr::{Expr, RoundingMode, Var};
 use r2smt_ir::program::{Instruction, Operand, OperandKind};
 use r2smt_ir::stmt::IrStmt;
 
@@ -96,6 +120,27 @@ use super::{LiftCtx, fp_sort_bits_checked, x86_memory_modellable};
 /// `st(0)`..`st(7)` by [`crate::effect::registers_in_operand`], which
 /// splits on non-alphanumerics and so yields the bare token `st`.
 pub(crate) const X87_STACK_REGISTER: &str = "st";
+
+/// The x87 status word, as a data-flow node of its own. The `fcom`
+/// family writes it and `fnstsw` reads it; no instruction names it as
+/// an operand, so unlike `st` it is never recovered from operand text.
+pub(crate) const X87_STATUS_REGISTER: &str = "fsw";
+
+/// Width of the status word.
+const X87_STATUS_BITS: u16 = 16;
+
+/// Status-word bit positions of the condition codes (Intel SDM Vol. 1
+/// §8.1.3). Their spacing is the whole reason the classic idiom works:
+/// `fnstsw ax` puts bits 15..8 in AH, so C0 lands at AH bit 0, C2 at
+/// bit 2 and C3 at bit 6 — exactly the CF, PF and ZF positions `sahf`
+/// transfers.
+const X87_C0_BIT: u16 = 8;
+/// C2 — the unordered indicator after a compare. C1, the bit between
+/// them, signals a stack fault, which the bounded stack model declines
+/// on rather than records, so it is written zero.
+const X87_C2_BIT: u16 = 10;
+/// C3 — the equality indicator after a compare.
+const X87_C3_BIT: u16 = 14;
 
 /// Number of x87 data registers (Intel SDM Vol. 1 §8.1.2).
 const X87_STACK_DEPTH: usize = 8;
@@ -237,7 +282,18 @@ impl X87Stack {
     }
 
     fn fresh_input(&mut self) -> Expr {
-        let value = Expr::var(format!("x87_in_{n}", n = self.free_inputs), X87_SLOT_BITS);
+        self.fresh(X87_SLOT_BITS)
+    }
+
+    /// A fresh free status word, for the bits of it a compare does not
+    /// define. Shares the counter with the slot inputs so no two free
+    /// values ever collide.
+    fn fresh_status(&mut self) -> Expr {
+        self.fresh(X87_STATUS_BITS)
+    }
+
+    fn fresh(&mut self, bits: u16) -> Expr {
+        let value = Expr::var(format!("x87_in_{n}", n = self.free_inputs), bits);
         self.free_inputs = self.free_inputs.saturating_add(1);
         value
     }
@@ -321,6 +377,14 @@ enum ArithSrc {
     Memory(u16),
 }
 
+/// The three IEEE predicates every x87 compare records, whichever
+/// destination it records them in.
+struct Compare {
+    unordered: Expr,
+    equal: Expr,
+    less: Expr,
+}
+
 /// In-place unary operations on `ST(0)`.
 #[derive(Clone, Copy)]
 enum UnaryOp {
@@ -356,6 +420,15 @@ enum X87Form {
         reversed: bool,
         pop: bool,
     },
+    /// Compare `ST(0)` against a source and record the outcome in the
+    /// status word's condition codes (`fcom` family), popping `pops`
+    /// slots afterwards.
+    CompareStatus { src: ArithSrc, pops: u8 },
+    /// Compare `ST(0)` against `ST(src)` and write EFLAGS directly
+    /// (`fcomi` family).
+    CompareFlags { src: usize, pop: bool },
+    /// Copy the status word into `operands[0]` (`fnstsw` / `fstsw`).
+    StoreStatus,
     /// Swap `ST(0)` with `ST(i)` (`fxch`).
     Exchange(usize),
     /// In-place unary on `ST(0)`.
@@ -372,6 +445,69 @@ enum X87Form {
 /// [`LiftCtx::lift_instruction_x87`] actually lowers.
 pub(crate) fn is_modelled_x87(insn: &Instruction) -> bool {
     classify(insn).is_some()
+}
+
+/// What an x87 instruction touches beyond the registers its operands
+/// name, as the effect table needs to see it.
+pub(crate) struct X87Effect {
+    /// Pseudo-registers the instruction defines.
+    pub(crate) defs: Vec<&'static str>,
+    /// Pseudo-registers the instruction reads.
+    pub(crate) uses: Vec<&'static str>,
+    /// Canonical register the instruction writes, if it writes one.
+    pub(crate) register_def: Option<&'static str>,
+    /// Whether the instruction writes EFLAGS.
+    pub(crate) defines_flags: bool,
+}
+
+/// The pseudo-register footprint of a modelled x87 instruction, or
+/// `None` when the instruction is not one.
+///
+/// Most of the family is uniform — every instruction that touches the
+/// data registers both defines and uses the whole stack. Three shapes
+/// are not: the `fcom` family also defines the status word, the `fcomi`
+/// family writes EFLAGS instead of the status word, and `fnstsw` reads
+/// the status word into a register without touching the data registers
+/// at all.
+pub(crate) fn x87_effect(insn: &Instruction) -> Option<X87Effect> {
+    let form = classify(insn)?;
+    let stack = || {
+        (
+            vec![X87_STACK_REGISTER],
+            vec![X87_STACK_REGISTER],
+            None,
+            false,
+        )
+    };
+    let (defs, uses, register_def, defines_flags) = match form {
+        X87Form::CompareStatus { .. } => (
+            vec![X87_STACK_REGISTER, X87_STATUS_REGISTER],
+            vec![X87_STACK_REGISTER],
+            None,
+            false,
+        ),
+        X87Form::CompareFlags { .. } => (
+            vec![X87_STACK_REGISTER],
+            vec![X87_STACK_REGISTER],
+            None,
+            true,
+        ),
+        X87Form::StoreStatus => (
+            Vec::new(),
+            vec![X87_STATUS_REGISTER],
+            insn.operands
+                .first()
+                .and_then(|op| crate::effect::canonical_register(&op.raw, Arch::X86_64)),
+            false,
+        ),
+        _ => stack(),
+    };
+    Some(X87Effect {
+        defs,
+        uses,
+        register_def,
+        defines_flags,
+    })
 }
 
 /// Resolve `insn` into the stack effect the lifter will apply, or
@@ -395,6 +531,18 @@ fn classify(insn: &Instruction) -> Option<X87Form> {
         "fstp" => classify_store(ops, MemFormat::Float, &X87_FLOAT_WIDTHS, true),
         "fist" => classify_store(ops, MemFormat::Integer, &X87_INT_STORE_WIDTHS, false),
         "fistp" => classify_store(ops, MemFormat::Integer, &X87_INT_WIDTHS, true),
+        // The ordered and unordered compares differ only in which NaN
+        // raises the invalid-operation exception, which the value model
+        // does not track — so they lift identically, and are told apart
+        // only by the operand shapes each encoding allows.
+        "fcom" => classify_status_compare(ops, 0, MemorySource::Allowed),
+        "fcomp" => classify_status_compare(ops, 1, MemorySource::Allowed),
+        "fucom" => classify_status_compare(ops, 0, MemorySource::Forbidden),
+        "fucomp" => classify_status_compare(ops, 1, MemorySource::Forbidden),
+        "fcompp" | "fucompp" => classify_paired_compare(ops),
+        "fcomi" | "fucomi" => classify_flag_compare(ops, false),
+        "fcomip" | "fucomip" => classify_flag_compare(ops, true),
+        "fnstsw" | "fstsw" => classify_store_status(ops),
         other => classify_arith(other, ops),
     }
 }
@@ -449,6 +597,71 @@ fn classify_store(
         format,
         pop,
     })
+}
+
+/// Whether a compare encoding has a memory form. `FCOM` / `FCOMP` do;
+/// the unordered `FUCOM` / `FUCOMP` are register-only.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MemorySource {
+    Allowed,
+    Forbidden,
+}
+
+/// `fcom` / `fcomp` / `fucom` / `fucomp` — compare `ST(0)` against the
+/// source. With no operand the source is `ST(1)`.
+fn classify_status_compare(ops: &[Operand], pops: u8, memory: MemorySource) -> Option<X87Form> {
+    let src = match ops {
+        [] => ArithSrc::Slot(1),
+        [op] if op.kind == OperandKind::Register => ArithSrc::Slot(slot_index(op)?),
+        [op] if memory == MemorySource::Allowed => {
+            ArithSrc::Memory(modellable_memory_width(op, &X87_FLOAT_SHORT_WIDTHS)?)
+        }
+        _ => return None,
+    };
+    Some(X87Form::CompareStatus { src, pops })
+}
+
+/// `fcompp` / `fucompp` — compare `ST(0)` against `ST(1)` and pop both.
+/// The encoding carries no operand.
+fn classify_paired_compare(ops: &[Operand]) -> Option<X87Form> {
+    no_operands(
+        ops,
+        X87Form::CompareStatus {
+            src: ArithSrc::Slot(1),
+            pops: 2,
+        },
+    )
+}
+
+/// `fcomi` / `fucomi` and their popping forms — register-only, and the
+/// destination operand is always `ST(0)`, so a one-operand spelling
+/// names the source directly.
+fn classify_flag_compare(ops: &[Operand], pop: bool) -> Option<X87Form> {
+    let src = match ops {
+        [src] => slot_index(src)?,
+        [_dst, src] => slot_index(src)?,
+        _ => return None,
+    };
+    Some(X87Form::CompareFlags { src, pop })
+}
+
+/// `fnstsw` / `fstsw` — the status word into `AX` or a 16-bit memory
+/// destination. The two mnemonics differ only in the `FWAIT` prefix,
+/// which is exception sequencing rather than value semantics.
+fn classify_store_status(ops: &[Operand]) -> Option<X87Form> {
+    let op = only_operand(ops)?;
+    match op.kind {
+        // The encoding has exactly one register form, and it names AX.
+        OperandKind::Register => op
+            .raw
+            .trim()
+            .eq_ignore_ascii_case("ax")
+            .then_some(X87Form::StoreStatus),
+        OperandKind::Memory => {
+            modellable_memory_width(op, &[X87_STATUS_BITS]).map(|_| X87Form::StoreStatus)
+        }
+        _ => None,
+    }
 }
 
 /// The arithmetic family, in Intel operand order.
@@ -695,6 +908,12 @@ impl LiftCtx {
                 reversed,
                 pop,
             } => self.x87_arith(insn, op, dst, src, reversed, pop),
+            X87Form::CompareStatus { src, pops } => self.x87_compare_status(insn, src, pops),
+            X87Form::CompareFlags { src, pop } => {
+                self.x87_compare_flags(src, pop);
+                Ok(())
+            }
+            X87Form::StoreStatus => self.x87_store_status(insn),
             X87Form::Exchange(index) => {
                 self.x87.exchange(index);
                 Ok(())
@@ -773,6 +992,120 @@ impl LiftCtx {
             self.x87.drop_top();
         }
         Ok(())
+    }
+
+    /// The three predicates every x87 compare is built from, over
+    /// `ST(0)` and a source, in that order.
+    ///
+    /// Identical to the SSE scalar compare's, and for the same reason:
+    /// the comparison itself is IEEE, and what differs between the two
+    /// instruction families is only where the answer is written.
+    fn x87_compare_predicates(
+        &mut self,
+        insn: &Instruction,
+        src: ArithSrc,
+    ) -> Result<Compare, X87Error> {
+        let a = as_extended(self.x87.read(0));
+        let b = as_extended(match src {
+            ArithSrc::Slot(index) => self.x87.read(index),
+            ArithSrc::Memory(width) => self.x87_memory_read(insn, width, MemFormat::Float)?,
+        });
+        Ok(Compare {
+            unordered: Expr::bool_or(Expr::fisnan(a.clone()), Expr::fisnan(b.clone())),
+            equal: Expr::feq(a.clone(), b.clone()),
+            less: Expr::flt(a, b),
+        })
+    }
+
+    /// `fcom` / `fcomp` / `fcompp` and their unordered forms — the
+    /// outcome goes into the status word's condition codes.
+    ///
+    /// SDM Vol. 2, "FCOM": greater clears C3/C2/C0, less sets C0 alone,
+    /// equal sets C3 alone, and unordered sets all three. C1 stays zero:
+    /// after a compare it signals a stack fault, and an empty stack is
+    /// already a decline here.
+    fn x87_compare_status(
+        &mut self,
+        insn: &Instruction,
+        src: ArithSrc,
+        pops: u8,
+    ) -> Result<(), X87Error> {
+        let cmp = self.x87_compare_predicates(insn, src)?;
+        let c0 = Expr::bool_or(cmp.unordered.clone(), cmp.less);
+        let c2 = cmp.unordered.clone();
+        let c3 = Expr::bool_or(cmp.unordered, cmp.equal);
+        let status = self.x87_status_word(c0, c2, c3);
+        self.assign(Var::new(X87_STATUS_REGISTER, X87_STATUS_BITS), status);
+        for _ in 0..pops {
+            self.x87.drop_top();
+        }
+        Ok(())
+    }
+
+    /// Assemble the status word around the three condition codes a
+    /// compare defines.
+    ///
+    /// Everything else in the word is left *free*: the exception flags
+    /// are sticky state this model does not carry, and TOP is the stack
+    /// pointer, which the lift-time stack deliberately does not number.
+    /// Writing zeros there would be a definite wrong answer for any
+    /// program that read them — and the idioms that matter
+    /// (`test ah, 0x41`, `sahf`) mask or ignore every free bit.
+    fn x87_status_word(&mut self, c0: Expr, c2: Expr, c3: Expr) -> Expr {
+        let free = self.x87.fresh_status();
+        let bit = |from: &Expr, index: u16| Expr::extract(from.clone(), index, index);
+        let span = |from: &Expr, hi: u16, lo: u16| Expr::extract(from.clone(), hi, lo);
+        // Assembled most-significant first: B, C3, TOP, C2, C1, C0, and
+        // the exception-flag byte.
+        Expr::concat(
+            bit(&free, X87_STATUS_BITS - 1),
+            Expr::concat(
+                c3,
+                Expr::concat(
+                    span(&free, X87_C3_BIT - 1, X87_C2_BIT + 1),
+                    Expr::concat(
+                        c2,
+                        Expr::concat(
+                            Expr::konst(0, 1),
+                            Expr::concat(c0, span(&free, X87_C0_BIT - 1, 0)),
+                        ),
+                    ),
+                ),
+            ),
+        )
+    }
+
+    /// `fcomi` / `fucomi` and their popping forms — the outcome goes
+    /// straight into EFLAGS, in the same encoding the SSE scalar
+    /// compares use, which is what lets the existing `jcc` lowering read
+    /// it unchanged. OF and SF are cleared per the SDM.
+    fn x87_compare_flags(&mut self, src: usize, pop: bool) {
+        let a = as_extended(self.x87.read(0));
+        let b = as_extended(self.x87.read(src));
+        let unordered = Expr::bool_or(Expr::fisnan(a.clone()), Expr::fisnan(b.clone()));
+        self.set_flag("PF", unordered.clone());
+        self.set_flag(
+            "ZF",
+            Expr::bool_or(unordered.clone(), Expr::feq(a.clone(), b.clone())),
+        );
+        self.set_flag("CF", Expr::bool_or(unordered, Expr::flt(a, b)));
+        self.set_flag("OF", Expr::konst(0, 1));
+        self.set_flag("SF", Expr::konst(0, 1));
+        if pop {
+            self.x87.drop_top();
+        }
+    }
+
+    /// `fnstsw` / `fstsw` — copy the status word into AX or a 16-bit
+    /// memory destination.
+    fn x87_store_status(&mut self, insn: &Instruction) -> Result<(), X87Error> {
+        let op = insn.operands.first().ok_or(X87Error::MalformedOperands)?;
+        let status = Expr::var(X87_STATUS_REGISTER, X87_STATUS_BITS);
+        if self.write_dst(op, status, X87_STATUS_BITS) {
+            Ok(())
+        } else {
+            Err(X87Error::UnwritableDestination)
+        }
     }
 
     /// The in-place unaries. Total rather than fallible: `fabs` and
