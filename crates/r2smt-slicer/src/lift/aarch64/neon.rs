@@ -136,6 +136,15 @@ enum NeonOp {
     /// `sdot` / `udot` — four byte products summed into each 32-bit
     /// destination lane, accumulated onto its prior value.
     DotProduct { signed: bool },
+    /// `tbl` / `tbx` — each destination byte selected from the table by
+    /// the corresponding index byte. `keep` marks `tbx`, which leaves
+    /// the destination byte alone where an out-of-range index makes
+    /// `tbl` write zero.
+    TableLookup { keep: bool, table_lanes: u16 },
+    /// `pmull` / `pmull2` — a carry-less polynomial multiply, whose
+    /// product is the `XOR` of the shifted multiplicand over the set
+    /// bits of the multiplier. `upper` is the `2` suffix.
+    PolynomialMultiply { upper: bool },
 }
 
 /// The by-element multiplies.
@@ -413,6 +422,9 @@ impl NeonShape {
                 ..
             } => true,
             NeonOp::ByElement { kind, .. } => kind.combines(),
+            // `tbx` preserves the destination byte for an out-of-range
+            // index; `tbl` writes zero and reads nothing.
+            NeonOp::TableLookup { keep, .. } => keep,
             _ => false,
         }
     }
@@ -450,6 +462,149 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| reduce_shape(insn, &mnemonic))
         .or_else(|| by_element_shape(insn, &mnemonic))
         .or_else(|| dot_product_shape(insn, &mnemonic))
+        .or_else(|| table_lookup_shape(insn, &mnemonic))
+        .or_else(|| polynomial_multiply_shape(insn, &mnemonic))
+}
+
+// ===================== table lookup =====================
+
+/// Ceiling on the selects one table lookup may expand into.
+///
+/// Every destination byte is an `Ite` chain over the whole table, so
+/// the formula grows as `destination bytes * table bytes` — 256 for the
+/// widest single-register form, and 1 024 for the four-register one.
+/// The bound exists so that growth is a decision rather than a
+/// surprise: past it the instruction declines, and the slicer truncates
+/// as it does for anything unmodelled.
+const TABLE_LOOKUP_SELECT_CAP: u32 = 512;
+
+/// `tbl vd.<T>, {vn.16b}, vm.<T>` and `tbx`.
+///
+/// Only the single-register table is resolved. A list of two or more is
+/// the same operand shape the structured load / store family needs and
+/// belongs with it; here it declines.
+fn table_lookup_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let keep = match mnemonic {
+        "tbl" => false,
+        "tbx" => true,
+        _ => return None,
+    };
+    if insn.operands.len() != 3 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    if destination.lane_bits != BITS_PER_BYTE {
+        return None;
+    }
+    let table = operand_arrangement(&single_register_table(insn.operands.get(1)?)?)?;
+    // A table register is always the full 128 bits, whatever the
+    // destination's arrangement.
+    if table.lane_bits != BITS_PER_BYTE || !spans_full_register(table) {
+        return None;
+    }
+    if operand_arrangement(insn.operands.get(2)?)? != destination {
+        return None;
+    }
+    let selects = u32::from(destination.lanes).checked_mul(u32::from(table.lanes))?;
+    if selects > TABLE_LOOKUP_SELECT_CAP {
+        tracing::debug!(
+            mnemonic,
+            selects,
+            cap = TABLE_LOOKUP_SELECT_CAP,
+            "declining a table lookup whose select chain exceeds the cap"
+        );
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::TableLookup {
+            keep,
+            table_lanes: table.lanes,
+        },
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+/// The one register a `{vN.16b}` table list names, as a plain register
+/// operand the SIMD readers accept.
+///
+/// Radare2 renders a register list as a single braced operand, which
+/// classifies as neither a register nor a memory reference because it
+/// is not one register name.
+pub(super) fn single_register_table(op: &Operand) -> Option<Operand> {
+    let raw = op.raw.trim().to_ascii_lowercase();
+    let body = raw.strip_prefix('{')?.strip_suffix('}')?.trim();
+    if body.contains(',') {
+        return None;
+    }
+    let operand = Operand {
+        raw: body.to_string(),
+        kind: OperandKind::Register,
+    };
+    operand_arrangement(&operand).map(|_| operand)
+}
+
+// ===================== polynomial multiply =====================
+
+/// Ceiling on the partial products one polynomial multiply may expand
+/// into, counted as `lanes * bits per multiplier`.
+///
+/// The `.1q` form -- the AES / GHASH shape, and the one that actually
+/// turns up -- is 64 partial products in a single lane, and the byte
+/// form is eight apiece across eight lanes. Both sit well inside the
+/// bound; it is here so that a wider encoding declines and says so
+/// rather than quietly emitting a formula nobody sized.
+const POLYNOMIAL_MULTIPLY_TERM_CAP: u32 = 256;
+
+/// `pmull` / `pmull2` — the carry-less product of two narrow elements.
+///
+/// The architecture encodes exactly two shapes: `8B` into `8H`, and
+/// `1D` into `1Q` under `FEAT_PMULL`. Nothing between them exists, so
+/// the narrow width is checked against that pair rather than against a
+/// range.
+fn polynomial_multiply_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (base, upper) = peel_upper(mnemonic);
+    if base != "pmull" || insn.operands.len() != 3 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    let narrow = destination.lane_bits / 2;
+    if !matches!(narrow, 8 | 64) {
+        return None;
+    }
+    let expected_lanes = if upper {
+        destination.lanes.checked_mul(2)?
+    } else {
+        destination.lanes
+    };
+    for operand in insn.operands.iter().skip(1) {
+        let arrangement = operand_arrangement(operand)?;
+        if arrangement.lane_bits != narrow || arrangement.lanes != expected_lanes {
+            return None;
+        }
+        if upper && !spans_full_register(arrangement) {
+            return None;
+        }
+    }
+    let terms = u32::from(narrow).checked_mul(u32::from(destination.lanes))?;
+    if terms > POLYNOMIAL_MULTIPLY_TERM_CAP {
+        tracing::debug!(
+            mnemonic,
+            terms,
+            cap = POLYNOMIAL_MULTIPLY_TERM_CAP,
+            "declining a polynomial multiply whose partial products exceed the cap"
+        );
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::PolynomialMultiply { upper },
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
 }
 
 // ===================== by-element multiplies =====================

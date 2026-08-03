@@ -13,7 +13,7 @@ use super::super::super::{FpArithOp, LiftCtx, fp_lane_result, fp_propagating_max
 use super::{
     AccumulateKind, AccumulateSources, BITS_PER_BYTE, ByElementKind, CompareKind, ConvertKind,
     DOT_PRODUCT_TERMS, NeonOp, NeonShape, PermuteKind, PermuteSource, ReduceKind, SaturateTo,
-    SaturatingKind, SelectRole, ShiftKind, WidenKind, operand_arrangement,
+    SaturatingKind, SelectRole, ShiftKind, WidenKind, operand_arrangement, single_register_table,
 };
 
 impl LiftCtx {
@@ -86,7 +86,116 @@ impl LiftCtx {
             } => self.reduce_lanes(insn, shape, kind, source_lanes, source_lane_bits),
             NeonOp::ByElement { kind, upper } => self.by_element_lanes(insn, shape, kind, upper),
             NeonOp::DotProduct { signed } => self.dot_product_lanes(insn, shape, signed),
+            NeonOp::TableLookup { keep, table_lanes } => {
+                self.table_lookup_lanes(insn, shape, keep, table_lanes)
+            }
+            NeonOp::PolynomialMultiply { upper } => {
+                self.polynomial_multiply_lanes(insn, shape, upper)
+            }
         }
+    }
+
+    /// `tbl` / `tbx` — each destination byte selected from the table by
+    /// the byte at the same position of the index vector.
+    ///
+    /// The chain is built with the out-of-range answer at its base and
+    /// the table entries layered over it, so an index no entry matches
+    /// falls through to that base: zero for `tbl`, the destination's
+    /// prior byte for `tbx`. The resolver caps how long the chain may
+    /// get, since it is `destination bytes * table bytes` long.
+    fn table_lookup_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        keep: bool,
+        table_lanes: u16,
+    ) -> Option<Expr> {
+        let table_operand = single_register_table(insn.operands.get(1)?)?;
+        let table_bits = table_lanes.checked_mul(BITS_PER_BYTE)?;
+        let table = self.simd_operand_value(&table_operand, table_bits)?;
+        let indices = self.widen_source(insn, 2)?;
+        let view = shape.lane_bits.checked_mul(shape.lanes)?;
+        let prior = if keep {
+            Some(self.simd_operand_value(&insn.operands.first()?.clone(), view)?)
+        } else {
+            None
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let selector = LiftCtx::extract_lane(indices.clone(), BITS_PER_BYTE, index)?;
+            let mut value = match prior.as_ref() {
+                Some(destination) => {
+                    LiftCtx::extract_lane(destination.clone(), BITS_PER_BYTE, index)?
+                }
+                None => Expr::konst(0, BITS_PER_BYTE),
+            };
+            for entry in 0..table_lanes {
+                let byte = LiftCtx::extract_lane(table.clone(), BITS_PER_BYTE, entry)?;
+                value = Expr::Ite {
+                    cond: Box::new(Expr::eq(
+                        selector.clone(),
+                        Expr::konst(u128::from(entry), BITS_PER_BYTE),
+                    )),
+                    then_expr: Box::new(byte),
+                    else_expr: Box::new(value),
+                };
+            }
+            lanes.push(value);
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// `pmull` / `pmull2` — the carry-less product of two narrow
+    /// elements, which is the `XOR` of the multiplicand shifted to
+    /// every set bit of the multiplier.
+    ///
+    /// Carry-less is the whole point: an ordinary multiply is the same
+    /// sum of shifted copies but with carries propagating between them,
+    /// so `Expr::mul` is not an approximation of this, it is a
+    /// different function. The product of two `n`-bit elements needs
+    /// `2n - 1` bits, so the destination element always holds it.
+    fn polynomial_multiply_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        upper: bool,
+    ) -> Option<Expr> {
+        let narrow = shape.lane_bits / 2;
+        let first = self.widen_source(insn, 1)?;
+        let second = self.widen_source(insn, 2)?;
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let source_lane = if upper {
+                index.checked_add(shape.lanes)?
+            } else {
+                index
+            };
+            let multiplicand = Expr::zero_ext(
+                LiftCtx::extract_lane(first.clone(), narrow, source_lane)?,
+                shape.lane_bits,
+            );
+            let multiplier = LiftCtx::extract_lane(second.clone(), narrow, source_lane)?;
+            let mut product = Expr::konst(0, shape.lane_bits);
+            for bit in 0..narrow {
+                let shifted = Expr::shl(
+                    multiplicand.clone(),
+                    Expr::konst(u128::from(bit), shape.lane_bits),
+                );
+                product = Expr::bv_xor(
+                    product,
+                    Expr::Ite {
+                        cond: Box::new(Expr::eq(
+                            Expr::extract(multiplier.clone(), bit, bit),
+                            Expr::konst(1, 1),
+                        )),
+                        then_expr: Box::new(shifted),
+                        else_expr: Box::new(Expr::konst(0, shape.lane_bits)),
+                    },
+                );
+            }
+            lanes.push(product);
+        }
+        Self::concat_lanes(lanes)
     }
 
     /// The by-element multiplies — one source element multiplied into

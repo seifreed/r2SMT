@@ -2736,14 +2736,15 @@ fn aarch64_half_width_arrangement_write_zeroes_the_upper_half() {
 
 #[test]
 fn aarch64_unmodelled_vector_mnemonic_declines() {
-    // `pmull` is a polynomial multiply — carry-less, so no combination
-    // of the integer primitives expresses it. A mnemonic no family
-    // claims must decline rather than fall into a same-width handler.
+    // `fmla` is *fused*: the product and the sum round once, together,
+    // which no combination of the IR's separate multiply and add
+    // reproduces. A mnemonic no family claims must decline rather than
+    // fall into a same-width handler.
     let i = insn(
         0x1000,
         4,
-        "pmull",
-        vec![reg("v0.8h"), reg("v1.8b"), reg("v2.8b")],
+        "fmla",
+        vec![reg("v0.4s"), reg("v1.4s"), reg("v2.4s")],
     );
     let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
     assert!(
@@ -3803,4 +3804,89 @@ fn aarch64_number_flavoured_float_reduction_still_declines() {
     // them a different mnemonic.
     assert!(neon_declines("fmaxnmv", &["s0", "v1.4s"]));
     assert!(neon_declines("fminnmv", &["s0", "v1.4s"]));
+}
+
+#[test]
+fn aarch64_table_lookup_lifts_the_single_register_form() {
+    let i = insn(
+        0x1000,
+        4,
+        "tbl",
+        vec![
+            reg("v0.8b"),
+            op("{v1.16b}", OperandKind::Unknown),
+            reg("v2.8b"),
+        ],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(stmts.as_slice(), [IrStmt::Assign { .. }]),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_table_lookup_declines_a_multi_register_table() {
+    // The list operand is the shape the structured load / store family
+    // needs and belongs with it.
+    let i = insn(
+        0x1000,
+        4,
+        "tbl",
+        vec![
+            reg("v0.16b"),
+            op("{v1.16b, v2.16b}", OperandKind::Unknown),
+            reg("v3.16b"),
+        ],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(stmts.as_slice(), [IrStmt::Unsupported { .. }]),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_table_lookup_declines_a_half_width_table() {
+    // A table register is always the full 128 bits, whatever the
+    // destination's arrangement.
+    let i = insn(
+        0x1000,
+        4,
+        "tbl",
+        vec![
+            reg("v0.8b"),
+            op("{v1.8b}", OperandKind::Unknown),
+            reg("v2.8b"),
+        ],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(stmts.as_slice(), [IrStmt::Unsupported { .. }]),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_polynomial_multiply_lifts_both_encodings() {
+    assert!(!neon_declines("pmull", &["v0.8h", "v1.8b", "v2.8b"]));
+    assert!(!neon_declines("pmull2", &["v0.8h", "v1.16b", "v2.16b"]));
+    // The AES / GHASH shape, whose destination is the one-lane 128-bit
+    // arrangement.
+    assert!(!neon_declines("pmull", &["v0.1q", "v1.1d", "v2.1d"]));
+    assert!(!neon_declines("pmull2", &["v0.1q", "v1.2d", "v2.2d"]));
+}
+
+#[test]
+fn aarch64_polynomial_multiply_declines_an_unencodable_element() {
+    // The architecture encodes `8B` into `8H` and `1D` into `1Q`, and
+    // nothing between them.
+    assert!(neon_declines("pmull", &["v0.4s", "v1.4h", "v2.4h"]));
+}
+
+#[test]
+fn aarch64_same_width_polynomial_multiply_still_declines() {
+    // `pmul` keeps the element width and is a different instruction
+    // from `pmull`; nothing claims it.
+    assert!(neon_declines("pmul", &["v0.8b", "v1.8b", "v2.8b"]));
 }

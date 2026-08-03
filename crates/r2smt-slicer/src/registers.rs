@@ -228,13 +228,20 @@ impl Arrangement {
     }
 }
 
-/// Width in bits of an ARM vector element-type letter (`b`/`h`/`s`/`d`).
+/// Width in bits of an ARM vector element-type letter.
+///
+/// `q` is a genuine element type and not only a register spelling:
+/// `pmull v0.1q, v1.1d, v2.1d` names a one-lane, 128-bit arrangement,
+/// which is the only shape a 64-by-64 carry-less product can be written
+/// in. It admits exactly one lane — `2q` would span 256 bits, which
+/// [`parse_arrangement`] rejects on total width.
 pub(crate) const fn element_type_bits(letter: char) -> Option<u16> {
     match letter {
         'b' => Some(8),
         'h' => Some(16),
         's' => Some(32),
         'd' => Some(64),
+        'q' => Some(128),
         _ => None,
     }
 }

@@ -631,3 +631,89 @@ fn fmax_of_a_positive_and_a_negative_zero_keeps_the_positive_one() {
         0,
     );
 }
+
+// ===================== table lookup and polynomial multiply =====================
+
+/// A register list, which radare2 renders as one braced operand and
+/// which classifies as neither a register nor a memory reference.
+const LIST: OperandKind = OperandKind::Unknown;
+
+/// The identity table: byte `i` holds `i`, so a looked-up byte equals
+/// the index that selected it and a wrong index is visible in the
+/// answer.
+fn identity_table() -> u128 {
+    packed(8, &(0..16).collect::<Vec<u128>>())
+}
+
+#[test]
+fn tbl_selects_the_table_byte_the_index_names() {
+    // Indices 3 and 1 select table bytes 3 and 1; index 20 is past the
+    // end of a single-register table, which `tbl` answers with zero.
+    assert_computes_mixed(
+        "tbl",
+        &[("v0.8b", REG), ("{v1.16b}", LIST), ("v2.8b", REG)],
+        &[
+            ("v1", identity_table()),
+            ("v2", packed(8, &[3, 1, 20, 0, 0, 0, 0, 0])),
+        ],
+        packed(8, &[3, 1, 0, 0, 0, 0, 0, 0]),
+    );
+}
+
+#[test]
+fn tbx_keeps_the_destination_byte_for_an_out_of_range_index() {
+    // The one difference from `tbl`, and the reason `tbx` reads its
+    // destination: byte 1's index is past the table, so the prior 0xaa
+    // survives where `tbl` would have written zero.
+    assert_computes_mixed(
+        "tbx",
+        &[("v0.8b", REG), ("{v1.16b}", LIST), ("v2.8b", REG)],
+        &[
+            ("v0", packed(8, &[0xaa; 8])),
+            ("v1", identity_table()),
+            ("v2", packed(8, &[3, 20, 0, 0, 0, 0, 0, 0])),
+        ],
+        packed(8, &[3, 0xaa, 0, 0, 0, 0, 0, 0]),
+    );
+}
+
+#[test]
+fn pmull_multiplies_without_carries() {
+    // 3 times 3 carry-less is `(3 << 0) XOR (3 << 1)` = 5. An ordinary
+    // multiply gives 9, so this is the whole contract in one lane: the
+    // two are different functions, not one an approximation of the
+    // other.
+    assert_computes(
+        "pmull",
+        &["v0.8h", "v1.8b", "v2.8b"],
+        &[("v1", packed(8, &[3])), ("v2", packed(8, &[3]))],
+        packed(16, &[5]),
+    );
+}
+
+#[test]
+fn pmull2_multiplies_the_upper_halves() {
+    // The low eight bytes are 0xff apiece so that reading them would be
+    // visible; the `2` suffix takes bytes 8..15.
+    let mut low = vec![0xffu128; 8];
+    low.push(3);
+    assert_computes(
+        "pmull2",
+        &["v0.8h", "v1.16b", "v2.16b"],
+        &[("v1", packed(8, &low)), ("v2", packed(8, &low))],
+        packed(16, &[5]),
+    );
+}
+
+#[test]
+fn pmull_of_two_doublewords_fills_the_quadword_lane() {
+    // The AES / GHASH shape. `2^63` squared carry-less is `2^126`,
+    // which only fits because the destination is the one-lane 128-bit
+    // arrangement — the reason `q` had to become a real element type.
+    assert_computes(
+        "pmull",
+        &["v0.1q", "v1.1d", "v2.1d"],
+        &[("v1", 1u128 << 63), ("v2", 1u128 << 63)],
+        1u128 << 126,
+    );
+}
