@@ -10,11 +10,12 @@ use r2smt_ir::expr::Expr;
 use r2smt_ir::program::{Instruction, Operand};
 
 use super::super::super::{FpArithOp, LiftCtx, fp_lane_result, fp_propagating_max_min};
-use super::{
-    AccumulateKind, AccumulateSources, BITS_PER_BYTE, ByElementKind, CompareKind, ConvertKind,
-    DOT_PRODUCT_TERMS, NeonOp, NeonShape, PermuteKind, PermuteSource, ReduceKind, SaturateTo,
-    SaturatingKind, SelectRole, ShiftKind, WidenKind, operand_arrangement, single_register_table,
-};
+use super::arith::{CompareKind, SaturateTo, SaturatingKind, ShiftKind};
+use super::geometry::{BITS_PER_BYTE, operand_arrangement};
+use super::multiply::{AccumulateKind, AccumulateSources, ByElementKind, DOT_PRODUCT_TERMS};
+use super::permute::{PermuteKind, PermuteSource, SelectRole, single_register_table};
+use super::width::{ConvertKind, ReduceKind, WidenKind};
+use super::{NeonOp, NeonShape};
 
 impl LiftCtx {
     /// Lower a resolved NEON instruction.
