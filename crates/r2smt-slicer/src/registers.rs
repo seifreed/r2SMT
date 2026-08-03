@@ -190,12 +190,24 @@ pub fn has_vector_arrangement(raw: &str, arch: Arch) -> bool {
     let lower = raw.trim().to_ascii_lowercase();
     if let Some(body) = lower.strip_prefix('{') {
         let first = body.split([',', '}']).next().unwrap_or_default().trim();
-        return names_vector_register(first, arch);
+        // A structured single-element list spells its lane index once,
+        // *outside* the brace (`{v0.s}[1]`), which leaves each member an
+        // incomplete spelling the register table does not resolve on its
+        // own. Its head still names a vector register, and carrying a
+        // suffix at all is what makes the list vector-shaped.
+        return names_vector_register(first, arch) || carries_vector_shape(first, arch);
     }
-    let head_len = lower
+    carries_vector_shape(&lower, arch)
+}
+
+/// Whether an operand spelling is a vector register name followed by
+/// shape of some kind — an arrangement, a lane index, or the bare
+/// element type a structured list's member carries.
+fn carries_vector_shape(spelling: &str, arch: Arch) -> bool {
+    let head_len = spelling
         .find(|c: char| !c.is_ascii_alphanumeric())
-        .unwrap_or(lower.len());
-    let (head, rest) = lower.split_at(head_len);
+        .unwrap_or(spelling.len());
+    let (head, rest) = spelling.split_at(head_len);
     !rest.is_empty() && names_vector_register(head, arch)
 }
 

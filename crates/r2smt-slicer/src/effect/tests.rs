@@ -749,6 +749,71 @@ fn aarch32_general_purpose_register_list_is_not_a_vector_shape() {
 }
 
 #[test]
+fn aarch64_contiguous_load_defines_its_listed_register() {
+    let i = insn(
+        "ld1",
+        vec![
+            op("{v0.16b}", OperandKind::Unknown),
+            op("[x8]", OperandKind::Memory),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert_eq!(effect.defs, vec!["v0"]);
+}
+
+#[test]
+fn aarch64_contiguous_store_reads_its_listed_registers() {
+    let i = insn(
+        "st1",
+        vec![
+            op("{v0.4s, v1.4s}", OperandKind::Unknown),
+            op("[x8]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).uses, vec!["x8", "v0", "v1"]);
+}
+
+#[test]
+fn aarch64_structured_load_is_a_memory_access() {
+    let i = insn(
+        "ld1",
+        vec![
+            op("{v0.16b}", OperandKind::Unknown),
+            op("[x8]", OperandKind::Memory),
+        ],
+    );
+    assert!(analyze(&i, Arch::Aarch64).has_memory_access);
+}
+
+#[test]
+fn aarch64_structured_post_index_defines_its_base_register() {
+    let i = insn(
+        "ld1",
+        vec![
+            op("{v0.16b}", OperandKind::Unknown),
+            op("[x8]", OperandKind::Memory),
+            op("16", OperandKind::Immediate),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).defs, vec!["v0", "x8"]);
+}
+
+#[test]
+fn aarch64_structured_single_element_load_reads_its_destination() {
+    // One lane is replaced and the rest of the register preserved, so
+    // the prior definition is still live.
+    let i = insn(
+        "ld1",
+        vec![
+            op("{v0.s}[1]", OperandKind::Unknown),
+            op("[x8]", OperandKind::Memory),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert!(effect.uses.contains(&"v0"), "{effect:?}");
+}
+
+#[test]
 fn aarch64_vector_register_list_is_still_a_vector_shape() {
     let i = insn(
         "st4",

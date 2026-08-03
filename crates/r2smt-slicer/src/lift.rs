@@ -42,6 +42,7 @@ mod simd;
 mod x86;
 mod x87;
 pub(crate) use aarch32::{VfpOp, neon_packed_op, vfp_scalar};
+pub(crate) use aarch64::neon::structured::StructuredEffect;
 use merge::lower_merge;
 pub(crate) use simd::{FpArithOp, PackedIntOp, PackedOp, fp_lane_result, fp_sort_bits_checked};
 pub(crate) use x86::{is_fp_compare_mnemonic, sse_scalar_move_lane};
@@ -269,6 +270,13 @@ pub(crate) enum VectorShape {
         /// accumulator's prior definition.
         reads_destination: bool,
     },
+    /// Vector-shaped, lowered, and moving bytes between the register
+    /// file and memory: the structured load / store family, whose
+    /// operand zero is a register *list*. Carried separately from
+    /// [`VectorShape::Lifted`] because a data-processing effect entry
+    /// describes neither the memory access nor a destination that is a
+    /// list.
+    LiftedMemory(StructuredEffect),
     /// Vector-shaped and not modelled. The effect table reports
     /// [`crate::effect::InstructionKind::Other`] so the slice truncates,
     /// and the dispatcher emits [`IrStmt::Unsupported`].
@@ -293,6 +301,9 @@ pub(crate) fn vector_shape(insn: &Instruction, arch: Arch) -> VectorShape {
     }
     match arch {
         Arch::Aarch64 => {
+            if let Some(access) = aarch64::neon::structured::resolve(insn) {
+                return VectorShape::LiftedMemory(access.effect());
+            }
             aarch64::neon::shape(insn).map_or(VectorShape::Declined, |shape| VectorShape::Lifted {
                 reads_destination: shape.reads_destination(),
             })

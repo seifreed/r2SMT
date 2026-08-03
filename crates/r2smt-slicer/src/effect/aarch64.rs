@@ -8,39 +8,8 @@ use r2smt_common::Arch;
 use r2smt_ir::program::Instruction;
 
 pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
-    // NEON reuses the integer and scalar-FP mnemonics (`add v0.4s`,
-    // `fadd v0.2d`), so the arrangement guard has to sit above the
-    // dispatch rather than in arms of its own — `"add"` and `"fadd"`
-    // are already claimed below. Without it the destination's
-    // arrangement makes `canonical_register` return `None` and the
-    // instruction passes with empty `defs` while its sources still
-    // resolve as `uses`: the slicer neither truncates nor keeps it, and
-    // a later read of the destination binds to a stale definition.
-    match crate::lift::vector_shape(insn, Arch::Aarch64) {
-        crate::lift::VectorShape::None => {}
-        // A packed write covers the destination's whole arrangement and
-        // zeroes the vector register above it, so the destination is a
-        // pure def — the 3-operand shape, not x86's read-modify-write
-        // one. Handled here rather than by falling through to the
-        // integer arms so that the mnemonics with no scalar `AArch64`
-        // form (`mvn`, `bic`) are classified too, without those arms
-        // newly claiming the scalar spellings the lifter does not model.
-        //
-        // An element insert is the exception: it preserves every lane it
-        // does not write, so its destination is a use as well, and the
-        // slicer has to keep whatever defined the register before it.
-        crate::lift::VectorShape::Lifted { reads_destination } => {
-            let mut effect = aarch64_arith3_effect(insn, InstructionKind::Simd, false);
-            if reads_destination {
-                for def in effect.defs.clone() {
-                    if !effect.uses.contains(&def) {
-                        effect.uses.push(def);
-                    }
-                }
-            }
-            return effect;
-        }
-        crate::lift::VectorShape::Declined => return other_effect(insn),
+    if let Some(effect) = aarch64_vector_effect(insn) {
+        return effect;
     }
     let mnemonic = insn.mnemonic.trim().to_ascii_lowercase();
     match mnemonic.as_str() {
@@ -163,6 +132,120 @@ pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
         "ldp" => aarch64_ldp_effect(insn),
         "stp" => aarch64_stp_effect(insn),
         _ => other_effect(insn),
+    }
+}
+
+/// The vector-shape guard, which has to sit above the mnemonic
+/// dispatch rather than in arms of its own.
+///
+/// NEON reuses the integer and scalar-FP mnemonics (`add v0.4s`,
+/// `fadd v0.2d`), which are already claimed below. Without the guard
+/// the destination's arrangement makes `canonical_register` return
+/// `None` and the instruction passes with empty `defs` while its
+/// sources still resolve as `uses`: the slicer neither truncates nor
+/// keeps it, and a later read of the destination binds to a stale
+/// definition.
+///
+/// `None` means no operand carries vector shape and the scalar
+/// dispatch applies.
+fn aarch64_vector_effect(insn: &Instruction) -> Option<InstructionEffect> {
+    match crate::lift::vector_shape(insn, Arch::Aarch64) {
+        crate::lift::VectorShape::None => None,
+        // A packed write covers the destination's whole arrangement and
+        // zeroes the vector register above it, so the destination is a
+        // pure def — the 3-operand shape, not x86's read-modify-write
+        // one. Handled here rather than by falling through to the
+        // integer arms so that the mnemonics with no scalar `AArch64`
+        // form (`mvn`, `bic`) are classified too, without those arms
+        // newly claiming the scalar spellings the lifter does not model.
+        //
+        // An element insert is the exception: it preserves every lane it
+        // does not write, so its destination is a use as well, and the
+        // slicer has to keep whatever defined the register before it.
+        crate::lift::VectorShape::Lifted { reads_destination } => {
+            let mut effect = aarch64_arith3_effect(insn, InstructionKind::Simd, false);
+            if reads_destination {
+                for def in effect.defs.clone() {
+                    if !effect.uses.contains(&def) {
+                        effect.uses.push(def);
+                    }
+                }
+            }
+            Some(effect)
+        }
+        // A structured load / store moves bytes rather than computing
+        // them, so its entry is the memory-shaped one: the register
+        // list on whichever side the transfer's direction puts it, the
+        // addressing registers as uses, and the base as a def when the
+        // access advances it.
+        crate::lift::VectorShape::LiftedMemory(effect) => {
+            Some(aarch64_structured_effect(insn, effect))
+        }
+        crate::lift::VectorShape::Declined => Some(other_effect(insn)),
+    }
+}
+
+/// The structured load / store family (`ld1`…`ld4`, `st1`…`st4`,
+/// `ld1r`…`ld4r`).
+///
+/// The listed registers come from the operand text rather than from the
+/// resolver: [`registers_in_operand`] already recovers every parent a
+/// brace list names, which is the same route `AArch32`'s `ldm` / `stm`
+/// entry takes. What the resolver supplies is the side each of them
+/// sits on — a single-element load reads its destinations as well as
+/// writing them, because it replaces one lane and preserves the rest.
+fn aarch64_structured_effect(
+    insn: &Instruction,
+    effect: crate::lift::StructuredEffect,
+) -> InstructionEffect {
+    let listed = insn
+        .operands
+        .first()
+        .map(|op| registers_in_operand(op, Arch::Aarch64))
+        .unwrap_or_default();
+    let addressing: Vec<&'static str> = insn
+        .operands
+        .iter()
+        .skip(1)
+        .flat_map(|op| registers_in_operand(op, Arch::Aarch64))
+        .collect();
+    let base = insn
+        .operands
+        .get(1)
+        .map(|op| registers_in_operand(op, Arch::Aarch64))
+        .unwrap_or_default();
+    let mut defs = Vec::new();
+    let mut uses = Vec::new();
+    extend_unique(&mut uses, &addressing);
+    if effect.reads_list {
+        extend_unique(&mut uses, &listed);
+    }
+    if effect.writes_list {
+        extend_unique(&mut defs, &listed);
+    }
+    if effect.writes_base {
+        extend_unique(&mut defs, &base);
+    }
+    InstructionEffect {
+        // `Mov` keeps the slicer out of the `Other`-truncation path;
+        // the memory side-effect is surfaced through
+        // `has_memory_access`, exactly as `ldr` / `str` do.
+        kind: InstructionKind::Mov,
+        defs,
+        uses,
+        defines_flags: false,
+        has_memory_access: true,
+        is_call: false,
+        reads_flags: false,
+    }
+}
+
+/// Append the registers of `from` that `into` does not already list.
+fn extend_unique(into: &mut Vec<&'static str>, from: &[&'static str]) {
+    for register in from {
+        if !into.contains(register) {
+            into.push(register);
+        }
     }
 }
 

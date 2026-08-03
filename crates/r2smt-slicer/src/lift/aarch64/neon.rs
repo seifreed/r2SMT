@@ -1282,3 +1282,4 @@ fn names_vector_register(raw: &str) -> bool {
 }
 
 mod lower;
+pub(crate) mod structured;

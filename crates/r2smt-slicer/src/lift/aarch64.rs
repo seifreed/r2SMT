@@ -9,8 +9,8 @@ use crate::registers::register_layout;
 
 use super::{
     BinOp, CsArithOp, FpArithOp, LiftCtx, MemAccess, VectorShape, Writeback,
-    aarch64_cond_suffix_to_predicate, fp_lane_result, fp_sort_bits_checked, nonzero_width,
-    vector_shape, width_mask,
+    aarch64_cond_suffix_to_predicate, constant_delta, fp_lane_result, fp_sort_bits_checked,
+    nonzero_width, vector_shape, width_mask,
 };
 use r2smt_common::Arch;
 
@@ -28,6 +28,15 @@ impl LiftCtx {
             VectorShape::Lifted { .. } => {
                 if let Some(shape) = neon::shape(insn) {
                     self.lift_neon(insn, shape);
+                }
+                return;
+            }
+            // The structured loads and stores: resolved by the same
+            // seam the effect table consulted, so the two cannot
+            // disagree about which of them the slicer may retain.
+            VectorShape::LiftedMemory(_) => {
+                if let Some(access) = neon::structured::resolve(insn) {
+                    self.lift_structured(insn, &access);
                 }
                 return;
             }
@@ -769,16 +778,19 @@ fn aarch64_mem_access(mem: &Operand, post: Option<&Operand>, ptr_bits: u16) -> O
     }
     let (base, offset) = parse_aarch64_memory(raw)?;
     let parent = aarch64_base_parent(&base);
-    // Post-index: `[Xn], #imm` — bare base plus a trailing immediate
-    // operand; address is Xn, then Xn := Xn+imm.
+    // Post-index: `[Xn], #imm` or `[Xn], Xm` — a bare base plus a
+    // trailing operand; the address is Xn, and Xn is then advanced by
+    // that operand. Returning `None` for a trailing operand we cannot
+    // read is what keeps the base update from being silently dropped.
     if let Some(op) = post
-        && op.kind == OperandKind::Immediate
         && offset == 0
     {
-        let delta = parse_signed_immediate(op.raw.strip_prefix('#').unwrap_or(&op.raw).trim())?;
         return Some(MemAccess {
             address: Expr::Var(Var::new(parent, ptr_bits)),
-            writeback: Some(Writeback::by_constant(parent, delta, ptr_bits)),
+            writeback: Some(Writeback {
+                base: parent.to_string(),
+                delta: aarch64_post_index_delta(op, ptr_bits)?,
+            }),
         });
     }
     Some(MemAccess {
@@ -786,6 +798,39 @@ fn aarch64_mem_access(mem: &Operand, post: Option<&Operand>, ptr_bits: u16) -> O
         writeback: None,
     })
 }
+
+/// The amount a post-index operand advances the base register by.
+///
+/// An immediate is the scalar forms' fixed stride. A register is the
+/// structured accesses' variable one (`ld1 {v0.16b}, [x0], x3`), which
+/// no constant can express — it is the reason a writeback delta is an
+/// expression at all. Only the 64-bit spelling is accepted: the
+/// architecture encodes no narrower post-index register, and widening
+/// one would invent a zero extension the instruction never performs.
+///
+/// The zero register declines rather than reading free bits: `Rm = 31`
+/// selects the *immediate* form in the encoding, so the spelling cannot
+/// arise, and a free `xzr` would model an unknown stride where the
+/// architecture has none.
+fn aarch64_post_index_delta(op: &Operand, ptr_bits: u16) -> Option<Expr> {
+    match op.kind {
+        OperandKind::Immediate => {
+            let raw = op.raw.strip_prefix('#').unwrap_or(&op.raw).trim();
+            let delta = parse_signed_immediate(raw)?;
+            Some(constant_delta(delta, ptr_bits))
+        }
+        OperandKind::Register => {
+            let layout = register_layout(&op.raw, r2smt_common::Arch::Aarch64)?;
+            let usable =
+                layout.parent != ZERO_REGISTER && layout.lo == 0 && layout.width() == ptr_bits;
+            usable.then(|| Expr::Var(Var::new(layout.parent, ptr_bits)))
+        }
+        _ => None,
+    }
+}
+
+/// Canonical parent name of the `AArch64` zero register.
+const ZERO_REGISTER: &str = "xzr";
 
 /// The canonical parent register name for an addressing base.
 fn aarch64_base_parent(base: &str) -> &str {
