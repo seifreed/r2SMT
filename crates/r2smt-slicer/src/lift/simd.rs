@@ -92,6 +92,26 @@ pub(crate) enum PackedOp {
         /// `vmls` subtracts the product where `vmla` adds it.
         subtract: bool,
     },
+    /// A shift whose amount is the same for every lane, taken from the
+    /// instruction's last operand rather than from a vector register.
+    ///
+    /// `left` is `vshl`; the right-shifting forms are `vshr` and, when
+    /// they add the shifted value into the destination, `vsra`.
+    ShiftImmediate {
+        /// Direction. A left shift needs no signedness — the bits it
+        /// discards are the same either way.
+        left: bool,
+        /// Whether a right shift replicates the sign bit.
+        signed: bool,
+        /// `vsra` adds the shifted lane into the destination.
+        accumulate: bool,
+    },
+    /// `vshl` with a per-lane amount read from a vector register, whose
+    /// *sign* chooses the direction.
+    ShiftRegister {
+        /// Whether a right shift replicates the sign bit.
+        signed: bool,
+    },
 }
 
 impl PackedOp {
@@ -362,6 +382,42 @@ fn halving_lane(
     };
     let halved = Expr::ashr(exact, wide_const(1, wide)?);
     Some(Expr::extract(halved, bits - 1, 0))
+}
+
+/// Width of the amount field a register-form vector shift reads.
+const SHIFT_AMOUNT_BITS: u16 = 8;
+
+/// A right shift of one lane, replicating the sign bit or not.
+fn shift_right_lane(signed: bool, value: Expr, amount: Expr) -> Expr {
+    if signed {
+        Expr::ashr(value, amount)
+    } else {
+        Expr::lshr(value, amount)
+    }
+}
+
+/// One destination lane of a register-form vector shift.
+///
+/// Only the low byte of the amount element is read, as a signed value
+/// whose sign chooses the direction — so both directions are built and
+/// an `Ite` picks between them. An out-of-range amount needs no special
+/// case: a bit-vector shift wider than the element already yields zero,
+/// or all sign bits for the arithmetic right shift, which is what the
+/// architecture specifies.
+fn shift_register_lane(signed: bool, value: Expr, raw_amount: Expr, bits: u16) -> Expr {
+    let amount = if bits > SHIFT_AMOUNT_BITS {
+        Expr::sign_ext(Expr::extract(raw_amount, SHIFT_AMOUNT_BITS - 1, 0), bits)
+    } else {
+        raw_amount
+    };
+    let left = Expr::shl(value.clone(), amount.clone());
+    let opposite = Expr::sub(Expr::konst(0, bits), amount.clone());
+    let right = shift_right_lane(signed, value, opposite);
+    Expr::Ite {
+        cond: Box::new(Expr::slt(amount, Expr::konst(0, bits))),
+        then_expr: Box::new(right),
+        else_expr: Box::new(left),
+    }
 }
 
 /// One destination lane of a multiply-accumulate.
@@ -750,6 +806,79 @@ impl LiftCtx {
         Self::concat_lanes(lanes)
     }
 
+    /// A whole-vector shift by an amount every lane shares.
+    ///
+    /// The amount operand is deliberately kept out of the view
+    /// resolution: it is an immediate, not a vector, and reading it at
+    /// the *lane* width is what lets it flow straight into the shift
+    /// node the solver then constant-folds.
+    fn packed_shift_immediate_result(
+        &mut self,
+        dst: &Operand,
+        a_op: &Operand,
+        amount_op: &Operand,
+        shape: PackedOp,
+        lane_bits: u16,
+    ) -> Option<Expr> {
+        let PackedOp::ShiftImmediate {
+            left,
+            signed,
+            accumulate,
+        } = shape
+        else {
+            return None;
+        };
+        let view = self.simd_instruction_view_bits(&[dst, a_op])?;
+        let count = Self::packed_lane_count(view, lane_bits)?;
+        let a_val = self.simd_operand_value(a_op, view)?;
+        let acc_val = if accumulate {
+            Some(self.simd_operand_value(dst, view)?)
+        } else {
+            None
+        };
+        let amount = self.read_operand_at(amount_op, lane_bits);
+        let mut lanes = Vec::with_capacity(usize::from(count));
+        for index in 0..count {
+            let a = Self::extract_lane(a_val.clone(), lane_bits, index)?;
+            let shifted = if left {
+                Expr::shl(a, amount.clone())
+            } else {
+                shift_right_lane(signed, a, amount.clone())
+            };
+            lanes.push(match acc_val.as_ref() {
+                Some(value) => Expr::add(
+                    Self::extract_lane(value.clone(), lane_bits, index)?,
+                    shifted,
+                ),
+                None => shifted,
+            });
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// A whole-vector shift whose amount is itself a vector, one
+    /// element per lane.
+    fn packed_shift_register_result(
+        &mut self,
+        dst: &Operand,
+        a_op: &Operand,
+        amount_op: &Operand,
+        signed: bool,
+        lane_bits: u16,
+    ) -> Option<Expr> {
+        let view = self.simd_instruction_view_bits(&[dst, a_op, amount_op])?;
+        let count = Self::packed_lane_count(view, lane_bits)?;
+        let a_val = self.simd_operand_value(a_op, view)?;
+        let amount_val = self.simd_operand_value(amount_op, view)?;
+        let mut lanes = Vec::with_capacity(usize::from(count));
+        for index in 0..count {
+            let a = Self::extract_lane(a_val.clone(), lane_bits, index)?;
+            let amount = Self::extract_lane(amount_val.clone(), lane_bits, index)?;
+            lanes.push(shift_register_lane(signed, a, amount, lane_bits));
+        }
+        Self::concat_lanes(lanes)
+    }
+
     /// Lower one packed ARM vector data-processing instruction: the same
     /// lane operation applied independently to every lane of the
     /// destination's view.
@@ -785,6 +914,18 @@ impl LiftCtx {
             PackedOp::Int(int) => self.packed_int_result(dst, a_op, b_op, int, lane_bits),
             PackedOp::Accumulate { float, subtract } => match b_op {
                 Some(b) => self.packed_accumulate_result(dst, a_op, b, float, subtract, lane_bits),
+                None => None,
+            },
+            PackedOp::ShiftImmediate { .. } => match b_op {
+                Some(amount) => {
+                    self.packed_shift_immediate_result(dst, a_op, amount, op, lane_bits)
+                }
+                None => None,
+            },
+            PackedOp::ShiftRegister { signed } => match b_op {
+                Some(amount) => {
+                    self.packed_shift_register_result(dst, a_op, amount, signed, lane_bits)
+                }
                 None => None,
             },
         };

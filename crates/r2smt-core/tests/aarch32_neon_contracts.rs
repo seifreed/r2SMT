@@ -41,10 +41,22 @@ const VECTOR_BITS: u16 = 128;
 const F32_ONE: u128 = 0x3f80_0000;
 const F32_MINUS_ONE: u128 = 0xbf80_0000;
 
+/// Classify a fixture operand the way the radare2 adapter's parser
+/// does: anything starting with a digit is an immediate, everything
+/// else names a register.
+///
+/// `AArch32` NEON shift counts matter here — radare2 prints them bare
+/// (`vshl.i32 q0, q1, 3`), and in hex once they reach `0x10`, rather
+/// than with the manual's `#`.
 fn operand(raw: &str) -> Operand {
+    let kind = if raw.starts_with(|c: char| c.is_ascii_digit()) {
+        OperandKind::Immediate
+    } else {
+        OperandKind::Register
+    };
     Operand {
         raw: raw.into(),
-        kind: OperandKind::Register,
+        kind,
     }
 }
 
@@ -436,6 +448,122 @@ fn vhsub_unsigned_halves_a_negative_difference() {
     // unsigned element type describes the *operands*, not the exact
     // difference, which can still be negative.
     assert_computes("vhsub.u8", &QUADS, &[("v1", 1), ("v2", 2)], 0xff);
+}
+
+// ---------------------------------------------------------------
+// `vshl` / `vshr` / `vsra` — shifts
+// ---------------------------------------------------------------
+
+#[test]
+fn vshl_immediate_shifts_every_lane_left() {
+    // Two lanes with different values, so a lowering that shifted the
+    // whole view as one number would carry across the lane boundary
+    // and fail here.
+    assert_computes(
+        "vshl.i32",
+        &["q0", "q1", "4"],
+        &[("v1", 0x0000_0003_8000_0001)],
+        0x0000_0030_0000_0010,
+    );
+}
+
+#[test]
+fn vshr_signed_replicates_the_sign_bit() {
+    // `0xfffffff0 >> 2` arithmetic is `0xfffffffc`.
+    assert_computes(
+        "vshr.s32",
+        &["q0", "q1", "2"],
+        &[("v1", 0xffff_fff0)],
+        0xffff_fffc,
+    );
+}
+
+#[test]
+fn vshr_unsigned_shifts_zeroes_in() {
+    // The teeth: the same bytes under the unsigned encoding give
+    // `0x3ffffffc`. Arithmetic against logical is the whole difference
+    // between these two mnemonics.
+    assert_computes(
+        "vshr.u32",
+        &["q0", "q1", "2"],
+        &[("v1", 0xffff_fff0)],
+        0x3fff_fffc,
+    );
+}
+
+#[test]
+fn vshr_unsigned_accepts_a_shift_of_the_whole_element() {
+    // `VSHR`'s immediate range is `1..=esize`, so a shift by 32 of a
+    // 32-bit element is a real encoding — and radare2 prints it in hex
+    // (`0x20`), not decimal. The result is zero.
+    assert_computes("vshr.u32", &["q0", "q1", "0x20"], &[("v1", 0xffff_ffff)], 0);
+}
+
+#[test]
+fn vsra_adds_the_shifted_value_into_the_destination() {
+    // `vsra` is `vshr` plus an accumulate: `0x10 + (0x40 >> 2)` is
+    // `0x20`. A lowering that overwrote instead would give `0x10`.
+    assert_computes(
+        "vsra.u32",
+        &["q0", "q1", "2"],
+        &[("v0", 0x10), ("v1", 0x40)],
+        0x20,
+    );
+}
+
+#[test]
+fn vshl_register_shifts_left_on_a_positive_amount() {
+    assert_computes("vshl.u32", &QUADS, &[("v1", 1), ("v2", 4)], 0x10);
+}
+
+#[test]
+fn vshl_register_shifts_right_on_a_negative_amount() {
+    // The register form reads a *signed* amount whose sign chooses the
+    // direction — the one thing that separates it from the immediate
+    // encoding beyond where the count comes from. `0xff` is `-1`.
+    assert_computes("vshl.u32", &QUADS, &[("v1", 0x10), ("v2", 0xff)], 8);
+}
+
+#[test]
+fn vshl_register_reads_only_the_low_byte_of_the_amount() {
+    // The architecture takes the amount from the element's low byte.
+    // Reading the whole element would make `0x100` a shift by 256 —
+    // zero — instead of by nothing.
+    assert_computes("vshl.u32", &QUADS, &[("v1", 7), ("v2", 0x100)], 7);
+}
+
+#[test]
+fn vshl_register_signedness_selects_the_right_shift_kind() {
+    // The same negative amount, the same value, and the two element
+    // classes disagree — which is what the signed flag is for.
+    assert_computes(
+        "vshl.s32",
+        &QUADS,
+        &[("v1", 0xffff_fff0), ("v2", 0xff)],
+        0xffff_fff8,
+    );
+}
+
+#[test]
+fn vshl_rejects_a_register_amount_under_the_immediate_encoding() {
+    // The element class alone tells `VSHL`'s two encodings apart, so
+    // an untyped mnemonic beside a register amount is not an
+    // instruction. Lifting it would read a vector register as a count.
+    assert!(declines("vshl.i32", &QUADS));
+}
+
+#[test]
+fn vshl_rejects_an_immediate_amount_under_the_register_encoding() {
+    assert!(declines("vshl.s32", &["q0", "q1", "4"]));
+}
+
+#[test]
+fn vshr_rejects_the_untyped_element_spelling() {
+    // Arithmetic against logical is the whole distinction, so there is
+    // nothing for an untyped right shift to mean and no encoding for
+    // one.
+    assert!(declines("vshr.i32", &["q0", "q1", "2"]));
+    assert!(declines("vsra.i32", &["q0", "q1", "2"]));
 }
 
 // ---------------------------------------------------------------

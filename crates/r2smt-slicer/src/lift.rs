@@ -41,7 +41,7 @@ mod merge;
 mod simd;
 mod x86;
 mod x87;
-pub(crate) use aarch32::{VfpOp, neon_packed_op, vfp_scalar};
+pub(crate) use aarch32::{VfpOp, is_aarch32_packed_instruction, vfp_scalar};
 use merge::lower_merge;
 pub(crate) use simd::{FpArithOp, PackedIntOp, PackedOp, fp_lane_result, fp_sort_bits_checked};
 pub(crate) use x86::{is_fp_compare_mnemonic, sse_scalar_move_lane};

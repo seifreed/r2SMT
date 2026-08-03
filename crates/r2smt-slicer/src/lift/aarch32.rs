@@ -725,6 +725,9 @@ pub(crate) fn neon_packed_op(mnemonic: &str) -> Option<(PackedOp, u16)> {
     if let Some(op) = neon_accumulate_op(base, kind) {
         return Some((op, lane_bits));
     }
+    if let Some(op) = neon_shift_op(base, kind) {
+        return Some((op, lane_bits));
+    }
     let op = match kind {
         ElementKind::Float => neon_float_op(base)?,
         _ => PackedOp::Int(neon_integer_op(base, kind)?),
@@ -749,6 +752,45 @@ fn neon_accumulate_op(base: &str, kind: ElementKind) -> Option<PackedOp> {
     Some(PackedOp::Accumulate {
         float: kind == ElementKind::Float,
         subtract,
+    })
+}
+
+/// The shift family, whose *element class* selects the encoding rather
+/// than merely describing the lanes.
+///
+/// `VSHL` has two encodings and the type tells them apart: the untyped
+/// `vshl.i32 q0, q1, 3` takes an immediate, and the signed or unsigned
+/// `vshl.s32 q0, q1, q2` takes a per-lane amount from a register whose
+/// sign chooses the direction. The right-shifting `vshr` and `vsra`
+/// have only the immediate encoding, and only in the signed and
+/// unsigned classes — arithmetic against logical is the whole
+/// distinction, so there is nothing for an untyped form to mean.
+fn neon_shift_op(base: &str, kind: ElementKind) -> Option<PackedOp> {
+    let signed = match kind {
+        ElementKind::Signed => true,
+        ElementKind::Unsigned => false,
+        ElementKind::Untyped => {
+            return (base == "vshl").then_some(PackedOp::ShiftImmediate {
+                left: true,
+                signed: false,
+                accumulate: false,
+            });
+        }
+        ElementKind::Float => return None,
+    };
+    Some(match base {
+        "vshl" => PackedOp::ShiftRegister { signed },
+        "vshr" => PackedOp::ShiftImmediate {
+            left: false,
+            signed,
+            accumulate: false,
+        },
+        "vsra" => PackedOp::ShiftImmediate {
+            left: false,
+            signed,
+            accumulate: true,
+        },
+        _ => return None,
     })
 }
 
@@ -865,11 +907,49 @@ impl LiftCtx {
     fn neon_packed_shape(&self, insn: &Instruction) -> Option<(PackedOp, u16)> {
         let mnem = insn.mnemonic.trim().to_ascii_lowercase();
         let (op, lane_bits) = neon_packed_op(&mnem)?;
-        if insn.operands.len() != op.operand_count() {
+        if insn.operands.len() != op.operand_count() || !neon_last_operand_fits(insn, op) {
             return None;
         }
         let view = self.simd_view_bits(insn.operands.first()?)?;
         (Self::packed_lane_count(view, lane_bits)? > 1).then_some((op, lane_bits))
+    }
+}
+
+/// Whether `insn` carries a packed NEON form in an operand shape the
+/// lifter accepts.
+///
+/// Instruction-taking rather than mnemonic-taking because the shift
+/// family's two encodings differ in operand *kind* rather than in
+/// spelling, and the effect table has to answer this exactly as the
+/// lifter does. It deliberately does **not** ask how many lanes the
+/// destination holds: a single-lane destination means the scalar
+/// handler owns the instruction, which is a different answer from "this
+/// is not an instruction".
+pub(crate) fn is_aarch32_packed_instruction(insn: &Instruction) -> bool {
+    let mnem = insn.mnemonic.trim().to_ascii_lowercase();
+    let Some((op, _)) = neon_packed_op(&mnem) else {
+        return false;
+    };
+    insn.operands.len() == op.operand_count() && neon_last_operand_fits(insn, op)
+}
+
+/// Whether the instruction's final operand is the kind its resolved
+/// shape reads.
+///
+/// Only the shift family makes this question interesting, and there it
+/// is load-bearing rather than defensive: the immediate and register
+/// encodings of `vshl` are told apart by the element class alone, so a
+/// mnemonic whose class says "immediate" beside a register operand is
+/// not an instruction, and lifting it would read a vector register as a
+/// shift count.
+fn neon_last_operand_fits(insn: &Instruction, op: PackedOp) -> bool {
+    let Some(last) = insn.operands.last() else {
+        return false;
+    };
+    match op {
+        PackedOp::ShiftImmediate { .. } => last.kind == OperandKind::Immediate,
+        PackedOp::ShiftRegister { .. } => last.kind == OperandKind::Register,
+        _ => true,
     }
 }
 
