@@ -14,6 +14,7 @@ use r2smt_ir::stmt::IrStmt;
 
 use crate::lift::LiftCtx;
 
+use super::permute::{PairKind, PairSource, paired_source};
 use super::{BITS_PER_BYTE, NeonOp, NeonShape};
 
 impl LiftCtx {
@@ -23,6 +24,10 @@ impl LiftCtx {
         insn: &Instruction,
         shape: NeonShape,
     ) {
+        if let NeonOp::PermutePair(kind) = shape.op {
+            self.lift_aarch32_permute_pair(insn, shape, kind);
+            return;
+        }
         let Some(destination) = insn.operands.first().cloned() else {
             self.push_aarch32_neon_unsupported(insn);
             return;
@@ -48,7 +53,78 @@ impl LiftCtx {
                 self.aarch32_reverse_lanes(insn, shape, container_bits)
             }
             NeonOp::Duplicate => self.aarch32_duplicate_lanes(insn, shape),
+            // Handled by the caller; it writes two destinations and so
+            // does not fit the one-value contract here.
+            NeonOp::PermutePair(_) => None,
         }
+    }
+
+    /// `vzip` / `vuzp` / `vtrn` — one permutation, two destinations.
+    ///
+    /// The second result is stashed in a temp **before** the first
+    /// destination is written, and that is load-bearing rather than
+    /// tidy. Both results read both operands, and SSA renames by
+    /// statement position, not by when the expression was built: an
+    /// assignment to the second register placed after the first would
+    /// have its reference to the first register rewritten to the
+    /// freshly permuted value. The temp pins the read to the original.
+    ///
+    /// Same hazard, and same remedy, as the flag-ordering invariant on
+    /// the integer side, where a flag-setting instruction whose
+    /// destination overlaps a source stashes the delta before the write.
+    fn lift_aarch32_permute_pair(&mut self, insn: &Instruction, shape: NeonShape, kind: PairKind) {
+        let (Some(first_operand), Some(second_operand)) = (
+            insn.operands.first().cloned(),
+            insn.operands.get(1).cloned(),
+        ) else {
+            self.push_aarch32_neon_unsupported(insn);
+            return;
+        };
+        let Some((into_first, into_second)) = self.aarch32_paired_values(insn, shape, kind) else {
+            self.push_aarch32_neon_unsupported(insn);
+            return;
+        };
+        let Some(view) = shape.view_bits() else {
+            self.push_aarch32_neon_unsupported(insn);
+            return;
+        };
+        let stashed = self.new_temp(insn.address, view);
+        self.assign(stashed.clone(), into_second);
+        // Only the *value* has to predate the first write. The splice
+        // inside the second write reads the parent as the first
+        // assignment left it, which is what keeps `vzip.8 d0, d1` — two
+        // halves of one register — from clobbering the half just
+        // written.
+        if !self.write_simd_dst(&first_operand, into_first, false)
+            || !self.write_simd_dst(&second_operand, Expr::Var(stashed), false)
+        {
+            self.push_aarch32_neon_unsupported(insn);
+        }
+    }
+
+    /// The two register values a paired permutation produces.
+    fn aarch32_paired_values(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        kind: PairKind,
+    ) -> Option<(Expr, Expr)> {
+        let view = shape.view_bits()?;
+        let first = self.simd_operand_value(&insn.operands.first()?.clone(), view)?;
+        let second = self.simd_operand_value(&insn.operands.get(1)?.clone(), view)?;
+        let build = |into_second: bool| {
+            let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+            for index in 0..shape.lanes {
+                let (which, source_lane) = paired_source(kind, index, into_second, shape.lanes)?;
+                let value = match which {
+                    PairSource::First => first.clone(),
+                    PairSource::Second => second.clone(),
+                };
+                lanes.push(Self::extract_lane(value, shape.lane_bits, source_lane)?);
+            }
+            Self::concat_lanes(lanes)
+        };
+        Some((build(false)?, build(true)?))
     }
 
     /// `vext` — the two sources laid end to end, read from a byte

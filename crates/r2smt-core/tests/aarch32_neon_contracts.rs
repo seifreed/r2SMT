@@ -97,19 +97,23 @@ fn solve_lowering(
         .iter()
         .map(|(name, value)| (*name, *value, VECTOR_BITS))
         .collect();
-    solve_lowering_at_widths(mnemonic, operands, &bindings, expected)
+    solve_lowering_at_widths(mnemonic, operands, &bindings, "v0", expected)
 }
 
 /// [`solve_lowering`], but each binding names the width its variable
-/// actually holds.
+/// holds and the assertion names the register to inspect.
 ///
-/// `vdup` is why this exists: its source is a general-purpose register,
-/// which the lifter reads at 32 bits, so binding it at the vector
-/// parent's width would make the slice contradict itself.
+/// `vdup` is why the widths are explicit: its source is a
+/// general-purpose register, which the lifter reads at 32 bits, so
+/// binding it at the vector parent's width would make the slice
+/// contradict itself. `vzip` is why the destination is explicit: it
+/// writes two registers, and checking only the first would let a wrong
+/// second result pass.
 fn solve_lowering_at_widths(
     mnemonic: &str,
     operands: &[&str],
     sources: &[(&str, u128, u16)],
+    destination: &str,
     expected: u128,
 ) -> SmtResult {
     let insn = Instruction {
@@ -143,7 +147,7 @@ fn solve_lowering_at_widths(
         branch: branch(),
         statements,
         condition: Expr::eq(
-            Expr::Var(Var::new("v0", VECTOR_BITS)),
+            Expr::Var(Var::new(destination, VECTOR_BITS)),
             Expr::konst(expected, VECTOR_BITS),
         ),
         status: SliceStatus::Complete,
@@ -174,9 +178,29 @@ fn assert_computes_at_widths(
     expected: u128,
 ) {
     assert_eq!(
-        solve_lowering_at_widths(mnemonic, operands, sources, expected),
+        solve_lowering_at_widths(mnemonic, operands, sources, "v0", expected),
         SmtResult::AlwaysTrue,
         "{mnemonic} {operands:?} with {sources:x?} should give {expected:#x}"
+    );
+}
+
+/// Assert what `mnemonic` leaves in a named register, for the forms
+/// whose result is not all in `v0`.
+fn assert_computes_into(
+    mnemonic: &str,
+    operands: &[&str],
+    sources: &[(&str, u128)],
+    destination: &str,
+    expected: u128,
+) {
+    let bindings: Vec<(&str, u128, u16)> = sources
+        .iter()
+        .map(|(name, value)| (*name, *value, VECTOR_BITS))
+        .collect();
+    assert_eq!(
+        solve_lowering_at_widths(mnemonic, operands, &bindings, destination, expected),
+        SmtResult::AlwaysTrue,
+        "{mnemonic} {operands:?} with {sources:x?} should leave {expected:#x} in {destination}"
     );
 }
 
@@ -927,13 +951,148 @@ fn vdup_declines_the_element_source_spelling() {
     assert!(declines("vdup.32", &["q0", "d2[1]"]));
 }
 
+// ---------------------------------------------------------------
+// The permutations that rewrite both named registers
+//
+// One AArch32 `vzip` does the work AArch64 splits across `zip1` and
+// `zip2`, writing both of its operands. Every test below therefore
+// comes in a pair, one per destination: checking only the first would
+// let a wrong second result through, and the second is exactly the half
+// a single-destination port would forget to write.
+// ---------------------------------------------------------------
+
 #[test]
-fn the_two_destination_permutations_still_decline() {
-    // `vzip` / `vuzp` / `vtrn` write *both* named registers on AArch32,
-    // unlike AArch64's single-destination `zip1` / `zip2`, so they need
-    // an effect entry naming two definitions rather than the shared one
-    // every family above uses.
-    assert!(declines("vzip.8", &QUAD_PAIR));
-    assert!(declines("vuzp.16", &QUAD_PAIR));
-    assert!(declines("vtrn.32", &QUAD_PAIR));
+fn vzip_interleaves_the_low_halves_into_the_first_register() {
+    // Laid end to end the two registers make one alternating sequence;
+    // the first destination takes its low half, so byte `2e` comes from
+    // the first source and `2e+1` from the second.
+    assert_computes(
+        "vzip.8",
+        &QUAD_PAIR,
+        &[("v0", BYTE_RAMP), ("v1", BYTE_RAMP_HIGH)],
+        0x1707_1606_1505_1404_1303_1202_1101_1000,
+    );
+}
+
+#[test]
+fn vzip_interleaves_the_high_halves_into_the_second_register() {
+    // The other half of the same instruction: the second destination
+    // takes the sequence's high half, starting at each source's element
+    // 8. A port that wrote only the first register leaves this one
+    // holding its input.
+    assert_computes_into(
+        "vzip.8",
+        &QUAD_PAIR,
+        &[("v0", BYTE_RAMP), ("v1", BYTE_RAMP_HIGH)],
+        "v1",
+        0x1f0f_1e0e_1d0d_1c0c_1b0b_1a0a_1909_1808,
+    );
+}
+
+#[test]
+fn vuzp_collects_the_even_elements_into_the_first_register() {
+    // The inverse of `vzip`: the first destination takes every even
+    // element of the concatenation — the first source's, then the
+    // second's.
+    assert_computes(
+        "vuzp.8",
+        &QUAD_PAIR,
+        &[("v0", BYTE_RAMP), ("v1", BYTE_RAMP_HIGH)],
+        0x1e1c_1a18_1614_1210_0e0c_0a08_0604_0200,
+    );
+}
+
+#[test]
+fn vuzp_collects_the_odd_elements_into_the_second_register() {
+    assert_computes_into(
+        "vuzp.8",
+        &QUAD_PAIR,
+        &[("v0", BYTE_RAMP), ("v1", BYTE_RAMP_HIGH)],
+        "v1",
+        0x1f1d_1b19_1715_1311_0f0d_0b09_0705_0301,
+    );
+}
+
+#[test]
+fn vtrn_swaps_each_odd_element_with_the_even_one_beside_it() {
+    // A 2x2 transpose: even elements of the first register stay put and
+    // the odd ones take the second register's even elements. Distinct
+    // from `vzip` on the same inputs, which is the point of testing
+    // both against one byte ramp.
+    assert_computes(
+        "vtrn.8",
+        &QUAD_PAIR,
+        &[("v0", BYTE_RAMP), ("v1", BYTE_RAMP_HIGH)],
+        0x1e0e_1c0c_1a0a_1808_1606_1404_1202_1000,
+    );
+}
+
+#[test]
+fn vtrn_moves_the_first_registers_odd_elements_into_the_second() {
+    assert_computes_into(
+        "vtrn.8",
+        &QUAD_PAIR,
+        &[("v0", BYTE_RAMP), ("v1", BYTE_RAMP_HIGH)],
+        "v1",
+        0x1f0f_1d0d_1b0b_1909_1707_1505_1303_1101,
+    );
+}
+
+#[test]
+fn a_paired_permutation_finishes_reading_before_it_starts_writing() {
+    // `d0` and `d1` are the low and high halves of the *same* parent,
+    // so this is the case that catches a lowering which materialises
+    // its second result after performing the first write: it would read
+    // the freshly zipped low half back as if it were the input. Both
+    // results here are functions of the original `v0` alone.
+    assert_computes(
+        "vzip.8",
+        &["d0", "d1"],
+        &[("v0", BYTE_RAMP)],
+        0x0f07_0e06_0d05_0c04_0b03_0a02_0901_0800,
+    );
+}
+
+#[test]
+fn vtrn_on_two_element_registers_is_a_single_swap() {
+    // `vtrn.32 d0, d2` holds two elements per register, so the
+    // transpose reduces to exchanging one element each way. The high
+    // half of `v0` is untouched.
+    assert_computes(
+        "vtrn.32",
+        &["d0", "d2"],
+        &[("v0", 0xaaaa_aaaa_1111_1111), ("v1", 0xbbbb_bbbb_2222_2222)],
+        0x2222_2222_1111_1111,
+    );
+}
+
+#[test]
+fn vtrn_on_two_element_registers_puts_the_other_pair_in_the_second() {
+    assert_computes_into(
+        "vtrn.32",
+        &["d0", "d2"],
+        &[("v0", 0xaaaa_aaaa_1111_1111), ("v1", 0xbbbb_bbbb_2222_2222)],
+        "v1",
+        0xbbbb_bbbb_aaaa_aaaa,
+    );
+}
+
+#[test]
+fn vzip_declines_where_a_register_holds_only_two_elements() {
+    // `VZIP.32 Dd, Dm` is UNDEFINED: with one element per half the
+    // operation degenerates to the swap `vtrn.32` spells, and an
+    // assembler accepting the spelling emits `VTRN`. Modelling it as a
+    // zip would compute a different permutation from the one the
+    // hardware runs.
+    assert!(declines("vzip.32", &["d0", "d2"]));
+    assert!(declines("vuzp.32", &["d0", "d2"]));
+}
+
+#[test]
+fn the_paired_permutations_decline_a_doubleword_element() {
+    // UNDEFINED at that size for all three, whatever the register
+    // class.
+    assert!(declines("vzip.64", &QUAD_PAIR));
+    assert!(declines("vuzp.64", &QUAD_PAIR));
+    assert!(declines("vtrn.64", &QUAD_PAIR));
 }

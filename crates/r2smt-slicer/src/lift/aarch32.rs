@@ -937,6 +937,17 @@ pub(crate) fn is_aarch32_neon_instruction(insn: &Instruction) -> bool {
     neon::resolve(insn).is_some()
 }
 
+/// Whether `insn` is a NEON form that writes both of its named
+/// registers — `vzip` / `vuzp` / `vtrn`.
+///
+/// The effect table needs this separately from
+/// [`is_aarch32_neon_instruction`]: a second destination recorded only
+/// as a use would let the slicer drop whatever defined it, leaving a
+/// later read bound to a stale value.
+pub(crate) fn aarch32_neon_writes_operand_pair(insn: &Instruction) -> bool {
+    neon::writes_operand_pair(insn)
+}
+
 /// Whether `insn` carries a packed NEON form in an operand shape the
 /// lifter accepts.
 ///

@@ -349,6 +349,18 @@ fn aarch32_vfp_effect(insn: &Instruction) -> InstructionEffect {
         // the vector register survives and the prior value stays live.
         uses.push(reg);
     }
+    // `vzip` / `vuzp` / `vtrn` rewrite both named registers, so the
+    // second operand is a definition too. Recorded here rather than in
+    // an arm of its own because it is the only way these differ from
+    // every other vector entry: the second operand is already a use,
+    // since an `AArch32` vector write merges.
+    if crate::lift::aarch32_neon_writes_operand_pair(insn)
+        && let Some(second) = insn.operands.get(1)
+        && let Some(reg) = canonical_register(&second.raw, Arch::Arm)
+        && !defs.contains(&reg)
+    {
+        defs.push(reg);
+    }
     for src in insn.operands.iter().skip(1) {
         for r in registers_in_operand(src, Arch::Arm) {
             if !uses.contains(&r) {

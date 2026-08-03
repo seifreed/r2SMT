@@ -42,7 +42,8 @@ mod simd;
 mod x86;
 mod x87;
 pub(crate) use aarch32::{
-    VfpOp, is_aarch32_neon_instruction, is_aarch32_packed_instruction, vfp_scalar,
+    VfpOp, aarch32_neon_writes_operand_pair, is_aarch32_neon_instruction,
+    is_aarch32_packed_instruction, vfp_scalar,
 };
 pub(crate) use aarch64::neon::structured::StructuredEffect;
 use merge::lower_merge;

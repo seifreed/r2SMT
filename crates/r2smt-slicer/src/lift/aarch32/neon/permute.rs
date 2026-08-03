@@ -1,10 +1,13 @@
 //! The `AArch32` NEON families that move bits without computing on
 //! them, and whose element is spelled as a bare width.
 //!
-//! `vzip` / `vuzp` / `vtrn` are deliberately absent: on `AArch32` they
-//! write *both* named registers, unlike `AArch64`'s single-destination
-//! `zip1` / `zip2`, so they need an effect entry of their own rather
-//! than the shared one every family here uses.
+//! `vzip` / `vuzp` / `vtrn` sit apart from the rest even here: on
+//! `AArch32` one of them rewrites *both* named registers, where
+//! `AArch64` splits the same work across the single-destination `zip1`
+//! and `zip2`. That is why [`PairKind`] is a separate vocabulary from
+//! the one-destination forms rather than another arm beside them — the
+//! effect table has to record two definitions, and the lowering has to
+//! finish reading before it starts writing.
 
 use r2smt_ir::program::{Instruction, OperandKind};
 
@@ -104,5 +107,124 @@ pub(super) fn duplicate_shape(insn: &Instruction, mnemonic: &str) -> Option<Neon
         op: NeonOp::Duplicate,
         lane_bits,
         lanes: view / lane_bits,
+    })
+}
+
+/// Which of the two named registers a lane comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::lift::aarch32) enum PairSource {
+    First,
+    Second,
+}
+
+/// The permutations that rewrite both of their operands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::lift::aarch32) enum PairKind {
+    /// `vzip` — interleave the two registers.
+    Zip,
+    /// `vuzp` — de-interleave them.
+    Uzp,
+    /// `vtrn` — transpose, swapping each odd element of the first
+    /// register with the even element beside it in the second.
+    Trn,
+}
+
+/// `vzip` / `vuzp` / `vtrn` — a permutation across the two named
+/// registers, writing both.
+pub(super) fn permute_pair_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (base, ty) = mnemonic.split_once('.')?;
+    let kind = match base {
+        "vzip" => PairKind::Zip,
+        "vuzp" => PairKind::Uzp,
+        "vtrn" => PairKind::Trn,
+        _ => return None,
+    };
+    let lane_bits = bare_element_bits(ty)?;
+    if insn.operands.len() != 2 {
+        return None;
+    }
+    let view = uniform_vector_view(insn, 2)?;
+    // All three are `UNDEFINED` at doubleword element size, whatever
+    // the register class.
+    if lane_bits == 64 {
+        return None;
+    }
+    let lanes = view.checked_div(lane_bits)?;
+    // `vzip` and `vuzp` are additionally undefined wherever a register
+    // holds only two elements — `VZIP.32 Dd, Dm` — because the
+    // operation there degenerates to the swap `vtrn.32` already spells,
+    // and an assembler accepting that spelling emits `VTRN`.
+    if lanes < 2 || (lanes == 2 && kind != PairKind::Trn) {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::PermutePair(kind),
+        lane_bits,
+        lanes,
+    })
+}
+
+/// The source lane feeding destination lane `index` of whichever
+/// register `into_second` names.
+///
+/// Transcribed from the `AArch32` pseudocode rather than adapted from
+/// `AArch64`'s `zip1` / `zip2`, which halve differently: there the
+/// suffix picks which half of the *sources* to read, here one
+/// instruction writes both destinations and each takes half of one
+/// combined sequence.
+pub(super) fn paired_source(
+    kind: PairKind,
+    index: u16,
+    into_second: bool,
+    lanes: u16,
+) -> Option<(PairSource, u16)> {
+    let half = lanes / 2;
+    Some(match kind {
+        // Laid end to end the two registers make one sequence twice as
+        // long, alternating between them; the first destination takes
+        // its low half and the second its high half.
+        PairKind::Zip => {
+            let source_lane =
+                index
+                    .checked_div(2)?
+                    .checked_add(if into_second { half } else { 0 })?;
+            if index % 2 == 0 {
+                (PairSource::First, source_lane)
+            } else {
+                (PairSource::Second, source_lane)
+            }
+        }
+        // The inverse: the first destination collects the even elements
+        // of the concatenation and the second the odd ones.
+        PairKind::Uzp => {
+            let offset = u16::from(into_second);
+            if index < half {
+                (
+                    PairSource::First,
+                    index.checked_mul(2)?.checked_add(offset)?,
+                )
+            } else {
+                (
+                    PairSource::Second,
+                    index
+                        .checked_sub(half)?
+                        .checked_mul(2)?
+                        .checked_add(offset)?,
+                )
+            }
+        }
+        // A 2x2 transpose: the odd element of the first register trades
+        // places with the even element of the second.
+        PairKind::Trn => {
+            let source_lane = index
+                .checked_div(2)?
+                .checked_mul(2)?
+                .checked_add(u16::from(into_second))?;
+            if index % 2 == 0 {
+                (PairSource::First, source_lane)
+            } else {
+                (PairSource::Second, source_lane)
+            }
+        }
     })
 }

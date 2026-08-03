@@ -2966,6 +2966,35 @@ fn aarch32_permutation_destination_is_also_a_use_because_the_write_merges() {
 }
 
 #[test]
+fn aarch32_paired_permutation_defines_both_named_registers() {
+    // The whole reason `vzip` / `vuzp` / `vtrn` need an effect entry of
+    // their own: `AArch64` reaches the same result with two
+    // single-destination instructions, so a port that recorded one
+    // definition would let the slicer drop whatever defined the second
+    // register and leave a later read on a stale value.
+    let i = insn(0x1000, 4, "vzip.8", vec![reg("q0"), reg("q1")]);
+    let e = crate::effect::analyze(&i, Arch::Arm);
+    assert!(e.defs.contains(&"v0") && e.defs.contains(&"v1"), "{e:?}");
+}
+
+#[test]
+fn aarch32_paired_permutation_stashes_the_second_result_before_writing() {
+    // SSA renames by statement position, so an assignment to the second
+    // register placed after the first would read the freshly permuted
+    // value as its input. The temp between them is what pins the read
+    // to the original.
+    let i = insn(0x1000, 4, "vzip.8", vec![reg("q0"), reg("q1")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Arm);
+    assert!(
+        matches!(
+            stmts.first(),
+            Some(IrStmt::Assign { dst, .. }) if dst.name.starts_with("t_")
+        ),
+        "{stmts:?}"
+    );
+}
+
+#[test]
 fn aarch32_vdup_from_a_vector_element_declines_at_the_lifter() {
     // `d2[1]` names one lane; the register table maps it onto the whole
     // `d2` slice, so lifting it would read 64 bits where the

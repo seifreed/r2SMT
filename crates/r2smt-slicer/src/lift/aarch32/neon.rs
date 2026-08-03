@@ -40,6 +40,15 @@ pub(super) enum NeonOp {
     /// `vdup` — replicate a general-purpose register's low element to
     /// every lane.
     Duplicate,
+    /// `vzip` / `vuzp` / `vtrn` — a permutation over the two named
+    /// registers that writes **both** of them.
+    ///
+    /// `AArch64` has no counterpart: its `zip1` / `zip2` are two
+    /// instructions each producing one destination, so a shape carrying
+    /// a single destination describes them. Here one instruction
+    /// rewrites both operands, and the effect table has to say so or
+    /// the slicer drops whatever defined the second one.
+    PermutePair(permute::PairKind),
 }
 
 /// A resolved `AArch32` NEON instruction: what to compute, and at what
@@ -64,6 +73,18 @@ impl NeonShape {
     pub(super) const fn view_bits(self) -> Option<u16> {
         self.lane_bits.checked_mul(self.lanes)
     }
+
+    /// Whether the lowering writes the second operand as well as the
+    /// first.
+    pub(super) const fn writes_operand_pair(self) -> bool {
+        matches!(self.op, NeonOp::PermutePair(_))
+    }
+}
+
+/// Whether `insn` is a NEON form that writes both of its named
+/// registers, so the effect table records two definitions.
+pub(super) fn writes_operand_pair(insn: &Instruction) -> bool {
+    resolve(insn).is_some_and(NeonShape::writes_operand_pair)
 }
 
 /// Resolve `insn` into the NEON form it names, or `None` when no family
@@ -78,6 +99,7 @@ pub(super) fn resolve(insn: &Instruction) -> Option<NeonShape> {
     permute::extract_shape(insn, &mnemonic)
         .or_else(|| permute::reverse_shape(insn, &mnemonic))
         .or_else(|| permute::duplicate_shape(insn, &mnemonic))
+        .or_else(|| permute::permute_pair_shape(insn, &mnemonic))
 }
 
 /// Element width a bare `AArch32` NEON size suffix names — the `8` in
