@@ -111,15 +111,11 @@ fn test_resolve_rejects_mixed_arrangements_in_one_list() {
 }
 
 #[test]
-fn test_resolve_declines_the_deinterleaving_family() {
-    // `ld2` / `ld3` / `ld4` and the replicating forms resolve as
-    // families but have no lowering yet, so they decline whole.
-    for mnemonic in ["ld2", "ld3", "ld4", "st2", "st4", "ld1r", "ld4r"] {
-        assert!(
-            resolve(&insn(mnemonic, &["{v0.4s, v1.4s, v2.4s, v3.4s}", "[x0]"])).is_none(),
-            "{mnemonic} is not lowered yet"
-        );
-    }
+fn test_resolve_rejects_a_deinterleaving_list_of_the_wrong_length() {
+    // `ld2` interleaves exactly two structures and names exactly two
+    // registers; one register is a shape the architecture has no
+    // encoding for.
+    assert!(resolve(&insn("ld2", &["{v0.4s}", "[x0]"])).is_none());
 }
 
 #[test]
@@ -129,10 +125,22 @@ fn test_resolve_accepts_a_four_register_contiguous_load() {
 }
 
 #[test]
+fn test_resolve_rejects_a_single_lane_arrangement_for_deinterleaving() {
+    // `1d` gives one element per register, which LD3 cannot
+    // de-interleave; the architecture does not encode it.
+    assert!(resolve(&insn("ld3", &["{v0.1d, v1.1d, v2.1d}", "[x0]"])).is_none());
+}
+
+#[test]
 fn test_resolve_rejects_a_replicating_store() {
     // A replicate reads one element and broadcasts it; there is no
     // store dual, and `st1r` is not a mnemonic.
     assert!(resolve(&insn("st1r", &["{v0.4s}", "[x0]"])).is_none());
+}
+
+#[test]
+fn test_resolve_rejects_a_replicating_single_element_list() {
+    assert!(resolve(&insn("ld1r", &["{v0.s}[1]", "[x0]"])).is_none());
 }
 
 #[test]
@@ -157,9 +165,9 @@ fn test_resolve_rejects_a_non_memory_second_operand() {
 }
 
 #[test]
-fn test_resolve_reads_the_arrangement_every_member_shares() {
+fn test_resolve_reads_the_replicating_load_arrangement() {
     assert_eq!(
-        resolve(&insn("ld1", &["{v0.4s, v1.4s}", "[x0]"])).map(|access| access.element),
+        resolve(&insn("ld2r", &["{v0.4s, v1.4s}", "[x0]"])).map(|access| access.element),
         Some(ListElement::Whole(crate::registers::Arrangement {
             lanes: 4,
             lane_bits: 32,

@@ -129,14 +129,6 @@ impl Structured {
 /// completely or the register it failed to write stays a free input.
 pub(crate) fn resolve(insn: &Instruction) -> Option<Structured> {
     let family = family(&insn.mnemonic.trim().to_ascii_lowercase())?;
-    // De-interleaving (`ld2` / `ld3` / `ld4`) and replication (`ldNr`)
-    // are recognised as families but have no lowering here yet, so they
-    // decline at resolution rather than at lowering: the effect table
-    // consults this same function, and a shape it retained but the
-    // lifter dropped would leave a later read bound to a stale value.
-    if family.interleave > 1 || family.replicate {
-        return None;
-    }
     let list = insn.operands.first()?;
     let memory = insn.operands.get(1)?;
     if memory.kind != OperandKind::Memory {
@@ -147,13 +139,21 @@ pub(crate) fn resolve(insn: &Instruction) -> Option<Structured> {
         return None;
     }
     let (members, element) = parse_vector_reglist(list)?;
-    // `ld1` / `st1` move one to four whole registers; the
-    // single-element form moves one element of one register.
-    let permitted = match element {
-        ListElement::Whole(_) => MAX_LIST_REGISTERS,
-        ListElement::Indexed { .. } => 1,
-    };
-    if members.is_empty() || members.len() > permitted {
+    if !member_count_matches(members.len(), family, element) {
+        return None;
+    }
+    // LD2 / LD3 / LD4 de-interleave, which needs at least two elements
+    // per register: the `1d` arrangement they would otherwise accept is
+    // not one the architecture encodes for them.
+    if let ListElement::Whole(arrangement) = element
+        && family.interleave > 1
+        && arrangement.lanes < 2
+    {
+        return None;
+    }
+    // A replicating access broadcasts across an arrangement's lanes, so
+    // a list that names single elements has nothing to broadcast into.
+    if family.replicate && matches!(element, ListElement::Indexed { .. }) {
         return None;
     }
     Some(Structured {
@@ -194,6 +194,22 @@ fn family(mnemonic: &str) -> Option<Family> {
         replicate,
         stores,
     })
+}
+
+/// Whether the list names as many registers as the family transfers.
+///
+/// `ldN` for `N > 1` interleaves exactly `N` structures and so names
+/// exactly `N` registers, and so does every single-element and
+/// replicating form. Contiguous `ld1` / `st1` is the exception: it
+/// moves one to four whole registers, which is what makes it the bulk
+/// of the family in practice.
+const fn member_count_matches(members: usize, family: Family, element: ListElement) -> bool {
+    let contiguous_whole =
+        family.interleave == 1 && !family.replicate && matches!(element, ListElement::Whole(_));
+    if contiguous_whole {
+        return members >= 1 && members <= MAX_LIST_REGISTERS;
+    }
+    members == family.interleave as usize
 }
 
 /// Whether a trailing operand is one a post-index access can carry: the
@@ -310,8 +326,14 @@ impl LiftCtx {
             return;
         };
         let transferred = match access.element {
-            ListElement::Whole(arrangement) => {
+            ListElement::Whole(arrangement) if access.family.replicate => {
+                self.transfer_replicated(insn, access, &address, arrangement)
+            }
+            ListElement::Whole(arrangement) if access.family.interleave == 1 => {
                 self.transfer_contiguous(insn, access, &address, arrangement)
+            }
+            ListElement::Whole(arrangement) => {
+                self.transfer_interleaved(insn, access, &address, arrangement)
             }
             ListElement::Indexed { lane_bits, index } => {
                 self.transfer_elements(insn, access, &address, lane_bits, index)
@@ -355,6 +377,69 @@ impl LiftCtx {
         true
     }
 
+    /// `ld2` / `ld3` / `ld4` and their stores: the memory block holds
+    /// the structures interleaved, so destination `k`'s lane `j` is
+    /// element `j * N + k` of the block.
+    ///
+    /// Lowered as one element-wide access each rather than as whole
+    /// views plus a shuffle: the interleave factor is a lift-time
+    /// constant, so the address of every element is too, and the
+    /// byte-granular memory model reassembles them.
+    fn transfer_interleaved(
+        &mut self,
+        insn: &Instruction,
+        access: &Structured,
+        base: &Expr,
+        arrangement: Arrangement,
+    ) -> bool {
+        let Some(stride) = byte_width(arrangement.lane_bits) else {
+            return false;
+        };
+        for (structure, member) in access.members.iter().enumerate() {
+            let mut lanes = Vec::with_capacity(usize::from(arrangement.lanes));
+            for lane in 0..arrangement.lanes {
+                let Some(position) =
+                    interleaved_position(lane, access.family.interleave, structure)
+                else {
+                    return false;
+                };
+                let Some(offset) = element_offset(position, stride) else {
+                    return false;
+                };
+                let address = self.offset_address(base, offset);
+                if access.family.stores {
+                    let Some(value) = self.read_simd_lane_bits(member, arrangement.lane_bits, lane)
+                    else {
+                        return false;
+                    };
+                    self.stmts.push(IrStmt::StoreMem {
+                        address,
+                        value,
+                        bits: arrangement.lane_bits,
+                    });
+                } else {
+                    let temp = self.new_temp(insn.address, arrangement.lane_bits);
+                    self.stmts.push(IrStmt::LoadMem {
+                        dst: temp.clone(),
+                        address,
+                        bits: arrangement.lane_bits,
+                    });
+                    lanes.push(Expr::Var(temp));
+                }
+            }
+            if access.family.stores {
+                continue;
+            }
+            let Some(value) = Self::concat_lanes(lanes) else {
+                return false;
+            };
+            if !self.write_simd_dst(member, value, true) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// The single-element forms: one element per member, at consecutive
     /// addresses, addressing the lane the list's index names. A load
     /// writes that lane and preserves the rest of the register.
@@ -381,6 +466,42 @@ impl LiftCtx {
                 lane: Some(index),
             };
             if !self.transfer_unit(insn, base, &unit, access.family.stores) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `ldNr`: one element per member, each broadcast across every lane
+    /// of the member's arrangement.
+    fn transfer_replicated(
+        &mut self,
+        insn: &Instruction,
+        access: &Structured,
+        base: &Expr,
+        arrangement: Arrangement,
+    ) -> bool {
+        let Some(stride) = byte_width(arrangement.lane_bits) else {
+            return false;
+        };
+        for (position, member) in access.members.iter().enumerate() {
+            let Some(offset) = list_position(position).and_then(|p| element_offset(p, stride))
+            else {
+                return false;
+            };
+            let address = self.offset_address(base, offset);
+            let temp = self.new_temp(insn.address, arrangement.lane_bits);
+            self.stmts.push(IrStmt::LoadMem {
+                dst: temp.clone(),
+                address,
+                bits: arrangement.lane_bits,
+            });
+            let Some(value) =
+                Self::concat_lanes(vec![Expr::Var(temp); usize::from(arrangement.lanes)])
+            else {
+                return false;
+            };
+            if !self.write_simd_dst(member, value, true) {
                 return false;
             }
         }
@@ -459,6 +580,15 @@ fn byte_width(bits: u16) -> Option<u16> {
         return None;
     }
     Some(bits / BITS_PER_BYTE)
+}
+
+/// Position in the memory block of `structure`'s `lane`-th element,
+/// under an `interleave`-way interleaving. The whole point of the
+/// family: `ld4`'s second destination takes elements 1, 5, 9, 13.
+fn interleaved_position(lane: u16, interleave: u16, structure: usize) -> Option<u32> {
+    u32::from(lane)
+        .checked_mul(u32::from(interleave))?
+        .checked_add(u32::try_from(structure).ok()?)
 }
 
 /// Byte offset of the `position`-th `stride`-byte unit of a transfer.

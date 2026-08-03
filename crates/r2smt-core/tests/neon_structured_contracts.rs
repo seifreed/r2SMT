@@ -190,6 +190,12 @@ fn assert_stores(
     );
 }
 
+/// Sixteen distinct bytes, one word each, as the de-interleaving
+/// fixtures' memory image: element `n` holds `0xn0`.
+fn words(count: u16) -> Vec<(u128, u16)> {
+    (0..count).map(|n| (u128::from(n) * 0x10, 32)).collect()
+}
+
 // ===================== ld1 / st1, whole registers =====================
 
 #[test]
@@ -299,6 +305,178 @@ fn test_st1_single_element_stores_the_addressed_lane() {
         &[("v0", 0x4444_4444_3333_3333_2222_2222_1111_1111)],
         (0, 32),
         0x4444_4444,
+    );
+}
+
+#[test]
+fn test_ld2_single_element_loads_consecutive_elements_into_each_register() {
+    // `ld2 {v0.s, v1.s}[1]` reads two words: the first goes to `v0`'s
+    // lane 1, the second to `v1`'s.
+    let mut statements = seed(&[(0x1111_1111, 32), (0x2222_2222, 32)]);
+    for name in ["v0", "v1"] {
+        statements.push(IrStmt::Assign {
+            dst: Var::new(name, VECTOR_BITS),
+            src: Expr::konst(0, VECTOR_BITS),
+        });
+    }
+    statements.extend(lift("ld2", &["{v0.s, v1.s}[1]", "[x0]"]));
+    let condition = Expr::eq(
+        Expr::Var(Var::new("v1", VECTOR_BITS)),
+        Expr::konst(0x2222_2222_0000_0000, VECTOR_BITS),
+    );
+    assert_eq!(solve(statements, condition), SmtResult::AlwaysTrue);
+}
+
+// ===================== de-interleaving =====================
+
+#[test]
+fn test_ld2_first_destination_takes_the_even_elements() {
+    // Memory holds e0..e7; `v0` gets e0, e2, e4, e6.
+    assert_loads(
+        "ld2",
+        &["{v0.4s, v1.4s}", "[x0]"],
+        &words(8),
+        "v0",
+        0x0000_0060_0000_0040_0000_0020_0000_0000,
+    );
+}
+
+#[test]
+fn test_ld2_second_destination_takes_the_odd_elements() {
+    assert_loads(
+        "ld2",
+        &["{v0.4s, v1.4s}", "[x0]"],
+        &words(8),
+        "v1",
+        0x0000_0070_0000_0050_0000_0030_0000_0010,
+    );
+}
+
+#[test]
+fn test_ld3_middle_destination_takes_every_third_element_from_one() {
+    // e1, e4, e7, e10 for `v1` of a 3-way interleave.
+    assert_loads(
+        "ld3",
+        &["{v0.4s, v1.4s, v2.4s}", "[x0]"],
+        &words(12),
+        "v1",
+        0x0000_00a0_0000_0070_0000_0040_0000_0010,
+    );
+}
+
+#[test]
+fn test_ld4_last_destination_takes_every_fourth_element_from_three() {
+    // e3, e7, e11, e15 for `v3` of a 4-way interleave.
+    assert_loads(
+        "ld4",
+        &["{v0.4s, v1.4s, v2.4s, v3.4s}", "[x0]"],
+        &words(16),
+        "v3",
+        0x0000_00f0_0000_00b0_0000_0070_0000_0030,
+    );
+}
+
+#[test]
+fn test_ld2_half_width_arrangement_zeroes_the_upper_half() {
+    assert_loads(
+        "ld2",
+        &["{v0.2s, v1.2s}", "[x0]"],
+        &words(4),
+        "v0",
+        0x0000_0020_0000_0000,
+    );
+}
+
+#[test]
+fn test_st2_interleaves_the_two_sources_into_memory() {
+    // `v0`'s lane 0 goes to element 0 and `v1`'s lane 0 to element 1,
+    // so the first doubleword is `v1.s[0] : v0.s[0]`.
+    assert_stores(
+        "st2",
+        &["{v0.4s, v1.4s}", "[x0]"],
+        &[
+            ("v0", 0x0000_0004_0000_0003_0000_0002_0000_0001),
+            ("v1", 0x0000_0040_0000_0030_0000_0020_0000_0010),
+        ],
+        (0, 64),
+        0x0000_0010_0000_0001,
+    );
+}
+
+#[test]
+fn test_st2_second_structure_follows_the_first() {
+    assert_stores(
+        "st2",
+        &["{v0.4s, v1.4s}", "[x0]"],
+        &[
+            ("v0", 0x0000_0004_0000_0003_0000_0002_0000_0001),
+            ("v1", 0x0000_0040_0000_0030_0000_0020_0000_0010),
+        ],
+        (8, 64),
+        0x0000_0020_0000_0002,
+    );
+}
+
+#[test]
+fn test_st4_writes_one_structure_per_lane_index() {
+    // Lane 0 of all four sources lands in the first four words.
+    assert_stores(
+        "st4",
+        &["{v0.4s, v1.4s, v2.4s, v3.4s}", "[x0]"],
+        &[
+            ("v0", 0x1111_1111),
+            ("v1", 0x2222_2222),
+            ("v2", 0x3333_3333),
+            ("v3", 0x4444_4444),
+        ],
+        (0, 128),
+        0x4444_4444_3333_3333_2222_2222_1111_1111,
+    );
+}
+
+// ===================== replication =====================
+
+#[test]
+fn test_ld1r_broadcasts_one_element_to_every_lane() {
+    assert_loads(
+        "ld1r",
+        &["{v0.4s}", "[x0]"],
+        &[(0xdead_beef, 32)],
+        "v0",
+        0xdead_beef_dead_beef_dead_beef_dead_beef,
+    );
+}
+
+#[test]
+fn test_ld1r_half_width_arrangement_zeroes_the_upper_half() {
+    assert_loads(
+        "ld1r",
+        &["{v0.2s}", "[x0]"],
+        &[(0xdead_beef, 32)],
+        "v0",
+        0xdead_beef_dead_beef,
+    );
+}
+
+#[test]
+fn test_ld2r_second_register_broadcasts_the_second_element() {
+    assert_loads(
+        "ld2r",
+        &["{v0.8b, v1.8b}", "[x0]"],
+        &[(0xaa, 8), (0xbb, 8)],
+        "v1",
+        0xbbbb_bbbb_bbbb_bbbb,
+    );
+}
+
+#[test]
+fn test_ld4r_last_register_broadcasts_the_fourth_element() {
+    assert_loads(
+        "ld4r",
+        &["{v0.4h, v1.4h, v2.4h, v3.4h}", "[x0]"],
+        &[(0x1111, 16), (0x2222, 16), (0x3333, 16), (0x4444, 16)],
+        "v3",
+        0x4444_4444_4444_4444,
     );
 }
 

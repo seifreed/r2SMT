@@ -616,11 +616,29 @@ fn aarch64_indexed_lane_operand_declines() {
 }
 
 #[test]
-fn aarch64_multi_register_list_operand_declines() {
+fn aarch64_multi_register_list_operand_recovers_every_parent() {
     let i = insn(
         "ld4",
         vec![
             op("{v16.4s, v17.4s, v18.4s, v19.4s}", OperandKind::Unknown),
+            op("[x2]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(
+        analyze(&i, Arch::Aarch64).defs,
+        vec!["v16", "v17", "v18", "v19"]
+    );
+}
+
+#[test]
+fn aarch64_structured_list_of_an_unmodelled_shape_still_declines() {
+    // A list the resolver cannot place -- here one whose registers are
+    // not consecutive -- must truncate the slice rather than pass with
+    // an empty `defs`.
+    let i = insn(
+        "ld4",
+        vec![
+            op("{v16.4s, v18.4s, v20.4s, v22.4s}", OperandKind::Unknown),
             op("[x2]", OperandKind::Memory),
         ],
     );
@@ -814,7 +832,7 @@ fn aarch64_structured_single_element_load_reads_its_destination() {
 }
 
 #[test]
-fn aarch64_vector_register_list_is_still_a_vector_shape() {
+fn aarch64_deinterleaving_store_defines_no_register() {
     let i = insn(
         "st4",
         vec![
@@ -822,7 +840,7 @@ fn aarch64_vector_register_list_is_still_a_vector_shape() {
             op("[x8]", OperandKind::Memory),
         ],
     );
-    assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);
+    assert!(analyze(&i, Arch::Aarch64).defs.is_empty());
 }
 
 // --- N3a: NEON broadcast and permutation ---
@@ -898,9 +916,7 @@ fn aarch64_broadcast_immediate_reads_no_register() {
 }
 
 #[test]
-fn aarch64_structured_load_still_declines() {
-    // `ld1`/`ld2`/`ld4` are multi-register lists with interleaving that
-    // the single-parent register model cannot express.
+fn aarch64_deinterleaving_load_defines_every_listed_register() {
     let i = insn(
         "ld2",
         vec![
@@ -908,7 +924,19 @@ fn aarch64_structured_load_still_declines() {
             op("[x2]", OperandKind::Memory),
         ],
     );
-    assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);
+    assert_eq!(analyze(&i, Arch::Aarch64).defs, vec!["v0", "v1"]);
+}
+
+#[test]
+fn aarch64_deinterleaving_load_reads_only_its_base_register() {
+    let i = insn(
+        "ld2",
+        vec![
+            op("{v0.4s, v1.4s}", OperandKind::Unknown),
+            op("[x2]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).uses, vec!["x2"]);
 }
 
 #[test]
