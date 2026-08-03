@@ -41,17 +41,33 @@ EOF
 }
 
 gate_check() {
+  # `--all-features` is applied to the whole workspace EXCEPT r2smt-explore.
+  # Its off-by-default `oracle-radius2` feature pulls in radius2 -> boolector-sys
+  # 0.7.2, whose vendored `cmake_minimum_required(VERSION 3.3)` is rejected by
+  # cmake >= 4.0 (a transitive C-toolchain incompatibility, not a Rust issue).
+  # r2smt-cli requests no features of r2smt-explore, so excluding it here keeps
+  # oracle-radius2 out of the graph; its default-feature code is linted
+  # separately below.
   echo "==> cargo fmt --all -- --check"
   cargo fmt --all -- --check
 
-  echo "==> cargo clippy --workspace --all-targets --all-features -- -D warnings"
-  cargo clippy --workspace --all-targets --all-features -- -D warnings
+  echo "==> cargo clippy --workspace --exclude r2smt-explore --all-targets --all-features -- -D warnings"
+  cargo clippy --workspace --exclude r2smt-explore --all-targets --all-features -- -D warnings
 
-  echo "==> cargo check --workspace --all-targets --all-features"
-  cargo check --workspace --all-targets --all-features
+  echo "==> cargo clippy -p r2smt-explore --all-targets -- -D warnings"
+  cargo clippy -p r2smt-explore --all-targets -- -D warnings
 
-  echo "==> cargo doc --workspace --no-deps --all-features"
-  RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+  echo "==> cargo check --workspace --exclude r2smt-explore --all-targets --all-features"
+  cargo check --workspace --exclude r2smt-explore --all-targets --all-features
+
+  echo "==> cargo check -p r2smt-explore --all-targets"
+  cargo check -p r2smt-explore --all-targets
+
+  echo "==> cargo doc --workspace --exclude r2smt-explore --no-deps --all-features"
+  RUSTDOCFLAGS="-D warnings" cargo doc --workspace --exclude r2smt-explore --no-deps --all-features
+
+  echo "==> cargo doc -p r2smt-explore --no-deps"
+  RUSTDOCFLAGS="-D warnings" cargo doc -p r2smt-explore --no-deps
 }
 
 gate_solver_contracts() {
