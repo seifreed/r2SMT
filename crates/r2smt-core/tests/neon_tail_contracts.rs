@@ -596,6 +596,35 @@ fn fmaxv_propagates_a_nan_lane_instead_of_selecting_a_number() {
 }
 
 #[test]
+fn fmaxnmv_ignores_a_quiet_nan_lane_and_returns_the_number() {
+    // The mirror of the fmaxv trap. `FPMaxNum` drops a quiet NaN in
+    // favour of a number, so the maximum of {NaN, 1, 5, 2} is 5 — the
+    // value fmaxv would have discarded in favour of propagating the NaN.
+    assert_computes(
+        "fmaxnmv",
+        &["s0", "v1.4s"],
+        &[(
+            "v1",
+            packed(32, &[F32_QUIET_NAN, F32_ONE, F32_FIVE, F32_TWO]),
+        )],
+        F32_FIVE,
+    );
+}
+
+#[test]
+fn fminnmv_ignores_a_quiet_nan_lane_and_returns_the_number() {
+    assert_computes(
+        "fminnmv",
+        &["s0", "v1.4s"],
+        &[(
+            "v1",
+            packed(32, &[F32_QUIET_NAN, F32_FIVE, F32_ONE, F32_TWO]),
+        )],
+        F32_ONE,
+    );
+}
+
+#[test]
 fn fmax_propagates_a_nan_operand() {
     // The same trap on the scalar handler, which reached for the x86
     // helper by name and had been wrong on this input since it landed.

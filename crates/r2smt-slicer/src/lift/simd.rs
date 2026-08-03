@@ -272,12 +272,20 @@ pub(crate) fn fp_lane_result(
 /// that writes FPCR is already rejected by the slicer's
 /// rounding-control guard, which is the same register.
 ///
+/// `number_wins` selects the `FPMaxNum` / `FPMinNum` behaviour instead:
+/// a *quiet* NaN in exactly one operand yields the other, numeric one,
+/// where `FPMax` would propagate the NaN. The signalling-NaN priority
+/// and the both-NaN case are unchanged — a signalling operand is still
+/// quieted and propagated, and two NaNs still yield the first — so only
+/// the two innermost quiet-NaN arms flip.
+///
 /// `None` for a lane width with no IEEE sort.
 pub(crate) fn fp_propagating_max_min(
     a_bits: Expr,
     b_bits: Expr,
     lane_bits: u16,
     max: bool,
+    number_wins: bool,
 ) -> Option<Expr> {
     let (ebits, sbits) = fp_sort_bits_checked(lane_bits)?;
     let a = Expr::bv_to_fp(a_bits.clone(), ebits, sbits);
@@ -320,18 +328,30 @@ pub(crate) fn fp_propagating_max_min(
         a_bits.clone(),
         select(second_wins, b_bits.clone(), tied),
     );
-    Some(select(
-        signalling(&a, &a_bits),
-        Expr::bv_or(a_bits.clone(), quiet_bit.clone()),
+    let a_signalling = signalling(&a, &a_bits);
+    let b_signalling = signalling(&b, &b_bits);
+    let a_quieted = Expr::bv_or(a_bits.clone(), quiet_bit.clone());
+    let b_quieted = Expr::bv_or(b_bits.clone(), quiet_bit);
+    // Neither operand is signalling here. `FPMax` propagates a quiet NaN;
+    // `FPMaxNum` returns the numeric operand when exactly one is a quiet
+    // NaN, and still yields the first when both are.
+    let quiet = if number_wins {
         select(
-            signalling(&b, &b_bits),
-            Expr::bv_or(b_bits.clone(), quiet_bit),
-            select(
-                Expr::fisnan(a),
-                a_bits,
-                select(Expr::fisnan(b), b_bits, numeric),
-            ),
-        ),
+            Expr::fisnan(a),
+            select(Expr::fisnan(b.clone()), a_bits.clone(), b_bits.clone()),
+            select(Expr::fisnan(b), a_bits, numeric),
+        )
+    } else {
+        select(
+            Expr::fisnan(a),
+            a_bits,
+            select(Expr::fisnan(b), b_bits, numeric),
+        )
+    };
+    Some(select(
+        a_signalling,
+        a_quieted,
+        select(b_signalling, b_quieted, quiet),
     ))
 }
 
@@ -832,7 +852,7 @@ impl LiftCtx {
             let a = Self::extract_lane(a_val.clone(), lane_bits, index)?;
             let b = Self::extract_lane(b_val.clone(), lane_bits, index)?;
             let lane = if propagating {
-                fp_propagating_max_min(a, b, lane_bits, matches!(op, FpArithOp::Max))?
+                fp_propagating_max_min(a, b, lane_bits, matches!(op, FpArithOp::Max), false)?
             } else {
                 fp_lane_result(op, a, b, lane_bits)?
             };

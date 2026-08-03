@@ -3804,13 +3804,12 @@ fn aarch64_float_across_lane_reduction_declines_a_non_ieee_lane() {
 }
 
 #[test]
-fn aarch64_number_flavoured_float_reduction_still_declines() {
-    // `fmaxnmv` / `fminnmv` are `FPMaxNum` / `FPMinNum`, which *ignore*
-    // a quiet NaN operand rather than propagating it. Sharing the
-    // `fmaxv` lowering would invert exactly the behaviour that makes
-    // them a different mnemonic.
-    assert!(neon_declines("fmaxnmv", &["s0", "v1.4s"]));
-    assert!(neon_declines("fminnmv", &["s0", "v1.4s"]));
+fn aarch64_number_flavoured_float_reduction_lifts() {
+    // `fmaxnmv` / `fminnmv` are `FPMaxNum` / `FPMinNum`, which ignore a
+    // quiet NaN operand rather than propagating it — a distinct fold
+    // from `fmaxv`, resolved through the same reduction shape.
+    assert!(!neon_declines("fmaxnmv", &["s0", "v1.4s"]));
+    assert!(!neon_declines("fminnmv", &["s0", "v1.4s"]));
 }
 
 #[test]

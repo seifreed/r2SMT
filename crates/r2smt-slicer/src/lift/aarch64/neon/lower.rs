@@ -871,7 +871,9 @@ impl LiftCtx {
 fn reduce_step(kind: ReduceKind, a: Expr, b: Expr, lane_bits: u16) -> Option<Expr> {
     Some(match kind {
         ReduceKind::Add | ReduceKind::AddLong { .. } => Expr::add(a, b),
-        ReduceKind::Float { max } => return fp_propagating_max_min(a, b, lane_bits, max),
+        ReduceKind::Float { max, number_wins } => {
+            return fp_propagating_max_min(a, b, lane_bits, max, number_wins);
+        }
         ReduceKind::MinMax { signed, max } => {
             let cond = if signed {
                 Expr::slt(a.clone(), b.clone())

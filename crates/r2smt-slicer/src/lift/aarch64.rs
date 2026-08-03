@@ -953,7 +953,7 @@ impl LiftCtx {
         // Intel's `MAXPS` and does neither.
         let result = match op {
             FpArithOp::Max | FpArithOp::Min => {
-                fp_propagating_max_min(a, b, lane, matches!(op, FpArithOp::Max))
+                fp_propagating_max_min(a, b, lane, matches!(op, FpArithOp::Max), false)
             }
             FpArithOp::Add | FpArithOp::Sub | FpArithOp::Mul | FpArithOp::Div => {
                 fp_lane_result(op, a, b, lane)

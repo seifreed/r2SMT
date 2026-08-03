@@ -310,8 +310,11 @@ pub(super) enum ReduceKind {
     /// that nothing can reach the integer comparison by accident. The
     /// two are not the same operation with a different sort: ARM's
     /// `FPMax` propagates NaN and combines the signs of a zero tie,
-    /// neither of which an integer `slt` can express.
-    Float { max: bool },
+    /// neither of which an integer `slt` can express. `number_wins`
+    /// selects `fmaxnmv` / `fminnmv`, whose fold uses `FPMaxNum` /
+    /// `FPMinNum` — a quiet NaN loses to a number rather than
+    /// propagating.
+    Float { max: bool, number_wins: bool },
 }
 
 /// The integer across-lane reductions.
@@ -333,8 +336,22 @@ pub(super) fn reduce_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonSha
         "smaxv" => min_max(true, true),
         "uminv" => min_max(false, false),
         "sminv" => min_max(true, false),
-        "fmaxv" => ReduceKind::Float { max: true },
-        "fminv" => ReduceKind::Float { max: false },
+        "fmaxv" => ReduceKind::Float {
+            max: true,
+            number_wins: false,
+        },
+        "fminv" => ReduceKind::Float {
+            max: false,
+            number_wins: false,
+        },
+        "fmaxnmv" => ReduceKind::Float {
+            max: true,
+            number_wins: true,
+        },
+        "fminnmv" => ReduceKind::Float {
+            max: false,
+            number_wins: true,
+        },
         _ => return None,
     };
     if insn.operands.len() != 2 {

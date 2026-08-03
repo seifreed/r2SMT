@@ -1042,7 +1042,7 @@ impl LiftCtx {
         // `MAXPS` and does neither.
         match arith {
             FpArithOp::Max | FpArithOp::Min => {
-                fp_propagating_max_min(a, b, lane, matches!(arith, FpArithOp::Max))
+                fp_propagating_max_min(a, b, lane, matches!(arith, FpArithOp::Max), false)
             }
             FpArithOp::Add | FpArithOp::Sub | FpArithOp::Mul | FpArithOp::Div => {
                 fp_lane_result(arith, a, b, lane)
