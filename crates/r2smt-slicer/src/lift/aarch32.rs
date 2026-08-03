@@ -791,6 +791,7 @@ fn neon_shift_op(base: &str, kind: ElementKind) -> Option<PackedOp> {
         "vsra" => right(true, false),
         "vrshr" => right(false, true),
         "vrsra" => right(true, true),
+        "vqshl" => PackedOp::SaturatingShiftLeftImmediate { signed },
         _ => return None,
     })
 }
@@ -948,7 +949,9 @@ fn neon_last_operand_fits(insn: &Instruction, op: PackedOp) -> bool {
         return false;
     };
     match op {
-        PackedOp::ShiftImmediate { .. } => last.kind == OperandKind::Immediate,
+        PackedOp::ShiftImmediate { .. } | PackedOp::SaturatingShiftLeftImmediate { .. } => {
+            last.kind == OperandKind::Immediate
+        }
         PackedOp::ShiftRegister { .. } => last.kind == OperandKind::Register,
         _ => true,
     }

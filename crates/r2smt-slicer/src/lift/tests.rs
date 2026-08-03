@@ -2810,6 +2810,34 @@ fn aarch32_packed_integer_add_lifts_one_addition_per_lane() {
 }
 
 #[test]
+fn aarch32_saturating_shift_left_immediate_lifts_but_register_form_declines() {
+    // `vqshl` with an immediate amount saturates; the register form,
+    // whose amount is a vector whose sign chooses the direction, is a
+    // different lowering and stays declining.
+    let immediate = insn(
+        0x1000,
+        4,
+        "vqshl.s16",
+        vec![reg("q0"), reg("q1"), op("3", OperandKind::Immediate)],
+    );
+    assert!(
+        crate::lift::lift_per_mnemonic(&immediate, Arch::Arm)
+            .iter()
+            .all(|s| !matches!(s, IrStmt::Unsupported { .. })),
+    );
+    let register = insn(
+        0x1000,
+        4,
+        "vqshl.s16",
+        vec![reg("q0"), reg("q1"), reg("q2")],
+    );
+    assert!(matches!(
+        crate::lift::lift_per_mnemonic(&register, Arch::Arm).as_slice(),
+        [IrStmt::Unsupported { .. }]
+    ));
+}
+
+#[test]
 fn aarch32_rounding_right_shifts_lift() {
     // `vrshr` / `vrsra` are the shift family's rounding forms; they lift
     // through the same immediate-shift path with the rounding flag set.

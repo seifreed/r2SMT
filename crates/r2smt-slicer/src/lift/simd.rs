@@ -116,6 +116,13 @@ pub(crate) enum PackedOp {
         /// Whether a right shift replicates the sign bit.
         signed: bool,
     },
+    /// `vqshl` with an immediate amount — shift left and clamp to the
+    /// element's range rather than letting the overflow wrap.
+    SaturatingShiftLeftImmediate {
+        /// Whether the element is signed, which selects both the
+        /// extension and the saturation bounds.
+        signed: bool,
+    },
 }
 
 impl PackedOp {
@@ -552,6 +559,34 @@ fn extend_lane(value: Expr, wide: u16, signed: bool) -> Expr {
     } else {
         Expr::zero_ext(value, wide)
     }
+}
+
+/// One destination lane of `vqshl` with an immediate amount.
+///
+/// The shift happens where it cannot overflow — a lane shifted left by
+/// at most its own width needs twice the bits, plus one so an unsigned
+/// maximum stays inside the signed range the clamp compares in — and the
+/// element bounds bring it back. Clamping at the element width would be
+/// too late, since the overflow this instruction saturates on would
+/// already have wrapped.
+fn saturating_shift_left_lane(signed: bool, value: Expr, amount: Expr, bits: u16) -> Option<Expr> {
+    let wide = bits.checked_mul(2)?.checked_add(1)?;
+    let shifted = Expr::shl(
+        extend_lane(value, wide, signed),
+        Expr::zero_ext(amount, wide),
+    );
+    let (min, max) = element_bounds(signed, bits, wide)?;
+    let below_max = Expr::Ite {
+        cond: Box::new(Expr::sle(shifted.clone(), max.clone())),
+        then_expr: Box::new(shifted),
+        else_expr: Box::new(max),
+    };
+    let clamped = Expr::Ite {
+        cond: Box::new(Expr::sle(min.clone(), below_max.clone())),
+        then_expr: Box::new(below_max),
+        else_expr: Box::new(min),
+    };
+    Some(Expr::extract(clamped, bits - 1, 0))
 }
 
 /// The exact sum or difference of two lanes, at the headroom width.
@@ -1138,6 +1173,33 @@ impl LiftCtx {
         Self::concat_lanes(lanes)
     }
 
+    /// `vqshl` with an immediate amount — each lane shifted left and
+    /// clamped to the element's range.
+    fn packed_saturating_shift_left_result(
+        &mut self,
+        dst: &Operand,
+        a_op: &Operand,
+        amount_op: &Operand,
+        signed: bool,
+        lane_bits: u16,
+    ) -> Option<Expr> {
+        let view = self.simd_instruction_view_bits(&[dst, a_op])?;
+        let count = Self::packed_lane_count(view, lane_bits)?;
+        let a_val = self.simd_operand_value(a_op, view)?;
+        let amount = self.read_operand_at(amount_op, lane_bits);
+        let mut lanes = Vec::with_capacity(usize::from(count));
+        for index in 0..count {
+            let a = Self::extract_lane(a_val.clone(), lane_bits, index)?;
+            lanes.push(saturating_shift_left_lane(
+                signed,
+                a,
+                amount.clone(),
+                lane_bits,
+            )?);
+        }
+        Self::concat_lanes(lanes)
+    }
+
     /// A whole-vector shift whose amount is itself a vector, one
     /// element per lane.
     fn packed_shift_register_result(
@@ -1207,6 +1269,12 @@ impl LiftCtx {
             PackedOp::ShiftRegister { signed } => match b_op {
                 Some(amount) => {
                     self.packed_shift_register_result(dst, a_op, amount, signed, lane_bits)
+                }
+                None => None,
+            },
+            PackedOp::SaturatingShiftLeftImmediate { signed } => match b_op {
+                Some(amount) => {
+                    self.packed_saturating_shift_left_result(dst, a_op, amount, signed, lane_bits)
                 }
                 None => None,
             },

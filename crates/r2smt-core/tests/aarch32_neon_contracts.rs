@@ -660,3 +660,43 @@ fn vrsra_adds_the_rounded_shift_into_the_destination() {
         0x12,
     );
 }
+
+#[test]
+fn vqshl_clamps_an_unsigned_overflow_to_the_element_maximum() {
+    // 0x4000_0000 << 4 is 0x4_0000_0000, past a 32-bit lane; a plain
+    // shift wraps it to zero, but vqshl saturates to the unsigned max.
+    assert_computes(
+        "vqshl.u32",
+        &["q0", "q1", "4"],
+        &[("v1", 0x4000_0000)],
+        0xffff_ffff,
+    );
+}
+
+#[test]
+fn vqshl_clamps_a_signed_positive_overflow_to_the_signed_maximum() {
+    assert_computes(
+        "vqshl.s32",
+        &["q0", "q1", "4"],
+        &[("v1", 0x4000_0000)],
+        0x7fff_ffff,
+    );
+}
+
+#[test]
+fn vqshl_clamps_a_signed_negative_overflow_to_the_signed_minimum() {
+    // 0xc000_0000 is -2^30; shifted left by 4 it underflows, and the
+    // lane saturates to the signed minimum rather than wrapping.
+    assert_computes(
+        "vqshl.s32",
+        &["q0", "q1", "4"],
+        &[("v1", 0xc000_0000)],
+        0x8000_0000,
+    );
+}
+
+#[test]
+fn vqshl_leaves_an_in_range_shift_alone() {
+    // No overflow, no clamp: 3 << 2 is 0xc.
+    assert_computes("vqshl.u32", &["q0", "q1", "2"], &[("v1", 3)], 0xc);
+}
