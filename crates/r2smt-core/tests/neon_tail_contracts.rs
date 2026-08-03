@@ -717,3 +717,40 @@ fn pmull_of_two_doublewords_fills_the_quadword_lane() {
         1u128 << 126,
     );
 }
+
+// ===================== estimates =====================
+
+#[test]
+fn frecpe_leaves_the_destination_free_rather_than_computing_a_reciprocal() {
+    // The anti-fabrication contract. `FDiv(1.0, 2.0)` is 0.5, and a
+    // lowering that computed it would make this `AlwaysTrue` — for a
+    // value the architecture does not require the machine to produce.
+    // The estimate is a free input instead, so 0.5 remains *possible*
+    // and is not asserted.
+    assert_eq!(
+        solve_lowering(
+            "frecpe",
+            &["v0.4s", "v1.4s"],
+            &[("v1", packed(32, &[F32_TWO; 4]))],
+            packed(32, &[0x3f00_0000; 4]),
+        ),
+        SmtResult::BothPossible,
+    );
+}
+
+#[test]
+fn frecpe_keeps_the_slice_complete_rather_than_truncating() {
+    // The other half of the same decision: a decline would have made
+    // the destination undefined and the verdict `Unsound`. A verdict
+    // that ranges over every value the estimate could take is worth
+    // more than no verdict at all.
+    assert_ne!(
+        solve_lowering(
+            "frecpe",
+            &["v0.4s", "v1.4s"],
+            &[("v1", packed(32, &[F32_TWO; 4]))],
+            packed(32, &[0x3f00_0000; 4]),
+        ),
+        SmtResult::Unsound,
+    );
+}

@@ -145,6 +145,14 @@ enum NeonOp {
     /// product is the `XOR` of the shifted multiplicand over the set
     /// bits of the multiplier. `upper` is the `2` suffix.
     PolynomialMultiply { upper: bool },
+    /// `frecpe` / `frsqrte` — the reciprocal and reciprocal-square-root
+    /// estimates, whose result is a free value.
+    ///
+    /// Both mnemonics share one variant because they share one
+    /// lowering: the architecture fixes only a relative error bound and
+    /// leaves the value itself implementation-defined, so there is
+    /// nothing to tell them apart *with*.
+    Estimate,
 }
 
 /// The by-element multiplies.
@@ -464,6 +472,44 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| dot_product_shape(insn, &mnemonic))
         .or_else(|| table_lookup_shape(insn, &mnemonic))
         .or_else(|| polynomial_multiply_shape(insn, &mnemonic))
+        .or_else(|| estimate_shape(insn, &mnemonic))
+}
+
+// ===================== estimates =====================
+
+/// `frecpe` / `frsqrte`, the reciprocal and reciprocal-square-root
+/// estimates.
+///
+/// Their *refinement* steps `frecps` / `frsqrts` are deliberately not
+/// here. `2.0 - x*y` and `(3.0 - x*y) / 2.0` describe them arithmetically,
+/// but `AArch64` computes both through `FPRecipStepFused` — one
+/// rounding over the whole expression, where a separate `fmul` and
+/// `fsub` round twice. That is the same objection that keeps `fmla`
+/// out: the IR has no fused node, so the obvious lowering would be a
+/// definite wrong value rather than a wider one. (It is expressible for
+/// binary32 lanes by computing in binary64, whose 53 bits exceed the
+/// `2 * 24 + 2` an exact emulation needs — but not for binary64 lanes,
+/// which would need binary128, so that is its own piece of work rather
+/// than a half-covered special case.)
+fn estimate_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    if !matches!(mnemonic, "frecpe" | "frsqrte") || insn.operands.len() != 2 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    // An estimate of an IEEE lane; `.16b` names no float format.
+    if !matches!(destination.lane_bits, 16 | 32 | 64) {
+        return None;
+    }
+    if operand_arrangement(insn.operands.get(1)?)? != destination {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::Estimate,
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
 }
 
 // ===================== table lookup =====================

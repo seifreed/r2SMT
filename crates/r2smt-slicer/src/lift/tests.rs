@@ -3890,3 +3890,38 @@ fn aarch64_same_width_polynomial_multiply_still_declines() {
     // from `pmull`; nothing claims it.
     assert!(neon_declines("pmul", &["v0.8b", "v1.8b", "v2.8b"]));
 }
+
+#[test]
+fn aarch64_reciprocal_estimate_assigns_the_destination() {
+    // Emitting *something* is the point: a decline would truncate the
+    // slice, while an assignment to a never-defined temp keeps it
+    // Complete with the estimate as a free input.
+    assert!(!neon_declines("frecpe", &["v0.4s", "v1.4s"]));
+    assert!(!neon_declines("frsqrte", &["v0.2d", "v1.2d"]));
+}
+
+#[test]
+fn aarch64_reciprocal_estimate_never_reads_its_source() {
+    // The architecture fixes only a relative error bound, so the value
+    // is implementation-defined and nothing about the source may reach
+    // the result — an expression mentioning `v1` would be a definite
+    // number the machine need not produce.
+    let i = insn(0x1000, 4, "frecpe", vec![reg("v0.4s"), reg("v1.4s")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(!format!("{stmts:?}").contains("v1"), "{stmts:?}");
+}
+
+#[test]
+fn aarch64_reciprocal_estimate_declines_a_non_ieee_lane() {
+    assert!(neon_declines("frecpe", &["v0.16b", "v1.16b"]));
+}
+
+#[test]
+fn aarch64_reciprocal_step_declines_as_a_fused_operation() {
+    // `frecps` / `frsqrts` are `2.0 - x*y` and `(3.0 - x*y) / 2.0`
+    // computed through `FPRecipStepFused` — one rounding over the whole
+    // expression, where a separate `fmul` and `fsub` round twice. Same
+    // objection as `fmla`.
+    assert!(neon_declines("frecps", &["v0.4s", "v1.4s", "v2.4s"]));
+    assert!(neon_declines("frsqrts", &["v0.4s", "v1.4s", "v2.4s"]));
+}

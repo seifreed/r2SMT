@@ -92,7 +92,35 @@ impl LiftCtx {
             NeonOp::PolynomialMultiply { upper } => {
                 self.polynomial_multiply_lanes(insn, shape, upper)
             }
+            NeonOp::Estimate => self.estimate_value(insn, shape),
         }
+    }
+
+    /// `frecpe` / `frsqrte` — a fresh value that is never assigned.
+    ///
+    /// The architecture guarantees only a relative error bound for
+    /// these and leaves the value itself implementation-defined, so
+    /// `FDiv(1.0, x)` would not be an approximation of the result: it
+    /// would be a *definite* number the machine is not required to
+    /// produce, which is the fabrication this pipeline exists to avoid.
+    ///
+    /// Emitting nothing is not the alternative either. The slicer has
+    /// already consumed the destination as a definition, so a decline
+    /// truncates the slice and every downstream verdict becomes
+    /// `Unsound`. Assigning a temp that is never defined keeps the slice
+    /// `Complete` instead: `ssa_convert` surfaces a variable read before
+    /// it is written as a free input, so the solver considers every
+    /// value the estimate could take and an `AlwaysTrue` verdict is
+    /// still one that holds for all of them.
+    ///
+    /// The temp is fresh per instruction, which loses one true fact —
+    /// two `frecpe`s over the same input agree, since the estimate is a
+    /// function. That is a widening, not an unsoundness, and recovering
+    /// it would mean naming the value by its operand rather than by its
+    /// address.
+    fn estimate_value(&mut self, insn: &Instruction, shape: NeonShape) -> Option<Expr> {
+        let view = shape.lane_bits.checked_mul(shape.lanes)?;
+        Some(Expr::Var(self.new_temp(insn.address, view)))
     }
 
     /// `tbl` / `tbx` — each destination byte selected from the table by
