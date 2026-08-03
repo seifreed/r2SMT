@@ -516,6 +516,31 @@ fn udot_zero_extends_the_same_byte_elements() {
     );
 }
 
+#[test]
+fn sdot_by_element_broadcasts_one_group_to_every_lane() {
+    // `v2.4b[1]` selects bytes 4..7 of v2 (values 2,3,4,5), broadcast to
+    // every destination lane. Group 0 is filled with 99s so that reading
+    // the wrong group would be plainly visible: lane 0's four ones dot
+    // the selected group to 2+3+4+5 = 14, lane 1's single one picks 2,
+    // and the empty lanes stay zero.
+    assert_computes(
+        "sdot",
+        &["v0.4s", "v1.16b", "v2.4b[1]"],
+        &[
+            ("v0", 0),
+            (
+                "v1",
+                packed(8, &[1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            ),
+            (
+                "v2",
+                packed(8, &[99, 99, 99, 99, 2, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0]),
+            ),
+        ],
+        packed(32, &[14, 2, 0, 0]),
+    );
+}
+
 // ===================== ARM `FPMax` / `FPMin` =====================
 //
 // The whole point of these: the family *looks* like one more reduction

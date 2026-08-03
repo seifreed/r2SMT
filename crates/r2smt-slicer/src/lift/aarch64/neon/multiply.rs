@@ -15,7 +15,8 @@ use r2smt_ir::program::Instruction;
 
 use super::super::super::BinOp;
 use super::geometry::{
-    BITS_PER_BYTE, indexed_element, operand_arrangement, peel_upper, spans_full_register,
+    BITS_PER_BYTE, dot_product_element, indexed_element, operand_arrangement, peel_upper,
+    spans_full_register,
 };
 use super::{NeonOp, NeonShape};
 
@@ -254,13 +255,12 @@ pub(super) const DOT_PRODUCT_TERMS: u16 = 4;
 /// Destination element width of a dot product.
 const DOT_PRODUCT_LANE_BITS: u16 = 32;
 
-/// `sdot` / `udot` over two whole vectors.
+/// `sdot` / `udot` over two whole vectors, or the by-element spelling.
 ///
-/// The by-element spelling (`sdot v0.4s, v1.16b, v2.4b[1]`) declines:
-/// its indexed operand names an arrangement *and* an index at once,
-/// which the register table's suffix parser does not resolve, so it
-/// yields no parent to read. That is a decline, not a wrong lowering —
-/// the effect table sees the same `None` and truncates the slice.
+/// The by-element form (`sdot v0.4s, v1.16b, v2.4b[1]`) names an
+/// arrangement *and* an index at once, which the arrangement parser does
+/// not resolve; [`dot_product_element`] parses it instead, and the index
+/// selects the four-byte group broadcast to every destination lane.
 pub(super) fn dot_product_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     let signed = match mnemonic {
         "sdot" => true,
@@ -275,18 +275,30 @@ pub(super) fn dot_product_shape(insn: &Instruction, mnemonic: &str) -> Option<Ne
         return None;
     }
     let expected_lanes = destination.lanes.checked_mul(DOT_PRODUCT_TERMS)?;
-    for operand in insn.operands.iter().skip(1) {
-        let arrangement = operand_arrangement(operand)?;
-        if arrangement.lane_bits != BITS_PER_BYTE || arrangement.lanes != expected_lanes {
-            return None;
-        }
+    // The first source is always the whole-byte vector.
+    let first = operand_arrangement(insn.operands.get(1)?)?;
+    if first.lane_bits != BITS_PER_BYTE || first.lanes != expected_lanes {
+        return None;
     }
+    // The second source is either the matching whole vector or the
+    // `v2.4b[i]` group selector.
+    let third = insn.operands.get(2)?;
+    let (by_element, source_index) = match operand_arrangement(third) {
+        Some(second) if second.lane_bits == BITS_PER_BYTE && second.lanes == expected_lanes => {
+            (false, 0)
+        }
+        Some(_) => return None,
+        None => {
+            let (_, index) = dot_product_element(third)?;
+            (true, index)
+        }
+    };
     Some(NeonShape {
-        op: NeonOp::DotProduct { signed },
+        op: NeonOp::DotProduct { signed, by_element },
         lane_bits: destination.lane_bits,
         lanes: destination.lanes,
         dest_index: 0,
-        source_index: 0,
+        source_index,
     })
 }
 

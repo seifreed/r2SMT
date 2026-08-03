@@ -77,6 +77,35 @@ pub(super) fn indexed_element(op: &Operand) -> Option<(u16, u16)> {
     (index < lanes).then_some((element_bits, index))
 }
 
+/// The `(register, group_index)` a `sdot` / `udot` by-element source
+/// names: `v2.4b[1]` selects the four-byte group at index 1 of `v2`.
+///
+/// This is the one NEON operand that carries an element shape *and* an
+/// index at once, which both [`operand_arrangement`] and
+/// [`indexed_element`] reject, so it has its own parser. The register is
+/// re-spelled bare so the SIMD readers, which resolve names through the
+/// register table, can materialise it.
+pub(super) fn dot_product_element(op: &Operand) -> Option<(Operand, u16)> {
+    // Four four-byte groups in the 128-bit register.
+    const DOT_PRODUCT_GROUPS: u16 = SIMD_REGISTER_BITS / 32;
+    if op.kind != OperandKind::Register {
+        return None;
+    }
+    let raw = op.raw.trim().to_ascii_lowercase();
+    let (register, body) = raw.split_once('.')?;
+    if !names_vector_register(register) {
+        return None;
+    }
+    let index = parse_lane_index(body.strip_prefix("4b")?)?;
+    (index < DOT_PRODUCT_GROUPS).then_some((
+        Operand {
+            raw: register.to_string(),
+            kind: OperandKind::Register,
+        },
+        index,
+    ))
+}
+
 /// Whether an operand names a general-purpose register.
 pub(super) fn is_general_register(op: &Operand) -> bool {
     op.kind == OperandKind::Register

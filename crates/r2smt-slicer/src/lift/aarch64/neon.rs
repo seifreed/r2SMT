@@ -113,8 +113,11 @@ enum NeonOp {
     /// destination lane. `upper` is the `2` suffix on the long members.
     ByElement { kind: ByElementKind, upper: bool },
     /// `sdot` / `udot` — four byte products summed into each 32-bit
-    /// destination lane, accumulated onto its prior value.
-    DotProduct { signed: bool },
+    /// destination lane, accumulated onto its prior value. `by_element`
+    /// marks the `v2.4b[i]` spelling, which broadcasts one four-byte
+    /// group (named by [`NeonShape::source_index`]) to every lane instead
+    /// of pairing each lane with its own group.
+    DotProduct { signed: bool, by_element: bool },
     /// `tbl` / `tbx` — each destination byte selected from the table by
     /// the corresponding index byte. `keep` marks `tbx`, which leaves
     /// the destination byte alone where an out-of-range index makes

@@ -3774,12 +3774,19 @@ fn aarch64_dot_product_declines_a_mismatched_source_geometry() {
 }
 
 #[test]
-fn aarch64_dot_product_declines_the_by_element_spelling() {
-    // `v2.4b[1]` names an arrangement and an index at once, which the
-    // register table's suffix parser does not resolve — so the operand
-    // yields no parent to read, and this is a decline rather than a
-    // lowering against the wrong register.
-    assert!(neon_declines("sdot", &["v0.4s", "v1.16b", "v2.4b[1]"]));
+fn aarch64_dot_product_lifts_the_by_element_spelling() {
+    // `v2.4b[1]` names an arrangement and an index at once; its own
+    // parser resolves it, and the index selects the four-byte group
+    // broadcast to every destination lane.
+    assert!(!neon_declines("sdot", &["v0.4s", "v1.16b", "v2.4b[1]"]));
+    assert!(!neon_declines("udot", &["v0.2s", "v1.8b", "v2.4b[3]"]));
+}
+
+#[test]
+fn aarch64_dot_product_by_element_declines_an_out_of_range_group() {
+    // Four four-byte groups fit the 128-bit register, so index 4 is off
+    // the end.
+    assert!(neon_declines("sdot", &["v0.4s", "v1.16b", "v2.4b[4]"]));
 }
 
 #[test]

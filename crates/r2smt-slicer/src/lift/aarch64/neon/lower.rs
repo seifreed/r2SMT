@@ -11,7 +11,7 @@ use r2smt_ir::program::{Instruction, Operand};
 
 use super::super::super::{FpArithOp, LiftCtx, fp_lane_result, fp_propagating_max_min};
 use super::arith::{CompareKind, SaturateTo, SaturatingKind, ShiftKind};
-use super::geometry::{BITS_PER_BYTE, operand_arrangement};
+use super::geometry::{BITS_PER_BYTE, dot_product_element, operand_arrangement};
 use super::multiply::{AccumulateKind, AccumulateSources, ByElementKind, DOT_PRODUCT_TERMS};
 use super::permute::{PermuteKind, PermuteSource, SelectRole, table_registers};
 use super::width::{ConvertKind, ReduceKind, WidenKind};
@@ -86,7 +86,9 @@ impl LiftCtx {
                 source_lane_bits,
             } => self.reduce_lanes(insn, shape, kind, source_lanes, source_lane_bits),
             NeonOp::ByElement { kind, upper } => self.by_element_lanes(insn, shape, kind, upper),
-            NeonOp::DotProduct { signed } => self.dot_product_lanes(insn, shape, signed),
+            NeonOp::DotProduct { signed, by_element } => {
+                self.dot_product_lanes(insn, shape, signed, by_element)
+            }
             NeonOp::TableLookup { keep, table_lanes } => {
                 self.table_lookup_lanes(insn, shape, keep, table_lanes)
             }
@@ -306,21 +308,43 @@ impl LiftCtx {
         insn: &Instruction,
         shape: NeonShape,
         signed: bool,
+        by_element: bool,
     ) -> Option<Expr> {
+        // Each source register is a full 128-bit view; a by-element
+        // source re-spells its group selector to the bare register.
+        const REGISTER_BITS: u16 = 128;
         let view = shape.lane_bits.checked_mul(shape.lanes)?;
         let accumulator = self.simd_operand_value(&insn.operands.first()?.clone(), view)?;
         let first = self.widen_source(insn, 1)?;
-        let second = self.widen_source(insn, 2)?;
+        let second = if by_element {
+            let (register, _) = dot_product_element(insn.operands.get(2)?)?;
+            self.simd_operand_value(&register, REGISTER_BITS)?
+        } else {
+            self.widen_source(insn, 2)?
+        };
+        let read = |value: &Expr, byte: u16| -> Option<Expr> {
+            let raw = LiftCtx::extract_lane(value.clone(), BITS_PER_BYTE, byte)?;
+            Some(extend(raw, shape.lane_bits, signed))
+        };
         let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
         for index in 0..shape.lanes {
             let mut sum = LiftCtx::extract_lane(accumulator.clone(), shape.lane_bits, index)?;
             for term in 0..DOT_PRODUCT_TERMS {
-                let byte = index.checked_mul(DOT_PRODUCT_TERMS)?.checked_add(term)?;
-                let read = |value: &Expr| -> Option<Expr> {
-                    let raw = LiftCtx::extract_lane(value.clone(), BITS_PER_BYTE, byte)?;
-                    Some(extend(raw, shape.lane_bits, signed))
+                let first_byte = index.checked_mul(DOT_PRODUCT_TERMS)?.checked_add(term)?;
+                // By-element broadcasts one group to every lane; the
+                // whole-vector form pairs each lane with its own.
+                let second_group = if by_element {
+                    shape.source_index
+                } else {
+                    index
                 };
-                sum = Expr::add(sum, Expr::mul(read(&first)?, read(&second)?));
+                let second_byte = second_group
+                    .checked_mul(DOT_PRODUCT_TERMS)?
+                    .checked_add(term)?;
+                sum = Expr::add(
+                    sum,
+                    Expr::mul(read(&first, first_byte)?, read(&second, second_byte)?),
+                );
             }
             lanes.push(sum);
         }
