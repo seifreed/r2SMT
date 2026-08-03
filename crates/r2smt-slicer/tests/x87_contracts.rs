@@ -936,6 +936,73 @@ fn test_x87_rounding_integer_store_truncates_on_a_control_word_write() {
     ));
 }
 
+// ---------------------------------------------------------------
+// `fcmov<cc>`
+// ---------------------------------------------------------------
+
+/// `fcmov<cc> st(0), st(1)`, the only operand shape the encoding has.
+fn conditional_move(suffix: &str) -> Instruction {
+    insn(
+        FUNCTION_ADDRESS,
+        &format!("fcmov{suffix}"),
+        vec![reg("st(0)"), reg("st(1)")],
+    )
+}
+
+#[test]
+fn test_x87_conditional_move_family_is_modelled() {
+    // `da c0+i` and `db c0+i`, spelled by `rasm2` as `fcmovb` /
+    // `fcmove` / `fcmovbe` / `fcmovu` and their `n`-prefixed mirrors.
+    for suffix in ["b", "e", "be", "u", "nb", "ne", "nbe", "nu"] {
+        assert_eq!(
+            analyze(&conditional_move(suffix), Arch::X86_64).kind,
+            InstructionKind::X87,
+            "fcmov{suffix}"
+        );
+    }
+}
+
+#[test]
+fn test_x87_conditional_move_reads_the_flags() {
+    // Without this the slicer drops the `cmp` or `fcomi` that produced
+    // the condition and the select runs on a free bit.
+    assert!(analyze(&conditional_move("e"), Arch::X86_64).reads_flags);
+}
+
+#[test]
+fn test_x87_conditional_move_does_not_define_the_flags() {
+    // It selects on EFLAGS and leaves every bit of them standing, so a
+    // following `jcc` must still see the original definer.
+    assert!(!analyze(&conditional_move("e"), Arch::X86_64).defines_flags);
+}
+
+#[test]
+fn test_x87_conditional_move_destination_is_the_top_of_stack() {
+    // The encoding has no other destination; a spelling naming one is
+    // not this instruction.
+    let i = insn(
+        FUNCTION_ADDRESS,
+        "fcmovne",
+        vec![reg("st(1)"), reg("st(2)")],
+    );
+    assert_eq!(analyze(&i, Arch::X86_64).kind, InstructionKind::Other);
+}
+
+#[test]
+fn test_x87_conditional_move_rejects_an_integer_condition_suffix() {
+    // The family spells the unordered condition `u` / `nu`, not the
+    // integer `p` / `np`, and has no signed conditions at all. Reading
+    // the suffix through the integer `cmov` table would claim
+    // instructions that do not exist.
+    for suffix in ["p", "np", "z", "g", "l", "s"] {
+        assert_eq!(
+            analyze(&conditional_move(suffix), Arch::X86_64).kind,
+            InstructionKind::Other,
+            "fcmov{suffix}"
+        );
+    }
+}
+
 #[test]
 fn test_x87_popping_flag_compare_takes_the_disassembler_spelling() {
     // `df f1` is `fcompi st(1)`, not the manual's `fcomip`.

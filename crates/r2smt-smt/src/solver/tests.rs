@@ -3158,3 +3158,82 @@ fn x87_rounding_integer_store_rounds_to_nearest() {
     let program = x87_integer_store_program("fistp", "3");
     assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
 }
+
+/// `xor eax, eax ; fldz ; fld1 ; <mnemonic> st(0), st(1) ;
+/// fstp qword [rbp - 0x20] ; mov rax, … ; cmp rax, <expect> ; je`.
+///
+/// The `xor` fixes `ZF = 1`, so the two polarities of the same
+/// conditional move select different slots: `ST(1)` holds `+0.0` and
+/// `ST(0)` holds `+1.0`.
+fn x87_conditional_move_program(mnemonic: &str, expect: &str) -> Program {
+    one_block(vec![
+        insn(
+            0x40_1000,
+            2,
+            "xor",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(0x40_1002, 2, "fldz", vec![]),
+        insn(0x40_1004, 2, "fld1", vec![]),
+        insn(
+            0x40_1006,
+            2,
+            mnemonic,
+            vec![
+                op("st(0)", OperandKind::Register),
+                op("st(1)", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            3,
+            "fstp",
+            vec![op("qword [rbp - 0x20]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_100b,
+            4,
+            "mov",
+            vec![
+                op("rax", OperandKind::Register),
+                op("qword [rbp - 0x20]", OperandKind::Memory),
+            ],
+        ),
+        insn(
+            0x40_100f,
+            10,
+            "cmp",
+            vec![
+                op("rax", OperandKind::Register),
+                op(expect, OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1019,
+            2,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ])
+}
+
+#[test]
+fn x87_conditional_move_takes_the_source_when_the_condition_holds() {
+    // `ZF = 1`, so `fcmove` overwrites the top of stack with `ST(1)`,
+    // which is `+0.0`.
+    let program = x87_conditional_move_program("fcmove", "0");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_conditional_move_keeps_the_destination_when_it_does_not() {
+    // The teeth, and the reason both polarities are pinned: with the
+    // condition inverted the same fixture must keep `+1.0`. A lowering
+    // whose `Ite` branches are swapped passes one of these two tests
+    // and fails the other.
+    let program = x87_conditional_move_program("fcmovne", "0x3ff0000000000000");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}

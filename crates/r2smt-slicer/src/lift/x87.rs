@@ -103,6 +103,12 @@
 //! were already modelled, so once `fnstsw` has written `ax` the chain
 //! resolves through the ordinary integer path.
 //!
+//! `fcmov<cc>` reads the same EFLAGS bits back and selects between two
+//! slots. It is the one x87 shape that *reads* the flags rather than
+//! writing them, which the effect table has to know or the slicer steps
+//! over whatever defined the condition and the select runs on a free
+//! bit. The lowering is an `Ite`, so the slice stays linear.
+//!
 //! ## Declining
 //!
 //! Everything [`classify`] rejects is rejected on the *instruction*
@@ -150,6 +156,10 @@ const X87_C0_BIT: u16 = 8;
 const X87_C2_BIT: u16 = 10;
 /// C3 — the equality indicator after a compare.
 const X87_C3_BIT: u16 = 14;
+
+/// Mnemonic prefix of the conditional-move family, whose suffix names
+/// an EFLAGS condition rather than being part of a fixed mnemonic.
+const X87_CONDITIONAL_MOVE_PREFIX: &str = "fcmov";
 
 /// Number of x87 data registers (Intel SDM Vol. 1 §8.1.2).
 const X87_STACK_DEPTH: usize = 8;
@@ -411,6 +421,70 @@ struct Compare {
     less: Expr,
 }
 
+/// The condition an `FCMOV<cc>` tests, as the SDM states it: over the
+/// EFLAGS bits an integer `cmp` or the `fcomi` family leaves behind,
+/// never over the x87 status word.
+///
+/// The suffixes are the integer `cmov` ones with `u` / `nu` in place of
+/// `p` / `np`, because after a floating-point compare parity *is* the
+/// unordered indicator. That renaming is the only reason this cannot
+/// reuse [`crate::condition::BranchCondition::from_suffix`].
+#[derive(Clone, Copy)]
+enum X87Condition {
+    /// `fcmovb` — below, `CF = 1`.
+    Below,
+    /// `fcmove` — equal, `ZF = 1`.
+    Equal,
+    /// `fcmovbe` — below or equal, `CF = 1 or ZF = 1`.
+    BelowOrEqual,
+    /// `fcmovu` — unordered, `PF = 1`.
+    Unordered,
+    /// `fcmovnb` — not below, `CF = 0`.
+    NotBelow,
+    /// `fcmovne` — not equal, `ZF = 0`.
+    NotEqual,
+    /// `fcmovnbe` — neither below nor equal, `CF = 0 and ZF = 0`.
+    NotBelowOrEqual,
+    /// `fcmovnu` — not unordered, `PF = 0`.
+    NotUnordered,
+}
+
+impl X87Condition {
+    /// The condition spelled by a `fcmov` mnemonic's suffix.
+    fn from_suffix(suffix: &str) -> Option<Self> {
+        Some(match suffix {
+            "b" => Self::Below,
+            "e" => Self::Equal,
+            "be" => Self::BelowOrEqual,
+            "u" => Self::Unordered,
+            "nb" => Self::NotBelow,
+            "ne" => Self::NotEqual,
+            "nbe" => Self::NotBelowOrEqual,
+            "nu" => Self::NotUnordered,
+            _ => return None,
+        })
+    }
+
+    /// The condition as a boolean over the lifter's flag variables.
+    fn predicate(self) -> Expr {
+        let cf = || Expr::flag("CF");
+        let zf = || Expr::flag("ZF");
+        let pf = || Expr::flag("PF");
+        let set = |flag: Expr| Expr::eq(flag, Expr::konst(1, 1));
+        let clear = |flag: Expr| Expr::eq(flag, Expr::konst(0, 1));
+        match self {
+            Self::Below => set(cf()),
+            Self::Equal => set(zf()),
+            Self::BelowOrEqual => Expr::bool_or(set(cf()), set(zf())),
+            Self::Unordered => set(pf()),
+            Self::NotBelow => clear(cf()),
+            Self::NotEqual => clear(zf()),
+            Self::NotBelowOrEqual => Expr::bool_and(clear(cf()), clear(zf())),
+            Self::NotUnordered => clear(pf()),
+        }
+    }
+}
+
 /// In-place unary operations on `ST(0)`.
 #[derive(Clone, Copy)]
 enum UnaryOp {
@@ -459,6 +533,8 @@ enum X87Form {
     /// Compare `ST(0)` against `ST(src)` and write EFLAGS directly
     /// (`fcomi` family).
     CompareFlags { src: usize, pop: bool },
+    /// `ST(0) := ST(src)` when `condition` holds (`fcmov<cc>`).
+    ConditionalMove { src: usize, condition: X87Condition },
     /// Copy the status word into `operands[0]` (`fnstsw` / `fstsw`).
     StoreStatus,
     /// Swap `ST(0)` with `ST(i)` (`fxch`).
@@ -490,55 +566,62 @@ pub(crate) struct X87Effect {
     pub(crate) register_def: Option<&'static str>,
     /// Whether the instruction writes EFLAGS.
     pub(crate) defines_flags: bool,
+    /// Whether the instruction reads EFLAGS, and so needs whatever
+    /// defined them kept alive in the slice.
+    pub(crate) reads_flags: bool,
+}
+
+impl X87Effect {
+    /// The uniform footprint: the whole data-register file, both
+    /// defined and used.
+    fn stack() -> Self {
+        Self {
+            defs: vec![X87_STACK_REGISTER],
+            uses: vec![X87_STACK_REGISTER],
+            register_def: None,
+            defines_flags: false,
+            reads_flags: false,
+        }
+    }
 }
 
 /// The pseudo-register footprint of a modelled x87 instruction, or
 /// `None` when the instruction is not one.
 ///
 /// Most of the family is uniform — every instruction that touches the
-/// data registers both defines and uses the whole stack. Three shapes
-/// are not: the `fcom` family also defines the status word, the `fcomi`
-/// family writes EFLAGS instead of the status word, and `fnstsw` reads
-/// the status word into a register without touching the data registers
-/// at all.
+/// data registers both defines and uses the whole stack. Four shapes are
+/// not: the `fcom` family also defines the status word, the `fcomi`
+/// family writes EFLAGS instead of the status word, the `fcmov` family
+/// *reads* EFLAGS, and `fnstsw` reads the status word into a register
+/// without touching the data registers at all.
 pub(crate) fn x87_effect(insn: &Instruction) -> Option<X87Effect> {
-    let form = classify(insn)?;
-    let stack = || {
-        (
-            vec![X87_STACK_REGISTER],
-            vec![X87_STACK_REGISTER],
-            None,
-            false,
-        )
-    };
-    let (defs, uses, register_def, defines_flags) = match form {
-        X87Form::CompareStatus { .. } => (
-            vec![X87_STACK_REGISTER, X87_STATUS_REGISTER],
-            vec![X87_STACK_REGISTER],
-            None,
-            false,
-        ),
-        X87Form::CompareFlags { .. } => (
-            vec![X87_STACK_REGISTER],
-            vec![X87_STACK_REGISTER],
-            None,
-            true,
-        ),
-        X87Form::StoreStatus => (
-            Vec::new(),
-            vec![X87_STATUS_REGISTER],
-            insn.operands
+    Some(match classify(insn)? {
+        X87Form::CompareStatus { .. } => X87Effect {
+            defs: vec![X87_STACK_REGISTER, X87_STATUS_REGISTER],
+            ..X87Effect::stack()
+        },
+        X87Form::CompareFlags { .. } => X87Effect {
+            defines_flags: true,
+            ..X87Effect::stack()
+        },
+        // Without this the slicer would step over the `cmp` or `fcomi`
+        // that produced the condition, and the `Ite` would select on a
+        // free flag.
+        X87Form::ConditionalMove { .. } => X87Effect {
+            reads_flags: true,
+            ..X87Effect::stack()
+        },
+        X87Form::StoreStatus => X87Effect {
+            defs: Vec::new(),
+            uses: vec![X87_STATUS_REGISTER],
+            register_def: insn
+                .operands
                 .first()
                 .and_then(|op| crate::effect::canonical_register(&op.raw, Arch::X86_64)),
-            false,
-        ),
-        _ => stack(),
-    };
-    Some(X87Effect {
-        defs,
-        uses,
-        register_def,
-        defines_flags,
+            defines_flags: false,
+            reads_flags: false,
+        },
+        _ => X87Effect::stack(),
     })
 }
 
@@ -604,6 +687,9 @@ fn classify(insn: &Instruction) -> Option<X87Form> {
         // given disassembler build chooses.
         "fcompi" | "fucompi" | "fcomip" | "fucomip" => classify_flag_compare(ops, true),
         "fnstsw" | "fstsw" => classify_store_status(ops),
+        other if other.starts_with(X87_CONDITIONAL_MOVE_PREFIX) => other
+            .strip_prefix(X87_CONDITIONAL_MOVE_PREFIX)
+            .and_then(|suffix| classify_conditional_move(suffix, ops)),
         // The integer-operand family is dispatched *before*
         // [`classify_arith`], which strips a trailing `p` to recognise
         // the popping forms: `ficomp` would otherwise be mis-stripped
@@ -768,6 +854,21 @@ fn classify_flag_compare(ops: &[Operand], pop: bool) -> Option<X87Form> {
         _ => return None,
     };
     Some(X87Form::CompareFlags { src, pop })
+}
+
+/// `fcmov<cc> st(0), st(i)` — move `ST(i)` into `ST(0)` when the
+/// condition holds, and leave `ST(0)` alone otherwise.
+///
+/// `db c9` disassembles as `fcmovne st(0), st(1)`: the encoding's
+/// destination is always the top of stack, so a spelling naming any
+/// other slot is not this instruction and declines.
+fn classify_conditional_move(suffix: &str, ops: &[Operand]) -> Option<X87Form> {
+    let condition = X87Condition::from_suffix(suffix)?;
+    let [dst, src] = ops else { return None };
+    (slot_index(dst)? == 0).then_some(X87Form::ConditionalMove {
+        src: slot_index(src)?,
+        condition,
+    })
 }
 
 /// `fnstsw` / `fstsw` — the status word into `AX` or a 16-bit memory
@@ -1071,6 +1172,10 @@ impl LiftCtx {
                 self.x87_compare_flags(src, pop);
                 Ok(())
             }
+            X87Form::ConditionalMove { src, condition } => {
+                self.x87_conditional_move(src, condition);
+                Ok(())
+            }
             X87Form::StoreStatus => self.x87_store_status(insn),
             X87Form::Exchange(index) => {
                 self.x87.exchange(index);
@@ -1265,6 +1370,27 @@ impl LiftCtx {
         } else {
             Err(X87Error::UnwritableDestination)
         }
+    }
+
+    /// `fcmov<cc>` — select between two slot values on an EFLAGS
+    /// predicate.
+    ///
+    /// A select, not a branch: both slots are read unconditionally and
+    /// an `Ite` picks between them, so the slice stays linear and the
+    /// SSA pass and the encoder need nothing new. Total, because both
+    /// reads are of the modelled stack and neither can present an
+    /// unmodelled width.
+    fn x87_conditional_move(&mut self, src: usize, condition: X87Condition) {
+        let taken = self.x87.read(src);
+        let kept = self.x87.read(0);
+        self.x87.write(
+            0,
+            Expr::Ite {
+                cond: Box::new(condition.predicate()),
+                then_expr: Box::new(taken),
+                else_expr: Box::new(kept),
+            },
+        );
     }
 
     /// The in-place unaries. Total rather than fallible: `fabs` and
