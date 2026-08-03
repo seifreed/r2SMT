@@ -975,7 +975,42 @@ enum ExtendKind {
 /// pre/post-index forms. Shared by the `AArch64` and `AArch32` handlers.
 pub(super) struct MemAccess {
     pub(super) address: Expr,
-    pub(super) writeback: Option<(String, i64)>,
+    pub(super) writeback: Option<Writeback>,
+}
+
+/// A base-register mutation `Xn := Xn + delta` performed by a pre- or
+/// post-index memory access.
+///
+/// The delta is an expression, not a constant, because the register
+/// post-index forms name a register (`ld1 {v0.16b}, [x0], x3`) whose
+/// value is only known at run time. Every immediate form goes through
+/// [`Writeback::by_constant`], so widening the type left them spelling
+/// the same expression they always did.
+pub(super) struct Writeback {
+    pub(super) base: String,
+    pub(super) delta: Expr,
+}
+
+impl Writeback {
+    /// The immediate form, whose delta is a signed constant carried at
+    /// the pointer width.
+    pub(super) fn by_constant(base: &str, delta: i64, ptr_bits: u16) -> Self {
+        Self {
+            base: base.to_string(),
+            delta: constant_delta(delta, ptr_bits),
+        }
+    }
+}
+
+/// A signed byte delta as a constant expression at the pointer width.
+///
+/// Bit-pattern reinterpretation of `delta` as `u64`: negative offsets
+/// carry their two's-complement representation, which `bvadd` then
+/// folds correctly at `ptr_bits`. Going through `to_le_bytes` keeps the
+/// conversion explicit (no `as` sign loss) and platform-stable.
+pub(super) fn constant_delta(delta: i64, ptr_bits: u16) -> Expr {
+    let masked = u64::from_le_bytes(delta.to_le_bytes()) & width_mask(ptr_bits);
+    Expr::konst(u128::from(masked), ptr_bits)
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -289,6 +289,15 @@ fn classify_operand_leaves_multi_register_lists_unknown() {
 }
 
 #[test]
+fn classify_operand_reads_a_single_element_list_as_a_list_not_memory() {
+    // `ld1 {v0.s}[1], [x8]` indexes a lane, so the brackets after the
+    // brace belong to the element. Typing the destination as memory
+    // would send a register write down the address path.
+    assert_eq!(classify_operand("{v0.s}[1]"), OperandKind::Unknown);
+    assert_eq!(classify_operand("{v0.s, v1.s}[1]"), OperandKind::Unknown);
+}
+
+#[test]
 fn classify_operand_reads_x87_stack_slots_as_registers() {
     // radare2 spells these with parentheses in disassembly.
     assert_eq!(classify_operand("st(0)"), OperandKind::Register);

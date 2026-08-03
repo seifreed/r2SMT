@@ -10,7 +10,7 @@ use r2smt_ir::stmt::IrStmt;
 use crate::registers::register_layout;
 
 use super::{
-    BinOp, FpArithOp, LiftCtx, MemAccess, PackedIntOp, PackedOp, VectorShape,
+    BinOp, FpArithOp, LiftCtx, MemAccess, PackedIntOp, PackedOp, VectorShape, Writeback,
     aarch64_cond_suffix_to_predicate, fp_lane_result, fp_sort_bits_checked,
     is_aarch32_base_supported, nonzero_width, strip_aarch32_cond_suffix, vector_shape, width_mask,
 };
@@ -417,7 +417,7 @@ impl LiftCtx {
         };
         let n = i64::try_from(regs.len()).unwrap_or(0);
         self.emit_store_multiple("sp", &regs, -4 * n);
-        self.emit_writeback(Some(("sp".to_string(), -4 * n)));
+        self.emit_writeback(Some(Writeback::by_constant("sp", -4 * n, self.bits)));
     }
 
     /// `pop {regs}` ≡ `ldmia sp!, {regs}` — load each register from an
@@ -429,7 +429,7 @@ impl LiftCtx {
         };
         let n = i64::try_from(regs.len()).unwrap_or(0);
         self.emit_load_multiple(insn, "sp", &regs, 0);
-        self.emit_writeback(Some(("sp".to_string(), 4 * n)));
+        self.emit_writeback(Some(Writeback::by_constant("sp", 4 * n, self.bits)));
     }
 
     /// `ldm{ia} Rn{!}, {regs}` — increment-after load multiple from the
@@ -449,7 +449,7 @@ impl LiftCtx {
         let n = i64::try_from(regs.len()).unwrap_or(0);
         self.emit_load_multiple(insn, &base, &regs, 0);
         if writeback {
-            self.emit_writeback(Some((base, 4 * n)));
+            self.emit_writeback(Some(Writeback::by_constant(&base, 4 * n, self.bits)));
         }
     }
 
@@ -470,7 +470,7 @@ impl LiftCtx {
         let n = i64::try_from(regs.len()).unwrap_or(0);
         self.emit_store_multiple(&base, &regs, 0);
         if writeback {
-            self.emit_writeback(Some((base, 4 * n)));
+            self.emit_writeback(Some(Writeback::by_constant(&base, 4 * n, self.bits)));
         }
     }
 
@@ -598,7 +598,7 @@ fn aarch32_mem_access(mem: &Operand, post: Option<&Operand>, ptr_bits: u16) -> O
         let parent = register_layout(&base, Arch::Arm).map(|l| l.parent)?;
         return Some(MemAccess {
             address: aarch32_addr_from(parent, offset, ptr_bits),
-            writeback: Some((parent.to_string(), offset)),
+            writeback: Some(Writeback::by_constant(parent, offset, ptr_bits)),
         });
     }
     let (base, offset) = parse_aarch32_memory(raw)?;
@@ -610,7 +610,7 @@ fn aarch32_mem_access(mem: &Operand, post: Option<&Operand>, ptr_bits: u16) -> O
         let delta = parse_aarch32_immediate(op.raw.strip_prefix('#').unwrap_or(&op.raw).trim())?;
         return Some(MemAccess {
             address: Expr::Var(Var::new(parent, ptr_bits)),
-            writeback: Some((parent.to_string(), delta)),
+            writeback: Some(Writeback::by_constant(parent, delta, ptr_bits)),
         });
     }
     Some(MemAccess {

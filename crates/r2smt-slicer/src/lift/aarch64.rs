@@ -8,8 +8,9 @@ use r2smt_ir::stmt::IrStmt;
 use crate::registers::register_layout;
 
 use super::{
-    BinOp, CsArithOp, FpArithOp, LiftCtx, MemAccess, VectorShape, aarch64_cond_suffix_to_predicate,
-    fp_lane_result, fp_sort_bits_checked, nonzero_width, vector_shape, width_mask,
+    BinOp, CsArithOp, FpArithOp, LiftCtx, MemAccess, VectorShape, Writeback,
+    aarch64_cond_suffix_to_predicate, fp_lane_result, fp_sort_bits_checked, nonzero_width,
+    vector_shape, width_mask,
 };
 use r2smt_common::Arch;
 
@@ -589,14 +590,12 @@ impl LiftCtx {
     /// access has no writeback. Emitted after the load/store so the
     /// `Xn` reads inside the access address stay the pre-write value
     /// under SSA rename.
-    pub(super) fn emit_writeback(&mut self, writeback: Option<(String, i64)>) {
-        let Some((base, delta)) = writeback else {
+    pub(super) fn emit_writeback(&mut self, writeback: Option<Writeback>) {
+        let Some(Writeback { base, delta }) = writeback else {
             return;
         };
         let base_var = Expr::Var(Var::new(&base, self.bits));
-        let masked = u64::from_le_bytes(delta.to_le_bytes()) & width_mask(self.bits);
-        let new_value = Expr::add(base_var, Expr::konst(u128::from(masked), self.bits));
-        self.assign(Var::new(&base, self.bits), new_value);
+        self.assign(Var::new(&base, self.bits), Expr::add(base_var, delta));
     }
 
     pub(super) fn lift_aarch64_ldp(&mut self, insn: &Instruction) {
@@ -765,7 +764,7 @@ fn aarch64_mem_access(mem: &Operand, post: Option<&Operand>, ptr_bits: u16) -> O
         let parent = aarch64_base_parent(&base);
         return Some(MemAccess {
             address: aarch64_addr_from(parent, offset, ptr_bits),
-            writeback: Some((parent.to_string(), offset)),
+            writeback: Some(Writeback::by_constant(parent, offset, ptr_bits)),
         });
     }
     let (base, offset) = parse_aarch64_memory(raw)?;
@@ -779,7 +778,7 @@ fn aarch64_mem_access(mem: &Operand, post: Option<&Operand>, ptr_bits: u16) -> O
         let delta = parse_signed_immediate(op.raw.strip_prefix('#').unwrap_or(&op.raw).trim())?;
         return Some(MemAccess {
             address: Expr::Var(Var::new(parent, ptr_bits)),
-            writeback: Some((parent.to_string(), delta)),
+            writeback: Some(Writeback::by_constant(parent, delta, ptr_bits)),
         });
     }
     Some(MemAccess {

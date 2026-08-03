@@ -629,6 +629,13 @@ fn is_shaped_vector_register(raw: &str) -> bool {
         && tail.ends_with(|c: char| c.is_ascii_alphanumeric() || c == ']')
 }
 
+/// Whether an operand is a brace-delimited register list. Purely
+/// syntactic: what the list contains is the slicer's question, and both
+/// ARM ISAs spell theirs the same way.
+fn is_register_list(raw: &str) -> bool {
+    raw.trim_start().starts_with('{')
+}
+
 /// An x87 stack slot as radare2 spells it in disassembly: `st(0)`
 /// through `st(7)`, with parentheses. Note r2's *ESIL* for the same
 /// instruction uses the bare `st0` form instead.
@@ -641,7 +648,15 @@ fn is_x87_stack_register(raw: &str) -> bool {
 }
 
 fn classify_operand(raw: &str) -> OperandKind {
-    if is_shaped_vector_register(raw) || is_x87_stack_register(raw) {
+    // A brace list is a register list on both ARM ISAs — the `AArch32`
+    // GPR forms (`{r4, r5, lr}`) and the `AArch64` vector ones
+    // (`{v0.4s, v1.4s}`, `{v0.s}[1]`). It has to be recognised before
+    // the memory test: the single-element form's brackets index a lane,
+    // not an address, and reading them as one would type the
+    // destination of `ld1 {v0.s}[1], [x8]` as memory.
+    if is_register_list(raw) {
+        OperandKind::Unknown
+    } else if is_shaped_vector_register(raw) || is_x87_stack_register(raw) {
         OperandKind::Register
     } else if raw.starts_with('[') || raw.contains("ptr ") || raw.contains('[') {
         OperandKind::Memory
