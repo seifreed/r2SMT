@@ -201,6 +201,7 @@ fn run(cli: Cli) -> Result<()> {
             function,
             max_instructions,
             timeout_ms,
+            rlimit,
             allow_memory,
             allow_calls,
             unknowns_on_truncation,
@@ -222,6 +223,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             let options = SolveOptions {
                 timeout_ms: timeout_ms.unwrap_or(SolveOptions::default().timeout_ms),
+                rlimit: rlimit.unwrap_or(SolveOptions::default().rlimit),
                 ..SolveOptions::default()
             };
             let plan = AnnotatePlan {
@@ -246,6 +248,7 @@ fn run(cli: Cli) -> Result<()> {
             function,
             max_instructions,
             timeout_ms,
+            rlimit,
             allow_memory,
             allow_calls,
             unknowns_on_truncation,
@@ -269,6 +272,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             let options = SolveOptions {
                 timeout_ms: timeout_ms.unwrap_or(SolveOptions::default().timeout_ms),
+                rlimit: rlimit.unwrap_or(SolveOptions::default().rlimit),
                 ..SolveOptions::default()
             };
             let cfg = PatchCli {
@@ -296,6 +300,7 @@ fn run(cli: Cli) -> Result<()> {
             function,
             max_instructions,
             timeout_ms,
+            rlimit,
             allow_memory,
             allow_calls,
             unknowns_on_truncation,
@@ -324,6 +329,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             let options = SolveOptions {
                 timeout_ms: timeout_ms.unwrap_or(SolveOptions::default().timeout_ms),
+                rlimit: rlimit.unwrap_or(SolveOptions::default().rlimit),
                 ..SolveOptions::default()
             };
             let filters = SolveFilters {
@@ -356,6 +362,7 @@ fn run(cli: Cli) -> Result<()> {
             threads,
             max_instructions,
             timeout_ms,
+            rlimit,
             allow_memory,
             allow_calls,
             unknowns_on_truncation,
@@ -379,6 +386,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             let options = SolveOptions {
                 timeout_ms: timeout_ms.unwrap_or(SolveOptions::default().timeout_ms),
+                rlimit: rlimit.unwrap_or(SolveOptions::default().rlimit),
                 ..SolveOptions::default()
             };
             batch(
@@ -399,6 +407,7 @@ fn run(cli: Cli) -> Result<()> {
             addr,
             patch: do_patch,
             timeout_ms,
+            rlimit,
             max_instructions,
             allow_memory,
             allow_calls,
@@ -417,6 +426,7 @@ fn run(cli: Cli) -> Result<()> {
             limits.allow_join_merge = allow_join_merge;
             let options = SolveOptions {
                 timeout_ms: timeout_ms.unwrap_or(SolveOptions::default().timeout_ms),
+                rlimit: rlimit.unwrap_or(SolveOptions::default().rlimit),
                 ..SolveOptions::default()
             };
             let verbosity = if quiet {

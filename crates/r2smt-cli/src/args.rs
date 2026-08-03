@@ -118,6 +118,16 @@ pub(crate) enum Command {
         #[arg(long, value_name = "MS")]
         timeout_ms: Option<u32>,
 
+        /// Per-branch solver budget in Z3 resource units instead of
+        /// wall-clock time. Unset by default. A wall-clock budget makes
+        /// the verdict depend on host load, so the same binary over the
+        /// same input can classify a branch `real_branch` on an idle
+        /// machine and `suspicious_but_unknown` on a busy one; this
+        /// bound counts work, not seconds, and so is reproducible.
+        /// Prefer it when diffing verdicts across two builds.
+        #[arg(long, value_name = "UNITS")]
+        rlimit: Option<u32>,
+
         /// Allow memory load / store instructions in slices.
         #[arg(long)]
         allow_memory: bool,
@@ -186,6 +196,16 @@ pub(crate) enum Command {
         /// Per-branch solver budget in milliseconds. Default: 500.
         #[arg(long, value_name = "MS")]
         timeout_ms: Option<u32>,
+
+        /// Per-branch solver budget in Z3 resource units instead of
+        /// wall-clock time. Unset by default. A wall-clock budget makes
+        /// the verdict depend on host load, so the same binary over the
+        /// same input can classify a branch `real_branch` on an idle
+        /// machine and `suspicious_but_unknown` on a busy one; this
+        /// bound counts work, not seconds, and so is reproducible.
+        /// Prefer it when diffing verdicts across two builds.
+        #[arg(long, value_name = "UNITS")]
+        rlimit: Option<u32>,
 
         /// Allow memory load / store instructions in slices.
         #[arg(long)]
@@ -265,6 +285,16 @@ pub(crate) enum Command {
         /// Per-branch solver budget in milliseconds. Default: 500.
         #[arg(long, value_name = "MS")]
         timeout_ms: Option<u32>,
+
+        /// Per-branch solver budget in Z3 resource units instead of
+        /// wall-clock time. Unset by default. A wall-clock budget makes
+        /// the verdict depend on host load, so the same binary over the
+        /// same input can classify a branch `real_branch` on an idle
+        /// machine and `suspicious_but_unknown` on a busy one; this
+        /// bound counts work, not seconds, and so is reproducible.
+        /// Prefer it when diffing verdicts across two builds.
+        #[arg(long, value_name = "UNITS")]
+        rlimit: Option<u32>,
 
         /// Allow memory load / store instructions in slices.
         #[arg(long)]
@@ -363,6 +393,16 @@ pub(crate) enum Command {
         #[arg(long, value_name = "MS")]
         timeout_ms: Option<u32>,
 
+        /// Per-branch solver budget in Z3 resource units instead of
+        /// wall-clock time. Unset by default. A wall-clock budget makes
+        /// the verdict depend on host load, so the same binary over the
+        /// same input can classify a branch `real_branch` on an idle
+        /// machine and `suspicious_but_unknown` on a busy one; this
+        /// bound counts work, not seconds, and so is reproducible.
+        /// Prefer it when diffing verdicts across two builds.
+        #[arg(long, value_name = "UNITS")]
+        rlimit: Option<u32>,
+
         /// Allow memory load / store instructions in slices.
         #[arg(long)]
         allow_memory: bool,
@@ -423,6 +463,16 @@ pub(crate) enum Command {
         /// Per-branch solver budget in milliseconds. Default: 500.
         #[arg(long, value_name = "MS")]
         timeout_ms: Option<u32>,
+
+        /// Per-branch solver budget in Z3 resource units instead of
+        /// wall-clock time. Unset by default. A wall-clock budget makes
+        /// the verdict depend on host load, so the same binary over the
+        /// same input can classify a branch `real_branch` on an idle
+        /// machine and `suspicious_but_unknown` on a busy one; this
+        /// bound counts work, not seconds, and so is reproducible.
+        /// Prefer it when diffing verdicts across two builds.
+        #[arg(long, value_name = "UNITS")]
+        rlimit: Option<u32>,
 
         /// Maximum number of instructions per slice. Default: 32.
         #[arg(long, value_name = "N")]
