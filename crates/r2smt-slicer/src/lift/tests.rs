@@ -2810,6 +2810,27 @@ fn aarch32_packed_integer_add_lifts_one_addition_per_lane() {
 }
 
 #[test]
+fn aarch32_rounding_right_shifts_lift() {
+    // `vrshr` / `vrsra` are the shift family's rounding forms; they lift
+    // through the same immediate-shift path with the rounding flag set.
+    for mnemonic in ["vrshr.u32", "vrsra.s16"] {
+        let i = insn(
+            0x1000,
+            4,
+            mnemonic,
+            vec![reg("q0"), reg("q1"), op("2", OperandKind::Immediate)],
+        );
+        let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Arm);
+        assert!(
+            stmts
+                .iter()
+                .all(|s| !matches!(s, IrStmt::Unsupported { .. })),
+            "{mnemonic}: {stmts:?}"
+        );
+    }
+}
+
+#[test]
 fn aarch32_single_precision_on_a_d_register_covers_both_lanes() {
     // `AArch32` puts only the element type in the mnemonic, so the lane
     // count comes from the destination: a `d` register holds two

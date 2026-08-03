@@ -774,22 +774,23 @@ fn neon_shift_op(base: &str, kind: ElementKind) -> Option<PackedOp> {
                 left: true,
                 signed: false,
                 accumulate: false,
+                rounding: false,
             });
         }
         ElementKind::Float => return None,
     };
+    let right = |accumulate, rounding| PackedOp::ShiftImmediate {
+        left: false,
+        signed,
+        accumulate,
+        rounding,
+    };
     Some(match base {
         "vshl" => PackedOp::ShiftRegister { signed },
-        "vshr" => PackedOp::ShiftImmediate {
-            left: false,
-            signed,
-            accumulate: false,
-        },
-        "vsra" => PackedOp::ShiftImmediate {
-            left: false,
-            signed,
-            accumulate: true,
-        },
+        "vshr" => right(false, false),
+        "vsra" => right(true, false),
+        "vrshr" => right(false, true),
+        "vrsra" => right(true, true),
         _ => return None,
     })
 }

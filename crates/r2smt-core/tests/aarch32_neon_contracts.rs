@@ -627,3 +627,36 @@ fn a_half_register_destination_preserves_the_other_half() {
         0xdead_beef_0000_0000_0000_0000_ffff_fffd,
     );
 }
+
+#[test]
+fn vrshr_rounds_the_discarded_bits_rather_than_truncating() {
+    // 6 >> 2 is 1 truncated, but vrshr adds half an ulp first:
+    // (6 + 2) >> 2 is 2. The whole contract is that difference from a
+    // plain vshr.
+    assert_computes("vrshr.u32", &["q0", "q1", "2"], &[("v1", 6)], 2);
+}
+
+#[test]
+fn vrshr_carries_the_round_past_the_signed_maximum() {
+    // round(INT_MAX / 2) is 0x4000_0000. The half added before the
+    // shift overflows a same-width signed value, so the lane is computed
+    // one bit wider — the teeth for that widening.
+    assert_computes(
+        "vrshr.s32",
+        &["q0", "q1", "1"],
+        &[("v1", 0x7fff_ffff)],
+        0x4000_0000,
+    );
+}
+
+#[test]
+fn vrsra_adds_the_rounded_shift_into_the_destination() {
+    // vrshr plus an accumulate: 0x10 + round(6 / 4) is 0x12, where a
+    // truncating accumulate would give 0x11.
+    assert_computes(
+        "vrsra.u32",
+        &["q0", "q1", "2"],
+        &[("v0", 0x10), ("v1", 6)],
+        0x12,
+    );
+}

@@ -105,6 +105,10 @@ pub(crate) enum PackedOp {
         signed: bool,
         /// `vsra` adds the shifted lane into the destination.
         accumulate: bool,
+        /// `vrshr` / `vrsra` add half an ulp of the shift before
+        /// discarding the low bits — the rounding right shifts. Only the
+        /// right-shifting forms carry it.
+        rounding: bool,
     },
     /// `vshl` with a per-lane amount read from a vector register, whose
     /// *sign* chooses the direction.
@@ -632,6 +636,30 @@ fn shift_right_lane(signed: bool, value: Expr, amount: Expr) -> Expr {
     }
 }
 
+/// A rounding right shift of one lane — `vrshr` / `vrsra`.
+///
+/// ARM rounds on the unbounded integer, adding half an ulp of the shift
+/// (`1 << (amount - 1)`) before discarding the low bits. The addition is
+/// done one bit wider than the lane so the half can carry past the top
+/// without overflowing — the same widening that keeps the `AArch64`
+/// rounding shifts correct at their signed maximum.
+fn rounding_shift_right_lane(signed: bool, value: Expr, amount: Expr, bits: u16) -> Option<Expr> {
+    let wide = bits.checked_add(1)?;
+    let value_wide = if signed {
+        Expr::sign_ext(value, wide)
+    } else {
+        Expr::zero_ext(value, wide)
+    };
+    let amount_wide = Expr::zero_ext(amount, wide);
+    let half = Expr::shl(
+        wide_const(1, wide)?,
+        Expr::sub(amount_wide.clone(), wide_const(1, wide)?),
+    );
+    let rounded = Expr::add(value_wide, half);
+    let shifted = shift_right_lane(signed, rounded, amount_wide);
+    Some(Expr::extract(shifted, bits - 1, 0))
+}
+
 /// One destination lane of a register-form vector shift.
 ///
 /// Only the low byte of the amount element is read, as a signed value
@@ -1075,6 +1103,7 @@ impl LiftCtx {
             left,
             signed,
             accumulate,
+            rounding,
         } = shape
         else {
             return None;
@@ -1093,6 +1122,8 @@ impl LiftCtx {
             let a = Self::extract_lane(a_val.clone(), lane_bits, index)?;
             let shifted = if left {
                 Expr::shl(a, amount.clone())
+            } else if rounding {
+                rounding_shift_right_lane(signed, a, amount.clone(), lane_bits)?
             } else {
                 shift_right_lane(signed, a, amount.clone())
             };
