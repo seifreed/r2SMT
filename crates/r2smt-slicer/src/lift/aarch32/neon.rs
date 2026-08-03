@@ -25,6 +25,7 @@ use crate::registers::{has_vector_arrangement, is_simd_parent, register_layout};
 mod element;
 pub(super) mod lower;
 mod permute;
+pub(super) mod structured;
 mod width;
 
 /// Bits in a byte, named because `vext` measures its window in them.

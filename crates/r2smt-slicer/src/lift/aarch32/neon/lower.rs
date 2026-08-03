@@ -345,7 +345,10 @@ impl LiftCtx {
         Self::concat_lanes(vec![element; usize::from(shape.lanes)])
     }
 
-    fn push_aarch32_neon_unsupported(&mut self, insn: &Instruction) {
+    pub(in crate::lift::aarch32::neon) fn push_aarch32_neon_unsupported(
+        &mut self,
+        insn: &Instruction,
+    ) {
         self.stmts.push(IrStmt::Unsupported {
             mnemonic: insn.mnemonic.clone(),
             comment: format!(

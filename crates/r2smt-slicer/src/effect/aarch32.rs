@@ -33,12 +33,23 @@ pub(super) fn analyze_aarch32(insn: &Instruction) -> InstructionEffect {
 
 fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> InstructionEffect {
     // See the note in the `AArch64` table: an operand carrying vector
-    // shape resolves as a `use` but not as a `def`, so it must fail
-    // closed above the dispatch. `AArch32` NEON is `v`-prefixed with a
-    // type suffix and so collides less, but the indexed form (`d0[1]`)
-    // reaches the integer arms exactly the same way.
-    if crate::lift::vector_shape(insn, Arch::Arm) == crate::lift::VectorShape::Declined {
-        return other_effect(insn);
+    // shape resolves as a `use` but not as a `def`, so it must be
+    // answered above the dispatch. `AArch32` NEON is `v`-prefixed with
+    // a type suffix and so collides less, but the indexed form
+    // (`d0[1]`) reaches the integer arms exactly the same way.
+    match crate::lift::vector_shape(insn, Arch::Arm) {
+        // A structured access moves bytes rather than computing them,
+        // so its entry is the memory-shaped one.
+        crate::lift::VectorShape::LiftedMemory(effect) => {
+            return aarch32_structured_effect(insn, effect);
+        }
+        crate::lift::VectorShape::Declined => return other_effect(insn),
+        // `None` means no operand carries vector shape and the mnemonic
+        // dispatch below applies — which is also where a `Lifted` form
+        // lands, at the guard arm that builds the vector entry. The two
+        // share this arm because on `AArch32` the packed families are
+        // recognised from the mnemonic either way.
+        crate::lift::VectorShape::None | crate::lift::VectorShape::Lifted { .. } => {}
     }
     match dispatch_mnemonic {
         // 2-operand `mov Rd, Rn/imm` and `mvn Rd, Op` (bitwise NOT).
@@ -394,6 +405,68 @@ fn aarch32_cmp_test_effect(insn: &Instruction, kind: InstructionKind) -> Instruc
         uses,
         defines_flags: true,
         has_memory_access: any_memory_operand(&insn.operands),
+        is_call: false,
+        reads_flags: false,
+    }
+}
+
+/// The `AArch32` structured load / store family (`vld1`–`vld4`,
+/// `vst1`–`vst4`).
+///
+/// The listed registers come from the operand text, exactly as the
+/// `ldm` / `push` entry above takes them: [`registers_in_operand`]
+/// already recovers every parent a brace list names. What the resolver
+/// supplies is the side each of them sits on.
+///
+/// Both `d0` and `d1` resolve to the parent `v0`, so a two-register
+/// list collapses to one entry here — which is right, since they are
+/// two halves of one register.
+fn aarch32_structured_effect(
+    insn: &Instruction,
+    effect: crate::lift::StructuredEffect,
+) -> InstructionEffect {
+    let listed = insn
+        .operands
+        .first()
+        .map(|op| registers_in_operand(op, Arch::Arm))
+        .unwrap_or_default();
+    let base = insn
+        .operands
+        .get(1)
+        .map(|op| registers_in_operand(op, Arch::Arm))
+        .unwrap_or_default();
+    let mut defs: Vec<&'static str> = Vec::new();
+    let mut uses: Vec<&'static str> = base.clone();
+    if effect.reads_list {
+        for register in &listed {
+            if !uses.contains(register) {
+                uses.push(register);
+            }
+        }
+    }
+    if effect.writes_list {
+        for register in &listed {
+            if !defs.contains(register) {
+                defs.push(register);
+            }
+        }
+    }
+    if effect.writes_base {
+        for register in &base {
+            if !defs.contains(register) {
+                defs.push(register);
+            }
+        }
+    }
+    InstructionEffect {
+        // `Mov` keeps the slicer out of the `Other`-truncation path;
+        // the memory side-effect is surfaced through
+        // `has_memory_access`, exactly as `ldr` / `str` do.
+        kind: InstructionKind::Mov,
+        defs,
+        uses,
+        defines_flags: false,
+        has_memory_access: true,
         is_call: false,
         reads_flags: false,
     }

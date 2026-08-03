@@ -42,14 +42,25 @@ const F32_ONE: u128 = 0x3f80_0000;
 const F32_MINUS_ONE: u128 = 0xbf80_0000;
 
 /// Classify a fixture operand the way the radare2 adapter's parser
-/// does: anything starting with a digit is an immediate, everything
-/// else names a register.
+/// does: a bracketed operand addresses memory, anything starting with a
+/// digit is an immediate, everything else names a register.
 ///
 /// `AArch32` NEON shift counts matter here — radare2 prints them bare
 /// (`vshl.i32 q0, q1, 3`), and in hex once they reach `0x10`, rather
 /// than with the manual's `#`.
+///
+/// The memory case is load-bearing for the structured accesses rather
+/// than cosmetic: their resolver refuses an operand that is not
+/// [`OperandKind::Memory`], so a fixture spelling `[r0]` as a register
+/// would make every one of their decline assertions pass without
+/// reaching the check it names.
 fn operand(raw: &str) -> Operand {
-    let kind = if raw.starts_with(|c: char| c.is_ascii_digit()) {
+    // The leading bracket is what separates an address from an indexed
+    // register: `[r0]` addresses memory, `d4[2]` names one lane of a
+    // register and must stay `Register` for the by-element resolver.
+    let kind = if raw.trim_start().starts_with('[') {
+        OperandKind::Memory
+    } else if raw.starts_with(|c: char| c.is_ascii_digit()) {
         OperandKind::Immediate
     } else {
         OperandKind::Register
@@ -1427,4 +1438,266 @@ fn an_indexed_operand_outside_this_family_still_declines() {
     // closed rather than reaching an integer handler that would read
     // all of `d0`.
     assert!(declines("vmov", &["r0", "d0[1]"]));
+}
+
+// ---------------------------------------------------------------
+// Structured loads and stores
+//
+// `vld1`–`vld4` / `vst1`–`vst4` move bytes rather than computing them,
+// so the thing worth solving is the *layout*: which memory byte lands
+// in which lane of which register. That cannot be observed from one
+// instruction, so these store a known pattern and read it back — which
+// also exercises the byte-granular memory model end to end.
+// ---------------------------------------------------------------
+
+/// Lift a sequence of instructions and ask what a named register holds
+/// afterwards.
+///
+/// Each step gets its own address: the lifter names its temporaries
+/// after the instruction address, so two instructions lifted at the
+/// same one would collide.
+fn solve_sequence(
+    steps: &[(&str, &[&str])],
+    sources: &[(&str, u128, u16)],
+    destination: (&str, u16),
+    expected: u128,
+) -> SmtResult {
+    let mut statements: Vec<IrStmt> = sources
+        .iter()
+        .map(|(name, value, bits)| IrStmt::Assign {
+            dst: Var::new(*name, *bits),
+            src: Expr::konst(*value, *bits),
+        })
+        .collect();
+    for (step, (mnemonic, operands)) in steps.iter().enumerate() {
+        let address = Address::new(0x1000 + 4 * step as u64);
+        let insn = Instruction {
+            address,
+            size: 4,
+            bytes: vec![],
+            mnemonic: (*mnemonic).into(),
+            operands: operands.iter().map(|o| operand(o)).collect(),
+            esil: None,
+            pcode: None,
+            is_thumb: false,
+        };
+        let lifted = lift_per_mnemonic(&insn, Arch::Arm);
+        assert!(
+            lifted
+                .iter()
+                .all(|s| !matches!(s, IrStmt::Unsupported { .. })),
+            "{mnemonic} declined: {lifted:?}"
+        );
+        statements.extend(lifted);
+    }
+    let (name, bits) = destination;
+    let slice = LiftedSlice {
+        branch: branch(),
+        statements,
+        condition: Expr::eq(Expr::Var(Var::new(name, bits)), Expr::konst(expected, bits)),
+        status: SliceStatus::Complete,
+        treat_truncation_as_inputs: false,
+        arch: Arch::Arm,
+    };
+    solve_branch(
+        &ssa_convert(&slice),
+        SolveOptions {
+            timeout_ms: TEST_SOLVE_TIMEOUT_MS,
+            ..SolveOptions::default()
+        },
+    )
+}
+
+fn assert_sequence(
+    steps: &[(&str, &[&str])],
+    sources: &[(&str, u128, u16)],
+    destination: (&str, u16),
+    expected: u128,
+) {
+    assert_eq!(
+        solve_sequence(steps, sources, destination, expected),
+        SmtResult::AlwaysTrue,
+        "{steps:?} should leave {expected:#x} in {destination:?}"
+    );
+}
+
+/// A base address and the two source registers holding a 32-byte ramp:
+/// memory byte `k` ends up holding `k`.
+const RAMP_SOURCES: [(&str, u128, u16); 3] = [
+    ("r0", 0x1000, 32),
+    ("v0", BYTE_RAMP, 128),
+    ("v1", BYTE_RAMP_HIGH, 128),
+];
+
+#[test]
+fn vst1_then_vld1_round_trips_the_bytes_unchanged() {
+    // `vld1` is contiguous: the list is one block, so what went in
+    // comes back in the same lanes. This is also the baseline the
+    // de-interleaving tests below are read against.
+    assert_sequence(
+        &[
+            ("vst1.8", &["{d0, d1}", "[r0]"]),
+            ("vld1.8", &["{d2, d3}", "[r0]"]),
+        ],
+        &RAMP_SOURCES,
+        ("v1", 128),
+        BYTE_RAMP,
+    );
+}
+
+#[test]
+fn vld2_sends_alternate_bytes_to_alternate_registers() {
+    // Two structures interleaved: the first register collects the even
+    // memory bytes and the second the odd ones. A contiguous read would
+    // give back the ramp instead.
+    assert_sequence(
+        &[
+            ("vst1.8", &["{d0, d1}", "[r0]"]),
+            ("vld2.8", &["{d2, d3}", "[r0]"]),
+        ],
+        &RAMP_SOURCES,
+        ("v1", 128),
+        0x0f0d_0b09_0705_0301_0e0c_0a08_0604_0200,
+    );
+}
+
+#[test]
+fn vld3_takes_every_third_byte_into_each_register() {
+    assert_sequence(
+        &[
+            ("vst1.8", &["{d0, d1, d2, d3}", "[r0]"]),
+            ("vld3.8", &["{d8, d9, d10}", "[r0]"]),
+        ],
+        &RAMP_SOURCES,
+        ("v4", 128),
+        0x1613_100d_0a07_0401_1512_0f0c_0906_0300,
+    );
+}
+
+#[test]
+fn vld4_takes_every_fourth_byte_into_each_register() {
+    assert_sequence(
+        &[
+            ("vst1.8", &["{d0, d1, d2, d3}", "[r0]"]),
+            ("vld4.8", &["{d8, d9, d10, d11}", "[r0]"]),
+        ],
+        &RAMP_SOURCES,
+        ("v4", 128),
+        0x1d19_1511_0d09_0501_1c18_1410_0c08_0400,
+    );
+}
+
+#[test]
+fn vld4_fills_its_third_and_fourth_registers_too() {
+    // The tail of the same instruction: a lowering that stopped after
+    // two registers would leave these holding their prior value.
+    assert_sequence(
+        &[
+            ("vst1.8", &["{d0, d1, d2, d3}", "[r0]"]),
+            ("vld4.8", &["{d8, d9, d10, d11}", "[r0]"]),
+        ],
+        &RAMP_SOURCES,
+        ("v5", 128),
+        0x1f1b_1713_0f0b_0703_1e1a_1612_0e0a_0602,
+    );
+}
+
+#[test]
+fn vst2_interleaves_on_the_way_out() {
+    // The store side of the same layout: written interleaved and read
+    // back contiguously, the bytes come out in the order `vld2` would
+    // have undone.
+    assert_sequence(
+        &[
+            ("vst2.8", &["{d0, d1}", "[r0]"]),
+            ("vld1.8", &["{d2, d3}", "[r0]"]),
+        ],
+        &RAMP_SOURCES,
+        ("v1", 128),
+        0x0f07_0e06_0d05_0c04_0b03_0a02_0901_0800,
+    );
+}
+
+#[test]
+fn a_structured_access_advances_its_base_by_what_it_transferred() {
+    // `[r0]!` is the immediate post-index: two registers is sixteen
+    // bytes, whatever the element width.
+    assert_sequence(
+        &[("vld1.8", &["{d2, d3}", "[r0]!"])],
+        &RAMP_SOURCES,
+        ("r0", 32),
+        0x1010,
+    );
+}
+
+#[test]
+fn a_four_register_access_advances_the_base_by_thirty_two() {
+    assert_sequence(
+        &[("vld1.32", &["{d2, d3, d4, d5}", "[r0]!"])],
+        &RAMP_SOURCES,
+        ("r0", 32),
+        0x1020,
+    );
+}
+
+// --- the boundary of the structured seam ---
+
+#[test]
+fn a_structured_access_declines_an_alignment_specifier() {
+    // Disassemblers spell alignment more than one way (`[r0:64]`,
+    // `[r0@64]`), and it constrains the address rather than describing
+    // the transfer, so anything but a bare register inside the brackets
+    // fails closed rather than being guessed at.
+    assert!(declines("vld1.8", &["{d0, d1}", "[r0:64]"]));
+    assert!(declines("vld1.8", &["{d0, d1}", "[r0@128]"]));
+}
+
+#[test]
+fn a_structured_access_declines_the_single_element_shape() {
+    // `{d0[3]}` transfers one element rather than whole registers.
+    assert!(declines("vld1.8", &["{d0[3]}", "[r0]"]));
+    assert!(declines("vld2.8", &["{d0[1], d1[1]}", "[r0]"]));
+}
+
+#[test]
+fn a_structured_access_declines_a_non_consecutive_list() {
+    // The stride-two spellings are a different encoding; reading them
+    // as consecutive would send the bytes to the wrong registers.
+    assert!(declines("vld2.8", &["{d0, d2}", "[r0]"]));
+}
+
+#[test]
+fn an_interleaved_access_declines_a_list_that_is_not_its_width() {
+    // A `vld3` names exactly three registers. The double-width `vld2`
+    // spelling with four is a separate encoding.
+    assert!(declines("vld3.8", &["{d0, d1}", "[r0]"]));
+    assert!(declines("vld2.8", &["{d0, d1, d2, d3}", "[r0]"]));
+}
+
+#[test]
+fn an_interleaved_access_declines_a_doubleword_element() {
+    // One structure would fill the whole register, so the architecture
+    // gives the interleaved family no such encoding.
+    assert!(declines("vld2.64", &["{d0, d1}", "[r0]"]));
+    assert!(declines("vld4.64", &["{d0, d1, d2, d3}", "[r0]"]));
+}
+
+#[test]
+fn a_structured_access_declines_a_register_post_index() {
+    // `[r0], r1` advances the base by a run-time value, which the
+    // constant writeback cannot spell.
+    assert!(declines("vld1.8", &["{d0, d1}", "[r0]", "r1"]));
+}
+
+#[test]
+fn the_structured_decline_assertions_have_teeth() {
+    // Positive control for the block above. Every one of those
+    // assertions names a memory operand, and the resolver refuses an
+    // operand that is not `OperandKind::Memory` — so if the fixture
+    // classified `[r0]` as a register they would all pass without
+    // reaching the check they name. This is the same shape that does
+    // not decline.
+    assert!(!declines("vld1.8", &["{d0, d1}", "[r0]"]));
+    assert!(!declines("vld1.8", &["{d0, d1}", "[r0]!"]));
+    assert!(!declines("vld4.8", &["{d0, d1, d2, d3}", "[r0]"]));
 }

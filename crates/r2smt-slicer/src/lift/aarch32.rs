@@ -118,6 +118,9 @@ impl LiftCtx {
             // operands most tightly — the shape resolver checks operand
             // count, register class and geometry, where the packed arm
             // below asks only what the mnemonic spells.
+            _ if let Some(access) = neon::structured::resolve(insn) => {
+                self.lift_aarch32_structured(insn, &access);
+            }
             _ if let Some(shape) = neon::resolve(insn) => self.lift_aarch32_neon(insn, shape),
             // NEON packed data processing. Recognised ahead of the VFP
             // arm because the two families share mnemonics: `vadd.f32`
@@ -628,7 +631,7 @@ fn aarch32_mem_access(mem: &Operand, post: Option<&Operand>, ptr_bits: u16) -> O
 }
 
 /// Build `base ± offset` at the pointer width (base alone if zero).
-fn aarch32_addr_from(parent: &str, offset: i64, ptr_bits: u16) -> Expr {
+pub(super) fn aarch32_addr_from(parent: &str, offset: i64, ptr_bits: u16) -> Expr {
     let base_var = Expr::Var(Var::new(parent, ptr_bits));
     if offset == 0 {
         return base_var;
@@ -946,6 +949,14 @@ pub(crate) fn is_aarch32_neon_instruction(insn: &Instruction) -> bool {
 /// later read bound to a stale value.
 pub(crate) fn aarch32_neon_writes_operand_pair(insn: &Instruction) -> bool {
     neon::writes_operand_pair(insn)
+}
+
+/// How the slicer should read a structured access's operands, or `None`
+/// when `insn` is not one this lifter models.
+pub(crate) fn aarch32_structured_effect(
+    insn: &Instruction,
+) -> Option<crate::lift::StructuredEffect> {
+    neon::structured::resolve(insn).map(|access| access.effect())
 }
 
 /// Whether `insn` carries a packed NEON form in an operand shape the

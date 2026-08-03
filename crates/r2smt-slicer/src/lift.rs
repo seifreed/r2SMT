@@ -42,8 +42,8 @@ mod simd;
 mod x86;
 mod x87;
 pub(crate) use aarch32::{
-    VfpOp, aarch32_neon_writes_operand_pair, is_aarch32_neon_instruction,
-    is_aarch32_packed_instruction, vfp_scalar,
+    VfpOp, aarch32_neon_writes_operand_pair, aarch32_structured_effect,
+    is_aarch32_neon_instruction, is_aarch32_packed_instruction, vfp_scalar,
 };
 pub(crate) use aarch64::neon::structured::StructuredEffect;
 use merge::lower_merge;
@@ -331,9 +331,17 @@ pub(crate) fn vector_shape(insn: &Instruction, arch: Arch) -> VectorShape {
         // `AArch64`, where a packed write zeroes the register above the
         // arrangement and only the element inserts read what they
         // overwrite.
-        Arch::Arm if is_aarch32_neon_instruction(insn) => VectorShape::Lifted {
-            reads_destination: true,
-        },
+        Arch::Arm => {
+            if let Some(effect) = aarch32_structured_effect(insn) {
+                return VectorShape::LiftedMemory(effect);
+            }
+            if is_aarch32_neon_instruction(insn) {
+                return VectorShape::Lifted {
+                    reads_destination: true,
+                };
+            }
+            VectorShape::Declined
+        }
         _ => VectorShape::Declined,
     }
 }
