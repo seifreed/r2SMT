@@ -341,6 +341,104 @@ fn vmls_float_subtracts_the_product() {
 }
 
 // ---------------------------------------------------------------
+// `vqadd` / `vqsub` — saturation
+// ---------------------------------------------------------------
+
+#[test]
+fn vqadd_signed_clamps_at_the_element_maximum() {
+    // `0x7f + 1` overflows a signed byte; the result is `INT_MAX`, not
+    // the wrapped `0x80`.
+    assert_computes("vqadd.s8", &QUADS, &[("v1", 0x7f), ("v2", 1)], 0x7f);
+}
+
+#[test]
+fn vqadd_signed_clamps_at_the_element_minimum() {
+    // `-128 + -1` underflows; the result is `INT_MIN`. The low clamp is
+    // a separate comparison from the high one, so it needs its own
+    // test.
+    assert_computes("vqadd.s8", &QUADS, &[("v1", 0x80), ("v2", 0xff)], 0x80);
+}
+
+#[test]
+fn vqadd_signed_leaves_a_representable_sum_alone() {
+    assert_computes("vqadd.s8", &QUADS, &[("v1", 0x10), ("v2", 0x20)], 0x30);
+}
+
+#[test]
+fn vqadd_unsigned_clamps_at_the_unsigned_maximum() {
+    // `0xff + 1` as unsigned bytes saturates at `0xff`. Under the
+    // signed reading the same bytes are `-1 + 1 = 0`, so this and the
+    // signed tests above cannot both pass by accident.
+    assert_computes("vqadd.u8", &QUADS, &[("v1", 0xff), ("v2", 1)], 0xff);
+}
+
+#[test]
+fn vqsub_unsigned_clamps_at_zero() {
+    // The case a naive widening gets wrong: `1 - 2` on zero-extended
+    // bytes wraps to a large *unsigned* value, and clamping that
+    // against the unsigned maximum would give `0xff` instead of `0`.
+    assert_computes("vqsub.u8", &QUADS, &[("v1", 1), ("v2", 2)], 0);
+}
+
+#[test]
+fn vqsub_signed_clamps_at_the_element_minimum() {
+    // `-128 - 1` underflows to `INT_MIN`.
+    assert_computes("vqsub.s8", &QUADS, &[("v1", 0x80), ("v2", 1)], 0x80);
+}
+
+#[test]
+fn vqadd_saturates_per_lane() {
+    // The high lane saturates and the low one does not, so a lowering
+    // that clamped the whole view once fails here.
+    assert_computes(
+        "vqadd.s8",
+        &QUADS,
+        &[("v1", 0x7f01), ("v2", 0x0102)],
+        0x7f03,
+    );
+}
+
+// ---------------------------------------------------------------
+// `vhadd` / `vhsub` / `vrhadd` — halving
+// ---------------------------------------------------------------
+
+#[test]
+fn vhadd_unsigned_halves_the_exact_sum() {
+    // `(0xff + 0xff) / 2` is `0xff`. Adding at the element width first
+    // would wrap to `0xfe` and halve to `0x7f`.
+    assert_computes("vhadd.u8", &QUADS, &[("v1", 0xff), ("v2", 0xff)], 0xff);
+}
+
+#[test]
+fn vhadd_unsigned_truncates_an_odd_sum() {
+    // `(3 + 4) / 2` is `3`: the halving forms truncate, which is what
+    // separates them from `vrhadd`.
+    assert_computes("vhadd.u8", &QUADS, &[("v1", 3), ("v2", 4)], 3);
+}
+
+#[test]
+fn vrhadd_rounds_an_odd_sum_up() {
+    // The teeth for the test above: the same operands under the
+    // rounding form give `4`.
+    assert_computes("vrhadd.u8", &QUADS, &[("v1", 3), ("v2", 4)], 4);
+}
+
+#[test]
+fn vhadd_signed_floors_a_negative_sum() {
+    // `(-3 + 0) / 2` is `-2` under the architecture's bit-slice
+    // definition, not the `-1` a truncation toward zero would give.
+    assert_computes("vhadd.s8", &QUADS, &[("v1", 0xfd), ("v2", 0)], 0xfe);
+}
+
+#[test]
+fn vhsub_unsigned_halves_a_negative_difference() {
+    // `(1 - 2) / 2` floors to `-1`, which is `0xff` in the byte. The
+    // unsigned element type describes the *operands*, not the exact
+    // difference, which can still be negative.
+    assert_computes("vhsub.u8", &QUADS, &[("v1", 1), ("v2", 2)], 0xff);
+}
+
+// ---------------------------------------------------------------
 // Element types the encodings do not have
 // ---------------------------------------------------------------
 

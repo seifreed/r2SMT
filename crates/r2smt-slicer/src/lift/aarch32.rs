@@ -792,6 +792,31 @@ fn neon_integer_op(base: &str, kind: ElementKind) -> Option<PackedIntOp> {
         "vmin" => PackedIntOp::MinMax { max: false, signed },
         "vabs" if signed => PackedIntOp::Abs,
         "vneg" if signed => PackedIntOp::Neg,
+        "vqadd" => PackedIntOp::Saturating {
+            subtract: false,
+            signed,
+        },
+        "vqsub" => PackedIntOp::Saturating {
+            subtract: true,
+            signed,
+        },
+        "vhadd" => PackedIntOp::Halving {
+            subtract: false,
+            signed,
+            rounding: false,
+        },
+        "vhsub" => PackedIntOp::Halving {
+            subtract: true,
+            signed,
+            rounding: false,
+        },
+        // There is no `vrhsub`: the architecture gives the rounding
+        // form to the add alone.
+        "vrhadd" => PackedIntOp::Halving {
+            subtract: false,
+            signed,
+            rounding: true,
+        },
         other => neon_untyped_op(other)?,
     })
 }

@@ -60,6 +60,17 @@ pub(crate) enum PackedIntOp {
     /// manipulations, so they are exact at every value including the
     /// NaNs and the infinities and need no float sort at all.
     SignBit { negate: bool },
+    /// `vqadd` / `vqsub` — saturating, clamped to the element's range
+    /// rather than wrapped.
+    Saturating { subtract: bool, signed: bool },
+    /// `vhadd` / `vhsub` / `vrhadd` — halving, the exact sum or
+    /// difference shifted down one bit. `rounding` adds a half first,
+    /// which only the add form (`vrhadd`) has an encoding for.
+    Halving {
+        subtract: bool,
+        signed: bool,
+        rounding: bool,
+    },
 }
 
 /// What a packed ARM vector data-processing instruction computes.
@@ -256,6 +267,103 @@ fn magnitude_mask(bits: u16) -> Option<Expr> {
     ))
 }
 
+/// Extra bits the saturating and halving lanes compute in.
+///
+/// **Two**, not one, and the difference is load-bearing. One extra bit
+/// holds the exact sum for either signedness, but not as a value the
+/// *signed* comparisons below can read: an unsigned `0xff + 0xff` fills
+/// nine bits, whose top bit a signed compare would take for a sign. Two
+/// bits let one set of signed comparisons serve both signednesses, which
+/// is what keeps the clamp from needing a second, mirrored copy.
+const WIDE_HEADROOM: u16 = 2;
+
+/// `value` as a `wide`-bit two's-complement constant.
+fn wide_const(value: i128, wide: u16) -> Option<Expr> {
+    let modulus = 1u128.checked_shl(u32::from(wide))?;
+    let pattern = u128::from_le_bytes(value.to_le_bytes());
+    Some(Expr::konst(pattern & (modulus - 1), wide))
+}
+
+/// Widen a lane to the headroom width, preserving its value under the
+/// element's own signedness.
+fn extend_lane(value: Expr, wide: u16, signed: bool) -> Expr {
+    if signed {
+        Expr::sign_ext(value, wide)
+    } else {
+        Expr::zero_ext(value, wide)
+    }
+}
+
+/// The exact sum or difference of two lanes, at the headroom width.
+fn wide_combination(subtract: bool, signed: bool, a: Expr, b: Expr, wide: u16) -> Expr {
+    let (x, y) = (extend_lane(a, wide, signed), extend_lane(b, wide, signed));
+    if subtract {
+        Expr::sub(x, y)
+    } else {
+        Expr::add(x, y)
+    }
+}
+
+/// The range an element of `bits` can represent, as headroom-width
+/// constants.
+fn element_bounds(signed: bool, bits: u16, wide: u16) -> Option<(Expr, Expr)> {
+    let span = 1i128.checked_shl(u32::from(bits))?;
+    let (min, max) = if signed {
+        (-(span / 2), span / 2 - 1)
+    } else {
+        (0, span - 1)
+    };
+    Some((wide_const(min, wide)?, wide_const(max, wide)?))
+}
+
+/// One destination lane of `vqadd` / `vqsub`.
+///
+/// The arithmetic happens where it cannot overflow and the clamp brings
+/// it back; doing it at the element width and clamping afterwards would
+/// be too late, since the overflow the instruction exists to detect
+/// would already have wrapped.
+fn saturating_lane(subtract: bool, signed: bool, a: Expr, b: Expr, bits: u16) -> Option<Expr> {
+    let wide = bits.checked_add(WIDE_HEADROOM)?;
+    let raw = wide_combination(subtract, signed, a, b, wide);
+    let (min, max) = element_bounds(signed, bits, wide)?;
+    let below_max = Expr::Ite {
+        cond: Box::new(Expr::sle(raw.clone(), max.clone())),
+        then_expr: Box::new(raw),
+        else_expr: Box::new(max),
+    };
+    let clamped = Expr::Ite {
+        cond: Box::new(Expr::sle(min.clone(), below_max.clone())),
+        then_expr: Box::new(below_max),
+        else_expr: Box::new(min),
+    };
+    Some(Expr::extract(clamped, bits - 1, 0))
+}
+
+/// One destination lane of `vhadd` / `vhsub` / `vrhadd`.
+///
+/// The shift is arithmetic at the headroom width because the value
+/// there is the exact integer in two's complement, and the architecture
+/// defines the result as its bit slice `[esize:1]` — which is the floor
+/// of the halved value, not a truncation toward zero.
+fn halving_lane(
+    subtract: bool,
+    signed: bool,
+    rounding: bool,
+    a: Expr,
+    b: Expr,
+    bits: u16,
+) -> Option<Expr> {
+    let wide = bits.checked_add(WIDE_HEADROOM)?;
+    let raw = wide_combination(subtract, signed, a, b, wide);
+    let exact = if rounding {
+        Expr::add(raw, wide_const(1, wide)?)
+    } else {
+        raw
+    };
+    let halved = Expr::ashr(exact, wide_const(1, wide)?);
+    Some(Expr::extract(halved, bits - 1, 0))
+}
+
 /// One destination lane of a multiply-accumulate.
 fn accumulate_lane(
     float: bool,
@@ -319,6 +427,14 @@ fn packed_int_lane(op: PackedIntOp, a: Expr, b: Option<Expr>, bits: u16) -> Opti
         PackedIntOp::Neg => Expr::sub(Expr::konst(0, bits), a),
         PackedIntOp::SignBit { negate: true } => Expr::bv_xor(a, sign_bit(bits)?),
         PackedIntOp::SignBit { negate: false } => Expr::bv_and(a, magnitude_mask(bits)?),
+        PackedIntOp::Saturating { subtract, signed } => {
+            saturating_lane(subtract, signed, a, b?, bits)?
+        }
+        PackedIntOp::Halving {
+            subtract,
+            signed,
+            rounding,
+        } => halving_lane(subtract, signed, rounding, a, b?, bits)?,
     })
 }
 
