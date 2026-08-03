@@ -3598,3 +3598,37 @@ fn aarch64_two_form_declines_a_half_width_full_register_operand() {
     assert!(neon_declines("uaddl2", &["v0.2s", "v1.4h", "v2.4h"]));
     assert!(neon_declines("sqxtn2", &["v0.8b", "v1.8h"]));
 }
+
+#[test]
+fn all_ones_below_the_payload_width_is_a_single_constant() {
+    assert_eq!(crate::lift::simd::all_ones(8), Expr::konst(0xff, 8));
+    assert_eq!(
+        crate::lift::simd::all_ones(64),
+        Expr::konst(u64::MAX.into(), 64)
+    );
+    assert_eq!(
+        crate::lift::simd::all_ones(128),
+        Expr::konst(u128::MAX, 128)
+    );
+}
+
+#[test]
+fn all_ones_above_the_payload_width_concatenates_full_chunks() {
+    // A `Const` carries a `u128`, so a wider mask cannot be one
+    // literal. Building it as `konst(u128::MAX, 256)` would denote a
+    // *zero-extended* `u128::MAX` — a valid, wrong mask whose top half
+    // is clear, which reads as correct at a glance and would silently
+    // invert only the low half of an `x XOR all-ones` complement.
+    let full = Expr::konst(u128::MAX, 128);
+    assert_eq!(
+        crate::lift::simd::all_ones(256),
+        Expr::concat(full.clone(), full.clone())
+    );
+    assert_eq!(
+        crate::lift::simd::all_ones(512),
+        Expr::concat(
+            Expr::concat(Expr::concat(full.clone(), full.clone()), full.clone()),
+            full
+        )
+    );
+}

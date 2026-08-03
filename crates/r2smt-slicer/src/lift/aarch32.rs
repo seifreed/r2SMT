@@ -857,7 +857,7 @@ impl LiftCtx {
         Some(if negate {
             Expr::bv_xor(bits, sign)
         } else {
-            Expr::bv_and(bits, Expr::bv_xor(sign, super::aarch64::all_ones(lane)))
+            Expr::bv_and(bits, Expr::bv_xor(sign, super::simd::all_ones(lane)))
         })
     }
 

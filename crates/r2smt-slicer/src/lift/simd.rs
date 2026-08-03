@@ -31,7 +31,6 @@ use r2smt_ir::stmt::IrStmt;
 use crate::effect::memory_operand_width;
 use crate::registers::{RegisterLayout, is_simd_parent, register_layout, simd_parent_bits};
 
-use super::aarch64::all_ones;
 use super::{BinOp, LiftCtx};
 
 /// Integer operation a packed ARM vector instruction applies to each
@@ -185,6 +184,25 @@ pub(crate) fn fp_lane_result(
 /// `None` when a two-source operation was handed no second source — an
 /// operand-count mismatch the caller declines on rather than inventing a
 /// value for.
+/// An all-ones bit-vector of `bits`.
+///
+/// A `Const` carries a `u128` payload, so a mask wider than 128 bits
+/// cannot be one literal and is built by concatenating full chunks.
+/// Getting that wrong is silent rather than loud: `konst(u128::MAX,
+/// 256)` is a *zero-extended* `u128::MAX`, which denotes a perfectly
+/// valid — and wrong — mask.
+pub(super) fn all_ones(bits: u16) -> Expr {
+    if bits > 128 {
+        return Expr::concat(all_ones(bits - 128), Expr::konst(u128::MAX, 128));
+    }
+    let mask = if bits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    };
+    Expr::konst(mask, bits)
+}
+
 fn packed_int_lane(op: PackedIntOp, a: Expr, b: Option<Expr>, bits: u16) -> Option<Expr> {
     Some(match op {
         PackedIntOp::Bin(bin) => bin.apply(a, b?),

@@ -950,7 +950,7 @@ impl LiftCtx {
         };
         let result = match op {
             // `abs` clears the sign bit: AND with its complement.
-            FpUnaryOp::Abs => Expr::bv_and(bits, Expr::bv_xor(sign, all_ones(lane))),
+            FpUnaryOp::Abs => Expr::bv_and(bits, Expr::bv_xor(sign, super::simd::all_ones(lane))),
             FpUnaryOp::Neg => Expr::bv_xor(bits, sign),
         };
         if !self.write_simd_dst(dst, result, true) {
@@ -1189,14 +1189,6 @@ pub(super) fn sign_bit_mask(bits: u16) -> Option<Expr> {
     let shift = u32::from(bits.checked_sub(1)?);
     let value = 1u128.checked_shl(shift)?;
     Some(Expr::konst(value, bits))
-}
-
-/// An all-ones bit-vector of `bits`.
-pub(super) fn all_ones(bits: u16) -> Expr {
-    if bits >= 128 {
-        return Expr::konst(u128::MAX, bits);
-    }
-    Expr::konst((1u128 << bits) - 1, bits)
 }
 
 /// Whether `op` is the `#0.0` immediate that `fcmp`'s compare-with-zero

@@ -626,7 +626,7 @@ impl LiftCtx {
             SimdBitOp::Or => Expr::bv_or(a, b),
             // `pandn`/`vpandn` compute `(~a) & b`. The IR has no bitwise
             // NOT, so `~a` is `a XOR all-ones` at the vector width.
-            SimdBitOp::AndNot => Expr::bv_and(Expr::bv_xor(a, simd_all_ones(width)), b),
+            SimdBitOp::AndNot => Expr::bv_and(Expr::bv_xor(a, super::simd::all_ones(width)), b),
         };
         if !self.write_simd_dst(dst, result, zero_upper) {
             self.push_simd_unsupported(insn);
@@ -1073,23 +1073,6 @@ fn is_xmm_register(op: &Operand) -> bool {
             .is_some_and(|layout| is_simd_parent(layout.parent, Arch::X86_64))
 }
 
-/// All-ones bit-vector at `bits` width. Constants wider than 128 bits
-/// cannot be a single `Const` (`value: u128`), so they are built by
-/// concatenating 128-bit all-ones chunks (`bits` is always a multiple
-/// of 128 for SIMD views).
-fn simd_all_ones(bits: u16) -> Expr {
-    if bits <= 128 {
-        let mask = if bits == 128 {
-            u128::MAX
-        } else {
-            (1u128 << bits) - 1
-        };
-        Expr::konst(mask, bits)
-    } else {
-        Expr::concat(simd_all_ones(bits - 128), Expr::konst(u128::MAX, 128))
-    }
-}
-
 /// Predicate of an SSE/AVX compare, as radare2 spells it: the immediate
 /// is baked into the mnemonic (`cmpeqps`, `cmpltsd`, …) rather than
 /// appearing as an operand.
@@ -1292,20 +1275,9 @@ fn fp_mask_lane(cmp: &FpCompare, a_bits: Expr, b_bits: Expr) -> Option<Expr> {
     };
     Some(Expr::Ite {
         cond: Box::new(cond),
-        then_expr: Box::new(lane_all_ones(cmp.lane_bits)),
+        then_expr: Box::new(super::simd::all_ones(cmp.lane_bits)),
         else_expr: Box::new(Expr::konst(0, cmp.lane_bits)),
     })
-}
-
-/// All-ones at a scalar lane width. Lanes are at most 64 bits, so this
-/// always fits the `u128` constant payload.
-fn lane_all_ones(lane_bits: u16) -> Expr {
-    let value = if lane_bits >= 128 {
-        u128::MAX
-    } else {
-        (1u128 << lane_bits) - 1
-    };
-    Expr::konst(value, lane_bits)
 }
 
 /// IEEE binary16 lane width used by the F16C conversions.
