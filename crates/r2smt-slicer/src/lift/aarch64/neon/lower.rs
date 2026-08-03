@@ -44,7 +44,7 @@ impl LiftCtx {
         } else if matches!(shape.op, NeonOp::Insert { .. }) {
             self.write_simd_lane(&destination, value, shape.lane_bits, shape.dest_index)
         } else {
-            self.write_xmm_dst(&destination, value, true)
+            self.write_simd_dst(&destination, value, true)
         };
         if !written {
             self.push_neon_unsupported(insn);

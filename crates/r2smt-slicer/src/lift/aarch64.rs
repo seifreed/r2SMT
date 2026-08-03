@@ -904,7 +904,7 @@ impl LiftCtx {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
-        if !self.write_xmm_dst(dst, result, true) {
+        if !self.write_simd_dst(dst, result, true) {
             self.push_aarch64_fp_unsupported(insn);
         }
     }
@@ -924,7 +924,7 @@ impl LiftCtx {
             return;
         };
         let root = Expr::fp_to_ieee_bv(Expr::fsqrt(value, RoundingMode::NearestTiesEven));
-        if !self.write_xmm_dst(dst, root, true) {
+        if !self.write_simd_dst(dst, root, true) {
             self.push_aarch64_fp_unsupported(insn);
         }
     }
@@ -953,7 +953,7 @@ impl LiftCtx {
             FpUnaryOp::Abs => Expr::bv_and(bits, Expr::bv_xor(sign, all_ones(lane))),
             FpUnaryOp::Neg => Expr::bv_xor(bits, sign),
         };
-        if !self.write_xmm_dst(dst, result, true) {
+        if !self.write_simd_dst(dst, result, true) {
             self.push_aarch64_fp_unsupported(insn);
         }
     }
@@ -976,7 +976,7 @@ impl LiftCtx {
                     self.push_aarch64_fp_unsupported(insn);
                     return;
                 };
-                if !self.write_xmm_dst(dst, bits, true) {
+                if !self.write_simd_dst(dst, bits, true) {
                     self.push_aarch64_fp_unsupported(insn);
                 }
             }
@@ -991,7 +991,7 @@ impl LiftCtx {
                     return;
                 };
                 let sized = Expr::extract(value, lane - 1, 0);
-                if !self.write_xmm_dst(dst, sized, true) {
+                if !self.write_simd_dst(dst, sized, true) {
                     self.push_aarch64_fp_unsupported(insn);
                 }
             }
@@ -1095,7 +1095,7 @@ impl LiftCtx {
             return;
         };
         let converted = Expr::fp_to_fp(value, RoundingMode::NearestTiesEven, ebits, sbits);
-        if !self.write_xmm_dst(dst, Expr::fp_to_ieee_bv(converted), true) {
+        if !self.write_simd_dst(dst, Expr::fp_to_ieee_bv(converted), true) {
             self.push_aarch64_fp_unsupported(insn);
         }
     }
@@ -1133,7 +1133,7 @@ impl LiftCtx {
             Expr::zero_ext(int, wider)
         };
         let converted = Expr::sbv_to_fp(source, RoundingMode::NearestTiesEven, ebits, sbits);
-        if !self.write_xmm_dst(dst, Expr::fp_to_ieee_bv(converted), true) {
+        if !self.write_simd_dst(dst, Expr::fp_to_ieee_bv(converted), true) {
             self.push_aarch64_fp_unsupported(insn);
         }
     }

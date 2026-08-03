@@ -498,11 +498,11 @@ impl LiftCtx {
             return;
         };
         let zero_upper = is_vex(insn);
-        let Some(value) = self.read_xmm_operand(src) else {
+        let Some(value) = self.read_simd_operand(src) else {
             self.push_simd_unsupported(insn);
             return;
         };
-        if !self.write_xmm_dst(dst, value, zero_upper) {
+        if !self.write_simd_dst(dst, value, zero_upper) {
             self.push_simd_unsupported(insn);
         }
     }
@@ -541,7 +541,7 @@ impl LiftCtx {
                 // Loading from memory zeroes above the lane; a
                 // register-to-register move merges.
                 let ok = if self.is_modellable_simd_memory(src) && self.is_simd_register(dst) {
-                    self.write_xmm_dst(dst, value, true)
+                    self.write_simd_dst(dst, value, true)
                 } else {
                     self.write_simd_lane(dst, value, lane, 0)
                 };
@@ -554,7 +554,7 @@ impl LiftCtx {
                     self.push_simd_unsupported(insn);
                     return;
                 };
-                if !self.write_xmm_dst(dst, merged, true) {
+                if !self.write_simd_dst(dst, merged, true) {
                     self.push_simd_unsupported(insn);
                 }
             }
@@ -576,7 +576,7 @@ impl LiftCtx {
             return None;
         }
         let low = self.read_simd_lane_bits(src2, lane, 0)?;
-        let upper = Expr::extract(self.read_xmm_operand(src1)?, view - 1, lane);
+        let upper = Expr::extract(self.read_simd_operand(src1)?, view - 1, lane);
         Some(Expr::concat(upper, low))
     }
 
@@ -607,7 +607,7 @@ impl LiftCtx {
             }
         };
         if matches!(op, SimdBitOp::Xor) && same_xmm_register(a_op, b_op) {
-            if !self.write_xmm_dst(dst, Expr::konst(0, width), zero_upper) {
+            if !self.write_simd_dst(dst, Expr::konst(0, width), zero_upper) {
                 self.push_simd_unsupported(insn);
             }
             return;
@@ -628,7 +628,7 @@ impl LiftCtx {
             // NOT, so `~a` is `a XOR all-ones` at the vector width.
             SimdBitOp::AndNot => Expr::bv_and(Expr::bv_xor(a, simd_all_ones(width)), b),
         };
-        if !self.write_xmm_dst(dst, result, zero_upper) {
+        if !self.write_simd_dst(dst, result, zero_upper) {
             self.push_simd_unsupported(insn);
         }
     }
@@ -659,7 +659,7 @@ impl LiftCtx {
             self.push_simd_unsupported(insn);
             return;
         };
-        if !self.write_xmm_dst(dst, result, zero_upper) {
+        if !self.write_simd_dst(dst, result, zero_upper) {
             self.push_simd_unsupported(insn);
         }
     }
@@ -677,7 +677,7 @@ impl LiftCtx {
             self.push_simd_unsupported(insn);
             return;
         };
-        if !self.write_xmm_dst(dst, result, true) {
+        if !self.write_simd_dst(dst, result, true) {
             self.push_simd_unsupported(insn);
         }
     }
@@ -708,7 +708,7 @@ impl LiftCtx {
             self.push_simd_unsupported(insn);
             return;
         };
-        if !self.write_xmm_dst(dst, result, true) {
+        if !self.write_simd_dst(dst, result, true) {
             self.push_simd_unsupported(insn);
         }
     }
@@ -761,7 +761,7 @@ impl LiftCtx {
             return;
         };
         let written = if cmp.packed {
-            self.write_xmm_dst(dst, result, is_vex(insn))
+            self.write_simd_dst(dst, result, is_vex(insn))
         } else {
             self.write_simd_lane(dst, result, cmp.lane_bits, 0)
         };
@@ -811,7 +811,7 @@ impl LiftCtx {
             return;
         };
         let written = if packed {
-            self.write_xmm_dst(dst, result, is_vex(insn))
+            self.write_simd_dst(dst, result, is_vex(insn))
         } else {
             self.write_simd_lane(dst, result, lane_bits, 0)
         };
