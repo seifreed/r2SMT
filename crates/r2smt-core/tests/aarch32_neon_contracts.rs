@@ -1096,3 +1096,196 @@ fn the_paired_permutations_decline_a_doubleword_element() {
     assert!(declines("vuzp.64", &QUAD_PAIR));
     assert!(declines("vtrn.64", &QUAD_PAIR));
 }
+
+// ---------------------------------------------------------------
+// Widening and narrowing
+//
+// The families whose destination element is twice its sources' width,
+// or half. Two things need solving rather than asserting on shape: that
+// the arithmetic really happens at the *wide* width — a sum that
+// overflows the narrow element must not wrap — and that the extension
+// follows the mnemonic's signedness, which is one boolean and changes
+// every lane.
+// ---------------------------------------------------------------
+
+/// Bytes chosen so half are negative as two's complement: `0x80`,
+/// `0xff` and `0x7f` sit at the boundaries the extension has to get
+/// right.
+const SIGNED_BYTES: u128 = 0x8001_7fff_0102_ff80;
+
+#[test]
+fn vmovl_signed_replicates_the_sign_bit_into_the_wide_element() {
+    assert_computes(
+        "vmovl.s8",
+        &["q0", "d2"],
+        &[("v1", SIGNED_BYTES)],
+        0xff80_0001_007f_ffff_0001_0002_ffff_ff80,
+    );
+}
+
+#[test]
+fn vmovl_unsigned_fills_the_wide_element_with_zeroes() {
+    // The teeth for the test above: the same bytes, one boolean apart,
+    // and every lane whose top bit is set differs.
+    assert_computes(
+        "vmovl.u8",
+        &["q0", "d2"],
+        &[("v1", SIGNED_BYTES)],
+        0x0080_0001_007f_00ff_0001_0002_00ff_0080,
+    );
+}
+
+#[test]
+fn vaddl_computes_at_the_destination_width_so_the_sum_cannot_wrap() {
+    // Lane 0 is `0x7fff + 1`, which overflows a halfword and would come
+    // back `0x8000` — a negative — if the addition happened before the
+    // extension. At the destination's width it is a plain `0x00008000`.
+    assert_computes(
+        "vaddl.s16",
+        &["q0", "d2", "d4"],
+        &[("v1", 0xffff_0001_8000_7fff), ("v2", 0x0001_0001_8000_0001)],
+        0x0000_0000_0000_0002_ffff_0000_0000_8000,
+    );
+}
+
+#[test]
+fn vaddl_unsigned_extends_the_same_lanes_differently() {
+    assert_computes(
+        "vaddl.u16",
+        &["q0", "d2", "d4"],
+        &[("v1", 0xffff_0001_8000_7fff), ("v2", 0x0001_0001_8000_0001)],
+        0x0001_0000_0000_0002_0001_0000_0000_8000,
+    );
+}
+
+#[test]
+fn vmull_signed_multiplies_two_negative_bytes_into_a_positive_halfword() {
+    // `0xff * 0xff` is `1` read as signed and `0xfe01` read as
+    // unsigned, so this pair pins the signedness of the widening on the
+    // multiply as well as on the extension.
+    assert_computes(
+        "vmull.s8",
+        &["q0", "d2", "d4"],
+        &[("v1", 0xff01_02ff_7f80_01ff), ("v2", 0xff02_03ff_0201_02ff)],
+        0x0001_0002_0006_0001_00fe_ff80_0002_0001,
+    );
+}
+
+#[test]
+fn vmull_unsigned_multiplies_the_same_bytes_as_magnitudes() {
+    assert_computes(
+        "vmull.u8",
+        &["q0", "d2", "d4"],
+        &[("v1", 0xff01_02ff_7f80_01ff), ("v2", 0xff02_03ff_0201_02ff)],
+        0xfe01_0002_0006_fe01_00fe_0080_0002_fe01,
+    );
+}
+
+#[test]
+fn vaddw_reads_its_first_source_at_the_destination_width() {
+    // `vaddw` is the `w`-suffixed form: only the second source is
+    // narrow. Extending the first as well would read four halfwords
+    // where the instruction names four words.
+    assert_computes(
+        "vaddw.s16",
+        &["q0", "q1", "d4"],
+        &[
+            ("v1", 0x0000_0000_0000_0002_ffff_0000_0000_8000),
+            ("v2", 0xffff_0001_8000_7fff),
+        ],
+        0xffff_ffff_0000_0003_fffe_8000_0000_ffff,
+    );
+}
+
+#[test]
+fn vmovn_keeps_the_low_half_of_every_element() {
+    assert_computes(
+        "vmovn.i16",
+        &["d0", "q1"],
+        &[("v0", 0), ("v1", 0x1234_5678_9abc_def0_1122_3344_5566_7788)],
+        0x3478_bcf0_2244_6688,
+    );
+}
+
+#[test]
+fn vmovn_on_a_half_register_preserves_the_other_half() {
+    assert_computes(
+        "vmovn.i16",
+        &["d0", "q1"],
+        &[
+            ("v0", 0xdead_beef_0000_0000_0000_0000_0000_0000),
+            ("v1", 0x1234_5678_9abc_def0_1122_3344_5566_7788),
+        ],
+        0xdead_beef_0000_0000_3478_bcf0_2244_6688,
+    );
+}
+
+#[test]
+fn vshrn_shifts_before_it_truncates() {
+    // Shifting after the truncation would discard the bits this is
+    // meant to bring down: lane 4 is `0xdef0`, whose shifted low byte
+    // is `0xef`, where truncate-then-shift gives `0x0f`.
+    assert_computes(
+        "vshrn.i16",
+        &["d0", "q1", "4"],
+        &[("v0", 0), ("v1", 0x1234_5678_9abc_def0_1122_3344_5566_7788)],
+        0x2367_abef_1234_5678,
+    );
+}
+
+// --- the boundary of the widening seam ---
+
+#[test]
+fn the_long_forms_decline_the_sign_agnostic_element_spelling() {
+    // The extension *is* the operation, so `i` has nothing to mean and
+    // the architecture has no encoding for it.
+    assert!(declines("vmovl.i8", &["q0", "d2"]));
+    assert!(declines("vaddl.i16", &["q0", "d2", "d4"]));
+    assert!(declines("vmull.i8", &["q0", "d2", "d4"]));
+}
+
+#[test]
+fn the_narrowing_forms_decline_a_signed_element_spelling() {
+    // Truncation keeps the low half whatever the sign, which is why
+    // these are spelled `I` and have no signed encoding to accept.
+    assert!(declines("vmovn.s16", &["d0", "q1"]));
+    assert!(declines("vshrn.u16", &["d0", "q1", "4"]));
+}
+
+#[test]
+fn the_long_forms_decline_a_source_that_is_not_narrow() {
+    // A `q` source beside a `q` destination is the same-width family,
+    // not this one; reading it as narrow would take four halfwords from
+    // a register holding four words.
+    assert!(declines("vmovl.s8", &["q0", "q1"]));
+    assert!(declines("vaddl.s16", &["q0", "q1", "d4"]));
+}
+
+#[test]
+fn the_narrowing_forms_decline_a_destination_that_is_not_narrow() {
+    assert!(declines("vmovn.i16", &["q0", "q1"]));
+}
+
+#[test]
+fn vmovl_declines_a_doubleword_source() {
+    // Doubling it would need a 128-bit destination element, which no
+    // arrangement spells.
+    assert!(declines("vmovl.s64", &["q0", "d2"]));
+}
+
+#[test]
+fn vshrn_declines_a_shift_past_the_destination_element() {
+    // The encoding bounds the amount by the destination element's
+    // width. It is also what makes the logical shift in the lowering
+    // exact — past it, the bits shifted in from the top would reach the
+    // half that is kept, and signedness would start to matter.
+    assert!(declines("vshrn.i16", &["d0", "q1", "9"]));
+    assert!(declines("vshrn.i16", &["d0", "q1", "0"]));
+}
+
+#[test]
+fn vmull_declines_the_polynomial_element_type() {
+    // `vmull.p8` is a carry-less multiply — a different lowering, not a
+    // wider one.
+    assert!(declines("vmull.p8", &["q0", "d2", "d4"]));
+}

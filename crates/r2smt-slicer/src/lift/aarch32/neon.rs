@@ -24,12 +24,15 @@ use crate::registers::{has_vector_arrangement, is_simd_parent, register_layout};
 
 pub(super) mod lower;
 mod permute;
+mod width;
 
 /// Bits in a byte, named because `vext` measures its window in them.
 pub(super) const BITS_PER_BYTE: u16 = 8;
 
 /// What a resolved `AArch32` NEON instruction computes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `PartialEq` is deliberately absent: `WidenKind` carries a `BinOp`,
+// which has no equality, and nothing here compares shapes.
+#[derive(Debug, Clone, Copy)]
 pub(super) enum NeonOp {
     /// `vext` — the window of the two sources concatenated that starts
     /// at this byte offset.
@@ -49,6 +52,14 @@ pub(super) enum NeonOp {
     /// rewrites both operands, and the effect table has to say so or
     /// the slicer drops whatever defined the second one.
     PermutePair(permute::PairKind),
+    /// A widening or narrowing element operation. `signed` selects how
+    /// a narrow element is extended into the width the operation is
+    /// computed at, and is meaningless for the narrowing members, which
+    /// discard the high half whatever the sign.
+    Widen {
+        kind: width::WidenKind,
+        signed: bool,
+    },
 }
 
 /// A resolved `AArch32` NEON instruction: what to compute, and at what
@@ -58,7 +69,7 @@ pub(super) enum NeonOp {
 /// its sources at the destination's width, and the families that do not
 /// — the widening forms and the reductions — will carry the difference
 /// on their [`NeonOp`] variant when they land, the way `AArch64` does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub(super) struct NeonShape {
     pub(super) op: NeonOp,
     /// Element width of the destination, in bits.
@@ -100,6 +111,14 @@ pub(super) fn resolve(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| permute::reverse_shape(insn, &mnemonic))
         .or_else(|| permute::duplicate_shape(insn, &mnemonic))
         .or_else(|| permute::permute_pair_shape(insn, &mnemonic))
+        .or_else(|| width::widen_long_shape(insn, &mnemonic))
+        .or_else(|| width::narrow_shape(insn, &mnemonic))
+}
+
+/// Architectural width of the `AArch32` vector register parent, which
+/// is also the width of a `q` view and twice that of a `d`.
+pub(super) fn vector_parent_bits() -> Option<u16> {
+    crate::registers::simd_parent_bits(Arch::Arm)
 }
 
 /// Element width a bare `AArch32` NEON size suffix names — the `8` in

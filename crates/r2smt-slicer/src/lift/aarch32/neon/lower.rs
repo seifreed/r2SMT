@@ -15,7 +15,18 @@ use r2smt_ir::stmt::IrStmt;
 use crate::lift::LiftCtx;
 
 use super::permute::{PairKind, PairSource, paired_source};
+use super::width::WidenKind;
 use super::{BITS_PER_BYTE, NeonOp, NeonShape};
+use crate::lift::BinOp;
+
+/// Widen `value` to `target` bits, replicating the sign bit or not.
+fn extend(value: Expr, target: u16, signed: bool) -> Expr {
+    if signed {
+        Expr::sign_ext(value, target)
+    } else {
+        Expr::zero_ext(value, target)
+    }
+}
 
 impl LiftCtx {
     /// Lower a resolved `AArch32` NEON instruction.
@@ -53,10 +64,96 @@ impl LiftCtx {
                 self.aarch32_reverse_lanes(insn, shape, container_bits)
             }
             NeonOp::Duplicate => self.aarch32_duplicate_lanes(insn, shape),
+            NeonOp::Widen { kind, signed } => match kind {
+                WidenKind::Narrow => self.aarch32_narrow_lanes(insn, shape, 0),
+                WidenKind::ShiftNarrow { shift } => self.aarch32_narrow_lanes(insn, shape, shift),
+                WidenKind::Long => self.aarch32_long_lanes(insn, shape, None, false, signed),
+                WidenKind::LongArith { op, wide_first } => {
+                    self.aarch32_long_lanes(insn, shape, Some(op), wide_first, signed)
+                }
+            },
             // Handled by the caller; it writes two destinations and so
             // does not fit the one-value contract here.
             NeonOp::PermutePair(_) => None,
         }
+    }
+
+    /// The long forms — each destination element is computed at twice
+    /// the width of the source elements feeding it, which is exactly
+    /// what stops a product or a sum overflowing.
+    ///
+    /// `wide_first` marks `vaddw` / `vsubw`, whose first source is
+    /// already at the destination's width and so is read rather than
+    /// extended.
+    fn aarch32_long_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        op: Option<BinOp>,
+        wide_first: bool,
+        signed: bool,
+    ) -> Option<Expr> {
+        let wide_view = shape.view_bits()?;
+        let narrow_bits = shape.lane_bits.checked_div(2)?;
+        let narrow_view = narrow_bits.checked_mul(shape.lanes)?;
+        let first_view = if wide_first { wide_view } else { narrow_view };
+        let first = self.simd_operand_value(&insn.operands.get(1)?.clone(), first_view)?;
+        let second = match insn.operands.get(2) {
+            Some(operand) => Some(self.simd_operand_value(&operand.clone(), narrow_view)?),
+            None => None,
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let a = if wide_first {
+                Self::extract_lane(first.clone(), shape.lane_bits, index)?
+            } else {
+                extend(
+                    Self::extract_lane(first.clone(), narrow_bits, index)?,
+                    shape.lane_bits,
+                    signed,
+                )
+            };
+            lanes.push(match (op, second.as_ref()) {
+                (None, _) => a,
+                (Some(op), Some(second)) => {
+                    let b = extend(
+                        Self::extract_lane(second.clone(), narrow_bits, index)?,
+                        shape.lane_bits,
+                        signed,
+                    );
+                    op.apply(a, b)
+                }
+                (Some(_), None) => return None,
+            });
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// The narrowing forms — each source element is shifted, then cut
+    /// down to the destination's width.
+    ///
+    /// The shift is logical rather than arithmetic, and that is exact
+    /// rather than approximate: the encoding bounds the amount by the
+    /// destination element's width, so no bit shifted in from the top
+    /// ever reaches the half that is kept.
+    fn aarch32_narrow_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        shift: u16,
+    ) -> Option<Expr> {
+        let source_bits = shape.lane_bits.checked_mul(2)?;
+        let source_view = source_bits.checked_mul(shape.lanes)?;
+        let source = self.simd_operand_value(&insn.operands.get(1)?.clone(), source_view)?;
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let mut element = Self::extract_lane(source.clone(), source_bits, index)?;
+            if shift > 0 {
+                element = Expr::lshr(element, Expr::konst(u128::from(shift), source_bits));
+            }
+            lanes.push(Expr::extract(element, shape.lane_bits.checked_sub(1)?, 0));
+        }
+        Self::concat_lanes(lanes)
     }
 
     /// `vzip` / `vuzp` / `vtrn` — one permutation, two destinations.
