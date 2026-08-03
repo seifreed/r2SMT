@@ -30,7 +30,10 @@
 //!
 //! That makes every rounding this module performs the same rounding the
 //! hardware performs, in the same place. `fld` of `m32fp` / `m64fp`
-//! widens exactly, arithmetic runs at the 64-bit significand, and
+//! widens exactly, `fild` and the integer-operand arithmetic convert
+//! their `m16int` / `m32int` operand exactly into it too — the 64-bit
+//! significand holds either without loss — arithmetic runs at that
+//! significand, and
 //! `fstp` to a narrower format rounds exactly once — at the store,
 //! where the hardware rounds. The predecessor of this model computed at
 //! binary64 and could differ from the hardware by one ulp on a `m64fp`
@@ -196,6 +199,14 @@ const X87_FLOAT_SHORT_WIDTHS: [u16; 2] = [32, 64];
 
 /// Memory widths `fild` / `fistp` accept: `m16int`, `m32int`, `m64int`.
 const X87_INT_WIDTHS: [u16; 3] = [16, 32, 64];
+
+/// Memory widths the integer-operand arithmetic family accepts.
+///
+/// Deliberately *not* [`X87_INT_WIDTHS`]: `FIADD` and its siblings are
+/// encoded by opcode `DE` (word) and `DA` (dword) only, and the SDM
+/// gives them no `m64int` form at all. Reusing the load table would
+/// accept a qword operand no encoding can produce.
+const X87_INT_ARITH_WIDTHS: [u16; 2] = [16, 32];
 
 /// Memory widths the *non-popping* `fist` accepts. The SDM gives it
 /// `m16int` and `m32int` only; the 64-bit integer store exists solely
@@ -372,9 +383,12 @@ enum MemFormat {
 enum ArithSrc {
     /// Another stack slot, `ST(i)`.
     Slot(usize),
-    /// A memory operand of this width, always floating-point — the
-    /// integer forms (`fiadd`, `fimul`, …) are not modelled.
-    Memory(u16),
+    /// A memory operand, in the width and value format the encoding
+    /// names. The format is carried rather than assumed because the
+    /// same operand shape spells both families: `fadd dword [eax]`
+    /// reads an `m32fp` and `fiadd dword [eax]` an `m32int`, and the
+    /// conversion into a slot differs accordingly.
+    Memory { width: u16, format: MemFormat },
 }
 
 /// The three IEEE predicates every x87 compare records, whichever
@@ -547,8 +561,49 @@ fn classify(insn: &Instruction) -> Option<X87Form> {
         // given disassembler build chooses.
         "fcompi" | "fucompi" | "fcomip" | "fucomip" => classify_flag_compare(ops, true),
         "fnstsw" | "fstsw" => classify_store_status(ops),
+        // The integer-operand family is dispatched *before*
+        // [`classify_arith`], which strips a trailing `p` to recognise
+        // the popping forms: `ficomp` would otherwise be mis-stripped
+        // to `ficom` and read as a non-popping compare.
+        "fiadd" | "fisub" | "fisubr" | "fimul" | "fidiv" | "fidivr" | "ficom" | "ficomp" => {
+            classify_integer_arith(mnemonic.as_str(), ops)
+        }
         other => classify_arith(other, ops),
     }
+}
+
+/// The integer-operand arithmetic and compare family (`fiadd`,
+/// `fisub`, `ficomp`, …).
+///
+/// Every member has exactly one memory operand of
+/// [`X87_INT_ARITH_WIDTHS`] and takes `ST(0)` as the other input; none
+/// has a register-to-register or popping-arithmetic encoding, so the
+/// operand shape is fixed and there is no `p` suffix to peel. The
+/// conversion into the extended sort is the same one `fild` performs.
+fn classify_integer_arith(mnemonic: &str, ops: &[Operand]) -> Option<X87Form> {
+    let op = only_operand(ops)?;
+    let src = ArithSrc::Memory {
+        width: modellable_memory_width(op, &X87_INT_ARITH_WIDTHS)?,
+        format: MemFormat::Integer,
+    };
+    let (arith, reversed) = match mnemonic {
+        "ficom" => return Some(X87Form::CompareStatus { src, pops: 0 }),
+        "ficomp" => return Some(X87Form::CompareStatus { src, pops: 1 }),
+        "fiadd" => (X87Arith::Add, false),
+        "fimul" => (X87Arith::Mul, false),
+        "fisub" => (X87Arith::Sub, false),
+        "fisubr" => (X87Arith::Sub, true),
+        "fidiv" => (X87Arith::Div, false),
+        "fidivr" => (X87Arith::Div, true),
+        _ => return None,
+    };
+    Some(X87Form::Arith {
+        op: arith,
+        dst: 0,
+        src,
+        reversed,
+        pop: false,
+    })
 }
 
 fn no_operands(ops: &[Operand], form: X87Form) -> Option<X87Form> {
@@ -617,9 +672,10 @@ fn classify_status_compare(ops: &[Operand], pops: u8, memory: MemorySource) -> O
     let src = match ops {
         [] => ArithSrc::Slot(1),
         [op] if op.kind == OperandKind::Register => ArithSrc::Slot(slot_index(op)?),
-        [op] if memory == MemorySource::Allowed => {
-            ArithSrc::Memory(modellable_memory_width(op, &X87_FLOAT_SHORT_WIDTHS)?)
-        }
+        [op] if memory == MemorySource::Allowed => ArithSrc::Memory {
+            width: modellable_memory_width(op, &X87_FLOAT_SHORT_WIDTHS)?,
+            format: MemFormat::Float,
+        },
         _ => return None,
     };
     Some(X87Form::CompareStatus { src, pops })
@@ -736,7 +792,10 @@ fn classify_arith(mnemonic: &str, ops: &[Operand]) -> Option<X87Form> {
             None if !pop => Some(X87Form::Arith {
                 op,
                 dst: 0,
-                src: ArithSrc::Memory(modellable_memory_width(only, &X87_FLOAT_SHORT_WIDTHS)?),
+                src: ArithSrc::Memory {
+                    width: modellable_memory_width(only, &X87_FLOAT_SHORT_WIDTHS)?,
+                    format: MemFormat::Float,
+                },
                 reversed,
                 pop,
             }),
@@ -1019,7 +1078,7 @@ impl LiftCtx {
         let a = self.x87.read(dst);
         let b = match src {
             ArithSrc::Slot(index) => self.x87.read(index),
-            ArithSrc::Memory(width) => self.x87_memory_read(insn, width, MemFormat::Float)?,
+            ArithSrc::Memory { width, format } => self.x87_memory_read(insn, width, format)?,
         };
         let (lhs, rhs) = if reversed { (b, a) } else { (a, b) };
         self.x87.write(dst, extended_arith(op, lhs, rhs));
@@ -1043,7 +1102,7 @@ impl LiftCtx {
         let a = as_extended(self.x87.read(0));
         let b = as_extended(match src {
             ArithSrc::Slot(index) => self.x87.read(index),
-            ArithSrc::Memory(width) => self.x87_memory_read(insn, width, MemFormat::Float)?,
+            ArithSrc::Memory { width, format } => self.x87_memory_read(insn, width, format)?,
         });
         Ok(Compare {
             unordered: Expr::bool_or(Expr::fisnan(a.clone()), Expr::fisnan(b.clone())),

@@ -2998,3 +2998,90 @@ fn x87_equality_after_a_free_compare_stays_undecided() {
     ]);
     assert_eq!(solve_first(&program), SmtResult::BothPossible);
 }
+
+/// `mov dword [rbp - 8], <seed> ; fld1 ; <mnemonic> dword [rbp - 8] ;
+/// fstp qword [rbp - 0x20] ; mov rax, … ; cmp rax, <expect> ; je`.
+///
+/// Seeds a definite integer in memory so the integer-operand family's
+/// conversion is observable as a value rather than as IR shape: read as
+/// an `m32fp` bit pattern instead, a small seed is a denormal that
+/// leaves `+1.0` unchanged, and every expectation below fails.
+fn x87_integer_operand_program(mnemonic: &str, seed: &str, expect: &str) -> Program {
+    one_block(vec![
+        insn(
+            0x40_1000,
+            7,
+            "mov",
+            vec![
+                op("dword [rbp - 0x8]", OperandKind::Memory),
+                op(seed, OperandKind::Immediate),
+            ],
+        ),
+        insn(0x40_1007, 2, "fld1", vec![]),
+        insn(
+            0x40_1009,
+            3,
+            mnemonic,
+            vec![op("dword [rbp - 0x8]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_100c,
+            3,
+            "fstp",
+            vec![op("qword [rbp - 0x20]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_100f,
+            4,
+            "mov",
+            vec![
+                op("rax", OperandKind::Register),
+                op("qword [rbp - 0x20]", OperandKind::Memory),
+            ],
+        ),
+        insn(
+            0x40_1013,
+            10,
+            "cmp",
+            vec![
+                op("rax", OperandKind::Register),
+                op(expect, OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_101d,
+            2,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ])
+}
+
+#[test]
+fn x87_integer_operand_add_converts_its_operand_as_an_integer() {
+    // `1.0 + 2` is `3.0` — binary64 `0x4008000000000000`. Reading the
+    // seed as a float bit pattern gives a denormal near 2.8e-45, whose
+    // sum with 1.0 rounds back to 1.0, so the mistake is a definite
+    // wrong number rather than a decline.
+    let program = x87_integer_operand_program("fiadd", "2", "0x4008000000000000");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_integer_operand_reverse_subtract_takes_the_memory_operand_first() {
+    // `fisubr m32int` is `m - ST(0)`: `4 - 1.0` is `3.0`. The
+    // non-reversed direction would give `-3.0`, which is the same
+    // magnitude with the sign bit set — a wrong value the shape of the
+    // expression alone would not catch.
+    let program = x87_integer_operand_program("fisubr", "4", "0x4008000000000000");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_integer_operand_source_is_two_s_complement() {
+    // `1.0 + (-2)` is `-1.0`. An unsigned reading of the same bytes
+    // would be 4294967294, so this pins the signedness of the
+    // conversion and not merely that some conversion happens.
+    let program = x87_integer_operand_program("fiadd", "-2", "0xbff0000000000000");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}

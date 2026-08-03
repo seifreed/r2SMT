@@ -1140,8 +1140,19 @@ pub(crate) fn pins_rounding_mode(insn: &Instruction) -> bool {
             | "fdivr"
             | "fdivrp"
             | "fsqrt"
+            // The integer-operand arithmetic converts its operand
+            // exactly and then rounds the result, exactly as the
+            // float-operand forms do.
+            | "fiadd"
+            | "fisub"
+            | "fisubr"
+            | "fimul"
+            | "fidiv"
+            | "fidivr"
             // The integer stores always round: no integer format holds
-            // an arbitrary extended value.
+            // an arbitrary extended value. `fisttp` is deliberately
+            // absent — it carries round-toward-zero in the opcode, so
+            // nothing it computes depends on the control word.
             | "fist"
             | "fistp"
     ) {

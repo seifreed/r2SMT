@@ -142,6 +142,18 @@ fn widened(bits: Expr, sort: (u16, u16)) -> Expr {
     ))
 }
 
+/// What an integer memory operand contributes: a two's-complement
+/// conversion into the extended sort. Exact for every `m16int` and
+/// `m32int`, both of which fit the 64-bit significand.
+fn from_integer(bits: Expr) -> Expr {
+    Expr::fp_to_ieee_bv(Expr::sbv_to_fp(
+        bits,
+        RoundingMode::NearestTiesEven,
+        EXTENDED.0,
+        EXTENDED.1,
+    ))
+}
+
 /// What `fstp` to a `sort`-wide memory operand writes: the single
 /// rounding, performed at the store exactly as the hardware does.
 fn narrowed(slot: Expr, sort: (u16, u16)) -> Expr {
@@ -693,6 +705,159 @@ fn test_x87_extended_memory_uses_the_disassembler_width_keyword() {
             "{raw}"
         );
     }
+}
+
+// ---------------------------------------------------------------
+// Integer-operand arithmetic
+// ---------------------------------------------------------------
+
+#[test]
+fn test_x87_integer_operand_arithmetic_is_modelled() {
+    // `de 00` is `fiadd word [eax]` and `da 00` `fiadd dword [eax]`.
+    for mnemonic in ["fiadd", "fisub", "fisubr", "fimul", "fidiv", "fidivr"] {
+        for width in ["word", "dword"] {
+            let i = insn(
+                FUNCTION_ADDRESS,
+                mnemonic,
+                vec![mem(&format!("{width} [rbp - 0x8]"))],
+            );
+            assert_eq!(
+                analyze(&i, Arch::X86_64).kind,
+                InstructionKind::X87,
+                "{mnemonic} {width}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_x87_integer_operand_arithmetic_has_no_qword_encoding() {
+    // Opcodes `DE` and `DA` give the family `m16int` and `m32int`
+    // alone. Reusing `fild`'s width table would accept a `m64int`
+    // operand no encoding can produce.
+    let i = insn(FUNCTION_ADDRESS, "fiadd", vec![mem("qword [rbp - 0x8]")]);
+    assert_eq!(analyze(&i, Arch::X86_64).kind, InstructionKind::Other);
+}
+
+#[test]
+fn test_x87_integer_compare_defines_the_status_word() {
+    let effect = analyze(
+        &insn(FUNCTION_ADDRESS, "ficom", vec![mem("dword [rbp - 0x8]")]),
+        Arch::X86_64,
+    );
+    assert_eq!(effect.kind, InstructionKind::X87);
+    assert!(effect.defs.contains(&"fsw"));
+}
+
+#[test]
+fn test_x87_integer_arithmetic_reads_its_operand_as_an_integer() {
+    // The whole point of carrying the format on the source: the same
+    // operand shape spells both families, and reading `m32int` as an
+    // `m32fp` bit pattern would be a definite wrong number rather than
+    // a decline.
+    let program = program_with_tail(
+        vec![
+            ("fld1", vec![]),
+            ("fiadd", vec![mem("dword [rbp - 0x8]")]),
+            ("fstp", vec![mem("qword [rbp - 0x20]")]),
+        ],
+        mem("qword [rbp - 0x20]"),
+    );
+    let lifted = lift_slice(&slice_of(&program), Arch::X86_64);
+    let sum = Expr::fp_to_ieee_bv(Expr::fadd(
+        as_extended(Expr::konst(ONE_BITS, SLOT_BITS)),
+        as_extended(from_integer(Expr::var("stk_rbp_-8", 32))),
+        RoundingMode::NearestTiesEven,
+    ));
+    assert_eq!(
+        first_stored_value(&lifted.statements),
+        narrowed(sum, DOUBLE)
+    );
+}
+
+#[test]
+fn test_x87_integer_reverse_divide_swaps_the_operands() {
+    // `fidivr m32int` is `ST(0) := m / ST(0)`, the mirror of `fidiv`.
+    let program = program_with_tail(
+        vec![
+            ("fld1", vec![]),
+            ("fidivr", vec![mem("dword [rbp - 0x8]")]),
+            ("fstp", vec![mem("qword [rbp - 0x20]")]),
+        ],
+        mem("qword [rbp - 0x20]"),
+    );
+    let lifted = lift_slice(&slice_of(&program), Arch::X86_64);
+    let quotient = Expr::fp_to_ieee_bv(Expr::fdiv(
+        as_extended(from_integer(Expr::var("stk_rbp_-8", 32))),
+        as_extended(Expr::konst(ONE_BITS, SLOT_BITS)),
+        RoundingMode::NearestTiesEven,
+    ));
+    assert_eq!(
+        first_stored_value(&lifted.statements),
+        narrowed(quotient, DOUBLE)
+    );
+}
+
+#[test]
+fn test_x87_integer_compare_pop_discards_the_top_of_stack() {
+    // `ficomp` is dispatched ahead of the suffix-stripping arithmetic
+    // classifier, which would otherwise peel its trailing `p` and read
+    // it as the non-popping `ficom`. The pop is observable: with it,
+    // the store writes the `+1.0` underneath; without it, the `+0.0`
+    // the compare examined.
+    let program = program_with_tail(
+        vec![
+            ("fld1", vec![]),
+            ("fldz", vec![]),
+            ("ficomp", vec![mem("dword [rbp - 0x8]")]),
+            ("fstp", vec![mem("qword [rbp - 0x20]")]),
+        ],
+        mem("qword [rbp - 0x20]"),
+    );
+    let lifted = lift_slice(&slice_of(&program), Arch::X86_64);
+    assert_eq!(
+        first_stored_value(&lifted.statements),
+        narrowed(Expr::konst(ONE_BITS, SLOT_BITS), DOUBLE)
+    );
+}
+
+#[test]
+fn test_x87_integer_arithmetic_truncates_when_a_control_word_is_reloaded() {
+    // `fiadd` rounds its result exactly as `fadd` does, so precision
+    // control reaches it and the guard has to cover it.
+    let program = program_with_trailer(
+        vec![
+            ("fld1", vec![]),
+            ("fiadd", vec![mem("dword [rbp - 0x8]")]),
+            ("fstp", vec![mem("qword [rbp - 0x20]")]),
+        ],
+        mem("qword [rbp - 0x20]"),
+        vec![("fldcw", vec![mem("word [rbp - 0x40]")])],
+    );
+    assert!(matches!(
+        slice_of(&program).status,
+        SliceStatus::Truncated { .. }
+    ));
+}
+
+#[test]
+fn test_x87_integer_compare_is_unaffected_by_a_control_word_write() {
+    // Teeth for the test above, and the reason `ficom` / `ficomp` stay
+    // out of the pinning set: a compare computes no result, so neither
+    // the rounding mode nor the precision control can change what it
+    // reports.
+    let fixture = program(vec![
+        ("fld1", vec![]),
+        ("ficom", vec![mem("dword [rbp - 0x8]")]),
+        ("fnstsw", vec![reg("ax")]),
+        (
+            "test",
+            vec![reg("ah"), op(NOT_GREATER_MASK, OperandKind::Immediate)],
+        ),
+        ("jz", vec![op("0x402000", OperandKind::Immediate)]),
+        ("fldcw", vec![mem("word [rbp - 0x40]")]),
+    ]);
+    assert_eq!(slice_of(&fixture).status, SliceStatus::Complete);
 }
 
 #[test]
