@@ -145,7 +145,8 @@ fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> Instruct
         // survives a write to `d0`, both halves of `q0`), so the
         // destination is a use as well as a def.
         m if crate::lift::vfp_scalar(m).is_some()
-            || crate::lift::is_aarch32_packed_instruction(insn) =>
+            || crate::lift::is_aarch32_packed_instruction(insn)
+            || crate::lift::is_aarch32_neon_instruction(insn) =>
         {
             aarch32_vfp_effect(insn)
         }

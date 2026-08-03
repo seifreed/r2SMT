@@ -93,6 +93,25 @@ fn solve_lowering(
     sources: &[(&str, u128)],
     expected: u128,
 ) -> SmtResult {
+    let bindings: Vec<(&str, u128, u16)> = sources
+        .iter()
+        .map(|(name, value)| (*name, *value, VECTOR_BITS))
+        .collect();
+    solve_lowering_at_widths(mnemonic, operands, &bindings, expected)
+}
+
+/// [`solve_lowering`], but each binding names the width its variable
+/// actually holds.
+///
+/// `vdup` is why this exists: its source is a general-purpose register,
+/// which the lifter reads at 32 bits, so binding it at the vector
+/// parent's width would make the slice contradict itself.
+fn solve_lowering_at_widths(
+    mnemonic: &str,
+    operands: &[&str],
+    sources: &[(&str, u128, u16)],
+    expected: u128,
+) -> SmtResult {
     let insn = Instruction {
         address: Address::new(0x1000),
         size: 4,
@@ -113,9 +132,9 @@ fn solve_lowering(
 
     let mut statements: Vec<IrStmt> = sources
         .iter()
-        .map(|(name, value)| IrStmt::Assign {
-            dst: Var::new(*name, VECTOR_BITS),
-            src: Expr::konst(*value, VECTOR_BITS),
+        .map(|(name, value, bits)| IrStmt::Assign {
+            dst: Var::new(*name, *bits),
+            src: Expr::konst(*value, *bits),
         })
         .collect();
     statements.extend(lifted);
@@ -143,6 +162,19 @@ fn solve_lowering(
 fn assert_computes(mnemonic: &str, operands: &[&str], sources: &[(&str, u128)], expected: u128) {
     assert_eq!(
         solve_lowering(mnemonic, operands, sources, expected),
+        SmtResult::AlwaysTrue,
+        "{mnemonic} {operands:?} with {sources:x?} should give {expected:#x}"
+    );
+}
+
+fn assert_computes_at_widths(
+    mnemonic: &str,
+    operands: &[&str],
+    sources: &[(&str, u128, u16)],
+    expected: u128,
+) {
+    assert_eq!(
+        solve_lowering_at_widths(mnemonic, operands, sources, expected),
         SmtResult::AlwaysTrue,
         "{mnemonic} {operands:?} with {sources:x?} should give {expected:#x}"
     );
@@ -699,4 +731,209 @@ fn vqshl_clamps_a_signed_negative_overflow_to_the_signed_minimum() {
 fn vqshl_leaves_an_in_range_shift_alone() {
     // No overflow, no clamp: 3 << 2 is 0xc.
     assert_computes("vqshl.u32", &["q0", "q1", "2"], &[("v1", 3)], 0xc);
+}
+
+// ---------------------------------------------------------------
+// The bit-moving families, whose element is a bare width
+//
+// `vext` / `vrev` / `vdup` spell their element as a number alone
+// (`vext.8`, `vrev64.16`) because they move bits rather than computing
+// on them, so there is no arithmetic for a sign to change. These solve
+// against hand-computed byte orders: a lane-index error reads correctly
+// and produces the wrong permutation, which no structural assertion
+// catches.
+// ---------------------------------------------------------------
+
+/// Byte `i` holds `i`, so a permuted result can be read straight off
+/// the hex digits.
+const BYTE_RAMP: u128 = 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100;
+/// The same ramp continued: byte `i` holds `0x10 + i`.
+const BYTE_RAMP_HIGH: u128 = 0x1f1e_1d1c_1b1a_1918_1716_1514_1312_1110;
+
+#[test]
+fn vext_takes_the_low_bytes_from_the_first_source() {
+    // Destination byte `i` is source-one byte `i + 3` while that is
+    // still inside the register, so bytes 0..12 walk 0x03..0x0f; the
+    // top three spill into source two at 0x10, 0x11, 0x12.
+    assert_computes(
+        "vext.8",
+        &["q0", "q1", "q2", "3"],
+        &[("v1", BYTE_RAMP), ("v2", BYTE_RAMP_HIGH)],
+        0x1211_100f_0e0d_0c0b_0a09_0807_0605_0403,
+    );
+}
+
+#[test]
+fn vext_runs_off_the_first_source_into_the_second() {
+    // The teeth for the test above, at the far end of the window: at
+    // offset 15 only one byte comes from source one and the other
+    // fifteen from source two. Concatenating the sources the other way
+    // round makes this the mirror image.
+    assert_computes(
+        "vext.8",
+        &["q0", "q1", "q2", "15"],
+        &[("v1", BYTE_RAMP), ("v2", BYTE_RAMP_HIGH)],
+        0x1e1d_1c1b_1a19_1817_1615_1413_1211_100f,
+    );
+}
+
+#[test]
+fn vext_at_offset_zero_is_the_first_source_entire() {
+    assert_computes(
+        "vext.8",
+        &["q0", "q1", "q2", "0"],
+        &[("v1", BYTE_RAMP), ("v2", BYTE_RAMP_HIGH)],
+        BYTE_RAMP,
+    );
+}
+
+#[test]
+fn vext_on_half_registers_wraps_at_the_doubleword() {
+    // `d2` is the low half of `v1` and `d4` the low half of `v2`, so
+    // the window is 8 bytes wide, not 16: bytes 0..4 come from `d2`'s
+    // bytes 3..7 and the top three from `d4`'s bytes 0..2.
+    assert_computes(
+        "vext.8",
+        &["d0", "d2", "d4", "3"],
+        &[
+            ("v0", 0),
+            ("v1", 0x0706_0504_0302_0100),
+            ("v2", 0x0f0e_0d0c_0b0a_0908),
+        ],
+        0x0a09_0807_0605_0403,
+    );
+}
+
+#[test]
+fn vrev64_reverses_the_bytes_inside_each_doubleword() {
+    // Each 64-bit container reverses independently: the low half's
+    // bytes 0..7 come back as 7..0, and the high half's separately.
+    // Reversing the whole register instead would swap the two halves.
+    assert_computes(
+        "vrev64.8",
+        &QUAD_PAIR,
+        &[("v1", BYTE_RAMP)],
+        0x0809_0a0b_0c0d_0e0f_0001_0203_0405_0607,
+    );
+}
+
+#[test]
+fn vrev32_reverses_the_halfwords_inside_each_word() {
+    // Same source, a different container and element: each 32-bit word
+    // swaps its two halfwords and nothing crosses a word boundary.
+    assert_computes(
+        "vrev32.16",
+        &QUAD_PAIR,
+        &[("v1", BYTE_RAMP)],
+        0x0d0c_0f0e_0908_0b0a_0504_0706_0100_0302,
+    );
+}
+
+#[test]
+fn vrev16_reverses_the_bytes_inside_each_halfword() {
+    assert_computes(
+        "vrev16.8",
+        &QUAD_PAIR,
+        &[("v1", BYTE_RAMP)],
+        0x0e0f_0c0d_0a0b_0809_0607_0405_0203_0001,
+    );
+}
+
+#[test]
+fn vrev_on_a_half_register_preserves_the_other_half() {
+    // `d0` is the low half of `v0`, so the reversal writes 64 bits and
+    // `v0[127:64]` survives. An AArch64-style zeroing write would clear
+    // it.
+    assert_computes(
+        "vrev64.8",
+        &["d0", "d2"],
+        &[
+            ("v0", 0xdead_beef_0000_0000_0000_0000_0000_0000),
+            ("v1", 0x0706_0504_0302_0100),
+        ],
+        0xdead_beef_0000_0000_0001_0203_0405_0607,
+    );
+}
+
+#[test]
+fn vdup_replicates_a_general_register_byte_to_every_lane() {
+    // Only the low 8 bits of `r1` are read, so the 0xff above them must
+    // not reach the result.
+    assert_computes_at_widths(
+        "vdup.8",
+        &["q0", "r1"],
+        &[("r1", 0xffff_ffab, 32)],
+        0xabab_abab_abab_abab_abab_abab_abab_abab,
+    );
+}
+
+#[test]
+fn vdup_replicates_a_general_register_halfword_to_every_lane() {
+    // The teeth for the test above: the same source at a wider element
+    // keeps one more byte, so a lowering that hardcoded the element
+    // width fails exactly one of the pair.
+    assert_computes_at_widths(
+        "vdup.16",
+        &["q0", "r1"],
+        &[("r1", 0xffff_beef, 32)],
+        0xbeef_beef_beef_beef_beef_beef_beef_beef,
+    );
+}
+
+#[test]
+fn vdup_on_a_half_register_fills_only_that_half() {
+    assert_computes_at_widths(
+        "vdup.32",
+        &["d0", "r1"],
+        &[
+            ("v0", 0xdead_beef_0000_0000_0000_0000_0000_0000, 128),
+            ("r1", 0x1234_5678, 32),
+        ],
+        0xdead_beef_0000_0000_1234_5678_1234_5678,
+    );
+}
+
+// ---------------------------------------------------------------
+// The boundary of what commit-one models
+// ---------------------------------------------------------------
+
+#[test]
+fn vext_declines_a_window_starting_past_the_view() {
+    // A 16-byte view has offsets 0..15; at 16 the window would be the
+    // second source entire, which the encoding cannot spell.
+    assert!(declines("vext.8", &["q0", "q1", "q2", "16"]));
+}
+
+#[test]
+fn vext_declines_a_mismatched_register_class() {
+    // Every operand names one view width; a `d` beside a `q` is not an
+    // instruction.
+    assert!(declines("vext.8", &["q0", "d2", "q2", "3"]));
+}
+
+#[test]
+fn vrev_declines_a_container_no_wider_than_its_element() {
+    // There is nothing to reverse inside a container holding one
+    // element, and the architecture has no such encoding.
+    assert!(declines("vrev32.32", &["q0", "q1"]));
+    assert!(declines("vrev16.32", &["q0", "q1"]));
+}
+
+#[test]
+fn vdup_declines_the_element_source_spelling() {
+    // `vdup.32 q0, d2[1]` broadcasts a vector lane rather than a
+    // general register. Its operand carries vector shape, which is the
+    // by-element seam, not this one.
+    assert!(declines("vdup.32", &["q0", "d2[1]"]));
+}
+
+#[test]
+fn the_two_destination_permutations_still_decline() {
+    // `vzip` / `vuzp` / `vtrn` write *both* named registers on AArch32,
+    // unlike AArch64's single-destination `zip1` / `zip2`, so they need
+    // an effect entry naming two definitions rather than the shared one
+    // every family above uses.
+    assert!(declines("vzip.8", &QUAD_PAIR));
+    assert!(declines("vuzp.16", &QUAD_PAIR));
+    assert!(declines("vtrn.32", &QUAD_PAIR));
 }

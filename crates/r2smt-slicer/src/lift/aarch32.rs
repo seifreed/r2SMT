@@ -9,6 +9,8 @@ use r2smt_ir::stmt::IrStmt;
 
 use crate::registers::register_layout;
 
+pub(super) mod neon;
+
 use super::{
     BinOp, FpArithOp, LiftCtx, MemAccess, PackedIntOp, PackedOp, VectorShape, Writeback,
     aarch64_cond_suffix_to_predicate, fp_lane_result, fp_propagating_max_min, fp_sort_bits_checked,
@@ -111,6 +113,12 @@ impl LiftCtx {
             "pop" => self.lift_aarch32_pop(insn),
             "ldm" | "ldmia" => self.lift_aarch32_ldm(insn),
             "stm" | "stmia" => self.lift_aarch32_stm(insn),
+            // The NEON families the element-typed mnemonic dispatch
+            // cannot resolve. Tried first because they constrain their
+            // operands most tightly — the shape resolver checks operand
+            // count, register class and geometry, where the packed arm
+            // below asks only what the mnemonic spells.
+            _ if let Some(shape) = neon::resolve(insn) => self.lift_aarch32_neon(insn, shape),
             // NEON packed data processing. Recognised ahead of the VFP
             // arm because the two families share mnemonics: `vadd.f32`
             // is scalar when its destination is an `s` register and
@@ -680,7 +688,10 @@ enum ElementKind {
 /// Element type named by an `AArch32` NEON data type (`i32`, `s16`,
 /// `u8`, `f32`), as a signedness class and a width.
 fn neon_element_type(ty: &str) -> Option<(ElementKind, u16)> {
-    let (kind, width) = ty.split_at(1);
+    // Checked rather than `split_at`, which panics on a suffix shorter
+    // than one character: `split_once('.')` hands this an empty string
+    // for a mnemonic spelled `vadd.`.
+    let (kind, width) = ty.split_at_checked(1)?;
     let kind = match kind {
         "i" => ElementKind::Untyped,
         "s" => ElementKind::Signed,
@@ -915,6 +926,15 @@ impl LiftCtx {
         let view = self.simd_view_bits(insn.operands.first()?)?;
         (Self::packed_lane_count(view, lane_bits)? > 1).then_some((op, lane_bits))
     }
+}
+
+/// Whether `insn` is one of the `AArch32` NEON forms [`neon::resolve`]
+/// models.
+///
+/// The effect table and the lifter both go through this, so they cannot
+/// disagree about which instructions the slicer may retain.
+pub(crate) fn is_aarch32_neon_instruction(insn: &Instruction) -> bool {
+    neon::resolve(insn).is_some()
 }
 
 /// Whether `insn` carries a packed NEON form in an operand shape the

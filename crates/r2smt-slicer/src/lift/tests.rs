@@ -2918,6 +2918,76 @@ fn aarch32_packed_write_preserves_the_rest_of_the_vector_register() {
     );
 }
 
+// --- the bit-moving NEON families, whose element is a bare width ---
+
+#[test]
+fn aarch32_bare_width_element_no_longer_hides_the_permutation_family() {
+    // `neon_element_type` reads the first character as the signedness
+    // class, so `.8` names none and the whole family used to fall
+    // through the mnemonic dispatch untouched.
+    let i = insn(
+        0x1000,
+        4,
+        "vext.8",
+        vec![
+            reg("q0"),
+            reg("q1"),
+            reg("q2"),
+            op("3", OperandKind::Immediate),
+        ],
+    );
+    assert!(
+        crate::lift::lift_per_mnemonic(&i, Arch::Arm)
+            .iter()
+            .all(|s| !matches!(s, IrStmt::Unsupported { .. })),
+    );
+}
+
+#[test]
+fn aarch32_permutation_destination_is_a_definition_the_slicer_keeps() {
+    // The trap this guards: a vector operand resolves as a `use` but
+    // not as a `def`, which leaves the instruction neither truncating
+    // the slice nor defining its destination, and a later read binds to
+    // a stale value.
+    let i = insn(0x1000, 4, "vrev64.8", vec![reg("q0"), reg("q1")]);
+    let e = crate::effect::analyze(&i, Arch::Arm);
+    assert_eq!(e.kind, crate::effect::InstructionKind::Simd);
+    assert!(e.defs.contains(&"v0"), "{e:?}");
+}
+
+#[test]
+fn aarch32_permutation_destination_is_also_a_use_because_the_write_merges() {
+    // An `AArch32` vector write preserves the parent bits outside the
+    // destination's view, so whatever defined the register before is
+    // still live.
+    let i = insn(0x1000, 4, "vrev64.8", vec![reg("d0"), reg("d2")]);
+    let e = crate::effect::analyze(&i, Arch::Arm);
+    assert!(e.uses.contains(&"v0"), "{e:?}");
+}
+
+#[test]
+fn aarch32_vdup_from_a_vector_element_declines_at_the_lifter() {
+    // `d2[1]` names one lane; the register table maps it onto the whole
+    // `d2` slice, so lifting it would read 64 bits where the
+    // instruction names 32.
+    let i = insn(0x1000, 4, "vdup.32", vec![reg("q0"), reg("d2[1]")]);
+    assert!(matches!(
+        crate::lift::lift_per_mnemonic(&i, Arch::Arm).as_slice(),
+        [IrStmt::Unsupported { .. }]
+    ));
+}
+
+#[test]
+fn aarch32_empty_element_type_suffix_does_not_panic() {
+    // `split_once('.')` hands the element-type parser an empty string
+    // for a mnemonic spelled `vadd.`, and `split_at(1)` panicked on it.
+    let i = insn(0x1000, 4, "vadd.", vec![reg("q0"), reg("q1"), reg("q2")]);
+    assert!(matches!(
+        crate::lift::lift_per_mnemonic(&i, Arch::Arm).as_slice(),
+        [IrStmt::Unsupported { .. }]
+    ));
+}
+
 // --- rounding-mode pinning on ARM ---
 
 /// The guard takes the whole instruction because x87 needs the operand

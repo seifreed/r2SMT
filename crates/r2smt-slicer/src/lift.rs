@@ -41,7 +41,9 @@ mod merge;
 mod simd;
 mod x86;
 mod x87;
-pub(crate) use aarch32::{VfpOp, is_aarch32_packed_instruction, vfp_scalar};
+pub(crate) use aarch32::{
+    VfpOp, is_aarch32_neon_instruction, is_aarch32_packed_instruction, vfp_scalar,
+};
 pub(crate) use aarch64::neon::structured::StructuredEffect;
 use merge::lower_merge;
 pub(crate) use simd::{
@@ -126,7 +128,11 @@ fn is_simd_instruction(insn: &Instruction, arch: Arch) -> bool {
     match arch {
         Arch::X86 | Arch::X86_64 => is_x86_simd_instruction(insn) || is_modelled_x87(insn),
         Arch::Aarch64 => is_aarch64_fp_instruction(insn),
-        Arch::Arm => vfp_scalar(&mnem).is_some() || aarch32::neon_packed_op(&mnem).is_some(),
+        Arch::Arm => {
+            vfp_scalar(&mnem).is_some()
+                || aarch32::neon_packed_op(&mnem).is_some()
+                || is_aarch32_neon_instruction(insn)
+        }
         _ => false,
     }
 }
