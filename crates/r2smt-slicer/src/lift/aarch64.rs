@@ -9,7 +9,7 @@ use crate::registers::register_layout;
 
 use super::{
     BinOp, CsArithOp, FpArithOp, LiftCtx, MemAccess, VectorShape, aarch64_cond_suffix_to_predicate,
-    fp_lane_result, fp_sort_bits, nonzero_width, vector_shape, width_mask,
+    fp_lane_result, fp_sort_bits_checked, nonzero_width, vector_shape, width_mask,
 };
 use r2smt_common::Arch;
 
@@ -900,7 +900,10 @@ impl LiftCtx {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
-        let result = fp_lane_result(op, a, b, lane);
+        let Some(result) = fp_lane_result(op, a, b, lane) else {
+            self.push_aarch64_fp_unsupported(insn);
+            return;
+        };
         if !self.write_xmm_dst(dst, result, true) {
             self.push_aarch64_fp_unsupported(insn);
         }
@@ -1051,7 +1054,10 @@ impl LiftCtx {
             };
             value
         } else if is_fp_zero_immediate(rhs) {
-            let (ebits, sbits) = fp_sort_bits(lane);
+            let Some((ebits, sbits)) = fp_sort_bits_checked(lane) else {
+                self.push_aarch64_fp_unsupported(insn);
+                return;
+            };
             Expr::bv_to_fp(Expr::konst(0, lane), ebits, sbits)
         } else {
             self.push_aarch64_fp_unsupported(insn);
@@ -1084,7 +1090,10 @@ impl LiftCtx {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
-        let (ebits, sbits) = fp_sort_bits(dst_lane);
+        let Some((ebits, sbits)) = fp_sort_bits_checked(dst_lane) else {
+            self.push_aarch64_fp_unsupported(insn);
+            return;
+        };
         let converted = Expr::fp_to_fp(value, RoundingMode::NearestTiesEven, ebits, sbits);
         if !self.write_xmm_dst(dst, Expr::fp_to_ieee_bv(converted), true) {
             self.push_aarch64_fp_unsupported(insn);
@@ -1105,7 +1114,10 @@ impl LiftCtx {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
-        let (ebits, sbits) = fp_sort_bits(lane);
+        let Some((ebits, sbits)) = fp_sort_bits_checked(lane) else {
+            self.push_aarch64_fp_unsupported(insn);
+            return;
+        };
         // The IR carries only the signed conversion. An unsigned value
         // zero-extended by one bit is the same number read as signed,
         // so `ucvtf` goes through the signed node exactly rather than

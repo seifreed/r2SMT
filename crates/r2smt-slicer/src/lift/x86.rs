@@ -10,7 +10,8 @@ use r2smt_ir::stmt::IrStmt;
 use crate::registers::{is_simd_parent, register_layout};
 
 use super::{
-    BitwiseOp, ExtendKind, FpArithOp, LiftCtx, ShiftOp, fp_lane_result, fp_sort_bits, nonzero_width,
+    BitwiseOp, ExtendKind, FpArithOp, LiftCtx, ShiftOp, fp_lane_result, fp_sort_bits_checked,
+    nonzero_width,
 };
 
 /// x86 SHL/SHR/SAR/SAL mask the shift count before shifting: 5 bits
@@ -724,8 +725,8 @@ impl LiftCtx {
     ) -> Option<Expr> {
         let view = self.simd_instruction_view_bits(&[count_from, src])?;
         let count = Self::packed_lane_count(view, from_bits.max(to_bits))?;
-        let (from_e, from_s) = fp_sort_bits(from_bits);
-        let (to_e, to_s) = fp_sort_bits(to_bits);
+        let (from_e, from_s) = fp_sort_bits_checked(from_bits)?;
+        let (to_e, to_s) = fp_sort_bits_checked(to_bits)?;
         let src_val = self.simd_operand_value(src, view)?;
         let mut lanes = Vec::with_capacity(usize::from(count));
         for index in 0..count {
@@ -779,7 +780,7 @@ impl LiftCtx {
         if !cmp.packed {
             let a = self.read_simd_lane_bits(a_op, cmp.lane_bits, 0)?;
             let b = self.read_simd_lane_bits(b_op, cmp.lane_bits, 0)?;
-            return Some(fp_mask_lane(cmp, a, b));
+            return fp_mask_lane(cmp, a, b);
         }
         let view = self.simd_instruction_view_bits(&[dst, a_op, b_op])?;
         let count = Self::packed_lane_count(view, cmp.lane_bits)?;
@@ -789,7 +790,7 @@ impl LiftCtx {
         for index in 0..count {
             let a = Self::extract_lane(a_val.clone(), cmp.lane_bits, index)?;
             let b = Self::extract_lane(b_val.clone(), cmp.lane_bits, index)?;
-            lanes.push(fp_mask_lane(cmp, a, b));
+            lanes.push(fp_mask_lane(cmp, a, b)?);
         }
         Self::concat_lanes(lanes)
     }
@@ -826,7 +827,7 @@ impl LiftCtx {
         lane_bits: u16,
         packed: bool,
     ) -> Option<Expr> {
-        let (ebits, sbits) = fp_sort_bits(lane_bits);
+        let (ebits, sbits) = fp_sort_bits_checked(lane_bits)?;
         let root = |bits: Expr| {
             Expr::fp_to_ieee_bv(Expr::fsqrt(
                 Expr::bv_to_fp(bits, ebits, sbits),
@@ -862,7 +863,10 @@ impl LiftCtx {
             self.push_simd_unsupported(insn);
             return;
         };
-        let result = fp_lane_result(op, a, b, lane);
+        let Some(result) = fp_lane_result(op, a, b, lane) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
         if !self.write_simd_lane(dst, result, lane, 0) {
             self.push_simd_unsupported(insn);
         }
@@ -917,7 +921,10 @@ impl LiftCtx {
             self.push_simd_unsupported(insn);
             return;
         };
-        let (ebits, sbits) = fp_sort_bits(lane);
+        let Some((ebits, sbits)) = fp_sort_bits_checked(lane) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
         let converted = Expr::sbv_to_fp(int, RoundingMode::NearestTiesEven, ebits, sbits);
         if !self.write_simd_lane(dst, Expr::fp_to_ieee_bv(converted), lane, 0) {
             self.push_simd_unsupported(insn);
@@ -957,7 +964,10 @@ impl LiftCtx {
             self.push_simd_unsupported(insn);
             return;
         };
-        let (ebits, sbits) = fp_sort_bits(dst_lane);
+        let Some((ebits, sbits)) = fp_sort_bits_checked(dst_lane) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
         let converted = Expr::fp_to_fp(f, RoundingMode::NearestTiesEven, ebits, sbits);
         if !self.write_simd_lane(dst, Expr::fp_to_ieee_bv(converted), dst_lane, 0) {
             self.push_simd_unsupported(insn);
@@ -1262,8 +1272,11 @@ fn parse_fp_compare(mnemonic: &str) -> Option<FpCompare> {
 
 /// One lane of a compare: the predicate as a 1-bit value, widened to a
 /// full-lane mask of all-ones or all-zeros.
-fn fp_mask_lane(cmp: &FpCompare, a_bits: Expr, b_bits: Expr) -> Expr {
-    let (ebits, sbits) = fp_sort_bits(cmp.lane_bits);
+///
+/// `None` for a lane width with no IEEE sort, so an unrecognised width
+/// declines instead of being reinterpreted as a double.
+fn fp_mask_lane(cmp: &FpCompare, a_bits: Expr, b_bits: Expr) -> Option<Expr> {
+    let (ebits, sbits) = fp_sort_bits_checked(cmp.lane_bits)?;
     let a = Expr::bv_to_fp(a_bits, ebits, sbits);
     let b = Expr::bv_to_fp(b_bits, ebits, sbits);
     let base = match cmp.pred {
@@ -1277,11 +1290,11 @@ fn fp_mask_lane(cmp: &FpCompare, a_bits: Expr, b_bits: Expr) -> Expr {
     } else {
         base
     };
-    Expr::Ite {
+    Some(Expr::Ite {
         cond: Box::new(cond),
         then_expr: Box::new(lane_all_ones(cmp.lane_bits)),
         else_expr: Box::new(Expr::konst(0, cmp.lane_bits)),
-    }
+    })
 }
 
 /// All-ones at a scalar lane width. Lanes are at most 64 bits, so this

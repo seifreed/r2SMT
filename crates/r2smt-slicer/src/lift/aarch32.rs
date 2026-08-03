@@ -11,8 +11,8 @@ use crate::registers::register_layout;
 
 use super::{
     BinOp, FpArithOp, LiftCtx, MemAccess, PackedIntOp, PackedOp, VectorShape,
-    aarch64_cond_suffix_to_predicate, fp_lane_result, fp_sort_bits, is_aarch32_base_supported,
-    nonzero_width, strip_aarch32_cond_suffix, vector_shape, width_mask,
+    aarch64_cond_suffix_to_predicate, fp_lane_result, fp_sort_bits_checked,
+    is_aarch32_base_supported, nonzero_width, strip_aarch32_cond_suffix, vector_shape, width_mask,
 };
 
 impl LiftCtx {
@@ -838,7 +838,7 @@ impl LiftCtx {
         let rhs = insn.operands.get(2)?.clone();
         let a = self.read_simd_lane_bits(&lhs, lane, 0)?;
         let b = self.read_simd_lane_bits(&rhs, lane, 0)?;
-        Some(fp_lane_result(arith, a, b, lane))
+        fp_lane_result(arith, a, b, lane)
     }
 
     fn vfp_sqrt_value(&mut self, insn: &Instruction, lane: u16) -> Option<Expr> {
@@ -884,7 +884,10 @@ impl LiftCtx {
             };
             value
         } else {
-            let (ebits, sbits) = fp_sort_bits(lane);
+            let Some((ebits, sbits)) = fp_sort_bits_checked(lane) else {
+                self.push_aarch32_vfp_unsupported(insn);
+                return;
+            };
             Expr::bv_to_fp(Expr::konst(0, lane), ebits, sbits)
         };
         let unordered = Expr::bool_or(Expr::fisnan(a.clone()), Expr::fisnan(b.clone()));

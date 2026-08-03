@@ -444,8 +444,18 @@ pub(crate) enum FpArithOp {
 /// The rounding mode is the architectural MXCSR default; a function
 /// that reprograms MXCSR is rejected by the slicer's guard rather than
 /// silently rounded here.
-pub(crate) fn fp_lane_result(op: FpArithOp, a_bits: Expr, b_bits: Expr, lane_bits: u16) -> Expr {
-    let (ebits, sbits) = fp_sort_bits(lane_bits);
+///
+/// `None` for a lane width with no IEEE sort. Callers derive the width
+/// from an operand's vector view, which can name a width no float
+/// format has, and reading such a lane as a double would be a definite
+/// wrong value rather than a decline.
+pub(crate) fn fp_lane_result(
+    op: FpArithOp,
+    a_bits: Expr,
+    b_bits: Expr,
+    lane_bits: u16,
+) -> Option<Expr> {
+    let (ebits, sbits) = fp_sort_bits_checked(lane_bits)?;
     let a = Expr::bv_to_fp(a_bits.clone(), ebits, sbits);
     let b = Expr::bv_to_fp(b_bits.clone(), ebits, sbits);
     let rm = RoundingMode::NearestTiesEven;
@@ -466,14 +476,14 @@ pub(crate) fn fp_lane_result(op: FpArithOp, a_bits: Expr, b_bits: Expr, lane_bit
             } else {
                 Expr::flt(a, b)
             };
-            return Expr::Ite {
+            return Some(Expr::Ite {
                 cond: Box::new(cond),
                 then_expr: Box::new(a_bits),
                 else_expr: Box::new(b_bits),
-            };
+            });
         }
     };
-    Expr::fp_to_ieee_bv(arith)
+    Some(Expr::fp_to_ieee_bv(arith))
 }
 
 /// IEEE interchange formats the pipeline can name and render.
@@ -516,20 +526,6 @@ pub(crate) fn fp_sort_bits_checked(lane_bits: u16) -> Option<(u16, u16)> {
         _ => return None,
     })
 }
-
-/// Total form of [`fp_sort_bits_checked`], for the handlers that select
-/// a lane width from a closed set of literals and so cannot present an
-/// unmodelled one.
-///
-/// The fallback exists because `fp_lane_result` — shared with the ARM
-/// scalar-FP handlers — returns an `Expr` rather than an `Option`.
-/// Prefer the checked form anywhere a width is derived from an operand.
-fn fp_sort_bits(lane_bits: u16) -> (u16, u16) {
-    fp_sort_bits_checked(lane_bits).unwrap_or(FP_DOUBLE_SORT)
-}
-
-/// `(ebits, sbits)` of IEEE binary64.
-const FP_DOUBLE_SORT: (u16, u16) = (11, 53);
 
 /// `Extract(Extract(x, inner_hi, 0), hi, lo)` denotes the same bits as
 /// `Extract(x, hi, lo)` whenever the outer slice fits inside the inner
@@ -1280,7 +1276,7 @@ impl LiftCtx {
         for index in 0..count {
             let a = Self::extract_lane(a_val.clone(), lane_bits, index)?;
             let b = Self::extract_lane(b_val.clone(), lane_bits, index)?;
-            lanes.push(fp_lane_result(op, a, b, lane_bits));
+            lanes.push(fp_lane_result(op, a, b, lane_bits)?);
         }
         Self::concat_lanes(lanes)
     }
