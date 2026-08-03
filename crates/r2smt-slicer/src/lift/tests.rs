@@ -3826,9 +3826,9 @@ fn aarch64_table_lookup_lifts_the_single_register_form() {
 }
 
 #[test]
-fn aarch64_table_lookup_declines_a_multi_register_table() {
-    // The list operand is the shape the structured load / store family
-    // needs and belongs with it.
+fn aarch64_table_lookup_lifts_a_multi_register_table() {
+    // A two-register table concatenates the members low-to-high into a
+    // 32-byte lookup table.
     let i = insn(
         0x1000,
         4,
@@ -3841,7 +3841,7 @@ fn aarch64_table_lookup_declines_a_multi_register_table() {
     );
     let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
     assert!(
-        matches!(stmts.as_slice(), [IrStmt::Unsupported { .. }]),
+        matches!(stmts.as_slice(), [IrStmt::Assign { .. }]),
         "{stmts:?}"
     );
 }

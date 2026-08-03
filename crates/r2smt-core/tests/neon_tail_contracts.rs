@@ -678,6 +678,24 @@ fn tbx_keeps_the_destination_byte_for_an_out_of_range_index() {
 }
 
 #[test]
+fn tbl_spans_a_two_register_table_low_to_high() {
+    // The two members concatenate into a 32-byte table: index 3 hits
+    // member 0's byte 3, index 20 hits member 1's byte 4 (0x24), and
+    // index 40 is past the 32-byte table so `tbl` answers with zero.
+    let upper = packed(8, &(0x20..0x30).collect::<Vec<u128>>());
+    assert_computes_mixed(
+        "tbl",
+        &[("v0.8b", REG), ("{v1.16b, v2.16b}", LIST), ("v3.8b", REG)],
+        &[
+            ("v1", identity_table()),
+            ("v2", upper),
+            ("v3", packed(8, &[3, 20, 40, 0, 0, 0, 0, 0])),
+        ],
+        packed(8, &[3, 0x24, 0, 0, 0, 0, 0, 0]),
+    );
+}
+
+#[test]
 fn pmull_multiplies_without_carries() {
     // 3 times 3 carry-less is `(3 << 0) XOR (3 << 1)` = 5. An ordinary
     // multiply gives 9, so this is the whole contract in one lane: the

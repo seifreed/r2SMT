@@ -225,6 +225,13 @@ fn is_post_index_operand(op: &Operand) -> bool {
 /// the bare `v0.s` a single-element list writes — together with the
 /// element shape every member shares.
 ///
+/// The consecutive registers a `{vN.T, …}` brace list names, without the
+/// shared element shape — for callers (the `tbl`/`tbx` table) that only
+/// need the members and validate the per-member arrangement themselves.
+pub(super) fn parse_reglist_members(op: &Operand) -> Option<Vec<Operand>> {
+    parse_vector_reglist(op).map(|(members, _)| members)
+}
+
 /// Sibling of `AArch32`'s `parse_reglist`, and different from it in the
 /// two ways the ISAs differ: the members carry an arrangement, and the
 /// list order is architectural rather than sorted, because a structured

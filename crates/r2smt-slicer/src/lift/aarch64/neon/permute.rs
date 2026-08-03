@@ -12,7 +12,7 @@
 //! that an index, a byte offset or a container size addresses something
 //! that exists.
 
-use r2smt_ir::program::{Instruction, Operand, OperandKind};
+use r2smt_ir::program::{Instruction, Operand};
 
 use super::super::super::parse_immediate;
 use super::geometry::{
@@ -305,13 +305,14 @@ pub(super) fn insert_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonSha
 /// The bound exists so that growth is a decision rather than a
 /// surprise: past it the instruction declines, and the slicer truncates
 /// as it does for anything unmodelled.
-const TABLE_LOOKUP_SELECT_CAP: u32 = 512;
+const TABLE_LOOKUP_SELECT_CAP: u32 = 1024;
 
-/// `tbl vd.<T>, {vn.16b}, vm.<T>` and `tbx`.
+/// `tbl vd.<T>, {vn.16b[, …]}, vm.<T>` and `tbx`.
 ///
-/// Only the single-register table is resolved. A list of two or more is
-/// the same operand shape the structured load / store family needs and
-/// belongs with it; here it declines.
+/// The table is one to four consecutive whole `.16b` registers whose
+/// bytes concatenate low-to-high into a single lookup table; the
+/// register-list length is bounded by the structured-access parser, and
+/// the resulting select chain by [`TABLE_LOOKUP_SELECT_CAP`].
 pub(super) fn table_lookup_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     let keep = match mnemonic {
         "tbl" => false,
@@ -325,16 +326,17 @@ pub(super) fn table_lookup_shape(insn: &Instruction, mnemonic: &str) -> Option<N
     if destination.lane_bits != BITS_PER_BYTE {
         return None;
     }
-    let table = operand_arrangement(&single_register_table(insn.operands.get(1)?)?)?;
-    // A table register is always the full 128 bits, whatever the
-    // destination's arrangement.
-    if table.lane_bits != BITS_PER_BYTE || !spans_full_register(table) {
-        return None;
+    // Each table register is always the full 128 bits, whatever the
+    // destination's arrangement; the byte count is their sum.
+    let tables = table_registers(insn.operands.get(1)?)?;
+    let mut table_lanes: u16 = 0;
+    for table in &tables {
+        table_lanes = table_lanes.checked_add(operand_arrangement(table)?.lanes)?;
     }
     if operand_arrangement(insn.operands.get(2)?)? != destination {
         return None;
     }
-    let selects = u32::from(destination.lanes).checked_mul(u32::from(table.lanes))?;
+    let selects = u32::from(destination.lanes).checked_mul(u32::from(table_lanes))?;
     if selects > TABLE_LOOKUP_SELECT_CAP {
         tracing::debug!(
             mnemonic,
@@ -345,10 +347,7 @@ pub(super) fn table_lookup_shape(insn: &Instruction, mnemonic: &str) -> Option<N
         return None;
     }
     Some(NeonShape {
-        op: NeonOp::TableLookup {
-            keep,
-            table_lanes: table.lanes,
-        },
+        op: NeonOp::TableLookup { keep, table_lanes },
         lane_bits: destination.lane_bits,
         lanes: destination.lanes,
         dest_index: 0,
@@ -356,23 +355,22 @@ pub(super) fn table_lookup_shape(insn: &Instruction, mnemonic: &str) -> Option<N
     })
 }
 
-/// The one register a `{vN.16b}` table list names, as a plain register
-/// operand the SIMD readers accept.
+/// The one-to-four consecutive registers a `{vN.16b[, …]}` table list
+/// names, as plain register operands the SIMD readers accept.
 ///
 /// Radare2 renders a register list as a single braced operand, which
-/// classifies as neither a register nor a memory reference because it
-/// is not one register name.
-pub(super) fn single_register_table(op: &Operand) -> Option<Operand> {
-    let raw = op.raw.trim().to_ascii_lowercase();
-    let body = raw.strip_prefix('{')?.strip_suffix('}')?.trim();
-    if body.contains(',') {
-        return None;
+/// classifies as neither a register nor a memory reference. The
+/// consecutive-register rule is enforced by the shared list parser; each
+/// member must be a whole `.16b` register.
+pub(super) fn table_registers(op: &Operand) -> Option<Vec<Operand>> {
+    let members = super::structured::parse_reglist_members(op)?;
+    for member in &members {
+        let arrangement = operand_arrangement(member)?;
+        if arrangement.lane_bits != BITS_PER_BYTE || !spans_full_register(arrangement) {
+            return None;
+        }
     }
-    let operand = Operand {
-        raw: body.to_string(),
-        kind: OperandKind::Register,
-    };
-    operand_arrangement(&operand).map(|_| operand)
+    Some(members)
 }
 
 // ===================== bitwise select =====================

@@ -13,7 +13,7 @@ use super::super::super::{FpArithOp, LiftCtx, fp_lane_result, fp_propagating_max
 use super::arith::{CompareKind, SaturateTo, SaturatingKind, ShiftKind};
 use super::geometry::{BITS_PER_BYTE, operand_arrangement};
 use super::multiply::{AccumulateKind, AccumulateSources, ByElementKind, DOT_PRODUCT_TERMS};
-use super::permute::{PermuteKind, PermuteSource, SelectRole, single_register_table};
+use super::permute::{PermuteKind, PermuteSource, SelectRole, table_registers};
 use super::width::{ConvertKind, ReduceKind, WidenKind};
 use super::{NeonOp, NeonShape};
 
@@ -139,9 +139,16 @@ impl LiftCtx {
         keep: bool,
         table_lanes: u16,
     ) -> Option<Expr> {
-        let table_operand = single_register_table(insn.operands.get(1)?)?;
-        let table_bits = table_lanes.checked_mul(BITS_PER_BYTE)?;
-        let table = self.simd_operand_value(&table_operand, table_bits)?;
+        // Each table register is a full 128-bit view; their bytes
+        // concatenate low-to-high, so byte `i` of member `m` is table
+        // byte `m * 16 + i`.
+        const TABLE_REGISTER_BITS: u16 = 128;
+        let members = table_registers(insn.operands.get(1)?)?;
+        let member_values = members
+            .iter()
+            .map(|operand| self.simd_operand_value(operand, TABLE_REGISTER_BITS))
+            .collect::<Option<Vec<_>>>()?;
+        let table = Self::concat_lanes(member_values)?;
         let indices = self.widen_source(insn, 2)?;
         let view = shape.lane_bits.checked_mul(shape.lanes)?;
         let prior = if keep {
