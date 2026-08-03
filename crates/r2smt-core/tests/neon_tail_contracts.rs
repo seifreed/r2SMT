@@ -225,3 +225,166 @@ fn uminv_compares_the_same_lanes_unsigned() {
         0x00,
     );
 }
+
+// ===================== `movi` with `msl`, and fixed point =====================
+
+/// [`solve_lowering`] for an instruction carrying immediate operands,
+/// which the all-register helper would misclassify.
+fn solve_mixed(
+    mnemonic: &str,
+    operands: &[(&str, OperandKind)],
+    sources: &[(&str, u128)],
+    expected: u128,
+) -> SmtResult {
+    let insn = Instruction {
+        address: Address::new(0x1000),
+        size: 4,
+        bytes: vec![],
+        mnemonic: mnemonic.into(),
+        operands: operands
+            .iter()
+            .map(|(raw, kind)| Operand {
+                raw: (*raw).into(),
+                kind: *kind,
+            })
+            .collect(),
+        esil: None,
+        pcode: None,
+        is_thumb: false,
+    };
+    let lifted = lift_per_mnemonic(&insn, Arch::Aarch64);
+    assert!(
+        lifted
+            .iter()
+            .all(|s| !matches!(s, IrStmt::Unsupported { .. })),
+        "{mnemonic} declined: {lifted:?}"
+    );
+    let mut statements: Vec<IrStmt> = sources
+        .iter()
+        .map(|(name, value)| IrStmt::Assign {
+            dst: Var::new(*name, VECTOR_BITS),
+            src: Expr::konst(*value, VECTOR_BITS),
+        })
+        .collect();
+    statements.extend(lifted);
+    let slice = LiftedSlice {
+        branch: branch(),
+        statements,
+        condition: Expr::eq(
+            Expr::Var(Var::new("v0", VECTOR_BITS)),
+            Expr::konst(expected, VECTOR_BITS),
+        ),
+        status: SliceStatus::Complete,
+        treat_truncation_as_inputs: false,
+        arch: Arch::Aarch64,
+    };
+    solve_branch(
+        &ssa_convert(&slice),
+        SolveOptions {
+            timeout_ms: TEST_SOLVE_TIMEOUT_MS,
+            ..SolveOptions::default()
+        },
+    )
+}
+
+fn assert_computes_mixed(
+    mnemonic: &str,
+    operands: &[(&str, OperandKind)],
+    sources: &[(&str, u128)],
+    expected: u128,
+) {
+    assert_eq!(
+        solve_mixed(mnemonic, operands, sources, expected),
+        SmtResult::AlwaysTrue,
+        "{mnemonic} {operands:?} with {sources:x?} should give {expected:#x}"
+    );
+}
+
+const REG: OperandKind = OperandKind::Register;
+const IMM: OperandKind = OperandKind::Immediate;
+
+#[test]
+fn movi_with_a_ones_shift_fills_the_vacated_bits_with_ones() {
+    // `msl 8` on an immediate of 1 gives 0x1ff, not 0x100 — the whole
+    // difference from `lsl`, and the reason it is a separate mnemonic.
+    assert_computes_mixed(
+        "movi",
+        &[("v0.4s", REG), ("1", IMM), ("msl 8", IMM)],
+        &[],
+        packed(32, &[0x1ff; 4]),
+    );
+}
+
+#[test]
+fn mvni_inverts_the_ones_shifted_immediate() {
+    assert_computes_mixed(
+        "mvni",
+        &[("v0.4s", REG), ("1", IMM), ("msl 8", IMM)],
+        &[],
+        packed(32, &[0xffff_fe00; 4]),
+    );
+}
+
+#[test]
+fn movi_with_a_zeroes_shift_still_fills_with_zeroes() {
+    // The regression guard on the pre-existing `lsl` path: it shares
+    // the parser with `msl` now, and must not have picked up its fill.
+    assert_computes_mixed(
+        "movi",
+        &[("v0.4s", REG), ("1", IMM), ("lsl 8", IMM)],
+        &[],
+        packed(32, &[0x100; 4]),
+    );
+}
+
+#[test]
+fn scvtf_with_a_fraction_width_divides_by_that_power_of_two() {
+    // 3 read as a fixed-point value with one fractional bit is 1.5,
+    // whose binary32 pattern is 0x3fc00000. Without the scale it would
+    // be 3.0 (0x40400000) — a different number, not a rounding.
+    assert_computes_mixed(
+        "scvtf",
+        &[("v0.4s", REG), ("v1.4s", REG), ("1", IMM)],
+        &[("v1", 3)],
+        0x3fc0_0000,
+    );
+}
+
+#[test]
+fn ucvtf_with_a_fraction_width_reads_the_lane_unsigned() {
+    // 0xffffffff over four is 1073741823.75, which rounds to 2^30
+    // (0x4e800000). Read signed the same lane is -0.25 (0xbe800000),
+    // so this pins the signedness as well as the scale.
+    assert_computes_mixed(
+        "ucvtf",
+        &[("v0.4s", REG), ("v1.4s", REG), ("2", IMM)],
+        &[("v1", 0xffff_ffff)],
+        0x4e80_0000,
+    );
+}
+
+#[test]
+fn fcvtzs_with_a_fraction_width_multiplies_before_truncating() {
+    // 1.5 with two fractional bits is the integer 6. Truncating first
+    // and scaling after would give 4.
+    assert_computes_mixed(
+        "fcvtzs",
+        &[("v0.4s", REG), ("v1.4s", REG), ("2", IMM)],
+        &[("v1", 0x3fc0_0000)],
+        6,
+    );
+}
+
+#[test]
+fn scvtf_scales_a_half_precision_lane_through_a_subnormal_factor() {
+    // The corner that decides how the scale is built: 2^16 is infinity
+    // in binary16, so a lowering that divided by `2^fbits` would give
+    // zero here. Multiplying by 2^-16 — a representable subnormal —
+    // gives 1/65536, whose binary16 pattern is 0x0100.
+    assert_computes_mixed(
+        "scvtf",
+        &[("v0.4h", REG), ("v1.4h", REG), ("16", IMM)],
+        &[("v1", 1)],
+        0x0100,
+    );
+}

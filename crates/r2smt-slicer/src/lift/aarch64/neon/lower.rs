@@ -75,7 +75,9 @@ impl LiftCtx {
             } => self.saturating_lanes(insn, shape, kind, signed_sources, upper),
             NeonOp::Shift { kind, signed } => self.shift_lanes(insn, shape, kind, signed),
             NeonOp::Compare { kind, zero } => self.compare_lanes(insn, shape, kind, zero),
-            NeonOp::Convert { kind, upper } => self.convert_lanes(insn, shape, kind, upper),
+            NeonOp::Convert { kind, upper, fbits } => {
+                self.convert_lanes(insn, shape, kind, upper, fbits)
+            }
             NeonOp::BitwiseSelect(role) => self.bitwise_select(insn, shape, role),
             NeonOp::Reduce {
                 kind,
@@ -180,6 +182,7 @@ impl LiftCtx {
         shape: NeonShape,
         kind: ConvertKind,
         upper: bool,
+        fbits: u16,
     ) -> Option<Expr> {
         let source = self.widen_source(insn, 1)?;
         let source_bits = match kind {
@@ -198,7 +201,13 @@ impl LiftCtx {
                     index
                 };
             let element = LiftCtx::extract_lane(source.clone(), source_bits, source_lane)?;
-            lanes.push(convert_lane(kind, element, source_bits, shape.lane_bits)?);
+            lanes.push(convert_lane(
+                kind,
+                element,
+                source_bits,
+                shape.lane_bits,
+                fbits,
+            )?);
         }
         let converted = Self::concat_lanes(lanes)?;
         if !upper || !matches!(kind, ConvertKind::FloatToFloat { widening: false }) {
@@ -923,17 +932,86 @@ fn fp_sort(lane_bits: u16) -> Option<(u16, u16)> {
     }
 }
 
+/// The IEEE bit pattern of `2^exponent` in the `(ebits, sbits)` sort,
+/// or `None` when that power is not representable there.
+///
+/// A subnormal result is built rather than declined: the fixed-point
+/// conversions scale by `2^-fbits`, and for a 16-bit element with
+/// `fbits = 16` that lands one exponent below the normal range — where
+/// the value is still exact, since a power of two is a single set bit
+/// of the stored significand.
+fn power_of_two(exponent: i32, ebits: u16, sbits: u16) -> Option<u128> {
+    let bias = (1i32 << (i32::from(ebits) - 1)) - 1;
+    let stored = i32::from(sbits) - 1;
+    let field = exponent.checked_add(bias)?;
+    if field >= 1 {
+        // Normal: the significand is implicit, so the pattern is the
+        // biased exponent alone. The all-ones field is infinity / NaN.
+        if field >= (1i32 << i32::from(ebits)) - 1 {
+            return None;
+        }
+        return Some(u128::try_from(field).ok()? << u32::try_from(stored).ok()?);
+    }
+    // Subnormal: the value is `significand * 2^(1 - bias - stored)`, so
+    // the set bit sits `exponent - (1 - bias - stored)` places up.
+    let bit = exponent.checked_sub(1 - bias - stored)?;
+    if bit < 0 || bit >= stored {
+        return None;
+    }
+    Some(1u128 << u32::try_from(bit).ok()?)
+}
+
+/// Scale `value` by `2^-fbits`, the fixed-point conversions' fraction
+/// width, in whichever direction `divide` names.
+///
+/// The constant is always built as `2^-fbits` and never as `2^fbits`,
+/// which is the only spelling representable at every encodable width:
+/// `2^16` is infinity in binary16, while `2^-16` is a perfectly good
+/// subnormal. Scaling by a power of two only shifts the exponent, so it
+/// introduces no rounding of its own — the result is the same one the
+/// architecture's single correctly-rounded conversion produces, except
+/// in a subnormal corner where the integer is small enough to be exact
+/// anyway.
+fn scale_by_fraction(
+    value: Expr,
+    fbits: u16,
+    ebits: u16,
+    sbits: u16,
+    divide: bool,
+) -> Option<Expr> {
+    if fbits == 0 {
+        return Some(value);
+    }
+    let scale = Expr::FpConst {
+        bits: power_of_two(-i32::from(fbits), ebits, sbits)?,
+        ebits,
+        sbits,
+    };
+    let round = r2smt_ir::expr::RoundingMode::NearestTiesEven;
+    Some(if divide {
+        Expr::fdiv(value, scale, round)
+    } else {
+        Expr::fmul(value, scale, round)
+    })
+}
+
 /// One destination lane of a conversion.
 ///
 /// The IR carries no unsigned integer conversion, so the unsigned forms
 /// go through the signed node with one extra bit of range — which covers
 /// the unsigned range exactly rather than approximately, the same trick
 /// the scalar `ucvtf` / `fcvtzu` already use.
+///
+/// `fbits` is the fixed-point fraction width, zero for the plain
+/// register forms. It reads the integer side as `Int(lane) / 2^fbits`,
+/// so the conversion into float multiplies by that factor and the
+/// conversion out of float divides by it.
 fn convert_lane(
     kind: ConvertKind,
     element: Expr,
     source_bits: u16,
     lane_bits: u16,
+    fbits: u16,
 ) -> Option<Expr> {
     let round = r2smt_ir::expr::RoundingMode::NearestTiesEven;
     match kind {
@@ -944,13 +1022,20 @@ fn convert_lane(
             } else {
                 Expr::zero_ext(element, source_bits.checked_add(1)?)
             };
-            Some(Expr::fp_to_ieee_bv(Expr::sbv_to_fp(
-                source, round, ebits, sbits,
-            )))
+            let converted = Expr::sbv_to_fp(source, round, ebits, sbits);
+            Some(Expr::fp_to_ieee_bv(scale_by_fraction(
+                converted, fbits, ebits, sbits, false,
+            )?))
         }
         ConvertKind::FloatToInt { signed } => {
             let (ebits, sbits) = fp_sort(source_bits)?;
-            let value = Expr::bv_to_fp(element, ebits, sbits);
+            let value = scale_by_fraction(
+                Expr::bv_to_fp(element, ebits, sbits),
+                fbits,
+                ebits,
+                sbits,
+                true,
+            )?;
             // The `z` in the mnemonic is round-toward-zero, so no
             // control register is assumed.
             let toward_zero = r2smt_ir::expr::RoundingMode::TowardZero;
@@ -965,6 +1050,8 @@ fn convert_lane(
             })
         }
         ConvertKind::FloatToFloat { .. } => {
+            // No fixed-point form: `convert_shape` rejects a third
+            // operand here, so `fbits` is zero and nothing scales.
             let (from_e, from_s) = fp_sort(source_bits)?;
             let (to_e, to_s) = fp_sort(lane_bits)?;
             Some(Expr::fp_to_ieee_bv(Expr::fp_to_fp(

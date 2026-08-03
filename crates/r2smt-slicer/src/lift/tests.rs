@@ -2978,9 +2978,13 @@ fn aarch64_movi_shifts_the_immediate_before_replicating() {
 }
 
 #[test]
-fn aarch64_movi_declines_the_mask_shift_form() {
-    // `msl` shifts ones in, not zeroes — a different operation.
-    assert!(neon_declines("movi", &["v0.4s", "#1", "msl #8"]));
+fn aarch64_movi_fills_the_mask_shift_form_with_ones() {
+    // `msl` shifts ones in, not zeroes, so the lane is 0x1ff rather
+    // than the 0x100 the `lsl` spelling above produces.
+    assert_eq!(
+        neon_lowering("movi", &["v0.4s", "#1", "msl #8"]),
+        "v0 := concat(0x1ff:32, concat(0x1ff:32, concat(0x1ff:32, 0x1ff:32)))"
+    );
 }
 
 #[test]
@@ -3537,10 +3541,11 @@ fn aarch64_compare_declines_a_non_zero_immediate() {
 }
 
 #[test]
-fn aarch64_fixed_point_convert_declines() {
-    // The three-operand form scales by a fractional-bit count, which is
-    // a different operation from the plain conversion.
-    assert!(neon_declines("scvtf", &["v0.2s", "v1.2s", "#4"]));
+fn aarch64_fixed_point_convert_lifts_at_a_half_width_arrangement() {
+    // The three-operand form scales by a fractional-bit count. It used
+    // to decline; the scale is an exact power of two, so it costs one
+    // multiply and introduces no rounding of its own.
+    assert!(!neon_declines("scvtf", &["v0.2s", "v1.2s", "#4"]));
 }
 
 #[test]
@@ -3664,4 +3669,63 @@ fn aarch64_across_lane_reduction_declines_an_arranged_destination() {
     // `addv v0.4s, v1.4s` is not an encoding: the destination of a
     // reduction holds one element, not a vector of them.
     assert!(neon_declines("addv", &["v0.4s", "v1.4s"]));
+}
+
+#[test]
+fn aarch64_movi_with_a_ones_shift_lifts() {
+    // `msl` shifts ones in, which is what builds the `0x0000ffff`-style
+    // masks a bare `lsl` cannot reach.
+    assert!(!neon_declines_mixed("movi", &["v0.4s", "1", "msl 8"]));
+    assert!(!neon_declines_mixed("mvni", &["v0.4s", "1", "msl 16"]));
+}
+
+#[test]
+fn aarch64_movi_ones_shift_declines_outside_its_encoding() {
+    // ARM ARM C7.2: `msl` is encoded for 32-bit elements only, and only
+    // for a shift of 8 or 16.
+    assert!(neon_declines_mixed("movi", &["v0.8h", "2", "msl 8"]));
+    assert!(neon_declines_mixed("movi", &["v0.4s", "1", "msl 4"]));
+}
+
+#[test]
+fn aarch64_fixed_point_conversion_lifts() {
+    assert!(!neon_declines_mixed("scvtf", &["v0.4s", "v1.4s", "4"]));
+    assert!(!neon_declines_mixed("fcvtzu", &["v0.2d", "v1.2d", "64"]));
+}
+
+#[test]
+fn aarch64_fixed_point_conversion_declines_an_out_of_range_fraction_width() {
+    // ARM ARM C7.2 bounds the fraction width by `1 <= fbits <= esize`.
+    assert!(neon_declines_mixed("scvtf", &["v0.4s", "v1.4s", "0"]));
+    assert!(neon_declines_mixed("scvtf", &["v0.4s", "v1.4s", "33"]));
+}
+
+#[test]
+fn aarch64_float_width_conversion_has_no_fixed_point_form() {
+    // `fcvtl` / `fcvtn` change the float format; there is no fixed
+    // point on either side, so a third operand is not an encoding.
+    assert!(neon_declines_mixed("fcvtl", &["v0.4s", "v1.4h", "2"]));
+}
+
+/// [`neon_declines`] for an instruction whose operands are not all
+/// registers — the immediate-bearing forms.
+fn neon_declines_mixed(mnemonic: &str, operands: &[&str]) -> bool {
+    let i = insn(
+        0x1000,
+        4,
+        mnemonic,
+        operands
+            .iter()
+            .map(|raw| {
+                let kind = if raw.starts_with('v') {
+                    OperandKind::Register
+                } else {
+                    OperandKind::Immediate
+                };
+                op(raw, kind)
+            })
+            .collect(),
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    matches!(stmts.as_slice(), [IrStmt::Unsupported { .. }])
 }

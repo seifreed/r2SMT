@@ -103,7 +103,15 @@ enum NeonOp {
     /// A lane-wise conversion between integer and floating point, or
     /// between float widths. `upper` is the `2` suffix, which only the
     /// width-changing forms carry.
-    Convert { kind: ConvertKind, upper: bool },
+    ///
+    /// `fbits` is the fixed-point form's fraction width, and zero for
+    /// the plain register forms — the integer side is then read as a
+    /// scaled value, `Int(lane) / 2^fbits`.
+    Convert {
+        kind: ConvertKind,
+        upper: bool,
+        fbits: u16,
+    },
     /// `bsl` / `bit` / `bif` — bitwise select, where one of the three
     /// registers supplies the mask and the destination is always one of
     /// the three.
@@ -186,6 +194,17 @@ enum ConvertKind {
     /// `fcvtl` / `fcvtn` — between float widths, one lane doubling or
     /// halving in size.
     FloatToFloat { widening: bool },
+}
+
+impl ConvertKind {
+    /// Whether the mnemonic has a fixed-point form, which carries the
+    /// number of fractional bits as a third operand.
+    ///
+    /// Only the integer conversions do: `fcvtl` / `fcvtn` change the
+    /// float format, and there is no fixed point on either side.
+    const fn scales(self) -> bool {
+        matches!(self, Self::IntToFloat { .. } | Self::FloatToInt { .. })
+    }
 }
 
 /// The same-width shift operations.
@@ -562,12 +581,21 @@ fn convert_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     if upper && !widths_differ {
         return None;
     }
-    // The two-operand register forms only; the fixed-point variants
-    // carry a third immediate operand and scale by it.
-    if insn.operands.len() != 2 {
-        return None;
-    }
     let destination = operand_arrangement(insn.operands.first()?)?;
+    // The fixed-point forms carry the fraction width as a third
+    // operand. ARM ARM C7.2 bounds it by `1 <= fbits <= esize`, and
+    // there is no fixed-point `2` form.
+    let fbits = match insn.operands.len() {
+        2 => 0,
+        3 if kind.scales() && !upper => {
+            let raw = u16::try_from(parse_immediate(&insn.operands.get(2)?.raw)?).ok()?;
+            if raw == 0 || raw > destination.lane_bits {
+                return None;
+            }
+            raw
+        }
+        _ => return None,
+    };
     let source = operand_arrangement(insn.operands.get(1)?)?;
     let (source_bits, written) = match kind {
         ConvertKind::FloatToFloat { widening: true } => {
@@ -615,7 +643,7 @@ fn convert_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
         return None;
     }
     Some(NeonShape {
-        op: NeonOp::Convert { kind, upper },
+        op: NeonOp::Convert { kind, upper, fbits },
         lane_bits: destination.lane_bits,
         lanes: written,
         dest_index: 0,
@@ -1129,14 +1157,12 @@ fn packed_shape_of(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
 
 // ===================== broadcast and permutation =====================
 
-/// `movi vd.<T>, #imm{, lsl #shift}` and `mvni`, which replicate an
+/// `movi vd.<T>, #imm{, lsl|msl #shift}` and `mvni`, which replicate an
 /// immediate across every lane.
 ///
 /// The disassembler prints the *decoded* immediate, so the printed value
 /// is the per-lane one and needs no re-expansion — including for `.2d`,
-/// whose encoded form is a byte mask. An `msl` shift is a different
-/// operation (it shifts ones in, not zeroes) and declines rather than
-/// being treated as `lsl`.
+/// whose encoded form is a byte mask.
 fn immediate_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     let invert = match mnemonic {
         "movi" => false,
@@ -1145,14 +1171,27 @@ fn immediate_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     };
     let arrangement = operand_arrangement(insn.operands.first()?)?;
     let raw = parse_immediate(&insn.operands.get(1)?.raw)?;
-    let shift = match insn.operands.len() {
-        2 => 0,
-        3 => shift_amount(insn.operands.get(2)?)?,
+    let shifted = match insn.operands.len() {
+        2 => raw,
+        3 => {
+            let (kind, shift) = shift_modifier(insn.operands.get(2)?)?;
+            // ARM ARM C7.2 (MOVI / MVNI, shifting ones): the `msl` form
+            // is encoded for 32-bit elements only, and only for a shift
+            // of 8 or 16.
+            if kind == ShiftModifier::Ones
+                && (arrangement.lane_bits != 32 || !matches!(shift, 8 | 16))
+            {
+                return None;
+            }
+            apply_shift_modifier(kind, raw, shift)?
+        }
         _ => return None,
     };
-    let value = raw.checked_shl(u32::from(shift))?;
     Some(NeonShape {
-        op: NeonOp::Immediate { value, invert },
+        op: NeonOp::Immediate {
+            value: shifted,
+            invert,
+        },
         lane_bits: arrangement.lane_bits,
         lanes: arrangement.lanes,
         dest_index: 0,
@@ -1160,12 +1199,43 @@ fn immediate_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     })
 }
 
-/// The `lsl #n` shift operand of a `movi`. Radare2 renders the shifting
-/// modifier as one operand, so the whole thing is parsed here.
-fn shift_amount(op: &Operand) -> Option<u16> {
+/// Which bit an immediate shift feeds in from the right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShiftModifier {
+    /// `lsl` — zeroes.
+    Zeroes,
+    /// `msl` — ones. The whole reason it is a separate mnemonic: it
+    /// builds the `0x0000ffff`-style masks a bare `lsl` cannot.
+    Ones,
+}
+
+/// The `lsl #n` / `msl #n` shift operand of a `movi`. Radare2 renders
+/// the shifting modifier as one operand, so the whole thing is parsed
+/// here.
+fn shift_modifier(op: &Operand) -> Option<(ShiftModifier, u16)> {
     let raw = op.raw.trim().to_ascii_lowercase();
-    let body = raw.strip_prefix("lsl")?.trim();
-    u16::try_from(parse_immediate(body)?).ok()
+    let (kind, body) = if let Some(body) = raw.strip_prefix("lsl") {
+        (ShiftModifier::Zeroes, body)
+    } else {
+        (ShiftModifier::Ones, raw.strip_prefix("msl")?)
+    };
+    Some((kind, u16::try_from(parse_immediate(body.trim())?).ok()?))
+}
+
+/// Apply a shift modifier to the printed immediate.
+///
+/// Both are computed here, in Rust, rather than lowered as IR: every
+/// operand of a `movi` is a literal, so the lane value is known at lift
+/// time and emitting a shift node would leave the solver folding a
+/// constant.
+fn apply_shift_modifier(kind: ShiftModifier, raw: u64, shift: u16) -> Option<u64> {
+    let shifted = raw.checked_shl(u32::from(shift))?;
+    Some(match kind {
+        ShiftModifier::Zeroes => shifted,
+        // The vacated bits come in set, so the low `shift` bits are all
+        // ones rather than all zeroes.
+        ShiftModifier::Ones => shifted | (1u64.checked_shl(u32::from(shift))? - 1),
+    })
 }
 
 /// `dup vd.<T>, rn` and `dup vd.<T>, vn.<Ts>[index]`.
