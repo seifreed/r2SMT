@@ -3632,3 +3632,36 @@ fn all_ones_above_the_payload_width_concatenates_full_chunks() {
         )
     );
 }
+
+#[test]
+fn aarch64_across_lane_reduction_lifts_from_the_source_arrangement() {
+    // The destination is a scalar and carries no arrangement, so the
+    // geometry has to come from operand 1. A resolver that read
+    // operand 0 the way every other family does would decline here.
+    assert!(!neon_declines("addv", &["s0", "v1.4s"]));
+    assert!(!neon_declines("uaddlv", &["h0", "v1.8b"]));
+    assert!(!neon_declines("smaxv", &["b0", "v1.16b"]));
+}
+
+#[test]
+fn aarch64_across_lane_reduction_declines_a_mismatched_destination_width() {
+    // `uaddlv` widens, so an 8-bit source element produces a 16-bit
+    // one — a byte destination is a different instruction.
+    assert!(neon_declines("uaddlv", &["b0", "v1.8b"]));
+    assert!(neon_declines("addv", &["h0", "v1.4s"]));
+}
+
+#[test]
+fn aarch64_across_lane_reduction_declines_an_unencodable_arrangement() {
+    // ARM ARM C7.2: a 64-bit element has no across-lane encoding, and
+    // a 32-bit one requires the full-width arrangement.
+    assert!(neon_declines("addv", &["d0", "v1.2d"]));
+    assert!(neon_declines("addv", &["s0", "v1.2s"]));
+}
+
+#[test]
+fn aarch64_across_lane_reduction_declines_an_arranged_destination() {
+    // `addv v0.4s, v1.4s` is not an encoding: the destination of a
+    // reduction holds one element, not a vector of them.
+    assert!(neon_declines("addv", &["v0.4s", "v1.4s"]));
+}

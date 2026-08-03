@@ -12,8 +12,8 @@ use r2smt_ir::program::{Instruction, Operand};
 use super::super::super::LiftCtx;
 use super::{
     AccumulateKind, AccumulateSources, BITS_PER_BYTE, CompareKind, ConvertKind, NeonOp, NeonShape,
-    PermuteKind, PermuteSource, SaturateTo, SaturatingKind, SelectRole, ShiftKind, WidenKind,
-    operand_arrangement,
+    PermuteKind, PermuteSource, ReduceKind, SaturateTo, SaturatingKind, SelectRole, ShiftKind,
+    WidenKind, operand_arrangement,
 };
 
 impl LiftCtx {
@@ -77,7 +77,44 @@ impl LiftCtx {
             NeonOp::Compare { kind, zero } => self.compare_lanes(insn, shape, kind, zero),
             NeonOp::Convert { kind, upper } => self.convert_lanes(insn, shape, kind, upper),
             NeonOp::BitwiseSelect(role) => self.bitwise_select(insn, shape, role),
+            NeonOp::Reduce {
+                kind,
+                source_lanes,
+                source_lane_bits,
+            } => self.reduce_lanes(insn, shape, kind, source_lanes, source_lane_bits),
         }
+    }
+
+    /// The across-lane reductions — every source lane folded into the
+    /// one element the scalar destination holds.
+    ///
+    /// The fold is left-associative, which the architecture permits to
+    /// matter for none of these: integer addition and the min / max
+    /// selects are associative, so no ordering is observable.
+    fn reduce_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        kind: ReduceKind,
+        source_lanes: u16,
+        source_lane_bits: u16,
+    ) -> Option<Expr> {
+        let source = self.widen_source(insn, 1)?;
+        let mut accumulator: Option<Expr> = None;
+        for index in 0..source_lanes {
+            let raw = LiftCtx::extract_lane(source.clone(), source_lane_bits, index)?;
+            // The widening forms extend before the fold; the same-width
+            // ones already sit at the destination's element width.
+            let element = match kind {
+                ReduceKind::AddLong { signed } => extend(raw, shape.lane_bits, signed),
+                ReduceKind::Add | ReduceKind::MinMax { .. } => raw,
+            };
+            accumulator = Some(match accumulator {
+                None => element,
+                Some(previous) => reduce_step(kind, previous, element),
+            });
+        }
+        accumulator
     }
 
     /// `bsl` / `bit` / `bif` — one bitwise select over the whole view.
@@ -540,6 +577,33 @@ impl LiftCtx {
             mnemonic: insn.mnemonic.clone(),
             comment: format!("unmodellable NEON operand at {addr}", addr = insn.address),
         });
+    }
+}
+
+/// Fold one more lane into an across-lane reduction's accumulator.
+///
+/// `addv` sums at the element width and keeps the low bits, which is
+/// what the architecture's truncation of the unbounded sum comes to; a
+/// wrapping add reproduces it exactly. `uaddlv` / `saddlv` arrive here
+/// already extended, and no encodable arrangement can overflow the
+/// doubled width (sixteen bytes reach 4 080, eight halfwords 524 280),
+/// so their sum is exact rather than truncated too.
+fn reduce_step(kind: ReduceKind, a: Expr, b: Expr) -> Expr {
+    match kind {
+        ReduceKind::Add | ReduceKind::AddLong { .. } => Expr::add(a, b),
+        ReduceKind::MinMax { signed, max } => {
+            let cond = if signed {
+                Expr::slt(a.clone(), b.clone())
+            } else {
+                Expr::ult(a.clone(), b.clone())
+            };
+            let (taken, other) = if max { (b, a) } else { (a, b) };
+            Expr::Ite {
+                cond: Box::new(cond),
+                then_expr: Box::new(taken),
+                else_expr: Box::new(other),
+            }
+        }
     }
 }
 

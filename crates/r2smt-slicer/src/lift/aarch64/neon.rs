@@ -108,6 +108,34 @@ enum NeonOp {
     /// registers supplies the mask and the destination is always one of
     /// the three.
     BitwiseSelect(SelectRole),
+    /// An across-lane reduction, folding every source lane into the
+    /// single element the scalar destination holds.
+    ///
+    /// The source geometry is carried here rather than on
+    /// [`NeonShape`] because a reduction is the one family whose two
+    /// sides genuinely differ: `uaddlv h0, v1.8b` folds eight 8-bit
+    /// lanes into one 16-bit element, so neither the lane width nor
+    /// the lane count is shared.
+    Reduce {
+        kind: ReduceKind,
+        source_lanes: u16,
+        source_lane_bits: u16,
+    },
+}
+
+/// The integer across-lane reductions.
+#[derive(Debug, Clone, Copy)]
+enum ReduceKind {
+    /// `addv` — sum every lane at the element width, keeping the low
+    /// bits, which is what the architecture's truncation of the
+    /// unbounded sum comes to.
+    Add,
+    /// `uaddlv` / `saddlv` — extend each lane to twice its width and
+    /// sum there. The widened sum cannot overflow for any encodable
+    /// arrangement, so this is exact rather than merely truncated.
+    AddLong { signed: bool },
+    /// `smaxv` / `umaxv` / `sminv` / `uminv`.
+    MinMax { signed: bool, max: bool },
 }
 
 /// Which role the destination register plays in a bitwise select.
@@ -334,6 +362,82 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| compare_shape(insn, &mnemonic))
         .or_else(|| convert_shape(insn, &mnemonic))
         .or_else(|| bitwise_select_shape(insn, &mnemonic))
+        .or_else(|| reduce_shape(insn, &mnemonic))
+}
+
+// ===================== across-lane reductions =====================
+
+/// The integer across-lane reductions.
+///
+/// Every other family reads its geometry from operand 0. These cannot:
+/// their destination is a *scalar* register (`s0`), which carries no
+/// arrangement at all, so the lane count and the source element width
+/// are spelled only on operand 1. The destination's own width is then
+/// checked against what the reduction produces, rather than assumed —
+/// that check is what tells `addv` from `uaddlv` when a caller has
+/// mistyped one for the other.
+fn reduce_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let min_max = |signed, max| ReduceKind::MinMax { signed, max };
+    let kind = match mnemonic {
+        "addv" => ReduceKind::Add,
+        "uaddlv" => ReduceKind::AddLong { signed: false },
+        "saddlv" => ReduceKind::AddLong { signed: true },
+        "umaxv" => min_max(false, true),
+        "smaxv" => min_max(true, true),
+        "uminv" => min_max(false, false),
+        "sminv" => min_max(true, false),
+        _ => return None,
+    };
+    if insn.operands.len() != 2 {
+        return None;
+    }
+    let source = operand_arrangement(insn.operands.get(1)?)?;
+    // ARM ARM C7.2 — the across-lane reductions encode `8B` / `16B`,
+    // `4H` / `8H` and `4S` only. A 32-bit element requires the
+    // full-width arrangement (`size == 10` implies `Q == 1`) and a
+    // 64-bit one has no encoding at all, so a shape outside that set is
+    // a spelling the architecture does not produce.
+    if !matches!(source.lane_bits, 8 | 16 | 32) {
+        return None;
+    }
+    if source.lane_bits == 32 && !spans_full_register(source) {
+        return None;
+    }
+    let lane_bits = match kind {
+        ReduceKind::AddLong { .. } => source.lane_bits.checked_mul(2)?,
+        _ => source.lane_bits,
+    };
+    if scalar_vector_width(insn.operands.first()?)? != lane_bits {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::Reduce {
+            kind,
+            source_lanes: source.lanes,
+            source_lane_bits: source.lane_bits,
+        },
+        lane_bits,
+        lanes: 1,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+/// Width of a bare scalar view of a vector register (`b0` → 8, `s0` →
+/// 32), which is how the reductions spell their destination.
+///
+/// An arranged or indexed spelling is rejected: those name a lane
+/// geometry, and the whole point here is an operand that names none.
+fn scalar_vector_width(op: &Operand) -> Option<u16> {
+    if op.kind != OperandKind::Register {
+        return None;
+    }
+    let raw = op.raw.trim().to_ascii_lowercase();
+    if raw.contains(['.', '[']) {
+        return None;
+    }
+    let layout = register_layout(&raw, Arch::Aarch64)?;
+    is_simd_parent(layout.parent, Arch::Aarch64).then(|| layout.width())
 }
 
 // ===================== bitwise select =====================
