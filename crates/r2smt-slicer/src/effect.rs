@@ -225,10 +225,15 @@ pub fn has_unmodellable_memory(operands: &[Operand], arch: Arch) -> bool {
 /// 79-to-80 bit bridge on exactly this width.
 #[must_use]
 pub fn memory_operand_width(raw: &str) -> Option<u16> {
-    const WIDTHS: [(&str, u16); 8] = [
+    const WIDTHS: [(&str, u16); 9] = [
         ("zmmword", 512),
         ("ymmword", 256),
         ("xmmword", 128),
+        // radare2 spells the 80-bit x87 format `xword`; `tbyte` is the
+        // Intel / MASM keyword other tools use. Both map to 80, and
+        // neither is a prefix of the other or of `xmmword`, so the
+        // scan order does not matter between them.
+        ("xword", 80),
         ("tbyte", 80),
         ("qword", 64),
         ("dword", 32),

@@ -2711,6 +2711,82 @@ fn x87_store_one_program(dst: &str, expect: &str) -> Program {
     ])
 }
 
+/// A chain pushed onto the x87 stack, stored to `m64fp`, and compared
+/// against `expect` as an integer bit pattern.
+fn x87_chain_program(chain: Vec<(&str, Vec<Operand>)>, expect: &str) -> Program {
+    let mut out = Vec::new();
+    let mut addr = 0x40_1000u64;
+    for (mnemonic, operands) in chain {
+        out.push(insn(addr, 2, mnemonic, operands));
+        addr += 2;
+    }
+    out.push(insn(
+        addr,
+        3,
+        "fstp",
+        vec![op("qword [rbp - 0x20]", OperandKind::Memory)],
+    ));
+    out.push(insn(
+        addr + 3,
+        4,
+        "mov",
+        vec![
+            op("rax", OperandKind::Register),
+            op("qword [rbp - 0x20]", OperandKind::Memory),
+        ],
+    ));
+    out.push(insn(
+        addr + 7,
+        10,
+        "cmp",
+        vec![
+            op("rax", OperandKind::Register),
+            op(expect, OperandKind::Immediate),
+        ],
+    ));
+    out.push(insn(
+        addr + 17,
+        2,
+        "je",
+        vec![op("0x401080", OperandKind::Immediate)],
+    ));
+    one_block(out)
+}
+
+#[test]
+fn x87_one_operand_pop_writes_the_named_slot_not_the_top() {
+    // `de c1` is `faddp st(1)`: ST(1) := ST(1) + ST(0), then pop, so
+    // the sum survives as the new top. Writing ST(0) instead would put
+    // the sum in the slot the pop discards and leave 1.0 behind, which
+    // is why the constants are chosen to differ under that mistake.
+    let program = x87_chain_program(
+        vec![
+            ("fld1", vec![]),
+            ("fld1", vec![]),
+            ("faddp", vec![op("st(1)", OperandKind::Register)]),
+        ],
+        "0x4000000000000000",
+    );
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_reverse_suffix_swaps_the_operands_of_a_one_operand_pop() {
+    // `fsubrp st(1)` is ST(1) := ST(0) - ST(1). With ST(0) = 0.0 and
+    // ST(1) = 1.0 that is -1.0; the non-reversed form would give +1.0.
+    // Intel swaps the mnemonics between the D8 and DC opcode groups,
+    // so getting this backwards is a wrong value, not a decline.
+    let program = x87_chain_program(
+        vec![
+            ("fld1", vec![]),
+            ("fldz", vec![]),
+            ("fsubrp", vec![op("st(1)", OperandKind::Register)]),
+        ],
+        "0xbff0000000000000",
+    );
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
 #[test]
 fn x87_extended_sort_stores_the_binary64_image_of_one() {
     // Pins that `FloatingPoint(15, 64)` really denotes x87's
@@ -2729,7 +2805,7 @@ fn x87_extended_sort_stores_the_explicit_integer_bit() {
     // explicit integer bit alone, the fraction being zero. Reading the
     // sort's own 79-bit pattern instead would put the exponent's low
     // bit there and this would not hold.
-    let program = x87_store_one_program("tbyte [rbp - 0x20]", "0x8000000000000000");
+    let program = x87_store_one_program("xword [rbp - 0x20]", "0x8000000000000000");
     assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
 }
 
@@ -2744,7 +2820,7 @@ fn x87_extended_sort_keeps_a_free_extended_load_undecided() {
             0x40_1000,
             3,
             "fld",
-            vec![op("tbyte [rbp - 0x10]", OperandKind::Memory)],
+            vec![op("xword [rbp - 0x10]", OperandKind::Memory)],
         ),
         insn(
             0x40_1003,

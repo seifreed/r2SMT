@@ -205,7 +205,7 @@ fn test_x87_load_defines_and_uses_the_stack() {
 #[test]
 fn test_x87_extended_precision_load_is_modelled() {
     let effect = analyze(
-        &insn(FUNCTION_ADDRESS, "fld", vec![mem("tbyte [rbp - 0x10]")]),
+        &insn(FUNCTION_ADDRESS, "fld", vec![mem("xword [rbp - 0x10]")]),
         Arch::X86_64,
     );
     assert_eq!(effect.kind, InstructionKind::X87);
@@ -217,7 +217,7 @@ fn test_x87_non_popping_store_has_no_extended_encoding() {
     // to store the extended format without popping, so `fst tbyte` is
     // not an instruction and must not be claimed.
     let effect = analyze(
-        &insn(FUNCTION_ADDRESS, "fst", vec![mem("tbyte [rbp - 0x10]")]),
+        &insn(FUNCTION_ADDRESS, "fst", vec![mem("xword [rbp - 0x10]")]),
         Arch::X86_64,
     );
     assert_eq!(effect.kind, InstructionKind::Other);
@@ -318,7 +318,7 @@ fn test_x87_chain_is_kept_whole_by_the_slicer() {
         vec![
             ("fld", vec![mem("qword [rbp - 0x10]")]),
             ("fld", vec![mem("qword [rbp - 0x18]")]),
-            ("faddp", vec![reg("st(1)"), reg("st(0)")]),
+            ("faddp", vec![reg("st(1)")]),
             ("fstp", vec![mem("qword [rbp - 0x20]")]),
         ],
         mem("qword [rbp - 0x20]"),
@@ -371,7 +371,7 @@ fn test_x87_chain_lifts_to_a_single_store_of_the_sum() {
         vec![
             ("fld", vec![mem("qword [rbp - 0x10]")]),
             ("fld", vec![mem("qword [rbp - 0x18]")]),
-            ("faddp", vec![reg("st(1)"), reg("st(0)")]),
+            ("faddp", vec![reg("st(1)")]),
             ("fstp", vec![mem("qword [rbp - 0x20]")]),
         ],
         mem("qword [rbp - 0x20]"),
@@ -401,7 +401,7 @@ fn test_x87_reverse_subtract_keeps_intel_operand_order() {
         vec![
             ("fld", vec![mem("qword [rbp - 0x10]")]),
             ("fld", vec![mem("qword [rbp - 0x18]")]),
-            ("fsubp", vec![reg("st(1)"), reg("st(0)")]),
+            ("fsubp", vec![reg("st(1)")]),
             ("fstp", vec![mem("qword [rbp - 0x20]")]),
         ],
         mem("qword [rbp - 0x20]"),
@@ -444,7 +444,7 @@ fn test_x87_extended_store_writes_the_eighty_bit_image() {
     // x87 makes the leading significand bit explicit. The store must
     // widen across that bridge rather than write the sort's pattern.
     let program = program_with_tail(
-        vec![("fld1", vec![]), ("fstp", vec![mem("tbyte [rbp - 0x20]")])],
+        vec![("fld1", vec![]), ("fstp", vec![mem("xword [rbp - 0x20]")])],
         mem("qword [rbp - 0x20]"),
     );
     let lifted = lift_slice(&slice_of(&program), Arch::X86_64);
@@ -460,7 +460,7 @@ fn test_x87_extended_load_declines_non_canonical_encodings() {
     // counterpart — otherwise the solver gets a definite wrong answer.
     let program = program_with_tail(
         vec![
-            ("fld", vec![mem("tbyte [rbp - 0x10]")]),
+            ("fld", vec![mem("xword [rbp - 0x10]")]),
             ("fstp", vec![mem("qword [rbp - 0x20]")]),
         ],
         mem("qword [rbp - 0x20]"),
@@ -588,7 +588,7 @@ fn rounding_chain() -> Vec<(&'static str, Vec<Operand>)> {
     vec![
         ("fld1", vec![]),
         ("fld1", vec![]),
-        ("faddp", vec![reg("st(1)"), reg("st(0)")]),
+        ("faddp", vec![reg("st(1)")]),
         ("fstp", vec![mem("qword [rbp - 0x20]")]),
     ]
 }
@@ -627,8 +627,8 @@ fn test_x87_exact_chain_is_unaffected_by_a_control_word_write() {
     // width, so this chain survives an `fldcw` in the same function.
     let program = program_with_trailer(
         vec![
-            ("fld", vec![mem("tbyte [rbp - 0x10]")]),
-            ("fstp", vec![mem("tbyte [rbp - 0x30]")]),
+            ("fld", vec![mem("xword [rbp - 0x10]")]),
+            ("fstp", vec![mem("xword [rbp - 0x30]")]),
         ],
         mem("qword [rbp - 0x30]"),
         vec![("fldcw", vec![mem("word [rbp - 0x40]")])],
@@ -646,4 +646,64 @@ fn test_x87_control_word_read_stays_unmodelled() {
         Arch::X86_64,
     );
     assert_eq!(effect.kind, InstructionKind::Other);
+}
+
+// --- the spellings radare2 actually emits ---
+//
+// Everything below pins a form against real disassembler output rather
+// than the Intel manual's rendering. Each one declined before this
+// round while a hand-written fixture in the manual's spelling passed,
+// which is exactly how the gap survived.
+
+#[test]
+fn test_x87_popping_arithmetic_takes_the_one_operand_spelling() {
+    // `de c1` disassembles as `faddp st(1)`, never as a bare `faddp`
+    // and never with two operands. The one-operand popping form is the
+    // most common x87 arithmetic encoding a compiler emits, and it
+    // reached the classifier's catch-all.
+    for mnemonic in ["faddp", "fsubp", "fsubrp", "fmulp", "fdivp", "fdivrp"] {
+        let i = insn(FUNCTION_ADDRESS, mnemonic, vec![reg("st(1)")]);
+        assert_eq!(
+            analyze(&i, Arch::X86_64).kind,
+            InstructionKind::X87,
+            "{mnemonic} st(1)"
+        );
+    }
+}
+
+#[test]
+fn test_x87_non_popping_register_arithmetic_targets_the_top_of_stack() {
+    // `d8 c1` is `fadd st(1)`, meaning ST(0) := ST(0) + ST(1). The
+    // operand count is what names the destination: one operand means
+    // the top of stack, two mean the register that is spelled.
+    let i = insn(FUNCTION_ADDRESS, "fadd", vec![reg("st(1)")]);
+    assert_eq!(analyze(&i, Arch::X86_64).kind, InstructionKind::X87);
+}
+
+#[test]
+fn test_x87_extended_memory_uses_the_disassembler_width_keyword() {
+    // radare2 writes the 80-bit format as `xword`; `tbyte` is the
+    // Intel / MASM keyword. Only the latter was recognised, so the
+    // whole 79-to-80 bit bridge was unreachable on real input.
+    for raw in ["xword [rbp - 0x10]", "tbyte [rbp - 0x10]"] {
+        let i = insn(FUNCTION_ADDRESS, "fld", vec![mem(raw)]);
+        assert_eq!(
+            analyze(&i, Arch::X86_64).kind,
+            InstructionKind::X87,
+            "{raw}"
+        );
+    }
+}
+
+#[test]
+fn test_x87_popping_flag_compare_takes_the_disassembler_spelling() {
+    // `df f1` is `fcompi st(1)`, not the manual's `fcomip`.
+    for mnemonic in ["fcompi", "fucompi", "fcomip", "fucomip"] {
+        let i = insn(FUNCTION_ADDRESS, mnemonic, vec![reg("st(1)")]);
+        assert_eq!(
+            analyze(&i, Arch::X86_64).kind,
+            InstructionKind::X87,
+            "{mnemonic}"
+        );
+    }
 }

@@ -83,6 +83,8 @@ gate_solver_contracts() {
     x87_extended_sort_is_declined_without_spawning_cvc5 \
     x87_extended_sort_is_declined_without_spawning_bitwuzla \
     x87_extended_sort_stores_the_binary64_image_of_one \
+    x87_one_operand_pop_writes_the_named_slot_not_the_top \
+    x87_reverse_suffix_swaps_the_operands_of_a_one_operand_pop \
     x87_extended_sort_stores_the_explicit_integer_bit \
     x87_extended_sort_keeps_a_free_extended_load_undecided \
     x87_equality_after_a_free_compare_stays_undecided \

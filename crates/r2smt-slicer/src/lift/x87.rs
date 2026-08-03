@@ -541,7 +541,11 @@ fn classify(insn: &Instruction) -> Option<X87Form> {
         "fucomp" => classify_status_compare(ops, 1, MemorySource::Forbidden),
         "fcompp" | "fucompp" => classify_paired_compare(ops),
         "fcomi" | "fucomi" => classify_flag_compare(ops, false),
-        "fcomip" | "fucomip" => classify_flag_compare(ops, true),
+        // radare2 spells the popping EFLAGS compares `fcompi` /
+        // `fucompi`, not the SDM's `fcomip` / `fucomip`. Both are
+        // accepted so the arm does not depend on which spelling a
+        // given disassembler build chooses.
+        "fcompi" | "fucompi" | "fcomip" | "fucomip" => classify_flag_compare(ops, true),
         "fnstsw" | "fstsw" => classify_store_status(ops),
         other => classify_arith(other, ops),
     }
@@ -687,8 +691,8 @@ fn classify_arith(mnemonic: &str, ops: &[Operand]) -> Option<X87Form> {
         _ => return None,
     };
     match ops {
-        // The popping forms have a no-operand encoding meaning
-        // `<op>p st(1), st(0)`; the non-popping ones do not.
+        // Defensive only: radare2 always prints the destination, so
+        // the bare no-operand spelling does not occur in practice.
         [] => pop.then_some(X87Form::Arith {
             op,
             dst: 1,
@@ -696,17 +700,48 @@ fn classify_arith(mnemonic: &str, ops: &[Operand]) -> Option<X87Form> {
             reversed,
             pop,
         }),
-        // `fadd m32fp` — `ST(0) := ST(0) op m`. There is no popping
-        // memory encoding, and a bare `<op> st(i)` is not a spelling
-        // the disassembler emits: without both operands there is no
-        // saying which one is the destination, so it declines.
-        [mem] if !pop => Some(X87Form::Arith {
-            op,
-            dst: 0,
-            src: ArithSrc::Memory(modellable_memory_width(mem, &X87_FLOAT_SHORT_WIDTHS)?),
-            reversed,
-            pop,
-        }),
+        // One operand, and its kind decides the family.
+        //
+        // A stack slot means a register-to-register encoding, where
+        // the *operand count* names the destination — which is what
+        // makes this decidable, contrary to an earlier note here. The
+        // one-operand spelling is the only one radare2 emits for the
+        // `D8`/`DE` register forms:
+        //
+        //   d8 c1  fadd  st(1)   `D8 C0+i`  ST(0) := ST(0) + ST(1)
+        //   de c1  faddp st(1)   `DE C0+i`  ST(1) := ST(1) + ST(0), pop
+        //
+        // The `r` suffix keeps its meaning through `reversed`, which
+        // matters because Intel swaps the mnemonics between the two
+        // opcode groups: `dc f1` is `fdivr st(1), st(0)` while
+        // `d8 f1` is `fdiv st(1)`. radare2 reports each faithfully, so
+        // no correction belongs here.
+        [only] => match slot_index(only) {
+            Some(index) if pop => Some(X87Form::Arith {
+                op,
+                dst: index,
+                src: ArithSrc::Slot(0),
+                reversed,
+                pop,
+            }),
+            Some(index) => Some(X87Form::Arith {
+                op,
+                dst: 0,
+                src: ArithSrc::Slot(index),
+                reversed,
+                pop,
+            }),
+            // `fadd m32fp` — `ST(0) := ST(0) op m`. There is no
+            // popping memory encoding.
+            None if !pop => Some(X87Form::Arith {
+                op,
+                dst: 0,
+                src: ArithSrc::Memory(modellable_memory_width(only, &X87_FLOAT_SHORT_WIDTHS)?),
+                reversed,
+                pop,
+            }),
+            None => None,
+        },
         [dst, src] => Some(X87Form::Arith {
             op,
             dst: slot_index(dst)?,
