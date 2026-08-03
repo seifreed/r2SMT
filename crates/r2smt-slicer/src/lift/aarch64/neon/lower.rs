@@ -9,7 +9,7 @@
 use r2smt_ir::expr::Expr;
 use r2smt_ir::program::{Instruction, Operand};
 
-use super::super::super::{FpArithOp, LiftCtx, fp_lane_result};
+use super::super::super::{FpArithOp, LiftCtx, fp_lane_result, fp_propagating_max_min};
 use super::{
     AccumulateKind, AccumulateSources, BITS_PER_BYTE, ByElementKind, CompareKind, ConvertKind,
     DOT_PRODUCT_TERMS, NeonOp, NeonShape, PermuteKind, PermuteSource, ReduceKind, SaturateTo,
@@ -204,11 +204,11 @@ impl LiftCtx {
             // ones already sit at the destination's element width.
             let element = match kind {
                 ReduceKind::AddLong { signed } => extend(raw, shape.lane_bits, signed),
-                ReduceKind::Add | ReduceKind::MinMax { .. } => raw,
+                ReduceKind::Add | ReduceKind::MinMax { .. } | ReduceKind::Float { .. } => raw,
             };
             accumulator = Some(match accumulator {
                 None => element,
-                Some(previous) => reduce_step(kind, previous, element),
+                Some(previous) => reduce_step(kind, previous, element, shape.lane_bits)?,
             });
         }
         accumulator
@@ -692,9 +692,17 @@ impl LiftCtx {
 /// already extended, and no encodable arrangement can overflow the
 /// doubled width (sixteen bytes reach 4 080, eight halfwords 524 280),
 /// so their sum is exact rather than truncated too.
-fn reduce_step(kind: ReduceKind, a: Expr, b: Expr) -> Expr {
-    match kind {
+/// `fmaxv` / `fminv` fold with [`fp_propagating_max_min`] and *not*
+/// with the integer comparison beside it, nor with
+/// [`super::super::super::fp_lane_result`]'s `Max` / `Min`, which is
+/// Intel's `MAXPS`: ARM's `FPMax` propagates NaN where `MAXPS` returns
+/// its second operand, and combines the signs of a zero tie where
+/// `MAXPS` again takes the second. Both differences are wrong values,
+/// not wider ones.
+fn reduce_step(kind: ReduceKind, a: Expr, b: Expr, lane_bits: u16) -> Option<Expr> {
+    Some(match kind {
         ReduceKind::Add | ReduceKind::AddLong { .. } => Expr::add(a, b),
+        ReduceKind::Float { max } => return fp_propagating_max_min(a, b, lane_bits, max),
         ReduceKind::MinMax { signed, max } => {
             let cond = if signed {
                 Expr::slt(a.clone(), b.clone())
@@ -708,7 +716,7 @@ fn reduce_step(kind: ReduceKind, a: Expr, b: Expr) -> Expr {
                 else_expr: Box::new(other),
             }
         }
-    }
+    })
 }
 
 /// Extend `value` from `from` bits to `to` bits.

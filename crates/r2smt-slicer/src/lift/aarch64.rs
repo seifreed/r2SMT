@@ -9,7 +9,8 @@ use crate::registers::register_layout;
 
 use super::{
     BinOp, CsArithOp, FpArithOp, LiftCtx, MemAccess, VectorShape, aarch64_cond_suffix_to_predicate,
-    fp_lane_result, fp_sort_bits_checked, nonzero_width, vector_shape, width_mask,
+    fp_lane_result, fp_propagating_max_min, fp_sort_bits_checked, nonzero_width, vector_shape,
+    width_mask,
 };
 use r2smt_common::Arch;
 
@@ -900,7 +901,18 @@ impl LiftCtx {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
-        let Some(result) = fp_lane_result(op, a, b, lane) else {
+        // `fmax` / `fmin` are `FPMax` / `FPMin`, which propagate NaN
+        // and combine the signs of a zero tie. [`fp_lane_result`] is
+        // Intel's `MAXPS` and does neither.
+        let result = match op {
+            FpArithOp::Max | FpArithOp::Min => {
+                fp_propagating_max_min(a, b, lane, matches!(op, FpArithOp::Max))
+            }
+            FpArithOp::Add | FpArithOp::Sub | FpArithOp::Mul | FpArithOp::Div => {
+                fp_lane_result(op, a, b, lane)
+            }
+        };
+        let Some(result) = result else {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };

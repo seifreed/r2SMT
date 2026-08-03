@@ -200,6 +200,14 @@ enum ReduceKind {
     AddLong { signed: bool },
     /// `smaxv` / `umaxv` / `sminv` / `uminv`.
     MinMax { signed: bool, max: bool },
+    /// `fmaxv` / `fminv` — the same fold over IEEE lanes.
+    ///
+    /// A separate variant, and not `MinMax` with a `float` flag, so
+    /// that nothing can reach the integer comparison by accident. The
+    /// two are not the same operation with a different sort: ARM's
+    /// `FPMax` propagates NaN and combines the signs of a zero tie,
+    /// neither of which an integer `slt` can express.
+    Float { max: bool },
 }
 
 /// Which role the destination register plays in a bitwise select.
@@ -592,12 +600,19 @@ fn reduce_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
         "smaxv" => min_max(true, true),
         "uminv" => min_max(false, false),
         "sminv" => min_max(true, false),
+        "fmaxv" => ReduceKind::Float { max: true },
+        "fminv" => ReduceKind::Float { max: false },
         _ => return None,
     };
     if insn.operands.len() != 2 {
         return None;
     }
     let source = operand_arrangement(insn.operands.get(1)?)?;
+    // A float reduction needs an IEEE lane, which rules out the byte
+    // arrangements the integer members admit.
+    if matches!(kind, ReduceKind::Float { .. }) && !matches!(source.lane_bits, 16 | 32) {
+        return None;
+    }
     // ARM ARM C7.2 — the across-lane reductions encode `8B` / `16B`,
     // `4H` / `8H` and `4S` only. A 32-bit element requires the
     // full-width arrangement (`size == 10` implies `Q == 1`) and a

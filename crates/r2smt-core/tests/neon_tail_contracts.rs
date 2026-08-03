@@ -515,3 +515,119 @@ fn udot_zero_extends_the_same_byte_elements() {
         510,
     );
 }
+
+// ===================== ARM `FPMax` / `FPMin` =====================
+//
+// The whole point of these: the family *looks* like one more reduction
+// over the existing `FpArithOp::Max` lane helper, and that helper is
+// Intel's `MAXPS` — "the second operand wins on unordered and on
+// equality". ARM's `FPMax` propagates NaN and combines the signs of a
+// zero tie instead. Every expectation below is one the reused helper
+// gets wrong, so a silent reuse fails here rather than passing.
+
+/// Binary32 patterns the max / min contracts bind.
+const F32_ONE: u128 = 0x3f80_0000;
+const F32_FIVE: u128 = 0x40a0_0000;
+const F32_TWO: u128 = 0x4000_0000;
+const F32_THREE: u128 = 0x4040_0000;
+const F32_NEGATIVE_ZERO: u128 = 0x8000_0000;
+const F32_QUIET_NAN: u128 = 0x7fc0_0000;
+const F32_SIGNALLING_NAN: u128 = 0x7f80_0001;
+
+#[test]
+fn fmaxv_reduces_to_the_largest_lane() {
+    assert_computes(
+        "fmaxv",
+        &["s0", "v1.4s"],
+        &[("v1", packed(32, &[F32_ONE, F32_FIVE, F32_TWO, F32_THREE]))],
+        F32_FIVE,
+    );
+}
+
+#[test]
+fn fminv_reduces_to_the_smallest_lane() {
+    assert_computes(
+        "fminv",
+        &["s0", "v1.4s"],
+        &[("v1", packed(32, &[F32_ONE, F32_FIVE, F32_TWO, F32_THREE]))],
+        F32_ONE,
+    );
+}
+
+#[test]
+fn fmaxv_propagates_a_nan_lane_instead_of_selecting_a_number() {
+    // The trap. `MAXPS` returns its second operand when the comparison
+    // is unordered, so reusing that helper would fold the NaN away and
+    // give 1.0 here. ARM propagates the NaN.
+    assert_computes(
+        "fmaxv",
+        &["s0", "v1.4s"],
+        &[(
+            "v1",
+            packed(32, &[F32_QUIET_NAN, F32_ONE, F32_ONE, F32_ONE]),
+        )],
+        F32_QUIET_NAN,
+    );
+}
+
+#[test]
+fn fmax_propagates_a_nan_operand() {
+    // The same trap on the scalar handler, which reached for the x86
+    // helper by name and had been wrong on this input since it landed.
+    assert_computes(
+        "fmax",
+        &["s0", "s1", "s2"],
+        &[("v1", F32_QUIET_NAN), ("v2", F32_ONE)],
+        F32_QUIET_NAN,
+    );
+}
+
+#[test]
+fn fmax_quiets_a_signalling_nan_operand() {
+    // `FPProcessNaN` with `FPCR.DN` at its reset value returns the
+    // operand with the leading significand bit set, so the payload
+    // survives and only the quiet bit changes.
+    assert_computes(
+        "fmax",
+        &["s0", "s1", "s2"],
+        &[("v1", F32_ONE), ("v2", F32_SIGNALLING_NAN)],
+        F32_QUIET_NAN | 1,
+    );
+}
+
+#[test]
+fn fmax_prefers_a_signalling_second_operand_over_a_quiet_first() {
+    // ARM's NaN priority is signalling before quiet, and only then
+    // first operand before second — so a plain "the first NaN wins"
+    // would return the quiet one and be wrong here.
+    assert_computes(
+        "fmax",
+        &["s0", "s1", "s2"],
+        &[("v1", F32_QUIET_NAN), ("v2", F32_SIGNALLING_NAN)],
+        F32_QUIET_NAN | 1,
+    );
+}
+
+#[test]
+fn fmin_of_a_negative_and_a_positive_zero_keeps_the_negative_one() {
+    // Neither compares less than the other, so the architecture
+    // combines the signs — `OR` for min. `MINPS` would take its second
+    // operand and give +0.0.
+    assert_computes(
+        "fmin",
+        &["s0", "s1", "s2"],
+        &[("v1", F32_NEGATIVE_ZERO), ("v2", 0)],
+        F32_NEGATIVE_ZERO,
+    );
+}
+
+#[test]
+fn fmax_of_a_positive_and_a_negative_zero_keeps_the_positive_one() {
+    // The mirror: `AND` for max. `MAXPS` would give -0.0.
+    assert_computes(
+        "fmax",
+        &["s0", "s1", "s2"],
+        &[("v1", 0), ("v2", F32_NEGATIVE_ZERO)],
+        0,
+    );
+}

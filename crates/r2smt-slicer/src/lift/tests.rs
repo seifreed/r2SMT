@@ -3780,3 +3780,27 @@ fn aarch64_dot_product_declines_the_by_element_spelling() {
     // lowering against the wrong register.
     assert!(neon_declines("sdot", &["v0.4s", "v1.16b", "v2.4b[1]"]));
 }
+
+#[test]
+fn aarch64_float_across_lane_reduction_lifts() {
+    assert!(!neon_declines("fmaxv", &["s0", "v1.4s"]));
+    assert!(!neon_declines("fminv", &["h0", "v1.8h"]));
+}
+
+#[test]
+fn aarch64_float_across_lane_reduction_declines_a_non_ieee_lane() {
+    // A byte element names no float format, and a doubleword one has
+    // no across-lane encoding.
+    assert!(neon_declines("fmaxv", &["b0", "v1.8b"]));
+    assert!(neon_declines("fmaxv", &["d0", "v1.2d"]));
+}
+
+#[test]
+fn aarch64_number_flavoured_float_reduction_still_declines() {
+    // `fmaxnmv` / `fminnmv` are `FPMaxNum` / `FPMinNum`, which *ignore*
+    // a quiet NaN operand rather than propagating it. Sharing the
+    // `fmaxv` lowering would invert exactly the behaviour that makes
+    // them a different mnemonic.
+    assert!(neon_declines("fmaxnmv", &["s0", "v1.4s"]));
+    assert!(neon_declines("fminnmv", &["s0", "v1.4s"]));
+}
