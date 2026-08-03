@@ -178,6 +178,99 @@ pub(crate) fn fp_lane_result(
     Some(Expr::fp_to_ieee_bv(arith))
 }
 
+/// Lane result of a floating-point max / min that **propagates** NaN
+/// and resolves a signed-zero tie by combining the two signs, rather
+/// than selecting an operand on a bare comparison.
+///
+/// This is ARM's `FPMax` / `FPMin` (ARM ARM J1.3), and it is emphatically
+/// not [`fp_lane_result`]'s `Max` / `Min`, which implement Intel's
+/// `MAXPS`. The two differ on the inputs that matter most:
+///
+/// - **NaN.** `MAXPS` returns the *second operand* when either is NaN,
+///   which for a NaN in the first operand means a perfectly ordinary
+///   number comes out. `FPMax` returns a NaN. Reusing the x86 helper
+///   here would therefore not be an approximation but a wrong value.
+/// - **Signed zero.** `MAXPS(+0, -0)` is `-0`, because the comparison
+///   is false and the second operand wins. `FPMax(+0, -0)` is `+0`: the
+///   architecture combines the two signs, `AND` for max and `OR` for
+///   min, which is what makes it order-independent.
+///
+/// The tie is expressed as a bitwise `AND` / `OR` of the two patterns
+/// rather than as an explicit sign-bit rebuild. It comes to the same
+/// thing: an IEEE interchange format has no redundant encodings, so two
+/// operands that compare equal are bit-identical *except* for the
+/// zeros, whose non-sign bits are all clear.
+///
+/// NaN is propagated in the architecture's priority order — a
+/// signalling operand first, quieted by setting the leading significand
+/// bit, then a quiet one, first operand before second in each case.
+/// Quieting assumes `FPCR.DN` holds its reset value of zero; a function
+/// that writes FPCR is already rejected by the slicer's
+/// rounding-control guard, which is the same register.
+///
+/// `None` for a lane width with no IEEE sort.
+pub(crate) fn fp_propagating_max_min(
+    a_bits: Expr,
+    b_bits: Expr,
+    lane_bits: u16,
+    max: bool,
+) -> Option<Expr> {
+    let (ebits, sbits) = fp_sort_bits_checked(lane_bits)?;
+    let a = Expr::bv_to_fp(a_bits.clone(), ebits, sbits);
+    let b = Expr::bv_to_fp(b_bits.clone(), ebits, sbits);
+    // The quiet bit is the most significant bit of the stored
+    // significand, which `sbits` counts with the implicit bit included.
+    let quiet_bit = Expr::konst(1u128 << u32::from(sbits.checked_sub(2)?), lane_bits);
+    let select = |cond: Expr, then_expr: Expr, else_expr: Expr| Expr::Ite {
+        cond: Box::new(cond),
+        then_expr: Box::new(then_expr),
+        else_expr: Box::new(else_expr),
+    };
+    let signalling = |value: &Expr, bits: &Expr| {
+        Expr::bool_and(
+            Expr::fisnan(value.clone()),
+            Expr::eq(
+                Expr::bv_and(bits.clone(), quiet_bit.clone()),
+                Expr::konst(0, lane_bits),
+            ),
+        )
+    };
+    let (first_wins, second_wins) = if max {
+        (
+            Expr::flt(b.clone(), a.clone()),
+            Expr::flt(a.clone(), b.clone()),
+        )
+    } else {
+        (
+            Expr::flt(a.clone(), b.clone()),
+            Expr::flt(b.clone(), a.clone()),
+        )
+    };
+    let tied = if max {
+        Expr::bv_and(a_bits.clone(), b_bits.clone())
+    } else {
+        Expr::bv_or(a_bits.clone(), b_bits.clone())
+    };
+    let numeric = select(
+        first_wins,
+        a_bits.clone(),
+        select(second_wins, b_bits.clone(), tied),
+    );
+    Some(select(
+        signalling(&a, &a_bits),
+        Expr::bv_or(a_bits.clone(), quiet_bit.clone()),
+        select(
+            signalling(&b, &b_bits),
+            Expr::bv_or(b_bits.clone(), quiet_bit),
+            select(
+                Expr::fisnan(a),
+                a_bits,
+                select(Expr::fisnan(b), b_bits, numeric),
+            ),
+        ),
+    ))
+}
+
 /// Apply an integer packed operation to one lane (or, for the
 /// lane-independent operations, to a whole view) of `bits` width.
 ///

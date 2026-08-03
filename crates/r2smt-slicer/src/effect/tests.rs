@@ -591,13 +591,16 @@ fn aarch64_packed_vector_instruction_sets_no_flags() {
 #[test]
 fn aarch64_unmodelled_vector_mnemonic_declines() {
     // Not modelled, so the effect table has to fail closed — otherwise
-    // the slicer retains a definition the lifter drops.
+    // the slicer retains a definition the lifter drops. `fmla` is the
+    // canary now that `pmull` lifts: it is *fused*, rounding the
+    // product and the sum once, which no combination of the IR's
+    // separate multiply and add reproduces.
     let i = insn(
-        "pmull",
+        "fmla",
         vec![
-            op("v0.8h", OperandKind::Register),
-            op("v1.8b", OperandKind::Register),
-            op("v2.8b", OperandKind::Register),
+            op("v0.4s", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+            op("v2.4s", OperandKind::Register),
         ],
     );
     assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);

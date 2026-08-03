@@ -2736,14 +2736,15 @@ fn aarch64_half_width_arrangement_write_zeroes_the_upper_half() {
 
 #[test]
 fn aarch64_unmodelled_vector_mnemonic_declines() {
-    // `pmull` is a polynomial multiply — carry-less, so no combination
-    // of the integer primitives expresses it. A mnemonic no family
-    // claims must decline rather than fall into a same-width handler.
+    // `fmla` is *fused*: the product and the sum round once, together,
+    // which no combination of the IR's separate multiply and add
+    // reproduces. A mnemonic no family claims must decline rather than
+    // fall into a same-width handler.
     let i = insn(
         0x1000,
         4,
-        "pmull",
-        vec![reg("v0.8h"), reg("v1.8b"), reg("v2.8b")],
+        "fmla",
+        vec![reg("v0.4s"), reg("v1.4s"), reg("v2.4s")],
     );
     let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
     assert!(
@@ -2768,19 +2769,19 @@ fn aarch64_mismatched_arrangement_on_a_modelled_mnemonic_declines() {
 }
 
 #[test]
-fn aarch64_by_element_operand_declines() {
-    // `mul v0.4s, v1.4s, v2.s[0]` broadcasts one lane of `v2`; the
-    // indexed operand carries no arrangement, so the shape resolver
-    // refuses it.
+fn aarch64_by_element_operand_reads_the_named_element() {
+    // `mul v0.4s, v1.4s, v2.s[0]` multiplies lane 0 of `v2` into every
+    // destination lane, so `v2` is read at one fixed index while `v1`
+    // walks its own.
     let i = insn(
         0x1000,
         4,
         "mul",
-        vec![reg("v0.4s"), reg("v1.4s"), reg("v2.s[0]")],
+        vec![reg("v0.4s"), reg("v1.4s"), reg("v2.s[1]")],
     );
     let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
     assert!(
-        matches!(stmts.as_slice(), [IrStmt::Unsupported { .. }]),
+        matches!(stmts.as_slice(), [IrStmt::Assign { .. }]),
         "{stmts:?}"
     );
 }
@@ -2978,9 +2979,13 @@ fn aarch64_movi_shifts_the_immediate_before_replicating() {
 }
 
 #[test]
-fn aarch64_movi_declines_the_mask_shift_form() {
-    // `msl` shifts ones in, not zeroes — a different operation.
-    assert!(neon_declines("movi", &["v0.4s", "#1", "msl #8"]));
+fn aarch64_movi_fills_the_mask_shift_form_with_ones() {
+    // `msl` shifts ones in, not zeroes, so the lane is 0x1ff rather
+    // than the 0x100 the `lsl` spelling above produces.
+    assert_eq!(
+        neon_lowering("movi", &["v0.4s", "#1", "msl #8"]),
+        "v0 := concat(0x1ff:32, concat(0x1ff:32, concat(0x1ff:32, 0x1ff:32)))"
+    );
 }
 
 #[test]
@@ -3367,10 +3372,11 @@ fn aarch64_same_width_accumulate_has_no_two_form() {
 }
 
 #[test]
-fn aarch64_accumulate_declines_a_by_element_source() {
-    // `mla v0.4s, v1.4s, v2.s[0]` broadcasts one lane of the second
-    // source; the indexed operand carries no arrangement.
-    assert!(neon_declines("mla", &["v0.4s", "v1.4s", "v2.s[0]"]));
+fn aarch64_accumulate_lifts_a_by_element_source() {
+    // `mla v0.4s, v1.4s, v2.s[0]` multiplies one lane of the second
+    // source into every destination lane. It used to decline on the
+    // shared "every operand carries the same arrangement" check.
+    assert!(!neon_declines("mla", &["v0.4s", "v1.4s", "v2.s[0]"]));
 }
 
 // --- N3f: NEON saturation ---
@@ -3537,10 +3543,11 @@ fn aarch64_compare_declines_a_non_zero_immediate() {
 }
 
 #[test]
-fn aarch64_fixed_point_convert_declines() {
-    // The three-operand form scales by a fractional-bit count, which is
-    // a different operation from the plain conversion.
-    assert!(neon_declines("scvtf", &["v0.2s", "v1.2s", "#4"]));
+fn aarch64_fixed_point_convert_lifts_at_a_half_width_arrangement() {
+    // The three-operand form scales by a fractional-bit count. It used
+    // to decline; the scale is an exact power of two, so it costs one
+    // multiply and introduces no rounding of its own.
+    assert!(!neon_declines("scvtf", &["v0.2s", "v1.2s", "#4"]));
 }
 
 #[test]
@@ -3631,4 +3638,290 @@ fn all_ones_above_the_payload_width_concatenates_full_chunks() {
             full
         )
     );
+}
+
+#[test]
+fn aarch64_across_lane_reduction_lifts_from_the_source_arrangement() {
+    // The destination is a scalar and carries no arrangement, so the
+    // geometry has to come from operand 1. A resolver that read
+    // operand 0 the way every other family does would decline here.
+    assert!(!neon_declines("addv", &["s0", "v1.4s"]));
+    assert!(!neon_declines("uaddlv", &["h0", "v1.8b"]));
+    assert!(!neon_declines("smaxv", &["b0", "v1.16b"]));
+}
+
+#[test]
+fn aarch64_across_lane_reduction_declines_a_mismatched_destination_width() {
+    // `uaddlv` widens, so an 8-bit source element produces a 16-bit
+    // one — a byte destination is a different instruction.
+    assert!(neon_declines("uaddlv", &["b0", "v1.8b"]));
+    assert!(neon_declines("addv", &["h0", "v1.4s"]));
+}
+
+#[test]
+fn aarch64_across_lane_reduction_declines_an_unencodable_arrangement() {
+    // ARM ARM C7.2: a 64-bit element has no across-lane encoding, and
+    // a 32-bit one requires the full-width arrangement.
+    assert!(neon_declines("addv", &["d0", "v1.2d"]));
+    assert!(neon_declines("addv", &["s0", "v1.2s"]));
+}
+
+#[test]
+fn aarch64_across_lane_reduction_declines_an_arranged_destination() {
+    // `addv v0.4s, v1.4s` is not an encoding: the destination of a
+    // reduction holds one element, not a vector of them.
+    assert!(neon_declines("addv", &["v0.4s", "v1.4s"]));
+}
+
+#[test]
+fn aarch64_movi_with_a_ones_shift_lifts() {
+    // `msl` shifts ones in, which is what builds the `0x0000ffff`-style
+    // masks a bare `lsl` cannot reach.
+    assert!(!neon_declines_mixed("movi", &["v0.4s", "1", "msl 8"]));
+    assert!(!neon_declines_mixed("mvni", &["v0.4s", "1", "msl 16"]));
+}
+
+#[test]
+fn aarch64_movi_ones_shift_declines_outside_its_encoding() {
+    // ARM ARM C7.2: `msl` is encoded for 32-bit elements only, and only
+    // for a shift of 8 or 16.
+    assert!(neon_declines_mixed("movi", &["v0.8h", "2", "msl 8"]));
+    assert!(neon_declines_mixed("movi", &["v0.4s", "1", "msl 4"]));
+}
+
+#[test]
+fn aarch64_fixed_point_conversion_lifts() {
+    assert!(!neon_declines_mixed("scvtf", &["v0.4s", "v1.4s", "4"]));
+    assert!(!neon_declines_mixed("fcvtzu", &["v0.2d", "v1.2d", "64"]));
+}
+
+#[test]
+fn aarch64_fixed_point_conversion_declines_an_out_of_range_fraction_width() {
+    // ARM ARM C7.2 bounds the fraction width by `1 <= fbits <= esize`.
+    assert!(neon_declines_mixed("scvtf", &["v0.4s", "v1.4s", "0"]));
+    assert!(neon_declines_mixed("scvtf", &["v0.4s", "v1.4s", "33"]));
+}
+
+#[test]
+fn aarch64_float_width_conversion_has_no_fixed_point_form() {
+    // `fcvtl` / `fcvtn` change the float format; there is no fixed
+    // point on either side, so a third operand is not an encoding.
+    assert!(neon_declines_mixed("fcvtl", &["v0.4s", "v1.4h", "2"]));
+}
+
+/// [`neon_declines`] for an instruction whose operands are not all
+/// registers — the immediate-bearing forms.
+fn neon_declines_mixed(mnemonic: &str, operands: &[&str]) -> bool {
+    let i = insn(
+        0x1000,
+        4,
+        mnemonic,
+        operands
+            .iter()
+            .map(|raw| {
+                let kind = if raw.starts_with('v') {
+                    OperandKind::Register
+                } else {
+                    OperandKind::Immediate
+                };
+                op(raw, kind)
+            })
+            .collect(),
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    matches!(stmts.as_slice(), [IrStmt::Unsupported { .. }])
+}
+
+#[test]
+fn aarch64_by_element_long_form_lifts() {
+    assert!(!neon_declines("umlal", &["v0.4s", "v1.4h", "v2.h[3]"]));
+    assert!(!neon_declines("umlal2", &["v0.4s", "v1.8h", "v2.h[3]"]));
+    assert!(!neon_declines("umull", &["v0.4s", "v1.4h", "v2.h[1]"]));
+    assert!(!neon_declines("fmul", &["v0.4s", "v1.4s", "v2.s[1]"]));
+}
+
+#[test]
+fn aarch64_by_element_declines_a_fused_multiply_add() {
+    // `fmla` / `fmls` round the product and the sum together, once.
+    // `fadd(d, fmul(a, b))` rounds twice, and the two differ in real
+    // cases, so the IR having no fused node is a decline rather than a
+    // licence to approximate.
+    assert!(neon_declines("fmla", &["v0.4s", "v1.4s", "v2.s[1]"]));
+    assert!(neon_declines("fmls", &["v0.4s", "v1.4s", "v2.s[1]"]));
+}
+
+#[test]
+fn aarch64_by_element_declines_a_mismatched_element_width() {
+    // The named element is the *source* width, so a long form over
+    // halfword sources cannot name a word element.
+    assert!(neon_declines("umlal", &["v0.4s", "v1.4h", "v2.s[1]"]));
+    // And the byte element the dot products use has no by-element
+    // multiply encoding at all.
+    assert!(neon_declines("mul", &["v0.16b", "v1.16b", "v2.b[1]"]));
+}
+
+#[test]
+fn aarch64_dot_product_lifts() {
+    assert!(!neon_declines("sdot", &["v0.4s", "v1.16b", "v2.16b"]));
+    assert!(!neon_declines("udot", &["v0.2s", "v1.8b", "v2.8b"]));
+}
+
+#[test]
+fn aarch64_dot_product_declines_a_mismatched_source_geometry() {
+    // Four byte products feed one 32-bit lane, so `.4s` needs `.16b`.
+    assert!(neon_declines("sdot", &["v0.4s", "v1.8b", "v2.8b"]));
+    assert!(neon_declines("sdot", &["v0.8h", "v1.16b", "v2.16b"]));
+}
+
+#[test]
+fn aarch64_dot_product_declines_the_by_element_spelling() {
+    // `v2.4b[1]` names an arrangement and an index at once, which the
+    // register table's suffix parser does not resolve — so the operand
+    // yields no parent to read, and this is a decline rather than a
+    // lowering against the wrong register.
+    assert!(neon_declines("sdot", &["v0.4s", "v1.16b", "v2.4b[1]"]));
+}
+
+#[test]
+fn aarch64_float_across_lane_reduction_lifts() {
+    assert!(!neon_declines("fmaxv", &["s0", "v1.4s"]));
+    assert!(!neon_declines("fminv", &["h0", "v1.8h"]));
+}
+
+#[test]
+fn aarch64_float_across_lane_reduction_declines_a_non_ieee_lane() {
+    // A byte element names no float format, and a doubleword one has
+    // no across-lane encoding.
+    assert!(neon_declines("fmaxv", &["b0", "v1.8b"]));
+    assert!(neon_declines("fmaxv", &["d0", "v1.2d"]));
+}
+
+#[test]
+fn aarch64_number_flavoured_float_reduction_still_declines() {
+    // `fmaxnmv` / `fminnmv` are `FPMaxNum` / `FPMinNum`, which *ignore*
+    // a quiet NaN operand rather than propagating it. Sharing the
+    // `fmaxv` lowering would invert exactly the behaviour that makes
+    // them a different mnemonic.
+    assert!(neon_declines("fmaxnmv", &["s0", "v1.4s"]));
+    assert!(neon_declines("fminnmv", &["s0", "v1.4s"]));
+}
+
+#[test]
+fn aarch64_table_lookup_lifts_the_single_register_form() {
+    let i = insn(
+        0x1000,
+        4,
+        "tbl",
+        vec![
+            reg("v0.8b"),
+            op("{v1.16b}", OperandKind::Unknown),
+            reg("v2.8b"),
+        ],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(stmts.as_slice(), [IrStmt::Assign { .. }]),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_table_lookup_declines_a_multi_register_table() {
+    // The list operand is the shape the structured load / store family
+    // needs and belongs with it.
+    let i = insn(
+        0x1000,
+        4,
+        "tbl",
+        vec![
+            reg("v0.16b"),
+            op("{v1.16b, v2.16b}", OperandKind::Unknown),
+            reg("v3.16b"),
+        ],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(stmts.as_slice(), [IrStmt::Unsupported { .. }]),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_table_lookup_declines_a_half_width_table() {
+    // A table register is always the full 128 bits, whatever the
+    // destination's arrangement.
+    let i = insn(
+        0x1000,
+        4,
+        "tbl",
+        vec![
+            reg("v0.8b"),
+            op("{v1.8b}", OperandKind::Unknown),
+            reg("v2.8b"),
+        ],
+    );
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(
+        matches!(stmts.as_slice(), [IrStmt::Unsupported { .. }]),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch64_polynomial_multiply_lifts_both_encodings() {
+    assert!(!neon_declines("pmull", &["v0.8h", "v1.8b", "v2.8b"]));
+    assert!(!neon_declines("pmull2", &["v0.8h", "v1.16b", "v2.16b"]));
+    // The AES / GHASH shape, whose destination is the one-lane 128-bit
+    // arrangement.
+    assert!(!neon_declines("pmull", &["v0.1q", "v1.1d", "v2.1d"]));
+    assert!(!neon_declines("pmull2", &["v0.1q", "v1.2d", "v2.2d"]));
+}
+
+#[test]
+fn aarch64_polynomial_multiply_declines_an_unencodable_element() {
+    // The architecture encodes `8B` into `8H` and `1D` into `1Q`, and
+    // nothing between them.
+    assert!(neon_declines("pmull", &["v0.4s", "v1.4h", "v2.4h"]));
+}
+
+#[test]
+fn aarch64_same_width_polynomial_multiply_still_declines() {
+    // `pmul` keeps the element width and is a different instruction
+    // from `pmull`; nothing claims it.
+    assert!(neon_declines("pmul", &["v0.8b", "v1.8b", "v2.8b"]));
+}
+
+#[test]
+fn aarch64_reciprocal_estimate_assigns_the_destination() {
+    // Emitting *something* is the point: a decline would truncate the
+    // slice, while an assignment to a never-defined temp keeps it
+    // Complete with the estimate as a free input.
+    assert!(!neon_declines("frecpe", &["v0.4s", "v1.4s"]));
+    assert!(!neon_declines("frsqrte", &["v0.2d", "v1.2d"]));
+}
+
+#[test]
+fn aarch64_reciprocal_estimate_never_reads_its_source() {
+    // The architecture fixes only a relative error bound, so the value
+    // is implementation-defined and nothing about the source may reach
+    // the result — an expression mentioning `v1` would be a definite
+    // number the machine need not produce.
+    let i = insn(0x1000, 4, "frecpe", vec![reg("v0.4s"), reg("v1.4s")]);
+    let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
+    assert!(!format!("{stmts:?}").contains("v1"), "{stmts:?}");
+}
+
+#[test]
+fn aarch64_reciprocal_estimate_declines_a_non_ieee_lane() {
+    assert!(neon_declines("frecpe", &["v0.16b", "v1.16b"]));
+}
+
+#[test]
+fn aarch64_reciprocal_step_declines_as_a_fused_operation() {
+    // `frecps` / `frsqrts` are `2.0 - x*y` and `(3.0 - x*y) / 2.0`
+    // computed through `FPRecipStepFused` — one rounding over the whole
+    // expression, where a separate `fmul` and `fsub` round twice. Same
+    // objection as `fmla`.
+    assert!(neon_declines("frecps", &["v0.4s", "v1.4s", "v2.4s"]));
+    assert!(neon_declines("frsqrts", &["v0.4s", "v1.4s", "v2.4s"]));
 }

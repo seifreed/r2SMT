@@ -103,11 +103,128 @@ enum NeonOp {
     /// A lane-wise conversion between integer and floating point, or
     /// between float widths. `upper` is the `2` suffix, which only the
     /// width-changing forms carry.
-    Convert { kind: ConvertKind, upper: bool },
+    ///
+    /// `fbits` is the fixed-point form's fraction width, and zero for
+    /// the plain register forms — the integer side is then read as a
+    /// scaled value, `Int(lane) / 2^fbits`.
+    Convert {
+        kind: ConvertKind,
+        upper: bool,
+        fbits: u16,
+    },
     /// `bsl` / `bit` / `bif` — bitwise select, where one of the three
     /// registers supplies the mask and the destination is always one of
     /// the three.
     BitwiseSelect(SelectRole),
+    /// An across-lane reduction, folding every source lane into the
+    /// single element the scalar destination holds.
+    ///
+    /// The source geometry is carried here rather than on
+    /// [`NeonShape`] because a reduction is the one family whose two
+    /// sides genuinely differ: `uaddlv h0, v1.8b` folds eight 8-bit
+    /// lanes into one 16-bit element, so neither the lane width nor
+    /// the lane count is shared.
+    Reduce {
+        kind: ReduceKind,
+        source_lanes: u16,
+        source_lane_bits: u16,
+    },
+    /// A by-element form: the second source contributes one element,
+    /// named by [`NeonShape::source_index`], multiplied into every
+    /// destination lane. `upper` is the `2` suffix on the long members.
+    ByElement { kind: ByElementKind, upper: bool },
+    /// `sdot` / `udot` — four byte products summed into each 32-bit
+    /// destination lane, accumulated onto its prior value.
+    DotProduct { signed: bool },
+    /// `tbl` / `tbx` — each destination byte selected from the table by
+    /// the corresponding index byte. `keep` marks `tbx`, which leaves
+    /// the destination byte alone where an out-of-range index makes
+    /// `tbl` write zero.
+    TableLookup { keep: bool, table_lanes: u16 },
+    /// `pmull` / `pmull2` — a carry-less polynomial multiply, whose
+    /// product is the `XOR` of the shifted multiplicand over the set
+    /// bits of the multiplier. `upper` is the `2` suffix.
+    PolynomialMultiply { upper: bool },
+    /// `frecpe` / `frsqrte` — the reciprocal and reciprocal-square-root
+    /// estimates, whose result is a free value.
+    ///
+    /// Both mnemonics share one variant because they share one
+    /// lowering: the architecture fixes only a relative error bound and
+    /// leaves the value itself implementation-defined, so there is
+    /// nothing to tell them apart *with*.
+    Estimate,
+}
+
+/// The by-element multiplies.
+///
+/// A three-way enum rather than a struct of flags because the
+/// combinations are not free: an integer accumulate is exact, a long
+/// one extends first, and the float member has no accumulating sibling
+/// here at all.
+#[derive(Debug, Clone, Copy)]
+enum ByElementKind {
+    /// `mul` / `mla` / `mls` — same-width integer lanes, the product
+    /// optionally combined with the destination's prior value.
+    Integer { combine: Option<BinOp> },
+    /// `umull` / `smull` / `umlal` / `smlal` / `umlsl` / `smlsl` — both
+    /// narrow sources extended to the destination's element width
+    /// before the multiply, so the product cannot overflow it.
+    Long {
+        signed: bool,
+        combine: Option<BinOp>,
+    },
+    /// `fmul` — one IEEE lane product.
+    ///
+    /// The fused `fmla` / `fmls` are deliberately not here. They round
+    /// the product and the sum together, once; `fadd(d, fmul(a, b))`
+    /// rounds twice, and the two differ in real cases. The IR has no
+    /// fused node, so modelling them that way would be a definite wrong
+    /// value rather than a wider one, and they decline instead.
+    Float,
+}
+
+impl ByElementKind {
+    /// How the product joins the destination's prior lane, or `None`
+    /// when it replaces it.
+    const fn combine(self) -> Option<BinOp> {
+        match self {
+            Self::Integer { combine } | Self::Long { combine, .. } => combine,
+            Self::Float => None,
+        }
+    }
+
+    /// Whether the destination's prior value is an input.
+    const fn combines(self) -> bool {
+        self.combine().is_some()
+    }
+
+    /// Whether the sources are half the destination's element width.
+    const fn widens(self) -> bool {
+        matches!(self, Self::Long { .. })
+    }
+}
+
+/// The integer across-lane reductions.
+#[derive(Debug, Clone, Copy)]
+enum ReduceKind {
+    /// `addv` — sum every lane at the element width, keeping the low
+    /// bits, which is what the architecture's truncation of the
+    /// unbounded sum comes to.
+    Add,
+    /// `uaddlv` / `saddlv` — extend each lane to twice its width and
+    /// sum there. The widened sum cannot overflow for any encodable
+    /// arrangement, so this is exact rather than merely truncated.
+    AddLong { signed: bool },
+    /// `smaxv` / `umaxv` / `sminv` / `uminv`.
+    MinMax { signed: bool, max: bool },
+    /// `fmaxv` / `fminv` — the same fold over IEEE lanes.
+    ///
+    /// A separate variant, and not `MinMax` with a `float` flag, so
+    /// that nothing can reach the integer comparison by accident. The
+    /// two are not the same operation with a different sort: ARM's
+    /// `FPMax` propagates NaN and combines the signs of a zero tie,
+    /// neither of which an integer `slt` can express.
+    Float { max: bool },
 }
 
 /// Which role the destination register plays in a bitwise select.
@@ -158,6 +275,17 @@ enum ConvertKind {
     /// `fcvtl` / `fcvtn` — between float widths, one lane doubling or
     /// halving in size.
     FloatToFloat { widening: bool },
+}
+
+impl ConvertKind {
+    /// Whether the mnemonic has a fixed-point form, which carries the
+    /// number of fractional bits as a third operand.
+    ///
+    /// Only the integer conversions do: `fcvtl` / `fcvtn` change the
+    /// float format, and there is no fixed point on either side.
+    const fn scales(self) -> bool {
+        matches!(self, Self::IntToFloat { .. } | Self::FloatToInt { .. })
+    }
 }
 
 /// The same-width shift operations.
@@ -291,17 +419,22 @@ impl NeonShape {
     /// so even a 64-bit arrangement replaces the register by zeroing its
     /// upper half.
     pub(crate) const fn reads_destination(&self) -> bool {
-        matches!(
-            self.op,
+        match self.op {
             NeonOp::Insert { .. }
-                | NeonOp::MultiplyAccumulate { .. }
-                | NeonOp::BitwiseSelect(_)
-                | NeonOp::Widen {
-                    kind: WidenKind::Narrow,
-                    upper: true,
-                    ..
-                }
-        )
+            | NeonOp::MultiplyAccumulate { .. }
+            | NeonOp::BitwiseSelect(_)
+            | NeonOp::DotProduct { .. }
+            | NeonOp::Widen {
+                kind: WidenKind::Narrow,
+                upper: true,
+                ..
+            } => true,
+            NeonOp::ByElement { kind, .. } => kind.combines(),
+            // `tbx` preserves the destination byte for an out-of-range
+            // index; `tbl` writes zero and reads nothing.
+            NeonOp::TableLookup { keep, .. } => keep,
+            _ => false,
+        }
     }
 
     /// Whether the destination is a general-purpose register rather than
@@ -334,6 +467,399 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| compare_shape(insn, &mnemonic))
         .or_else(|| convert_shape(insn, &mnemonic))
         .or_else(|| bitwise_select_shape(insn, &mnemonic))
+        .or_else(|| reduce_shape(insn, &mnemonic))
+        .or_else(|| by_element_shape(insn, &mnemonic))
+        .or_else(|| dot_product_shape(insn, &mnemonic))
+        .or_else(|| table_lookup_shape(insn, &mnemonic))
+        .or_else(|| polynomial_multiply_shape(insn, &mnemonic))
+        .or_else(|| estimate_shape(insn, &mnemonic))
+}
+
+// ===================== estimates =====================
+
+/// `frecpe` / `frsqrte`, the reciprocal and reciprocal-square-root
+/// estimates.
+///
+/// Their *refinement* steps `frecps` / `frsqrts` are deliberately not
+/// here. `2.0 - x*y` and `(3.0 - x*y) / 2.0` describe them arithmetically,
+/// but `AArch64` computes both through `FPRecipStepFused` — one
+/// rounding over the whole expression, where a separate `fmul` and
+/// `fsub` round twice. That is the same objection that keeps `fmla`
+/// out: the IR has no fused node, so the obvious lowering would be a
+/// definite wrong value rather than a wider one. (It is expressible for
+/// binary32 lanes by computing in binary64, whose 53 bits exceed the
+/// `2 * 24 + 2` an exact emulation needs — but not for binary64 lanes,
+/// which would need binary128, so that is its own piece of work rather
+/// than a half-covered special case.)
+fn estimate_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    if !matches!(mnemonic, "frecpe" | "frsqrte") || insn.operands.len() != 2 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    // An estimate of an IEEE lane; `.16b` names no float format.
+    if !matches!(destination.lane_bits, 16 | 32 | 64) {
+        return None;
+    }
+    if operand_arrangement(insn.operands.get(1)?)? != destination {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::Estimate,
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+// ===================== table lookup =====================
+
+/// Ceiling on the selects one table lookup may expand into.
+///
+/// Every destination byte is an `Ite` chain over the whole table, so
+/// the formula grows as `destination bytes * table bytes` — 256 for the
+/// widest single-register form, and 1 024 for the four-register one.
+/// The bound exists so that growth is a decision rather than a
+/// surprise: past it the instruction declines, and the slicer truncates
+/// as it does for anything unmodelled.
+const TABLE_LOOKUP_SELECT_CAP: u32 = 512;
+
+/// `tbl vd.<T>, {vn.16b}, vm.<T>` and `tbx`.
+///
+/// Only the single-register table is resolved. A list of two or more is
+/// the same operand shape the structured load / store family needs and
+/// belongs with it; here it declines.
+fn table_lookup_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let keep = match mnemonic {
+        "tbl" => false,
+        "tbx" => true,
+        _ => return None,
+    };
+    if insn.operands.len() != 3 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    if destination.lane_bits != BITS_PER_BYTE {
+        return None;
+    }
+    let table = operand_arrangement(&single_register_table(insn.operands.get(1)?)?)?;
+    // A table register is always the full 128 bits, whatever the
+    // destination's arrangement.
+    if table.lane_bits != BITS_PER_BYTE || !spans_full_register(table) {
+        return None;
+    }
+    if operand_arrangement(insn.operands.get(2)?)? != destination {
+        return None;
+    }
+    let selects = u32::from(destination.lanes).checked_mul(u32::from(table.lanes))?;
+    if selects > TABLE_LOOKUP_SELECT_CAP {
+        tracing::debug!(
+            mnemonic,
+            selects,
+            cap = TABLE_LOOKUP_SELECT_CAP,
+            "declining a table lookup whose select chain exceeds the cap"
+        );
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::TableLookup {
+            keep,
+            table_lanes: table.lanes,
+        },
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+/// The one register a `{vN.16b}` table list names, as a plain register
+/// operand the SIMD readers accept.
+///
+/// Radare2 renders a register list as a single braced operand, which
+/// classifies as neither a register nor a memory reference because it
+/// is not one register name.
+pub(super) fn single_register_table(op: &Operand) -> Option<Operand> {
+    let raw = op.raw.trim().to_ascii_lowercase();
+    let body = raw.strip_prefix('{')?.strip_suffix('}')?.trim();
+    if body.contains(',') {
+        return None;
+    }
+    let operand = Operand {
+        raw: body.to_string(),
+        kind: OperandKind::Register,
+    };
+    operand_arrangement(&operand).map(|_| operand)
+}
+
+// ===================== polynomial multiply =====================
+
+/// Ceiling on the partial products one polynomial multiply may expand
+/// into, counted as `lanes * bits per multiplier`.
+///
+/// The `.1q` form -- the AES / GHASH shape, and the one that actually
+/// turns up -- is 64 partial products in a single lane, and the byte
+/// form is eight apiece across eight lanes. Both sit well inside the
+/// bound; it is here so that a wider encoding declines and says so
+/// rather than quietly emitting a formula nobody sized.
+const POLYNOMIAL_MULTIPLY_TERM_CAP: u32 = 256;
+
+/// `pmull` / `pmull2` — the carry-less product of two narrow elements.
+///
+/// The architecture encodes exactly two shapes: `8B` into `8H`, and
+/// `1D` into `1Q` under `FEAT_PMULL`. Nothing between them exists, so
+/// the narrow width is checked against that pair rather than against a
+/// range.
+fn polynomial_multiply_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (base, upper) = peel_upper(mnemonic);
+    if base != "pmull" || insn.operands.len() != 3 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    let narrow = destination.lane_bits / 2;
+    if !matches!(narrow, 8 | 64) {
+        return None;
+    }
+    let expected_lanes = if upper {
+        destination.lanes.checked_mul(2)?
+    } else {
+        destination.lanes
+    };
+    for operand in insn.operands.iter().skip(1) {
+        let arrangement = operand_arrangement(operand)?;
+        if arrangement.lane_bits != narrow || arrangement.lanes != expected_lanes {
+            return None;
+        }
+        if upper && !spans_full_register(arrangement) {
+            return None;
+        }
+    }
+    let terms = u32::from(narrow).checked_mul(u32::from(destination.lanes))?;
+    if terms > POLYNOMIAL_MULTIPLY_TERM_CAP {
+        tracing::debug!(
+            mnemonic,
+            terms,
+            cap = POLYNOMIAL_MULTIPLY_TERM_CAP,
+            "declining a polynomial multiply whose partial products exceed the cap"
+        );
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::PolynomialMultiply { upper },
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+// ===================== by-element multiplies =====================
+
+/// The by-element multiply a mnemonic names.
+fn by_element_kind(base: &str) -> Option<ByElementKind> {
+    let integer = |combine| ByElementKind::Integer { combine };
+    let long = |signed, combine| ByElementKind::Long { signed, combine };
+    Some(match base {
+        "mul" => integer(None),
+        "mla" => integer(Some(BinOp::Add)),
+        "mls" => integer(Some(BinOp::Sub)),
+        "fmul" => ByElementKind::Float,
+        "umull" => long(false, None),
+        "smull" => long(true, None),
+        "umlal" => long(false, Some(BinOp::Add)),
+        "smlal" => long(true, Some(BinOp::Add)),
+        "umlsl" => long(false, Some(BinOp::Sub)),
+        "smlsl" => long(true, Some(BinOp::Sub)),
+        _ => return None,
+    })
+}
+
+/// The by-element family: `mul v0.4s, v1.4s, v2.s[0]` and its
+/// relatives, where the second source names *one* element rather than a
+/// whole vector.
+///
+/// Nothing about the index needed building — [`indexed_element`] already
+/// returns `(32, 0)` for `v2.s[0]`, and [`NeonShape`] already carries a
+/// source index. What declined was the geometry check the lane-wise and
+/// widening resolvers share: both require every operand to yield the
+/// *same* arrangement, and an indexed operand yields none at all.
+fn by_element_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (base, upper) = peel_upper(mnemonic);
+    let kind = by_element_kind(base)?;
+    // Only the long forms have a `2` variant.
+    if upper && !kind.widens() {
+        return None;
+    }
+    if insn.operands.len() != 3 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    let source_bits = if kind.widens() {
+        destination.lane_bits / 2
+    } else {
+        destination.lane_bits
+    };
+    // ARM ARM C7.2 — the by-element encodings name a 16- or 32-bit
+    // element, and the float ones a 64-bit one as well. There is no
+    // byte-element form, which is what the dot products exist for.
+    let encodable = match kind {
+        ByElementKind::Float => matches!(source_bits, 16 | 32 | 64),
+        ByElementKind::Integer { .. } | ByElementKind::Long { .. } => {
+            matches!(source_bits, 16 | 32)
+        }
+    };
+    if !encodable {
+        return None;
+    }
+    let first = operand_arrangement(insn.operands.get(1)?)?;
+    let expected_lanes = if upper {
+        destination.lanes.checked_mul(2)?
+    } else {
+        destination.lanes
+    };
+    if first.lane_bits != source_bits || first.lanes != expected_lanes {
+        return None;
+    }
+    if upper && !spans_full_register(first) {
+        return None;
+    }
+    let (element_bits, source_index) = indexed_element(insn.operands.get(2)?)?;
+    if element_bits != source_bits {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::ByElement { kind, upper },
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index,
+    })
+}
+
+// ===================== dot products =====================
+
+/// Byte products summed into one destination lane by `sdot` / `udot`.
+pub(super) const DOT_PRODUCT_TERMS: u16 = 4;
+
+/// Destination element width of a dot product.
+const DOT_PRODUCT_LANE_BITS: u16 = 32;
+
+/// `sdot` / `udot` over two whole vectors.
+///
+/// The by-element spelling (`sdot v0.4s, v1.16b, v2.4b[1]`) declines:
+/// its indexed operand names an arrangement *and* an index at once,
+/// which the register table's suffix parser does not resolve, so it
+/// yields no parent to read. That is a decline, not a wrong lowering —
+/// the effect table sees the same `None` and truncates the slice.
+fn dot_product_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let signed = match mnemonic {
+        "sdot" => true,
+        "udot" => false,
+        _ => return None,
+    };
+    if insn.operands.len() != 3 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    if destination.lane_bits != DOT_PRODUCT_LANE_BITS {
+        return None;
+    }
+    let expected_lanes = destination.lanes.checked_mul(DOT_PRODUCT_TERMS)?;
+    for operand in insn.operands.iter().skip(1) {
+        let arrangement = operand_arrangement(operand)?;
+        if arrangement.lane_bits != BITS_PER_BYTE || arrangement.lanes != expected_lanes {
+            return None;
+        }
+    }
+    Some(NeonShape {
+        op: NeonOp::DotProduct { signed },
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+// ===================== across-lane reductions =====================
+
+/// The integer across-lane reductions.
+///
+/// Every other family reads its geometry from operand 0. These cannot:
+/// their destination is a *scalar* register (`s0`), which carries no
+/// arrangement at all, so the lane count and the source element width
+/// are spelled only on operand 1. The destination's own width is then
+/// checked against what the reduction produces, rather than assumed —
+/// that check is what tells `addv` from `uaddlv` when a caller has
+/// mistyped one for the other.
+fn reduce_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let min_max = |signed, max| ReduceKind::MinMax { signed, max };
+    let kind = match mnemonic {
+        "addv" => ReduceKind::Add,
+        "uaddlv" => ReduceKind::AddLong { signed: false },
+        "saddlv" => ReduceKind::AddLong { signed: true },
+        "umaxv" => min_max(false, true),
+        "smaxv" => min_max(true, true),
+        "uminv" => min_max(false, false),
+        "sminv" => min_max(true, false),
+        "fmaxv" => ReduceKind::Float { max: true },
+        "fminv" => ReduceKind::Float { max: false },
+        _ => return None,
+    };
+    if insn.operands.len() != 2 {
+        return None;
+    }
+    let source = operand_arrangement(insn.operands.get(1)?)?;
+    // A float reduction needs an IEEE lane, which rules out the byte
+    // arrangements the integer members admit.
+    if matches!(kind, ReduceKind::Float { .. }) && !matches!(source.lane_bits, 16 | 32) {
+        return None;
+    }
+    // ARM ARM C7.2 — the across-lane reductions encode `8B` / `16B`,
+    // `4H` / `8H` and `4S` only. A 32-bit element requires the
+    // full-width arrangement (`size == 10` implies `Q == 1`) and a
+    // 64-bit one has no encoding at all, so a shape outside that set is
+    // a spelling the architecture does not produce.
+    if !matches!(source.lane_bits, 8 | 16 | 32) {
+        return None;
+    }
+    if source.lane_bits == 32 && !spans_full_register(source) {
+        return None;
+    }
+    let lane_bits = match kind {
+        ReduceKind::AddLong { .. } => source.lane_bits.checked_mul(2)?,
+        _ => source.lane_bits,
+    };
+    if scalar_vector_width(insn.operands.first()?)? != lane_bits {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::Reduce {
+            kind,
+            source_lanes: source.lanes,
+            source_lane_bits: source.lane_bits,
+        },
+        lane_bits,
+        lanes: 1,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+/// Width of a bare scalar view of a vector register (`b0` → 8, `s0` →
+/// 32), which is how the reductions spell their destination.
+///
+/// An arranged or indexed spelling is rejected: those name a lane
+/// geometry, and the whole point here is an operand that names none.
+fn scalar_vector_width(op: &Operand) -> Option<u16> {
+    if op.kind != OperandKind::Register {
+        return None;
+    }
+    let raw = op.raw.trim().to_ascii_lowercase();
+    if raw.contains(['.', '[']) {
+        return None;
+    }
+    let layout = register_layout(&raw, Arch::Aarch64)?;
+    is_simd_parent(layout.parent, Arch::Aarch64).then(|| layout.width())
 }
 
 // ===================== bitwise select =====================
@@ -458,12 +984,21 @@ fn convert_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     if upper && !widths_differ {
         return None;
     }
-    // The two-operand register forms only; the fixed-point variants
-    // carry a third immediate operand and scale by it.
-    if insn.operands.len() != 2 {
-        return None;
-    }
     let destination = operand_arrangement(insn.operands.first()?)?;
+    // The fixed-point forms carry the fraction width as a third
+    // operand. ARM ARM C7.2 bounds it by `1 <= fbits <= esize`, and
+    // there is no fixed-point `2` form.
+    let fbits = match insn.operands.len() {
+        2 => 0,
+        3 if kind.scales() && !upper => {
+            let raw = u16::try_from(parse_immediate(&insn.operands.get(2)?.raw)?).ok()?;
+            if raw == 0 || raw > destination.lane_bits {
+                return None;
+            }
+            raw
+        }
+        _ => return None,
+    };
     let source = operand_arrangement(insn.operands.get(1)?)?;
     let (source_bits, written) = match kind {
         ConvertKind::FloatToFloat { widening: true } => {
@@ -511,7 +1046,7 @@ fn convert_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
         return None;
     }
     Some(NeonShape {
-        op: NeonOp::Convert { kind, upper },
+        op: NeonOp::Convert { kind, upper, fbits },
         lane_bits: destination.lane_bits,
         lanes: written,
         dest_index: 0,
@@ -1025,14 +1560,12 @@ fn packed_shape_of(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
 
 // ===================== broadcast and permutation =====================
 
-/// `movi vd.<T>, #imm{, lsl #shift}` and `mvni`, which replicate an
+/// `movi vd.<T>, #imm{, lsl|msl #shift}` and `mvni`, which replicate an
 /// immediate across every lane.
 ///
 /// The disassembler prints the *decoded* immediate, so the printed value
 /// is the per-lane one and needs no re-expansion — including for `.2d`,
-/// whose encoded form is a byte mask. An `msl` shift is a different
-/// operation (it shifts ones in, not zeroes) and declines rather than
-/// being treated as `lsl`.
+/// whose encoded form is a byte mask.
 fn immediate_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     let invert = match mnemonic {
         "movi" => false,
@@ -1041,14 +1574,27 @@ fn immediate_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     };
     let arrangement = operand_arrangement(insn.operands.first()?)?;
     let raw = parse_immediate(&insn.operands.get(1)?.raw)?;
-    let shift = match insn.operands.len() {
-        2 => 0,
-        3 => shift_amount(insn.operands.get(2)?)?,
+    let shifted = match insn.operands.len() {
+        2 => raw,
+        3 => {
+            let (kind, shift) = shift_modifier(insn.operands.get(2)?)?;
+            // ARM ARM C7.2 (MOVI / MVNI, shifting ones): the `msl` form
+            // is encoded for 32-bit elements only, and only for a shift
+            // of 8 or 16.
+            if kind == ShiftModifier::Ones
+                && (arrangement.lane_bits != 32 || !matches!(shift, 8 | 16))
+            {
+                return None;
+            }
+            apply_shift_modifier(kind, raw, shift)?
+        }
         _ => return None,
     };
-    let value = raw.checked_shl(u32::from(shift))?;
     Some(NeonShape {
-        op: NeonOp::Immediate { value, invert },
+        op: NeonOp::Immediate {
+            value: shifted,
+            invert,
+        },
         lane_bits: arrangement.lane_bits,
         lanes: arrangement.lanes,
         dest_index: 0,
@@ -1056,12 +1602,43 @@ fn immediate_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     })
 }
 
-/// The `lsl #n` shift operand of a `movi`. Radare2 renders the shifting
-/// modifier as one operand, so the whole thing is parsed here.
-fn shift_amount(op: &Operand) -> Option<u16> {
+/// Which bit an immediate shift feeds in from the right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShiftModifier {
+    /// `lsl` — zeroes.
+    Zeroes,
+    /// `msl` — ones. The whole reason it is a separate mnemonic: it
+    /// builds the `0x0000ffff`-style masks a bare `lsl` cannot.
+    Ones,
+}
+
+/// The `lsl #n` / `msl #n` shift operand of a `movi`. Radare2 renders
+/// the shifting modifier as one operand, so the whole thing is parsed
+/// here.
+fn shift_modifier(op: &Operand) -> Option<(ShiftModifier, u16)> {
     let raw = op.raw.trim().to_ascii_lowercase();
-    let body = raw.strip_prefix("lsl")?.trim();
-    u16::try_from(parse_immediate(body)?).ok()
+    let (kind, body) = if let Some(body) = raw.strip_prefix("lsl") {
+        (ShiftModifier::Zeroes, body)
+    } else {
+        (ShiftModifier::Ones, raw.strip_prefix("msl")?)
+    };
+    Some((kind, u16::try_from(parse_immediate(body.trim())?).ok()?))
+}
+
+/// Apply a shift modifier to the printed immediate.
+///
+/// Both are computed here, in Rust, rather than lowered as IR: every
+/// operand of a `movi` is a literal, so the lane value is known at lift
+/// time and emitting a shift node would leave the solver folding a
+/// constant.
+fn apply_shift_modifier(kind: ShiftModifier, raw: u64, shift: u16) -> Option<u64> {
+    let shifted = raw.checked_shl(u32::from(shift))?;
+    Some(match kind {
+        ShiftModifier::Zeroes => shifted,
+        // The vacated bits come in set, so the low `shift` bits are all
+        // ones rather than all zeroes.
+        ShiftModifier::Ones => shifted | (1u64.checked_shl(u32::from(shift))? - 1),
+    })
 }
 
 /// `dup vd.<T>, rn` and `dup vd.<T>, vn.<Ts>[index]`.

@@ -11,7 +11,7 @@ use crate::registers::register_layout;
 
 use super::{
     BinOp, FpArithOp, LiftCtx, MemAccess, PackedIntOp, PackedOp, VectorShape, Writeback,
-    aarch64_cond_suffix_to_predicate, fp_lane_result, fp_sort_bits_checked,
+    aarch64_cond_suffix_to_predicate, fp_lane_result, fp_propagating_max_min, fp_sort_bits_checked,
     is_aarch32_base_supported, nonzero_width, strip_aarch32_cond_suffix, vector_shape, width_mask,
 };
 
@@ -838,7 +838,17 @@ impl LiftCtx {
         let rhs = insn.operands.get(2)?.clone();
         let a = self.read_simd_lane_bits(&lhs, lane, 0)?;
         let b = self.read_simd_lane_bits(&rhs, lane, 0)?;
-        fp_lane_result(arith, a, b, lane)
+        // `vmax` / `vmin` are `FPMax` / `FPMin`, which propagate NaN and
+        // combine the signs of a zero tie. [`fp_lane_result`] is Intel's
+        // `MAXPS` and does neither.
+        match arith {
+            FpArithOp::Max | FpArithOp::Min => {
+                fp_propagating_max_min(a, b, lane, matches!(arith, FpArithOp::Max))
+            }
+            FpArithOp::Add | FpArithOp::Sub | FpArithOp::Mul | FpArithOp::Div => {
+                fp_lane_result(arith, a, b, lane)
+            }
+        }
     }
 
     fn vfp_sqrt_value(&mut self, insn: &Instruction, lane: u16) -> Option<Expr> {

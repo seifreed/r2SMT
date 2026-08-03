@@ -9,11 +9,11 @@
 use r2smt_ir::expr::Expr;
 use r2smt_ir::program::{Instruction, Operand};
 
-use super::super::super::LiftCtx;
+use super::super::super::{FpArithOp, LiftCtx, fp_lane_result, fp_propagating_max_min};
 use super::{
-    AccumulateKind, AccumulateSources, BITS_PER_BYTE, CompareKind, ConvertKind, NeonOp, NeonShape,
-    PermuteKind, PermuteSource, SaturateTo, SaturatingKind, SelectRole, ShiftKind, WidenKind,
-    operand_arrangement,
+    AccumulateKind, AccumulateSources, BITS_PER_BYTE, ByElementKind, CompareKind, ConvertKind,
+    DOT_PRODUCT_TERMS, NeonOp, NeonShape, PermuteKind, PermuteSource, ReduceKind, SaturateTo,
+    SaturatingKind, SelectRole, ShiftKind, WidenKind, operand_arrangement, single_register_table,
 };
 
 impl LiftCtx {
@@ -75,9 +75,280 @@ impl LiftCtx {
             } => self.saturating_lanes(insn, shape, kind, signed_sources, upper),
             NeonOp::Shift { kind, signed } => self.shift_lanes(insn, shape, kind, signed),
             NeonOp::Compare { kind, zero } => self.compare_lanes(insn, shape, kind, zero),
-            NeonOp::Convert { kind, upper } => self.convert_lanes(insn, shape, kind, upper),
+            NeonOp::Convert { kind, upper, fbits } => {
+                self.convert_lanes(insn, shape, kind, upper, fbits)
+            }
             NeonOp::BitwiseSelect(role) => self.bitwise_select(insn, shape, role),
+            NeonOp::Reduce {
+                kind,
+                source_lanes,
+                source_lane_bits,
+            } => self.reduce_lanes(insn, shape, kind, source_lanes, source_lane_bits),
+            NeonOp::ByElement { kind, upper } => self.by_element_lanes(insn, shape, kind, upper),
+            NeonOp::DotProduct { signed } => self.dot_product_lanes(insn, shape, signed),
+            NeonOp::TableLookup { keep, table_lanes } => {
+                self.table_lookup_lanes(insn, shape, keep, table_lanes)
+            }
+            NeonOp::PolynomialMultiply { upper } => {
+                self.polynomial_multiply_lanes(insn, shape, upper)
+            }
+            NeonOp::Estimate => self.estimate_value(insn, shape),
         }
+    }
+
+    /// `frecpe` / `frsqrte` — a fresh value that is never assigned.
+    ///
+    /// The architecture guarantees only a relative error bound for
+    /// these and leaves the value itself implementation-defined, so
+    /// `FDiv(1.0, x)` would not be an approximation of the result: it
+    /// would be a *definite* number the machine is not required to
+    /// produce, which is the fabrication this pipeline exists to avoid.
+    ///
+    /// Emitting nothing is not the alternative either. The slicer has
+    /// already consumed the destination as a definition, so a decline
+    /// truncates the slice and every downstream verdict becomes
+    /// `Unsound`. Assigning a temp that is never defined keeps the slice
+    /// `Complete` instead: `ssa_convert` surfaces a variable read before
+    /// it is written as a free input, so the solver considers every
+    /// value the estimate could take and an `AlwaysTrue` verdict is
+    /// still one that holds for all of them.
+    ///
+    /// The temp is fresh per instruction, which loses one true fact —
+    /// two `frecpe`s over the same input agree, since the estimate is a
+    /// function. That is a widening, not an unsoundness, and recovering
+    /// it would mean naming the value by its operand rather than by its
+    /// address.
+    fn estimate_value(&mut self, insn: &Instruction, shape: NeonShape) -> Option<Expr> {
+        let view = shape.lane_bits.checked_mul(shape.lanes)?;
+        Some(Expr::Var(self.new_temp(insn.address, view)))
+    }
+
+    /// `tbl` / `tbx` — each destination byte selected from the table by
+    /// the byte at the same position of the index vector.
+    ///
+    /// The chain is built with the out-of-range answer at its base and
+    /// the table entries layered over it, so an index no entry matches
+    /// falls through to that base: zero for `tbl`, the destination's
+    /// prior byte for `tbx`. The resolver caps how long the chain may
+    /// get, since it is `destination bytes * table bytes` long.
+    fn table_lookup_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        keep: bool,
+        table_lanes: u16,
+    ) -> Option<Expr> {
+        let table_operand = single_register_table(insn.operands.get(1)?)?;
+        let table_bits = table_lanes.checked_mul(BITS_PER_BYTE)?;
+        let table = self.simd_operand_value(&table_operand, table_bits)?;
+        let indices = self.widen_source(insn, 2)?;
+        let view = shape.lane_bits.checked_mul(shape.lanes)?;
+        let prior = if keep {
+            Some(self.simd_operand_value(&insn.operands.first()?.clone(), view)?)
+        } else {
+            None
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let selector = LiftCtx::extract_lane(indices.clone(), BITS_PER_BYTE, index)?;
+            let mut value = match prior.as_ref() {
+                Some(destination) => {
+                    LiftCtx::extract_lane(destination.clone(), BITS_PER_BYTE, index)?
+                }
+                None => Expr::konst(0, BITS_PER_BYTE),
+            };
+            for entry in 0..table_lanes {
+                let byte = LiftCtx::extract_lane(table.clone(), BITS_PER_BYTE, entry)?;
+                value = Expr::Ite {
+                    cond: Box::new(Expr::eq(
+                        selector.clone(),
+                        Expr::konst(u128::from(entry), BITS_PER_BYTE),
+                    )),
+                    then_expr: Box::new(byte),
+                    else_expr: Box::new(value),
+                };
+            }
+            lanes.push(value);
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// `pmull` / `pmull2` — the carry-less product of two narrow
+    /// elements, which is the `XOR` of the multiplicand shifted to
+    /// every set bit of the multiplier.
+    ///
+    /// Carry-less is the whole point: an ordinary multiply is the same
+    /// sum of shifted copies but with carries propagating between them,
+    /// so `Expr::mul` is not an approximation of this, it is a
+    /// different function. The product of two `n`-bit elements needs
+    /// `2n - 1` bits, so the destination element always holds it.
+    fn polynomial_multiply_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        upper: bool,
+    ) -> Option<Expr> {
+        let narrow = shape.lane_bits / 2;
+        let first = self.widen_source(insn, 1)?;
+        let second = self.widen_source(insn, 2)?;
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let source_lane = if upper {
+                index.checked_add(shape.lanes)?
+            } else {
+                index
+            };
+            let multiplicand = Expr::zero_ext(
+                LiftCtx::extract_lane(first.clone(), narrow, source_lane)?,
+                shape.lane_bits,
+            );
+            let multiplier = LiftCtx::extract_lane(second.clone(), narrow, source_lane)?;
+            let mut product = Expr::konst(0, shape.lane_bits);
+            for bit in 0..narrow {
+                let shifted = Expr::shl(
+                    multiplicand.clone(),
+                    Expr::konst(u128::from(bit), shape.lane_bits),
+                );
+                product = Expr::bv_xor(
+                    product,
+                    Expr::Ite {
+                        cond: Box::new(Expr::eq(
+                            Expr::extract(multiplier.clone(), bit, bit),
+                            Expr::konst(1, 1),
+                        )),
+                        then_expr: Box::new(shifted),
+                        else_expr: Box::new(Expr::konst(0, shape.lane_bits)),
+                    },
+                );
+            }
+            lanes.push(product);
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// The by-element multiplies — one source element multiplied into
+    /// every destination lane.
+    ///
+    /// The element is read once, outside the loop. Reading it per lane
+    /// would emit the same extract `lanes` times over, and for a memory
+    /// operand it would be a load per lane.
+    fn by_element_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        kind: ByElementKind,
+        upper: bool,
+    ) -> Option<Expr> {
+        let source_bits = if kind.widens() {
+            shape.lane_bits / 2
+        } else {
+            shape.lane_bits
+        };
+        let first = self.widen_source(insn, 1)?;
+        let element = self.read_simd_lane_bits(
+            &insn.operands.get(2)?.clone(),
+            source_bits,
+            shape.source_index,
+        )?;
+        let view = shape.lane_bits.checked_mul(shape.lanes)?;
+        let accumulator = match kind.combine() {
+            Some(_) => Some(self.simd_operand_value(&insn.operands.first()?.clone(), view)?),
+            None => None,
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            // A `2` form reads the first source's upper half; the
+            // element operand is indexed absolutely and is never halved.
+            let source_lane = if upper {
+                index.checked_add(shape.lanes)?
+            } else {
+                index
+            };
+            let a = LiftCtx::extract_lane(first.clone(), source_bits, source_lane)?;
+            let product = match kind {
+                ByElementKind::Long { signed, .. } => Expr::mul(
+                    extend(a, shape.lane_bits, signed),
+                    extend(element.clone(), shape.lane_bits, signed),
+                ),
+                ByElementKind::Integer { .. } => Expr::mul(a, element.clone()),
+                ByElementKind::Float => {
+                    fp_lane_result(FpArithOp::Mul, a, element.clone(), shape.lane_bits)?
+                }
+            };
+            lanes.push(match (kind.combine(), accumulator.as_ref()) {
+                (Some(combine), Some(previous)) => combine.apply(
+                    LiftCtx::extract_lane(previous.clone(), shape.lane_bits, index)?,
+                    product,
+                ),
+                _ => product,
+            });
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// `sdot` / `udot` — four byte products summed into each 32-bit
+    /// destination lane, on top of that lane's prior value.
+    ///
+    /// The products are formed at the destination's width rather than
+    /// the byte's, which is what the architecture's extension of each
+    /// element before the multiply comes to; the accumulation then wraps
+    /// at 32 bits exactly as ARM defines it.
+    fn dot_product_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        signed: bool,
+    ) -> Option<Expr> {
+        let view = shape.lane_bits.checked_mul(shape.lanes)?;
+        let accumulator = self.simd_operand_value(&insn.operands.first()?.clone(), view)?;
+        let first = self.widen_source(insn, 1)?;
+        let second = self.widen_source(insn, 2)?;
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let mut sum = LiftCtx::extract_lane(accumulator.clone(), shape.lane_bits, index)?;
+            for term in 0..DOT_PRODUCT_TERMS {
+                let byte = index.checked_mul(DOT_PRODUCT_TERMS)?.checked_add(term)?;
+                let read = |value: &Expr| -> Option<Expr> {
+                    let raw = LiftCtx::extract_lane(value.clone(), BITS_PER_BYTE, byte)?;
+                    Some(extend(raw, shape.lane_bits, signed))
+                };
+                sum = Expr::add(sum, Expr::mul(read(&first)?, read(&second)?));
+            }
+            lanes.push(sum);
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// The across-lane reductions — every source lane folded into the
+    /// one element the scalar destination holds.
+    ///
+    /// The fold is left-associative, which the architecture permits to
+    /// matter for none of these: integer addition and the min / max
+    /// selects are associative, so no ordering is observable.
+    fn reduce_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        kind: ReduceKind,
+        source_lanes: u16,
+        source_lane_bits: u16,
+    ) -> Option<Expr> {
+        let source = self.widen_source(insn, 1)?;
+        let mut accumulator: Option<Expr> = None;
+        for index in 0..source_lanes {
+            let raw = LiftCtx::extract_lane(source.clone(), source_lane_bits, index)?;
+            // The widening forms extend before the fold; the same-width
+            // ones already sit at the destination's element width.
+            let element = match kind {
+                ReduceKind::AddLong { signed } => extend(raw, shape.lane_bits, signed),
+                ReduceKind::Add | ReduceKind::MinMax { .. } | ReduceKind::Float { .. } => raw,
+            };
+            accumulator = Some(match accumulator {
+                None => element,
+                Some(previous) => reduce_step(kind, previous, element, shape.lane_bits)?,
+            });
+        }
+        accumulator
     }
 
     /// `bsl` / `bit` / `bif` — one bitwise select over the whole view.
@@ -143,6 +414,7 @@ impl LiftCtx {
         shape: NeonShape,
         kind: ConvertKind,
         upper: bool,
+        fbits: u16,
     ) -> Option<Expr> {
         let source = self.widen_source(insn, 1)?;
         let source_bits = match kind {
@@ -161,7 +433,13 @@ impl LiftCtx {
                     index
                 };
             let element = LiftCtx::extract_lane(source.clone(), source_bits, source_lane)?;
-            lanes.push(convert_lane(kind, element, source_bits, shape.lane_bits)?);
+            lanes.push(convert_lane(
+                kind,
+                element,
+                source_bits,
+                shape.lane_bits,
+                fbits,
+            )?);
         }
         let converted = Self::concat_lanes(lanes)?;
         if !upper || !matches!(kind, ConvertKind::FloatToFloat { widening: false }) {
@@ -543,6 +821,41 @@ impl LiftCtx {
     }
 }
 
+/// Fold one more lane into an across-lane reduction's accumulator.
+///
+/// `addv` sums at the element width and keeps the low bits, which is
+/// what the architecture's truncation of the unbounded sum comes to; a
+/// wrapping add reproduces it exactly. `uaddlv` / `saddlv` arrive here
+/// already extended, and no encodable arrangement can overflow the
+/// doubled width (sixteen bytes reach 4 080, eight halfwords 524 280),
+/// so their sum is exact rather than truncated too.
+/// `fmaxv` / `fminv` fold with [`fp_propagating_max_min`] and *not*
+/// with the integer comparison beside it, nor with
+/// [`super::super::super::fp_lane_result`]'s `Max` / `Min`, which is
+/// Intel's `MAXPS`: ARM's `FPMax` propagates NaN where `MAXPS` returns
+/// its second operand, and combines the signs of a zero tie where
+/// `MAXPS` again takes the second. Both differences are wrong values,
+/// not wider ones.
+fn reduce_step(kind: ReduceKind, a: Expr, b: Expr, lane_bits: u16) -> Option<Expr> {
+    Some(match kind {
+        ReduceKind::Add | ReduceKind::AddLong { .. } => Expr::add(a, b),
+        ReduceKind::Float { max } => return fp_propagating_max_min(a, b, lane_bits, max),
+        ReduceKind::MinMax { signed, max } => {
+            let cond = if signed {
+                Expr::slt(a.clone(), b.clone())
+            } else {
+                Expr::ult(a.clone(), b.clone())
+            };
+            let (taken, other) = if max { (b, a) } else { (a, b) };
+            Expr::Ite {
+                cond: Box::new(cond),
+                then_expr: Box::new(taken),
+                else_expr: Box::new(other),
+            }
+        }
+    })
+}
+
 /// Extend `value` from `from` bits to `to` bits.
 fn extend(value: Expr, to: u16, signed: bool) -> Expr {
     if signed {
@@ -859,17 +1172,86 @@ fn fp_sort(lane_bits: u16) -> Option<(u16, u16)> {
     }
 }
 
+/// The IEEE bit pattern of `2^exponent` in the `(ebits, sbits)` sort,
+/// or `None` when that power is not representable there.
+///
+/// A subnormal result is built rather than declined: the fixed-point
+/// conversions scale by `2^-fbits`, and for a 16-bit element with
+/// `fbits = 16` that lands one exponent below the normal range — where
+/// the value is still exact, since a power of two is a single set bit
+/// of the stored significand.
+fn power_of_two(exponent: i32, ebits: u16, sbits: u16) -> Option<u128> {
+    let bias = (1i32 << (i32::from(ebits) - 1)) - 1;
+    let stored = i32::from(sbits) - 1;
+    let field = exponent.checked_add(bias)?;
+    if field >= 1 {
+        // Normal: the significand is implicit, so the pattern is the
+        // biased exponent alone. The all-ones field is infinity / NaN.
+        if field >= (1i32 << i32::from(ebits)) - 1 {
+            return None;
+        }
+        return Some(u128::try_from(field).ok()? << u32::try_from(stored).ok()?);
+    }
+    // Subnormal: the value is `significand * 2^(1 - bias - stored)`, so
+    // the set bit sits `exponent - (1 - bias - stored)` places up.
+    let bit = exponent.checked_sub(1 - bias - stored)?;
+    if bit < 0 || bit >= stored {
+        return None;
+    }
+    Some(1u128 << u32::try_from(bit).ok()?)
+}
+
+/// Scale `value` by `2^-fbits`, the fixed-point conversions' fraction
+/// width, in whichever direction `divide` names.
+///
+/// The constant is always built as `2^-fbits` and never as `2^fbits`,
+/// which is the only spelling representable at every encodable width:
+/// `2^16` is infinity in binary16, while `2^-16` is a perfectly good
+/// subnormal. Scaling by a power of two only shifts the exponent, so it
+/// introduces no rounding of its own — the result is the same one the
+/// architecture's single correctly-rounded conversion produces, except
+/// in a subnormal corner where the integer is small enough to be exact
+/// anyway.
+fn scale_by_fraction(
+    value: Expr,
+    fbits: u16,
+    ebits: u16,
+    sbits: u16,
+    divide: bool,
+) -> Option<Expr> {
+    if fbits == 0 {
+        return Some(value);
+    }
+    let scale = Expr::FpConst {
+        bits: power_of_two(-i32::from(fbits), ebits, sbits)?,
+        ebits,
+        sbits,
+    };
+    let round = r2smt_ir::expr::RoundingMode::NearestTiesEven;
+    Some(if divide {
+        Expr::fdiv(value, scale, round)
+    } else {
+        Expr::fmul(value, scale, round)
+    })
+}
+
 /// One destination lane of a conversion.
 ///
 /// The IR carries no unsigned integer conversion, so the unsigned forms
 /// go through the signed node with one extra bit of range — which covers
 /// the unsigned range exactly rather than approximately, the same trick
 /// the scalar `ucvtf` / `fcvtzu` already use.
+///
+/// `fbits` is the fixed-point fraction width, zero for the plain
+/// register forms. It reads the integer side as `Int(lane) / 2^fbits`,
+/// so the conversion into float multiplies by that factor and the
+/// conversion out of float divides by it.
 fn convert_lane(
     kind: ConvertKind,
     element: Expr,
     source_bits: u16,
     lane_bits: u16,
+    fbits: u16,
 ) -> Option<Expr> {
     let round = r2smt_ir::expr::RoundingMode::NearestTiesEven;
     match kind {
@@ -880,13 +1262,20 @@ fn convert_lane(
             } else {
                 Expr::zero_ext(element, source_bits.checked_add(1)?)
             };
-            Some(Expr::fp_to_ieee_bv(Expr::sbv_to_fp(
-                source, round, ebits, sbits,
-            )))
+            let converted = Expr::sbv_to_fp(source, round, ebits, sbits);
+            Some(Expr::fp_to_ieee_bv(scale_by_fraction(
+                converted, fbits, ebits, sbits, false,
+            )?))
         }
         ConvertKind::FloatToInt { signed } => {
             let (ebits, sbits) = fp_sort(source_bits)?;
-            let value = Expr::bv_to_fp(element, ebits, sbits);
+            let value = scale_by_fraction(
+                Expr::bv_to_fp(element, ebits, sbits),
+                fbits,
+                ebits,
+                sbits,
+                true,
+            )?;
             // The `z` in the mnemonic is round-toward-zero, so no
             // control register is assumed.
             let toward_zero = r2smt_ir::expr::RoundingMode::TowardZero;
@@ -901,6 +1290,8 @@ fn convert_lane(
             })
         }
         ConvertKind::FloatToFloat { .. } => {
+            // No fixed-point form: `convert_shape` rejects a third
+            // operand here, so `fbits` is zero and nothing scales.
             let (from_e, from_s) = fp_sort(source_bits)?;
             let (to_e, to_s) = fp_sort(lane_bits)?;
             Some(Expr::fp_to_ieee_bv(Expr::fp_to_fp(
