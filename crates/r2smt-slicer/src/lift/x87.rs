@@ -120,6 +120,28 @@
 //! all — so it additionally *havocs* the modelled stack: every later
 //! read then produces a free symbolic input rather than a stale value
 //! from a slot the hardware would have overwritten.
+//!
+//! ### Why `fnstcw` stays out
+//!
+//! It is the one omission that looks like an oversight, so it is worth
+//! stating. `fnstcw` stores the control word, and there are three things
+//! this model could do with it. Storing the reset value fabricates: a
+//! program that reads the field back sees a definite number this
+//! analysis invented, and every verdict downstream of it inherits that.
+//! Storing a *free* value is sound but strictly worse than the third
+//! option, because the slice then reports `Complete` while resting on a
+//! register the model does not carry — the confidence ladder would call
+//! that `High`. Truncating says exactly what is true, so the mnemonic
+//! stays outside [`classify`] and the slicer's `Other` rule does the
+//! rest.
+//!
+//! Modelling it properly needs a real `fcw` pseudo-register, and the
+//! obstacle there is not effort. Precision control selects a 24-, 53- or
+//! 64-bit significand for every subsequent result, and a fixed
+//! `FloatingPoint(15, 64)` sort cannot express a narrowed one at all —
+//! so a faithful `fcw` would have to make the arithmetic sort depend on
+//! a *symbolic* field, which is a different value model, not a bigger
+//! table.
 
 use r2smt_common::Arch;
 use r2smt_ir::expr::{Expr, RoundingMode, Var};

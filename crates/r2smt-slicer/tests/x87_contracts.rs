@@ -660,6 +660,30 @@ fn test_x87_control_word_read_stays_unmodelled() {
     assert_eq!(effect.kind, InstructionKind::Other);
 }
 
+#[test]
+fn test_x87_control_word_read_truncates_a_chain_that_depends_on_it() {
+    // The reason `fnstcw` is left declining rather than given a free
+    // value, pinned as a consequence rather than as a classification.
+    //
+    // A free `fcw` would be sound, but the slice would come back
+    // `Complete` — and so `High` confidence — while resting on a
+    // register this model does not carry. Truncating says what is
+    // actually true. Storing the *reset* value, the other tempting
+    // option, is worse still: it hands the solver a definite number
+    // this analysis invented.
+    let fixture = program(vec![
+        ("fnstcw", vec![mem("word [rbp - 0x40]")]),
+        ("mov", vec![reg("ax"), mem("word [rbp - 0x40]")]),
+        ("and", vec![reg("eax"), op("0x300", OperandKind::Immediate)]),
+        ("cmp", vec![reg("eax"), op("0", OperandKind::Immediate)]),
+        ("je", vec![op("0x402000", OperandKind::Immediate)]),
+    ]);
+    let SliceStatus::Truncated { reason } = slice_of(&fixture).status else {
+        panic!("a chain reading the control word must not resolve");
+    };
+    assert!(reason.contains("fnstcw"), "{reason}");
+}
+
 // --- the spellings radare2 actually emits ---
 //
 // Everything below pins a form against real disassembler output rather
