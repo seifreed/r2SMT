@@ -658,23 +658,44 @@ fn parse_aarch32_immediate(raw: &str) -> Option<i64> {
     s.parse::<i64>().ok()
 }
 
-/// Element width named by an `AArch32` NEON data type (`i32`, `s16`,
-/// `u8`, `f32`). Signedness does not change the width, and for the
-/// operations modelled here it does not change the result either:
-/// two's-complement add, subtract and multiply are sign-agnostic at a
-/// fixed width.
-fn neon_element_bits(ty: &str) -> Option<u16> {
+/// The signedness class an `AArch32` NEON data type spells.
+///
+/// It is part of the mnemonic rather than the operands, and for some of
+/// the family it is part of the *operation*: two's-complement add,
+/// subtract and multiply give the same bits either way, but `vmax` and
+/// `vabs` do not, and the assembler will not accept an untyped `i` form
+/// for those at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ElementKind {
+    /// `s8` / `s16` / `s32` / `s64`.
+    Signed,
+    /// `u8` / `u16` / `u32` / `u64`.
+    Unsigned,
+    /// `i8` / `i16` / `i32` / `i64` — the sign-agnostic spelling.
+    Untyped,
+    /// `f16` / `f32` / `f64`.
+    Float,
+}
+
+/// Element type named by an `AArch32` NEON data type (`i32`, `s16`,
+/// `u8`, `f32`), as a signedness class and a width.
+fn neon_element_type(ty: &str) -> Option<(ElementKind, u16)> {
     let (kind, width) = ty.split_at(1);
-    if !matches!(kind, "i" | "s" | "u" | "f") {
-        return None;
-    }
-    match width {
-        "8" if kind != "f" => Some(8),
-        "16" => Some(16),
-        "32" => Some(32),
-        "64" => Some(64),
-        _ => None,
-    }
+    let kind = match kind {
+        "i" => ElementKind::Untyped,
+        "s" => ElementKind::Signed,
+        "u" => ElementKind::Unsigned,
+        "f" => ElementKind::Float,
+        _ => return None,
+    };
+    let bits = match width {
+        "8" if kind != ElementKind::Float => 8,
+        "16" => 16,
+        "32" => 32,
+        "64" => 64,
+        _ => return None,
+    };
+    Some((kind, bits))
 }
 
 /// The packed operation and element width an `AArch32` NEON
@@ -686,30 +707,80 @@ fn neon_element_bits(ty: &str) -> Option<u16> {
 /// (`vand q0, q1, q2`). A bitwise operation needs no element width to be
 /// exact — it is lane-independent — so the bare forms report the byte,
 /// the smallest element the register file admits.
+///
+/// Recognising a mnemonic here is load-bearing beyond adding it: the
+/// dispatcher tries this **before** the scalar VFP handler, and several
+/// of these mnemonics — `vmax`, `vmin`, `vabs`, `vneg` — are spelled
+/// identically in both families. A packed form this function does not
+/// know therefore does not decline; it falls through to the scalar
+/// handler, which computes lane 0 and leaves every other lane holding
+/// whatever the destination held before.
 pub(crate) fn neon_packed_op(mnemonic: &str) -> Option<(PackedOp, u16)> {
     const NEON_BITWISE_ELEMENT_BITS: u16 = 8;
     if let Some(op) = neon_bitwise_op(mnemonic) {
         return Some((PackedOp::Int(op), NEON_BITWISE_ELEMENT_BITS));
     }
     let (base, ty) = mnemonic.split_once('.')?;
-    let lane_bits = neon_element_bits(ty)?;
-    let op = if ty.starts_with('f') {
-        PackedOp::Fp(match base {
-            "vadd" => FpArithOp::Add,
-            "vsub" => FpArithOp::Sub,
-            "vmul" => FpArithOp::Mul,
-            "vdiv" => FpArithOp::Div,
-            _ => return None,
-        })
-    } else {
-        PackedOp::Int(PackedIntOp::Bin(match base {
-            "vadd" => BinOp::Add,
-            "vsub" => BinOp::Sub,
-            "vmul" => BinOp::Mul,
-            _ => return None,
-        }))
+    let (kind, lane_bits) = neon_element_type(ty)?;
+    let op = match kind {
+        ElementKind::Float => neon_float_op(base)?,
+        _ => PackedOp::Int(neon_integer_op(base, kind)?),
     };
     Some((op, lane_bits))
+}
+
+/// The float-typed packed forms.
+///
+/// `vabs` and `vneg` come back as *integer* lane operations on purpose:
+/// both are sign-bit manipulations, exact at every value including the
+/// NaNs, and routing them through a float sort would gain nothing and
+/// decline at the widths that have none.
+fn neon_float_op(base: &str) -> Option<PackedOp> {
+    Some(match base {
+        "vadd" => PackedOp::Fp(FpArithOp::Add),
+        "vsub" => PackedOp::Fp(FpArithOp::Sub),
+        "vmul" => PackedOp::Fp(FpArithOp::Mul),
+        "vdiv" => PackedOp::Fp(FpArithOp::Div),
+        "vmax" => PackedOp::Fp(FpArithOp::Max),
+        "vmin" => PackedOp::Fp(FpArithOp::Min),
+        "vabs" => PackedOp::Int(PackedIntOp::SignBit { negate: false }),
+        "vneg" => PackedOp::Int(PackedIntOp::SignBit { negate: true }),
+        _ => return None,
+    })
+}
+
+/// The integer-typed packed forms.
+///
+/// The arithmetic family accepts every signedness class because
+/// two's-complement add, subtract and multiply give the same bits either
+/// way — which is exactly why the assembler offers the untyped `i`
+/// spelling for them. `vmax` / `vmin` need the comparison's signedness
+/// and `vabs` / `vneg` are meaningless on an unsigned element, so both
+/// reject the classes their encodings do not have.
+fn neon_integer_op(base: &str, kind: ElementKind) -> Option<PackedIntOp> {
+    let signed = match kind {
+        ElementKind::Signed => true,
+        ElementKind::Unsigned => false,
+        // Reached only by the arithmetic arms below, which ignore it.
+        _ => return neon_untyped_op(base),
+    };
+    Some(match base {
+        "vmax" => PackedIntOp::MinMax { max: true, signed },
+        "vmin" => PackedIntOp::MinMax { max: false, signed },
+        "vabs" if signed => PackedIntOp::Abs,
+        "vneg" if signed => PackedIntOp::Neg,
+        other => neon_untyped_op(other)?,
+    })
+}
+
+/// The forms whose result does not depend on the element's signedness.
+fn neon_untyped_op(base: &str) -> Option<PackedIntOp> {
+    Some(PackedIntOp::Bin(match base {
+        "vadd" => BinOp::Add,
+        "vsub" => BinOp::Sub,
+        "vmul" => BinOp::Mul,
+        _ => return None,
+    }))
 }
 
 /// The bitwise NEON mnemonics, which carry no element type.

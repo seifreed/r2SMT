@@ -45,6 +45,21 @@ pub(crate) enum PackedIntOp {
     Not,
     /// `mov` — copy, one source.
     Copy,
+    /// `vmin` / `vmax` — the lane-wise ordered select. The comparison
+    /// is the whole operation, so its signedness is carried here rather
+    /// than inferred: `max` of `0xff` and `0x01` is the first byte
+    /// unsigned and the second signed.
+    MinMax { max: bool, signed: bool },
+    /// `vabs` on integer lanes. Non-saturating, so the most negative
+    /// value maps to itself — which the two's-complement negation
+    /// already gives at a fixed width, with no special case.
+    Abs,
+    /// `vneg` on integer lanes — `0 - a`, wrapping for the same reason.
+    Neg,
+    /// `vabs` / `vneg` on floating-point lanes. Both are sign-bit
+    /// manipulations, so they are exact at every value including the
+    /// NaNs and the infinities and need no float sort at all.
+    SignBit { negate: bool },
 }
 
 /// What a packed ARM vector data-processing instruction computes.
@@ -61,7 +76,13 @@ impl PackedOp {
     /// destination included.
     pub(super) const fn operand_count(self) -> usize {
         match self {
-            Self::Int(PackedIntOp::Not | PackedIntOp::Copy) => 2,
+            Self::Int(
+                PackedIntOp::Not
+                | PackedIntOp::Copy
+                | PackedIntOp::Abs
+                | PackedIntOp::Neg
+                | PackedIntOp::SignBit { .. },
+            ) => 2,
             _ => 3,
         }
     }
@@ -203,6 +224,26 @@ pub(super) fn all_ones(bits: u16) -> Expr {
     Expr::konst(mask, bits)
 }
 
+/// A `bits`-wide value with only the most significant bit set.
+///
+/// Built by concatenation rather than as a literal so it stays correct
+/// above the 128 bits a `Const` payload can carry.
+fn sign_bit(bits: u16) -> Option<Expr> {
+    Some(Expr::concat(
+        Expr::konst(1, 1),
+        Expr::konst(0, bits.checked_sub(1)?),
+    ))
+}
+
+/// A `bits`-wide value with every bit but the most significant set —
+/// the mask a floating-point `abs` applies.
+fn magnitude_mask(bits: u16) -> Option<Expr> {
+    Some(Expr::concat(
+        Expr::konst(0, 1),
+        all_ones(bits.checked_sub(1)?),
+    ))
+}
+
 fn packed_int_lane(op: PackedIntOp, a: Expr, b: Option<Expr>, bits: u16) -> Option<Expr> {
     Some(match op {
         PackedIntOp::Bin(bin) => bin.apply(a, b?),
@@ -210,6 +251,36 @@ fn packed_int_lane(op: PackedIntOp, a: Expr, b: Option<Expr>, bits: u16) -> Opti
         PackedIntOp::BitClear => Expr::bv_and(a, Expr::bv_xor(b?, all_ones(bits))),
         PackedIntOp::Not => Expr::bv_xor(a, all_ones(bits)),
         PackedIntOp::Copy => a,
+        PackedIntOp::MinMax { max, signed } => {
+            let other = b?;
+            // `max` keeps the first operand when the second is smaller;
+            // `min` keeps it when the second is larger. Written as one
+            // comparison with the operands swapped rather than four
+            // predicates, so the two directions cannot drift.
+            let (lo, hi) = if max {
+                (other.clone(), a.clone())
+            } else {
+                (a.clone(), other.clone())
+            };
+            let cond = if signed {
+                Expr::slt(lo, hi)
+            } else {
+                Expr::ult(lo, hi)
+            };
+            Expr::Ite {
+                cond: Box::new(cond),
+                then_expr: Box::new(a),
+                else_expr: Box::new(other),
+            }
+        }
+        PackedIntOp::Abs => Expr::Ite {
+            cond: Box::new(Expr::slt(a.clone(), Expr::konst(0, bits))),
+            then_expr: Box::new(Expr::sub(Expr::konst(0, bits), a.clone())),
+            else_expr: Box::new(a),
+        },
+        PackedIntOp::Neg => Expr::sub(Expr::konst(0, bits), a),
+        PackedIntOp::SignBit { negate: true } => Expr::bv_xor(a, sign_bit(bits)?),
+        PackedIntOp::SignBit { negate: false } => Expr::bv_and(a, magnitude_mask(bits)?),
     })
 }
 

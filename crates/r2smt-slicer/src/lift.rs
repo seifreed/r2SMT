@@ -360,7 +360,17 @@ pub(crate) fn pins_rounding_mode(insn: &Instruction, arch: Arch) -> bool {
                     _
                 ))
             );
-            vfp_rounds || matches!(aarch32::neon_packed_op(&lower), Some((PackedOp::Fp(_), _)))
+            // Same narrowness as the scalar arm above: the packed
+            // `vmax` / `vmin` select an operand rather than computing
+            // one, so no rounding mode reaches them.
+            let neon_rounds = matches!(
+                aarch32::neon_packed_op(&lower),
+                Some((
+                    PackedOp::Fp(FpArithOp::Add | FpArithOp::Sub | FpArithOp::Mul | FpArithOp::Div),
+                    _
+                ))
+            );
+            vfp_rounds || neon_rounds
         }
         _ => false,
     }
