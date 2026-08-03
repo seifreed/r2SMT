@@ -14,6 +14,7 @@ use r2smt_ir::stmt::IrStmt;
 
 use crate::lift::LiftCtx;
 
+use super::element::ByElementKind;
 use super::permute::{PairKind, PairSource, paired_source};
 use super::width::WidenKind;
 use super::{BITS_PER_BYTE, NeonOp, NeonShape};
@@ -72,10 +73,70 @@ impl LiftCtx {
                     self.aarch32_long_lanes(insn, shape, Some(op), wide_first, signed)
                 }
             },
+            NeonOp::ByElement { kind, index } => {
+                self.aarch32_by_element_lanes(insn, shape, kind, index)
+            }
             // Handled by the caller; it writes two destinations and so
             // does not fit the one-value contract here.
             NeonOp::PermutePair(_) => None,
         }
+    }
+
+    /// The by-element forms — one element of the second source
+    /// multiplied into every destination lane.
+    ///
+    /// The element is read **once**, outside the loop, rather than
+    /// re-extracted per lane: it is the same value every time, and on a
+    /// memory operand the difference would be one load against one per
+    /// lane.
+    fn aarch32_by_element_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        kind: ByElementKind,
+        index: u16,
+    ) -> Option<Expr> {
+        let (combine, signed, source_bits) = match kind {
+            ByElementKind::Same { combine } => (combine, false, shape.lane_bits),
+            ByElementKind::Long { combine, signed } => {
+                (combine, signed, shape.lane_bits.checked_div(2)?)
+            }
+        };
+        let widens = source_bits != shape.lane_bits;
+        let lanewise_view = source_bits.checked_mul(shape.lanes)?;
+        let lanewise = self.simd_operand_value(&insn.operands.get(1)?.clone(), lanewise_view)?;
+        let indexed = insn.operands.get(2)?.clone();
+        let element = self.read_simd_lane_bits(&indexed, source_bits, index)?;
+        let element = if widens {
+            extend(element, shape.lane_bits, signed)
+        } else {
+            element
+        };
+        let accumulator = match combine {
+            Some(_) => {
+                Some(self.simd_operand_value(&insn.operands.first()?.clone(), shape.view_bits()?)?)
+            }
+            None => None,
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for lane in 0..shape.lanes {
+            let a = Self::extract_lane(lanewise.clone(), source_bits, lane)?;
+            let a = if widens {
+                extend(a, shape.lane_bits, signed)
+            } else {
+                a
+            };
+            let product = Expr::mul(a, element.clone());
+            lanes.push(match (combine, accumulator.as_ref()) {
+                (None, _) => product,
+                (Some(op), Some(previous)) => op.apply(
+                    Self::extract_lane(previous.clone(), shape.lane_bits, lane)?,
+                    product,
+                ),
+                (Some(_), None) => return None,
+            });
+        }
+        Self::concat_lanes(lanes)
     }
 
     /// The long forms — each destination element is computed at twice

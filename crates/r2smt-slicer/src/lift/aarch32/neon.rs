@@ -22,6 +22,7 @@ use r2smt_ir::program::{Instruction, Operand, OperandKind};
 
 use crate::registers::{has_vector_arrangement, is_simd_parent, register_layout};
 
+mod element;
 pub(super) mod lower;
 mod permute;
 mod width;
@@ -59,6 +60,13 @@ pub(super) enum NeonOp {
     Widen {
         kind: width::WidenKind,
         signed: bool,
+    },
+    /// A by-element product: the second source contributes the single
+    /// element `index` names to every destination lane, rather than
+    /// pairing lane with lane.
+    ByElement {
+        kind: element::ByElementKind,
+        index: u16,
     },
 }
 
@@ -113,6 +121,7 @@ pub(super) fn resolve(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| permute::permute_pair_shape(insn, &mnemonic))
         .or_else(|| width::widen_long_shape(insn, &mnemonic))
         .or_else(|| width::narrow_shape(insn, &mnemonic))
+        .or_else(|| element::by_element_shape(insn, &mnemonic))
 }
 
 /// Architectural width of the `AArch32` vector register parent, which

@@ -1289,3 +1289,142 @@ fn vmull_declines_the_polynomial_element_type() {
     // wider one.
     assert!(declines("vmull.p8", &["q0", "d2", "d4"]));
 }
+
+// ---------------------------------------------------------------
+// The by-element forms
+//
+// The second source contributes one element to every destination lane
+// rather than pairing lane with lane. These are blocked differently
+// from the rest: `d4[2]` carries vector shape, so the whole instruction
+// was declined before any mnemonic was looked at.
+//
+// Recognising them matters beyond coverage. `vmul.i16 q0, q1, d4[2]`
+// has exactly the operand count and kinds the *lane-wise* multiply
+// accepts, so a form the resolver misses is not declined — it is
+// lowered as a lane-wise multiply reading all of `d4`, which is a wrong
+// value. Every test below therefore differs from the lane-wise answer.
+// ---------------------------------------------------------------
+
+#[test]
+fn vmul_by_element_broadcasts_one_lane_of_the_second_source() {
+    // `d4` is the low half of `v2` and its lane 2 holds `0x000c`, so
+    // every destination lane is its own source lane times twelve. A
+    // lane-wise multiply would pair lane 4 with `d4`'s lane 0 instead.
+    assert_computes(
+        "vmul.i16",
+        &["q0", "q1", "d4[2]"],
+        &[
+            ("v1", 0x0008_0007_0006_0005_0004_0003_0002_0001),
+            ("v2", 0x000d_000c_000b_000a),
+        ],
+        0x0060_0054_0048_003c_0030_0024_0018_000c,
+    );
+}
+
+#[test]
+fn vmul_by_element_reads_the_index_the_operand_names() {
+    // The teeth for the test above: the same registers, a different
+    // index, and every lane changes. An index the lowering ignored
+    // would give the same answer twice.
+    assert_computes(
+        "vmul.i16",
+        &["q0", "q1", "d4[0]"],
+        &[
+            ("v1", 0x0008_0007_0006_0005_0004_0003_0002_0001),
+            ("v2", 0x000d_000c_000b_000a),
+        ],
+        0x0050_0046_003c_0032_0028_001e_0014_000a,
+    );
+}
+
+#[test]
+fn vmla_by_element_accumulates_into_the_destination() {
+    assert_computes(
+        "vmla.i32",
+        &["q0", "q1", "d4[1]"],
+        &[
+            ("v0", 0x0000_0064_0000_0063_0000_0062_0000_0061),
+            ("v1", 0x0000_0004_0000_0003_0000_0002_0000_0001),
+            ("v2", 0x0000_0007_0000_0006),
+        ],
+        0x0000_0080_0000_0078_0000_0070_0000_0068,
+    );
+}
+
+#[test]
+fn vmls_by_element_subtracts_the_product_from_the_destination() {
+    assert_computes(
+        "vmls.i32",
+        &["q0", "q1", "d4[1]"],
+        &[
+            ("v0", 0x0000_0064_0000_0063_0000_0062_0000_0061),
+            ("v1", 0x0000_0004_0000_0003_0000_0002_0000_0001),
+            ("v2", 0x0000_0007_0000_0006),
+        ],
+        0x0000_0048_0000_004e_0000_0054_0000_005a,
+    );
+}
+
+#[test]
+fn vmull_by_element_widens_both_the_lane_and_the_element() {
+    // The element is `0xffff`, which is `-1` signed, so each product is
+    // the negated source lane at twice the width. Extending only the
+    // lane-wise side would multiply by `65535` instead.
+    assert_computes(
+        "vmull.s16",
+        &["q0", "d2", "d4[0]"],
+        &[("v1", 0xffff_0002_8000_7fff), ("v2", 0x0000_0000_0000_ffff)],
+        0x0000_0001_ffff_fffe_0000_8000_ffff_8001,
+    );
+}
+
+#[test]
+fn vmull_by_element_unsigned_reads_the_same_element_as_a_magnitude() {
+    assert_computes(
+        "vmull.u16",
+        &["q0", "d2", "d4[0]"],
+        &[("v1", 0xffff_0002_8000_7fff), ("v2", 0x0000_0000_0000_ffff)],
+        0xfffe_0001_0001_fffe_7fff_8000_7ffe_8001,
+    );
+}
+
+// --- the boundary of the by-element seam ---
+
+#[test]
+fn a_by_element_index_past_the_register_declines() {
+    // `d4` holds four halfwords, so index 4 addresses nothing. The
+    // register table maps `d4[4]` onto the whole of `d4` regardless,
+    // which is exactly why this has to fail closed here.
+    assert!(declines("vmul.i16", &["q0", "q1", "d4[4]"]));
+    assert!(declines("vmla.i32", &["q0", "q1", "d4[2]"]));
+}
+
+#[test]
+fn the_by_element_forms_decline_a_byte_element() {
+    // No by-element encoding exists at byte size.
+    assert!(declines("vmul.i8", &["q0", "q1", "d4[2]"]));
+    assert!(declines("vmull.s8", &["q0", "d2", "d4[2]"]));
+}
+
+#[test]
+fn the_long_by_element_forms_decline_the_sign_agnostic_spelling() {
+    // Widening needs the extension named.
+    assert!(declines("vmull.i16", &["q0", "d2", "d4[0]"]));
+    assert!(declines("vmlal.i16", &["q0", "d2", "d4[0]"]));
+}
+
+#[test]
+fn the_float_by_element_forms_still_decline() {
+    // `vmul.f32 d0, d1, d2[0]` is a floating-point product, a separate
+    // lowering from the integer one above.
+    assert!(declines("vmul.f32", &["d0", "d2", "d4[0]"]));
+}
+
+#[test]
+fn an_indexed_operand_outside_this_family_still_declines() {
+    // The seam opened here is narrow: `vmov r0, d0[1]` moves a lane to
+    // a general register and is not modelled, so it must keep failing
+    // closed rather than reaching an integer handler that would read
+    // all of `d0`.
+    assert!(declines("vmov", &["r0", "d0[1]"]));
+}

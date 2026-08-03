@@ -318,6 +318,22 @@ pub(crate) fn vector_shape(insn: &Instruction, arch: Arch) -> VectorShape {
                 reads_destination: shape.reads_destination(),
             })
         }
+        // The `AArch32` families whose shape lives on the operand
+        // rather than the mnemonic — today the indexed element a
+        // by-element product reads. Anything this resolver does not
+        // claim keeps declining, so every spelling that fell through
+        // here before still does.
+        //
+        // `reads_destination` is unconditionally true, and not an
+        // oversight: an `AArch32` vector write *merges*, preserving the
+        // parent bits outside the destination's view, so its prior
+        // value is live whatever the operation. The flag exists for
+        // `AArch64`, where a packed write zeroes the register above the
+        // arrangement and only the element inserts read what they
+        // overwrite.
+        Arch::Arm if is_aarch32_neon_instruction(insn) => VectorShape::Lifted {
+            reads_destination: true,
+        },
         _ => VectorShape::Declined,
     }
 }
