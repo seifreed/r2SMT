@@ -860,6 +860,82 @@ fn test_x87_integer_compare_is_unaffected_by_a_control_word_write() {
     assert_eq!(slice_of(&fixture).status, SliceStatus::Complete);
 }
 
+// ---------------------------------------------------------------
+// `fisttp` — truncation by opcode
+// ---------------------------------------------------------------
+
+#[test]
+fn test_x87_truncating_integer_store_is_modelled() {
+    // `df 08` / `db 08` / `dd 08` are `fisttp` at word / dword / qword.
+    for width in ["word", "dword", "qword"] {
+        let i = insn(
+            FUNCTION_ADDRESS,
+            "fisttp",
+            vec![mem(&format!("{width} [rbp - 0x20]"))],
+        );
+        assert_eq!(
+            analyze(&i, Arch::X86_64).kind,
+            InstructionKind::X87,
+            "fisttp {width}"
+        );
+    }
+}
+
+#[test]
+fn test_x87_truncating_integer_store_rounds_toward_zero() {
+    // `fisttp` reads its rounding from the opcode, not the control
+    // word. Emitting the pinned nearest-ties-even mode instead is a
+    // wrong value for every operand with a fractional half.
+    let program = program_with_tail(
+        vec![
+            ("fld1", vec![]),
+            ("fisttp", vec![mem("dword [rbp - 0x20]")]),
+        ],
+        mem("dword [rbp - 0x20]"),
+    );
+    let lifted = lift_slice(&slice_of(&program), Arch::X86_64);
+    assert_eq!(
+        first_stored_value(&lifted.statements),
+        Expr::fp_to_sbv(
+            as_extended(Expr::konst(ONE_BITS, SLOT_BITS)),
+            RoundingMode::TowardZero,
+            32
+        )
+    );
+}
+
+#[test]
+fn test_x87_truncating_store_survives_a_control_word_write() {
+    // The asymmetry, from the side that keeps working: nothing in a
+    // `fisttp` chain consults the control word, so reprogramming it
+    // cannot change the value and the slice stays whole.
+    let program = program_with_trailer(
+        vec![
+            ("fld1", vec![]),
+            ("fisttp", vec![mem("dword [rbp - 0x20]")]),
+        ],
+        mem("dword [rbp - 0x20]"),
+        vec![("fldcw", vec![mem("word [rbp - 0x40]")])],
+    );
+    assert_eq!(slice_of(&program).status, SliceStatus::Complete);
+}
+
+#[test]
+fn test_x87_rounding_integer_store_truncates_on_a_control_word_write() {
+    // The other side of the same asymmetry, and the teeth for the test
+    // above: `fistp` does read the control word's rounding, so the same
+    // chain with the same trailer must truncate.
+    let program = program_with_trailer(
+        vec![("fld1", vec![]), ("fistp", vec![mem("dword [rbp - 0x20]")])],
+        mem("dword [rbp - 0x20]"),
+        vec![("fldcw", vec![mem("word [rbp - 0x40]")])],
+    );
+    assert!(matches!(
+        slice_of(&program).status,
+        SliceStatus::Truncated { .. }
+    ));
+}
+
 #[test]
 fn test_x87_popping_flag_compare_takes_the_disassembler_spelling() {
     // `df f1` is `fcompi st(1)`, not the manual's `fcomip`.

@@ -69,9 +69,15 @@
 //! The rounding mode is pinned to the control word's reset value (round
 //! to nearest, ties to even) and the precision-control field is assumed
 //! to hold its reset value too — extended, which is what this sort
-//! models. There is no guard yet on `fldcw`, which reprograms both;
-//! that is follow-up work, and until it lands the mnemonic is outside
-//! [`classify`] so it truncates the slice.
+//! models. `fldcw` reprograms both, so it is in `writes_fp_control` and
+//! truncates any slice whose result depends on either.
+//!
+//! One member of the family escapes that: `fisttp` carries
+//! round-toward-zero in its opcode rather than reading the control word,
+//! so it pins nothing and its chains survive an `fldcw` that truncates
+//! the `fistp` chain beside it. That asymmetry is the whole difference
+//! between the two mnemonics in this model, and it is pinned from both
+//! sides.
 //!
 //! ## Compares, and the two idioms
 //!
@@ -217,6 +223,12 @@ const X87_INT_STORE_WIDTHS: [u16; 2] = [16, 32];
 /// the control word's reset value, round to nearest with ties to even
 /// (Intel SDM Vol. 1 §8.1.5.3).
 const X87_ROUNDING: RoundingMode = RoundingMode::NearestTiesEven;
+
+/// Rounding `fisttp` performs regardless of the control word: the SSE3
+/// store-and-pop family encodes round-toward-zero in the opcode, which
+/// is exactly what makes its chains survive an `fldcw` where an `fistp`
+/// chain truncates.
+const X87_TRUNCATING: RoundingMode = RoundingMode::TowardZero;
 
 /// The arithmetic x87 performs on its stack. Narrower than the SSE
 /// [`super::FpArithOp`] on purpose: x87 has no `max` / `min`, so there
@@ -418,11 +430,17 @@ enum X87Form {
     PushMemory { width: u16, format: MemFormat },
     /// Push a copy of `ST(i)` (`fld st(i)`).
     PushSlot(usize),
-    /// Convert `ST(0)` into `operands[0]` (`fst`/`fstp`, `fist`/`fistp`).
+    /// Convert `ST(0)` into `operands[0]` (`fst`/`fstp`, `fist`/`fistp`,
+    /// `fisttp`).
     StoreMemory {
         width: u16,
         format: MemFormat,
         pop: bool,
+        /// How the conversion rounds. The control word's mode for the
+        /// whole family bar `fisttp`, which carries round-toward-zero
+        /// in its opcode — the one x87 store whose result does not
+        /// depend on the control word at all.
+        rounding: RoundingMode,
     },
     /// Copy `ST(0)` into `ST(i)` (`fst`/`fstp st(i)`).
     StoreSlot { index: usize, pop: bool },
@@ -541,10 +559,35 @@ fn classify(insn: &Instruction) -> Option<X87Form> {
         "fxch" => classify_exchange(ops),
         "fld" => classify_load(ops, MemFormat::Float, &X87_FLOAT_WIDTHS),
         "fild" => classify_load(ops, MemFormat::Integer, &X87_INT_WIDTHS),
-        "fst" => classify_store(ops, MemFormat::Float, &X87_FLOAT_SHORT_WIDTHS, false),
-        "fstp" => classify_store(ops, MemFormat::Float, &X87_FLOAT_WIDTHS, true),
-        "fist" => classify_store(ops, MemFormat::Integer, &X87_INT_STORE_WIDTHS, false),
-        "fistp" => classify_store(ops, MemFormat::Integer, &X87_INT_WIDTHS, true),
+        "fst" => classify_store(
+            ops,
+            &StoreSpec::pinned(MemFormat::Float, &X87_FLOAT_SHORT_WIDTHS, false),
+        ),
+        "fstp" => classify_store(
+            ops,
+            &StoreSpec::pinned(MemFormat::Float, &X87_FLOAT_WIDTHS, true),
+        ),
+        "fist" => classify_store(
+            ops,
+            &StoreSpec::pinned(MemFormat::Integer, &X87_INT_STORE_WIDTHS, false),
+        ),
+        "fistp" => classify_store(
+            ops,
+            &StoreSpec::pinned(MemFormat::Integer, &X87_INT_WIDTHS, true),
+        ),
+        // `fisttp` (SSE3) is `fistp` with the rounding fixed by the
+        // opcode instead of read from the control word. It has no
+        // non-popping form, and no stack-slot destination — the
+        // truncation only makes sense against an integer format.
+        "fisttp" => classify_store(
+            ops,
+            &StoreSpec {
+                format: MemFormat::Integer,
+                widths: &X87_INT_WIDTHS,
+                pop: true,
+                rounding: X87_TRUNCATING,
+            },
+        ),
         // The ordered and unordered compares differ only in which NaN
         // raises the invalid-operation exception, which the value model
         // does not track — so they lift identically, and are told apart
@@ -639,22 +682,44 @@ fn classify_load(ops: &[Operand], format: MemFormat, widths: &[u16]) -> Option<X
     })
 }
 
+/// The fixed part of a store encoding: the value format the memory
+/// destination holds, the widths it accepts, whether it pops afterwards,
+/// and how the conversion rounds.
+struct StoreSpec {
+    format: MemFormat,
+    widths: &'static [u16],
+    pop: bool,
+    rounding: RoundingMode,
+}
+
+impl StoreSpec {
+    /// The ordinary case: rounding taken from the control word, whose
+    /// reset value this module pins.
+    const fn pinned(format: MemFormat, widths: &'static [u16], pop: bool) -> Self {
+        Self {
+            format,
+            widths,
+            pop,
+            rounding: X87_ROUNDING,
+        }
+    }
+}
+
 /// Same asymmetry as [`classify_load`]: `fst`/`fstp` can name a stack
 /// slot, `fist`/`fistp` cannot.
-fn classify_store(
-    ops: &[Operand],
-    format: MemFormat,
-    widths: &[u16],
-    pop: bool,
-) -> Option<X87Form> {
+fn classify_store(ops: &[Operand], spec: &StoreSpec) -> Option<X87Form> {
     let op = only_operand(ops)?;
     if let Some(index) = slot_index(op) {
-        return (format == MemFormat::Float).then_some(X87Form::StoreSlot { index, pop });
+        return (spec.format == MemFormat::Float).then_some(X87Form::StoreSlot {
+            index,
+            pop: spec.pop,
+        });
     }
     Some(X87Form::StoreMemory {
-        width: modellable_memory_width(op, widths)?,
-        format,
-        pop,
+        width: modellable_memory_width(op, spec.widths)?,
+        format: spec.format,
+        pop: spec.pop,
+        rounding: spec.rounding,
     })
 }
 
@@ -940,25 +1005,21 @@ fn to_slot(raw: Expr, width: u16, format: MemFormat) -> Option<Expr> {
     })
 }
 
-/// Convert a slot value into the form a memory destination stores.
+/// Convert a slot value into the form a memory destination stores,
+/// under the rounding the encoding selects.
 ///
 /// This is where the narrowing rounding happens, once, at the store —
 /// exactly where the hardware performs it.
-fn from_slot(value: Expr, width: u16, format: MemFormat) -> Option<Expr> {
+fn from_slot(value: Expr, width: u16, format: MemFormat, rounding: RoundingMode) -> Option<Expr> {
     Some(match format {
         MemFormat::Float if width == X87_MEMORY_BITS => extended_to_memory(&value),
         MemFormat::Float => {
             let (dst_e, dst_s) = fp_sort_bits_checked(width)?;
-            from_extended(Expr::fp_to_fp(
-                as_extended(value),
-                X87_ROUNDING,
-                dst_e,
-                dst_s,
-            ))
+            from_extended(Expr::fp_to_fp(as_extended(value), rounding, dst_e, dst_s))
         }
-        // `fist` / `fistp` round per the control word, unlike SSE's
-        // `cvtt*` family which truncates by opcode.
-        MemFormat::Integer => Expr::fp_to_sbv(as_extended(value), X87_ROUNDING, width),
+        // `fist` / `fistp` round per the control word; `fisttp`
+        // truncates by opcode, the way SSE's `cvtt*` family does.
+        MemFormat::Integer => Expr::fp_to_sbv(as_extended(value), rounding, width),
     })
 }
 
@@ -984,9 +1045,12 @@ impl LiftCtx {
                 let value = self.x87_memory_read(insn, width, format)?;
                 self.x87.push(value)
             }
-            X87Form::StoreMemory { width, format, pop } => {
-                self.x87_store_memory(insn, width, format, pop)
-            }
+            X87Form::StoreMemory {
+                width,
+                format,
+                pop,
+                rounding,
+            } => self.x87_store_memory(insn, width, format, pop, rounding),
             X87Form::StoreSlot { index, pop } => {
                 let value = self.x87.read(0);
                 self.x87.write(index, value);
@@ -1051,13 +1115,14 @@ impl LiftCtx {
         width: u16,
         format: MemFormat,
         pop: bool,
+        rounding: RoundingMode,
     ) -> Result<(), X87Error> {
         let value = if pop {
             self.x87.pop()
         } else {
             self.x87.read(0)
         };
-        let stored = from_slot(value, width, format).ok_or(X87Error::UnmodelledWidth)?;
+        let stored = from_slot(value, width, format, rounding).ok_or(X87Error::UnmodelledWidth)?;
         let op = insn.operands.first().ok_or(X87Error::MalformedOperands)?;
         if self.write_dst(op, stored, width) {
             Ok(())

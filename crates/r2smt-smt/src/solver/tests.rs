@@ -3085,3 +3085,76 @@ fn x87_integer_operand_source_is_two_s_complement() {
     let program = x87_integer_operand_program("fiadd", "-2", "0xbff0000000000000");
     assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
 }
+
+/// `mov dword [rbp - 8], 0x40300000 ; fld dword [rbp - 8] ;
+/// <mnemonic> dword [rbp - 0x20] ; mov eax, dword [rbp - 0x20] ;
+/// cmp eax, <expect> ; je`.
+///
+/// `0x40300000` is binary32 `+2.75`, chosen because truncation and
+/// round-to-nearest disagree about it: `2` against `3`.
+fn x87_integer_store_program(mnemonic: &str, expect: &str) -> Program {
+    one_block(vec![
+        insn(
+            0x40_1000,
+            7,
+            "mov",
+            vec![
+                op("dword [rbp - 0x8]", OperandKind::Memory),
+                op("0x40300000", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1007,
+            3,
+            "fld",
+            vec![op("dword [rbp - 0x8]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_100a,
+            3,
+            mnemonic,
+            vec![op("dword [rbp - 0x20]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_100d,
+            3,
+            "mov",
+            vec![
+                op("eax", OperandKind::Register),
+                op("dword [rbp - 0x20]", OperandKind::Memory),
+            ],
+        ),
+        insn(
+            0x40_1010,
+            3,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op(expect, OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1013,
+            2,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ])
+}
+
+#[test]
+fn x87_truncating_integer_store_rounds_toward_zero() {
+    // `fisttp` of `+2.75` stores `2`. Reading the pinned control-word
+    // mode instead would store `3`, so this fails against exactly the
+    // mistake the mnemonic exists to avoid.
+    let program = x87_integer_store_program("fisttp", "2");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_rounding_integer_store_rounds_to_nearest() {
+    // The teeth: `fistp` of the same value stores `3`, which is what
+    // makes the pair a discrimination rather than a coincidence.
+    let program = x87_integer_store_program("fistp", "3");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
