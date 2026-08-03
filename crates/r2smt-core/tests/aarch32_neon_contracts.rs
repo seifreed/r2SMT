@@ -272,6 +272,75 @@ fn vmax_float_selects_a_whole_lane_not_a_scalar() {
 }
 
 // ---------------------------------------------------------------
+// `vmla` / `vmls` — the destination is an input
+// ---------------------------------------------------------------
+
+#[test]
+fn vmla_accumulates_into_the_destination() {
+    // `3 + 5 * 7` is `38`. Overwriting the destination instead of
+    // accumulating into it gives `35`, which is the mistake the
+    // constants are chosen to separate.
+    assert_computes(
+        "vmla.i32",
+        &QUADS,
+        &[("v0", 3), ("v1", 5), ("v2", 7)],
+        3 + 5 * 7,
+    );
+}
+
+#[test]
+fn vmls_subtracts_the_product_from_the_destination() {
+    // `3 - 5 * 7` is `-32`, wrapping to `0xffffffe0` in the low lane.
+    // The subtraction's direction is what this pins: `5 * 7 - 3` would
+    // be `32`.
+    assert_computes(
+        "vmls.i32",
+        &QUADS,
+        &[("v0", 3), ("v1", 5), ("v2", 7)],
+        0xffff_ffe0,
+    );
+}
+
+#[test]
+fn vmla_accumulates_lane_by_lane() {
+    // Two lanes with different accumulators, so a lowering that read
+    // the destination once for the whole view fails here.
+    assert_computes(
+        "vmla.i32",
+        &QUADS,
+        &[
+            ("v0", 0x0000_000a_0000_0003),
+            ("v1", 0x0000_0002_0000_0005),
+            ("v2", 0x0000_0003_0000_0007),
+        ],
+        0x0000_0010_0000_0026,
+    );
+}
+
+#[test]
+fn vmla_float_rounds_at_the_product_and_again_at_the_sum() {
+    // `VMLA.F32` is not fused — that is `VFMA` — so this is exactly two
+    // roundings. `1.0 + 2.0 * 3.0` is `7.0`, `0x40e00000`.
+    assert_computes(
+        "vmla.f32",
+        &QUADS,
+        &[("v0", F32_ONE), ("v1", 0x4000_0000), ("v2", 0x4040_0000)],
+        0x40e0_0000,
+    );
+}
+
+#[test]
+fn vmls_float_subtracts_the_product() {
+    // `1.0 - 2.0 * 3.0` is `-5.0`, `0xc0a00000`.
+    assert_computes(
+        "vmls.f32",
+        &QUADS,
+        &[("v0", F32_ONE), ("v1", 0x4000_0000), ("v2", 0x4040_0000)],
+        0xc0a0_0000,
+    );
+}
+
+// ---------------------------------------------------------------
 // Element types the encodings do not have
 // ---------------------------------------------------------------
 

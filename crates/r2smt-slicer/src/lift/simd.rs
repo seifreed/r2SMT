@@ -69,6 +69,18 @@ pub(crate) enum PackedOp {
     Int(PackedIntOp),
     /// IEEE floating-point lanes.
     Fp(FpArithOp),
+    /// Multiply-accumulate: `dst := dst ± a * b`, lane-wise.
+    ///
+    /// A variant of its own rather than a [`PackedIntOp`] or an
+    /// [`FpArithOp`], because both of those describe one lane operation
+    /// over at most two sources and this one reads its *destination* as
+    /// a third.
+    Accumulate {
+        /// Whether the lanes are floating-point.
+        float: bool,
+        /// `vmls` subtracts the product where `vmla` adds it.
+        subtract: bool,
+    },
 }
 
 impl PackedOp {
@@ -242,6 +254,32 @@ fn magnitude_mask(bits: u16) -> Option<Expr> {
         Expr::konst(0, 1),
         all_ones(bits.checked_sub(1)?),
     ))
+}
+
+/// One destination lane of a multiply-accumulate.
+fn accumulate_lane(
+    float: bool,
+    subtract: bool,
+    acc: Expr,
+    a: Expr,
+    b: Expr,
+    bits: u16,
+) -> Option<Expr> {
+    if !float {
+        let product = Expr::mul(a, b);
+        return Some(if subtract {
+            Expr::sub(acc, product)
+        } else {
+            Expr::add(acc, product)
+        });
+    }
+    let product = fp_lane_result(FpArithOp::Mul, a, b, bits)?;
+    let combine = if subtract {
+        FpArithOp::Sub
+    } else {
+        FpArithOp::Add
+    };
+    fp_lane_result(combine, acc, product, bits)
 }
 
 fn packed_int_lane(op: PackedIntOp, a: Expr, b: Option<Expr>, bits: u16) -> Option<Expr> {
@@ -560,6 +598,42 @@ impl LiftCtx {
         Self::concat_lanes(lanes)
     }
 
+    /// `dst := dst ± a * b`, lane-wise.
+    ///
+    /// The destination is materialised as a source like any other, so
+    /// the SSA pass turns the read into the previous version and the
+    /// write into a new one — nothing here has to know that the two
+    /// name the same register.
+    ///
+    /// The float form rounds **twice**: once at the product and once at
+    /// the sum. That is the architectural behaviour — `VMLA` is not a
+    /// fused multiply-add, which is `VFMA` and a different mnemonic —
+    /// and collapsing the two roundings into one would be a definite
+    /// wrong value at every operand where they differ.
+    fn packed_accumulate_result(
+        &mut self,
+        dst: &Operand,
+        a_op: &Operand,
+        b_op: &Operand,
+        float: bool,
+        subtract: bool,
+        lane_bits: u16,
+    ) -> Option<Expr> {
+        let view = self.simd_instruction_view_bits(&[dst, a_op, b_op])?;
+        let count = Self::packed_lane_count(view, lane_bits)?;
+        let acc_val = self.simd_operand_value(dst, view)?;
+        let a_val = self.simd_operand_value(a_op, view)?;
+        let b_val = self.simd_operand_value(b_op, view)?;
+        let mut lanes = Vec::with_capacity(usize::from(count));
+        for index in 0..count {
+            let acc = Self::extract_lane(acc_val.clone(), lane_bits, index)?;
+            let a = Self::extract_lane(a_val.clone(), lane_bits, index)?;
+            let b = Self::extract_lane(b_val.clone(), lane_bits, index)?;
+            lanes.push(accumulate_lane(float, subtract, acc, a, b, lane_bits)?);
+        }
+        Self::concat_lanes(lanes)
+    }
+
     /// Lower one packed ARM vector data-processing instruction: the same
     /// lane operation applied independently to every lane of the
     /// destination's view.
@@ -593,6 +667,10 @@ impl LiftCtx {
                 None => None,
             },
             PackedOp::Int(int) => self.packed_int_result(dst, a_op, b_op, int, lane_bits),
+            PackedOp::Accumulate { float, subtract } => match b_op {
+                Some(b) => self.packed_accumulate_result(dst, a_op, b, float, subtract, lane_bits),
+                None => None,
+            },
         };
         let Some(value) = result else {
             self.push_packed_unsupported(insn);

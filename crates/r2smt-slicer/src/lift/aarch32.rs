@@ -722,11 +722,34 @@ pub(crate) fn neon_packed_op(mnemonic: &str) -> Option<(PackedOp, u16)> {
     }
     let (base, ty) = mnemonic.split_once('.')?;
     let (kind, lane_bits) = neon_element_type(ty)?;
+    if let Some(op) = neon_accumulate_op(base, kind) {
+        return Some((op, lane_bits));
+    }
     let op = match kind {
         ElementKind::Float => neon_float_op(base)?,
         _ => PackedOp::Int(neon_integer_op(base, kind)?),
     };
     Some((op, lane_bits))
+}
+
+/// The multiply-accumulate pair, which is the one family reading its
+/// destination as an input and so is resolved above the split by
+/// element class.
+///
+/// Every integer class is accepted for the same reason `vadd` accepts
+/// them: a two's-complement multiply and add give the same bits signed
+/// or unsigned, which is why the disassembler spells these `.i8` /
+/// `.i16` / `.i32` in the first place.
+fn neon_accumulate_op(base: &str, kind: ElementKind) -> Option<PackedOp> {
+    let subtract = match base {
+        "vmla" => false,
+        "vmls" => true,
+        _ => return None,
+    };
+    Some(PackedOp::Accumulate {
+        float: kind == ElementKind::Float,
+        subtract,
+    })
 }
 
 /// The float-typed packed forms.

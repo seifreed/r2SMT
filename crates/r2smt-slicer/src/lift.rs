@@ -366,7 +366,8 @@ pub(crate) fn pins_rounding_mode(insn: &Instruction, arch: Arch) -> bool {
             let neon_rounds = matches!(
                 aarch32::neon_packed_op(&lower),
                 Some((
-                    PackedOp::Fp(FpArithOp::Add | FpArithOp::Sub | FpArithOp::Mul | FpArithOp::Div),
+                    PackedOp::Fp(FpArithOp::Add | FpArithOp::Sub | FpArithOp::Mul | FpArithOp::Div)
+                        | PackedOp::Accumulate { float: true, .. },
                     _
                 ))
             );
