@@ -129,6 +129,62 @@ enum NeonOp {
         source_lanes: u16,
         source_lane_bits: u16,
     },
+    /// A by-element form: the second source contributes one element,
+    /// named by [`NeonShape::source_index`], multiplied into every
+    /// destination lane. `upper` is the `2` suffix on the long members.
+    ByElement { kind: ByElementKind, upper: bool },
+    /// `sdot` / `udot` — four byte products summed into each 32-bit
+    /// destination lane, accumulated onto its prior value.
+    DotProduct { signed: bool },
+}
+
+/// The by-element multiplies.
+///
+/// A three-way enum rather than a struct of flags because the
+/// combinations are not free: an integer accumulate is exact, a long
+/// one extends first, and the float member has no accumulating sibling
+/// here at all.
+#[derive(Debug, Clone, Copy)]
+enum ByElementKind {
+    /// `mul` / `mla` / `mls` — same-width integer lanes, the product
+    /// optionally combined with the destination's prior value.
+    Integer { combine: Option<BinOp> },
+    /// `umull` / `smull` / `umlal` / `smlal` / `umlsl` / `smlsl` — both
+    /// narrow sources extended to the destination's element width
+    /// before the multiply, so the product cannot overflow it.
+    Long {
+        signed: bool,
+        combine: Option<BinOp>,
+    },
+    /// `fmul` — one IEEE lane product.
+    ///
+    /// The fused `fmla` / `fmls` are deliberately not here. They round
+    /// the product and the sum together, once; `fadd(d, fmul(a, b))`
+    /// rounds twice, and the two differ in real cases. The IR has no
+    /// fused node, so modelling them that way would be a definite wrong
+    /// value rather than a wider one, and they decline instead.
+    Float,
+}
+
+impl ByElementKind {
+    /// How the product joins the destination's prior lane, or `None`
+    /// when it replaces it.
+    const fn combine(self) -> Option<BinOp> {
+        match self {
+            Self::Integer { combine } | Self::Long { combine, .. } => combine,
+            Self::Float => None,
+        }
+    }
+
+    /// Whether the destination's prior value is an input.
+    const fn combines(self) -> bool {
+        self.combine().is_some()
+    }
+
+    /// Whether the sources are half the destination's element width.
+    const fn widens(self) -> bool {
+        matches!(self, Self::Long { .. })
+    }
 }
 
 /// The integer across-lane reductions.
@@ -338,17 +394,19 @@ impl NeonShape {
     /// so even a 64-bit arrangement replaces the register by zeroing its
     /// upper half.
     pub(crate) const fn reads_destination(&self) -> bool {
-        matches!(
-            self.op,
+        match self.op {
             NeonOp::Insert { .. }
-                | NeonOp::MultiplyAccumulate { .. }
-                | NeonOp::BitwiseSelect(_)
-                | NeonOp::Widen {
-                    kind: WidenKind::Narrow,
-                    upper: true,
-                    ..
-                }
-        )
+            | NeonOp::MultiplyAccumulate { .. }
+            | NeonOp::BitwiseSelect(_)
+            | NeonOp::DotProduct { .. }
+            | NeonOp::Widen {
+                kind: WidenKind::Narrow,
+                upper: true,
+                ..
+            } => true,
+            NeonOp::ByElement { kind, .. } => kind.combines(),
+            _ => false,
+        }
     }
 
     /// Whether the destination is a general-purpose register rather than
@@ -382,6 +440,135 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| convert_shape(insn, &mnemonic))
         .or_else(|| bitwise_select_shape(insn, &mnemonic))
         .or_else(|| reduce_shape(insn, &mnemonic))
+        .or_else(|| by_element_shape(insn, &mnemonic))
+        .or_else(|| dot_product_shape(insn, &mnemonic))
+}
+
+// ===================== by-element multiplies =====================
+
+/// The by-element multiply a mnemonic names.
+fn by_element_kind(base: &str) -> Option<ByElementKind> {
+    let integer = |combine| ByElementKind::Integer { combine };
+    let long = |signed, combine| ByElementKind::Long { signed, combine };
+    Some(match base {
+        "mul" => integer(None),
+        "mla" => integer(Some(BinOp::Add)),
+        "mls" => integer(Some(BinOp::Sub)),
+        "fmul" => ByElementKind::Float,
+        "umull" => long(false, None),
+        "smull" => long(true, None),
+        "umlal" => long(false, Some(BinOp::Add)),
+        "smlal" => long(true, Some(BinOp::Add)),
+        "umlsl" => long(false, Some(BinOp::Sub)),
+        "smlsl" => long(true, Some(BinOp::Sub)),
+        _ => return None,
+    })
+}
+
+/// The by-element family: `mul v0.4s, v1.4s, v2.s[0]` and its
+/// relatives, where the second source names *one* element rather than a
+/// whole vector.
+///
+/// Nothing about the index needed building — [`indexed_element`] already
+/// returns `(32, 0)` for `v2.s[0]`, and [`NeonShape`] already carries a
+/// source index. What declined was the geometry check the lane-wise and
+/// widening resolvers share: both require every operand to yield the
+/// *same* arrangement, and an indexed operand yields none at all.
+fn by_element_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (base, upper) = peel_upper(mnemonic);
+    let kind = by_element_kind(base)?;
+    // Only the long forms have a `2` variant.
+    if upper && !kind.widens() {
+        return None;
+    }
+    if insn.operands.len() != 3 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    let source_bits = if kind.widens() {
+        destination.lane_bits / 2
+    } else {
+        destination.lane_bits
+    };
+    // ARM ARM C7.2 — the by-element encodings name a 16- or 32-bit
+    // element, and the float ones a 64-bit one as well. There is no
+    // byte-element form, which is what the dot products exist for.
+    let encodable = match kind {
+        ByElementKind::Float => matches!(source_bits, 16 | 32 | 64),
+        ByElementKind::Integer { .. } | ByElementKind::Long { .. } => {
+            matches!(source_bits, 16 | 32)
+        }
+    };
+    if !encodable {
+        return None;
+    }
+    let first = operand_arrangement(insn.operands.get(1)?)?;
+    let expected_lanes = if upper {
+        destination.lanes.checked_mul(2)?
+    } else {
+        destination.lanes
+    };
+    if first.lane_bits != source_bits || first.lanes != expected_lanes {
+        return None;
+    }
+    if upper && !spans_full_register(first) {
+        return None;
+    }
+    let (element_bits, source_index) = indexed_element(insn.operands.get(2)?)?;
+    if element_bits != source_bits {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::ByElement { kind, upper },
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index,
+    })
+}
+
+// ===================== dot products =====================
+
+/// Byte products summed into one destination lane by `sdot` / `udot`.
+pub(super) const DOT_PRODUCT_TERMS: u16 = 4;
+
+/// Destination element width of a dot product.
+const DOT_PRODUCT_LANE_BITS: u16 = 32;
+
+/// `sdot` / `udot` over two whole vectors.
+///
+/// The by-element spelling (`sdot v0.4s, v1.16b, v2.4b[1]`) declines:
+/// its indexed operand names an arrangement *and* an index at once,
+/// which the register table's suffix parser does not resolve, so it
+/// yields no parent to read. That is a decline, not a wrong lowering —
+/// the effect table sees the same `None` and truncates the slice.
+fn dot_product_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let signed = match mnemonic {
+        "sdot" => true,
+        "udot" => false,
+        _ => return None,
+    };
+    if insn.operands.len() != 3 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    if destination.lane_bits != DOT_PRODUCT_LANE_BITS {
+        return None;
+    }
+    let expected_lanes = destination.lanes.checked_mul(DOT_PRODUCT_TERMS)?;
+    for operand in insn.operands.iter().skip(1) {
+        let arrangement = operand_arrangement(operand)?;
+        if arrangement.lane_bits != BITS_PER_BYTE || arrangement.lanes != expected_lanes {
+            return None;
+        }
+    }
+    Some(NeonShape {
+        op: NeonOp::DotProduct { signed },
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
 }
 
 // ===================== across-lane reductions =====================

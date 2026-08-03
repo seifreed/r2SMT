@@ -9,11 +9,11 @@
 use r2smt_ir::expr::Expr;
 use r2smt_ir::program::{Instruction, Operand};
 
-use super::super::super::LiftCtx;
+use super::super::super::{FpArithOp, LiftCtx, fp_lane_result};
 use super::{
-    AccumulateKind, AccumulateSources, BITS_PER_BYTE, CompareKind, ConvertKind, NeonOp, NeonShape,
-    PermuteKind, PermuteSource, ReduceKind, SaturateTo, SaturatingKind, SelectRole, ShiftKind,
-    WidenKind, operand_arrangement,
+    AccumulateKind, AccumulateSources, BITS_PER_BYTE, ByElementKind, CompareKind, ConvertKind,
+    DOT_PRODUCT_TERMS, NeonOp, NeonShape, PermuteKind, PermuteSource, ReduceKind, SaturateTo,
+    SaturatingKind, SelectRole, ShiftKind, WidenKind, operand_arrangement,
 };
 
 impl LiftCtx {
@@ -84,7 +84,102 @@ impl LiftCtx {
                 source_lanes,
                 source_lane_bits,
             } => self.reduce_lanes(insn, shape, kind, source_lanes, source_lane_bits),
+            NeonOp::ByElement { kind, upper } => self.by_element_lanes(insn, shape, kind, upper),
+            NeonOp::DotProduct { signed } => self.dot_product_lanes(insn, shape, signed),
         }
+    }
+
+    /// The by-element multiplies — one source element multiplied into
+    /// every destination lane.
+    ///
+    /// The element is read once, outside the loop. Reading it per lane
+    /// would emit the same extract `lanes` times over, and for a memory
+    /// operand it would be a load per lane.
+    fn by_element_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        kind: ByElementKind,
+        upper: bool,
+    ) -> Option<Expr> {
+        let source_bits = if kind.widens() {
+            shape.lane_bits / 2
+        } else {
+            shape.lane_bits
+        };
+        let first = self.widen_source(insn, 1)?;
+        let element = self.read_simd_lane_bits(
+            &insn.operands.get(2)?.clone(),
+            source_bits,
+            shape.source_index,
+        )?;
+        let view = shape.lane_bits.checked_mul(shape.lanes)?;
+        let accumulator = match kind.combine() {
+            Some(_) => Some(self.simd_operand_value(&insn.operands.first()?.clone(), view)?),
+            None => None,
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            // A `2` form reads the first source's upper half; the
+            // element operand is indexed absolutely and is never halved.
+            let source_lane = if upper {
+                index.checked_add(shape.lanes)?
+            } else {
+                index
+            };
+            let a = LiftCtx::extract_lane(first.clone(), source_bits, source_lane)?;
+            let product = match kind {
+                ByElementKind::Long { signed, .. } => Expr::mul(
+                    extend(a, shape.lane_bits, signed),
+                    extend(element.clone(), shape.lane_bits, signed),
+                ),
+                ByElementKind::Integer { .. } => Expr::mul(a, element.clone()),
+                ByElementKind::Float => {
+                    fp_lane_result(FpArithOp::Mul, a, element.clone(), shape.lane_bits)?
+                }
+            };
+            lanes.push(match (kind.combine(), accumulator.as_ref()) {
+                (Some(combine), Some(previous)) => combine.apply(
+                    LiftCtx::extract_lane(previous.clone(), shape.lane_bits, index)?,
+                    product,
+                ),
+                _ => product,
+            });
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// `sdot` / `udot` — four byte products summed into each 32-bit
+    /// destination lane, on top of that lane's prior value.
+    ///
+    /// The products are formed at the destination's width rather than
+    /// the byte's, which is what the architecture's extension of each
+    /// element before the multiply comes to; the accumulation then wraps
+    /// at 32 bits exactly as ARM defines it.
+    fn dot_product_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        signed: bool,
+    ) -> Option<Expr> {
+        let view = shape.lane_bits.checked_mul(shape.lanes)?;
+        let accumulator = self.simd_operand_value(&insn.operands.first()?.clone(), view)?;
+        let first = self.widen_source(insn, 1)?;
+        let second = self.widen_source(insn, 2)?;
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let mut sum = LiftCtx::extract_lane(accumulator.clone(), shape.lane_bits, index)?;
+            for term in 0..DOT_PRODUCT_TERMS {
+                let byte = index.checked_mul(DOT_PRODUCT_TERMS)?.checked_add(term)?;
+                let read = |value: &Expr| -> Option<Expr> {
+                    let raw = LiftCtx::extract_lane(value.clone(), BITS_PER_BYTE, byte)?;
+                    Some(extend(raw, shape.lane_bits, signed))
+                };
+                sum = Expr::add(sum, Expr::mul(read(&first)?, read(&second)?));
+            }
+            lanes.push(sum);
+        }
+        Self::concat_lanes(lanes)
     }
 
     /// The across-lane reductions — every source lane folded into the

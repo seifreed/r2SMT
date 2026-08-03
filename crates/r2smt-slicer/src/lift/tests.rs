@@ -2768,19 +2768,19 @@ fn aarch64_mismatched_arrangement_on_a_modelled_mnemonic_declines() {
 }
 
 #[test]
-fn aarch64_by_element_operand_declines() {
-    // `mul v0.4s, v1.4s, v2.s[0]` broadcasts one lane of `v2`; the
-    // indexed operand carries no arrangement, so the shape resolver
-    // refuses it.
+fn aarch64_by_element_operand_reads_the_named_element() {
+    // `mul v0.4s, v1.4s, v2.s[0]` multiplies lane 0 of `v2` into every
+    // destination lane, so `v2` is read at one fixed index while `v1`
+    // walks its own.
     let i = insn(
         0x1000,
         4,
         "mul",
-        vec![reg("v0.4s"), reg("v1.4s"), reg("v2.s[0]")],
+        vec![reg("v0.4s"), reg("v1.4s"), reg("v2.s[1]")],
     );
     let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
     assert!(
-        matches!(stmts.as_slice(), [IrStmt::Unsupported { .. }]),
+        matches!(stmts.as_slice(), [IrStmt::Assign { .. }]),
         "{stmts:?}"
     );
 }
@@ -3371,10 +3371,11 @@ fn aarch64_same_width_accumulate_has_no_two_form() {
 }
 
 #[test]
-fn aarch64_accumulate_declines_a_by_element_source() {
-    // `mla v0.4s, v1.4s, v2.s[0]` broadcasts one lane of the second
-    // source; the indexed operand carries no arrangement.
-    assert!(neon_declines("mla", &["v0.4s", "v1.4s", "v2.s[0]"]));
+fn aarch64_accumulate_lifts_a_by_element_source() {
+    // `mla v0.4s, v1.4s, v2.s[0]` multiplies one lane of the second
+    // source into every destination lane. It used to decline on the
+    // shared "every operand carries the same arrangement" check.
+    assert!(!neon_declines("mla", &["v0.4s", "v1.4s", "v2.s[0]"]));
 }
 
 // --- N3f: NEON saturation ---
@@ -3728,4 +3729,54 @@ fn neon_declines_mixed(mnemonic: &str, operands: &[&str]) -> bool {
     );
     let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
     matches!(stmts.as_slice(), [IrStmt::Unsupported { .. }])
+}
+
+#[test]
+fn aarch64_by_element_long_form_lifts() {
+    assert!(!neon_declines("umlal", &["v0.4s", "v1.4h", "v2.h[3]"]));
+    assert!(!neon_declines("umlal2", &["v0.4s", "v1.8h", "v2.h[3]"]));
+    assert!(!neon_declines("umull", &["v0.4s", "v1.4h", "v2.h[1]"]));
+    assert!(!neon_declines("fmul", &["v0.4s", "v1.4s", "v2.s[1]"]));
+}
+
+#[test]
+fn aarch64_by_element_declines_a_fused_multiply_add() {
+    // `fmla` / `fmls` round the product and the sum together, once.
+    // `fadd(d, fmul(a, b))` rounds twice, and the two differ in real
+    // cases, so the IR having no fused node is a decline rather than a
+    // licence to approximate.
+    assert!(neon_declines("fmla", &["v0.4s", "v1.4s", "v2.s[1]"]));
+    assert!(neon_declines("fmls", &["v0.4s", "v1.4s", "v2.s[1]"]));
+}
+
+#[test]
+fn aarch64_by_element_declines_a_mismatched_element_width() {
+    // The named element is the *source* width, so a long form over
+    // halfword sources cannot name a word element.
+    assert!(neon_declines("umlal", &["v0.4s", "v1.4h", "v2.s[1]"]));
+    // And the byte element the dot products use has no by-element
+    // multiply encoding at all.
+    assert!(neon_declines("mul", &["v0.16b", "v1.16b", "v2.b[1]"]));
+}
+
+#[test]
+fn aarch64_dot_product_lifts() {
+    assert!(!neon_declines("sdot", &["v0.4s", "v1.16b", "v2.16b"]));
+    assert!(!neon_declines("udot", &["v0.2s", "v1.8b", "v2.8b"]));
+}
+
+#[test]
+fn aarch64_dot_product_declines_a_mismatched_source_geometry() {
+    // Four byte products feed one 32-bit lane, so `.4s` needs `.16b`.
+    assert!(neon_declines("sdot", &["v0.4s", "v1.8b", "v2.8b"]));
+    assert!(neon_declines("sdot", &["v0.8h", "v1.16b", "v2.16b"]));
+}
+
+#[test]
+fn aarch64_dot_product_declines_the_by_element_spelling() {
+    // `v2.4b[1]` names an arrangement and an index at once, which the
+    // register table's suffix parser does not resolve — so the operand
+    // yields no parent to read, and this is a decline rather than a
+    // lowering against the wrong register.
+    assert!(neon_declines("sdot", &["v0.4s", "v1.16b", "v2.4b[1]"]));
 }

@@ -388,3 +388,130 @@ fn scvtf_scales_a_half_precision_lane_through_a_subnormal_factor() {
         0x0100,
     );
 }
+
+// ===================== by-element and dot products =====================
+
+#[test]
+fn mul_by_element_broadcasts_the_named_lane() {
+    // The element is `v2` lane 1, which is 20. Picking lane 0 instead
+    // would give a perfectly plausible [10, 20, 30, 40] — a wrong value
+    // rather than a decline, which is why this is solved and not
+    // asserted structurally.
+    assert_computes(
+        "mul",
+        &["v0.4s", "v1.4s", "v2.s[1]"],
+        &[
+            ("v1", packed(32, &[1, 2, 3, 4])),
+            ("v2", packed(32, &[10, 20, 30, 40])),
+        ],
+        packed(32, &[20, 40, 60, 80]),
+    );
+}
+
+#[test]
+fn umlal_by_element_accumulates_onto_the_destination() {
+    // Each lane is its prior value plus the product of the halfword
+    // source lane and `v2` lane 3.
+    assert_computes(
+        "umlal",
+        &["v0.4s", "v1.4h", "v2.h[3]"],
+        &[
+            ("v0", packed(32, &[1, 1, 1, 1])),
+            ("v1", packed(16, &[2, 3, 4, 5])),
+            ("v2", packed(16, &[0, 0, 0, 7])),
+        ],
+        packed(32, &[15, 22, 29, 36]),
+    );
+}
+
+#[test]
+fn umlal2_by_element_reads_the_first_source_upper_half() {
+    // The low four halfwords are 100 apiece precisely so that reading
+    // them would be visible: the `2` suffix takes lanes 4..7.
+    assert_computes(
+        "umlal2",
+        &["v0.4s", "v1.8h", "v2.h[3]"],
+        &[
+            ("v0", 0),
+            ("v1", packed(16, &[100, 100, 100, 100, 2, 3, 4, 5])),
+            ("v2", packed(16, &[0, 0, 0, 7])),
+        ],
+        packed(32, &[14, 21, 28, 35]),
+    );
+}
+
+#[test]
+fn smlal_by_element_sign_extends_both_narrow_sources() {
+    // The element is 0xffff, which is -1. Read unsigned the product
+    // would be 131070 rather than -2.
+    assert_computes(
+        "smlal",
+        &["v0.4s", "v1.4h", "v2.h[0]"],
+        &[
+            ("v0", 0),
+            ("v1", packed(16, &[2])),
+            ("v2", packed(16, &[0xffff])),
+        ],
+        0xffff_fffe,
+    );
+}
+
+#[test]
+fn fmul_by_element_multiplies_every_lane_by_the_named_float() {
+    // 2.0 times `v2` lane 1, which is 3.0, is 6.0 (0x40c00000).
+    assert_computes(
+        "fmul",
+        &["v0.4s", "v1.4s", "v2.s[1]"],
+        &[
+            ("v1", packed(32, &[0x4000_0000])),
+            ("v2", packed(32, &[0x3f80_0000, 0x4040_0000])),
+        ],
+        packed(32, &[0x40c0_0000]),
+    );
+}
+
+#[test]
+fn sdot_sums_four_byte_products_onto_the_destination_lane() {
+    // 1*10 + 2*20 + 3*30 + 4*40 is 300, on top of a prior lane of 5.
+    assert_computes(
+        "sdot",
+        &["v0.4s", "v1.16b", "v2.16b"],
+        &[
+            ("v0", packed(32, &[5])),
+            ("v1", packed(8, &[1, 2, 3, 4])),
+            ("v2", packed(8, &[10, 20, 30, 40])),
+        ],
+        packed(32, &[305]),
+    );
+}
+
+#[test]
+fn sdot_sign_extends_its_byte_elements() {
+    // 0xff is -1, so the product is -2 and the lane is 0xfffffffe.
+    assert_computes(
+        "sdot",
+        &["v0.4s", "v1.16b", "v2.16b"],
+        &[
+            ("v0", 0),
+            ("v1", packed(8, &[0xff])),
+            ("v2", packed(8, &[2])),
+        ],
+        0xffff_fffe,
+    );
+}
+
+#[test]
+fn udot_zero_extends_the_same_byte_elements() {
+    // The mirror: 255 * 2 is 510, which is what makes the signed test
+    // above a signedness contract rather than a restatement.
+    assert_computes(
+        "udot",
+        &["v0.4s", "v1.16b", "v2.16b"],
+        &[
+            ("v0", 0),
+            ("v1", packed(8, &[0xff])),
+            ("v2", packed(8, &[2])),
+        ],
+        510,
+    );
+}
