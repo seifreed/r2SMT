@@ -144,7 +144,9 @@ fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> Instruct
         // vector write preserves the rest of the register file (`d1`
         // survives a write to `d0`, both halves of `q0`), so the
         // destination is a use as well as a def.
-        m if crate::lift::vfp_scalar(m).is_some() || crate::lift::neon_packed_op(m).is_some() => {
+        m if crate::lift::vfp_scalar(m).is_some()
+            || crate::lift::is_aarch32_packed_instruction(insn) =>
+        {
             aarch32_vfp_effect(insn)
         }
         _ => other_effect(insn),

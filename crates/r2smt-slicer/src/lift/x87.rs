@@ -30,7 +30,10 @@
 //!
 //! That makes every rounding this module performs the same rounding the
 //! hardware performs, in the same place. `fld` of `m32fp` / `m64fp`
-//! widens exactly, arithmetic runs at the 64-bit significand, and
+//! widens exactly, `fild` and the integer-operand arithmetic convert
+//! their `m16int` / `m32int` operand exactly into it too — the 64-bit
+//! significand holds either without loss — arithmetic runs at that
+//! significand, and
 //! `fstp` to a narrower format rounds exactly once — at the store,
 //! where the hardware rounds. The predecessor of this model computed at
 //! binary64 and could differ from the hardware by one ulp on a `m64fp`
@@ -66,9 +69,15 @@
 //! The rounding mode is pinned to the control word's reset value (round
 //! to nearest, ties to even) and the precision-control field is assumed
 //! to hold its reset value too — extended, which is what this sort
-//! models. There is no guard yet on `fldcw`, which reprograms both;
-//! that is follow-up work, and until it lands the mnemonic is outside
-//! [`classify`] so it truncates the slice.
+//! models. `fldcw` reprograms both, so it is in `writes_fp_control` and
+//! truncates any slice whose result depends on either.
+//!
+//! One member of the family escapes that: `fisttp` carries
+//! round-toward-zero in its opcode rather than reading the control word,
+//! so it pins nothing and its chains survive an `fldcw` that truncates
+//! the `fistp` chain beside it. That asymmetry is the whole difference
+//! between the two mnemonics in this model, and it is pinned from both
+//! sides.
 //!
 //! ## Compares, and the two idioms
 //!
@@ -94,6 +103,12 @@
 //! were already modelled, so once `fnstsw` has written `ax` the chain
 //! resolves through the ordinary integer path.
 //!
+//! `fcmov<cc>` reads the same EFLAGS bits back and selects between two
+//! slots. It is the one x87 shape that *reads* the flags rather than
+//! writing them, which the effect table has to know or the slicer steps
+//! over whatever defined the condition and the select runs on a free
+//! bit. The lowering is an `Ite`, so the slice stays linear.
+//!
 //! ## Declining
 //!
 //! Everything [`classify`] rejects is rejected on the *instruction*
@@ -105,6 +120,28 @@
 //! all — so it additionally *havocs* the modelled stack: every later
 //! read then produces a free symbolic input rather than a stale value
 //! from a slot the hardware would have overwritten.
+//!
+//! ### Why `fnstcw` stays out
+//!
+//! It is the one omission that looks like an oversight, so it is worth
+//! stating. `fnstcw` stores the control word, and there are three things
+//! this model could do with it. Storing the reset value fabricates: a
+//! program that reads the field back sees a definite number this
+//! analysis invented, and every verdict downstream of it inherits that.
+//! Storing a *free* value is sound but strictly worse than the third
+//! option, because the slice then reports `Complete` while resting on a
+//! register the model does not carry — the confidence ladder would call
+//! that `High`. Truncating says exactly what is true, so the mnemonic
+//! stays outside [`classify`] and the slicer's `Other` rule does the
+//! rest.
+//!
+//! Modelling it properly needs a real `fcw` pseudo-register, and the
+//! obstacle there is not effort. Precision control selects a 24-, 53- or
+//! 64-bit significand for every subsequent result, and a fixed
+//! `FloatingPoint(15, 64)` sort cannot express a narrowed one at all —
+//! so a faithful `fcw` would have to make the arithmetic sort depend on
+//! a *symbolic* field, which is a different value model, not a bigger
+//! table.
 
 use r2smt_common::Arch;
 use r2smt_ir::expr::{Expr, RoundingMode, Var};
@@ -141,6 +178,10 @@ const X87_C0_BIT: u16 = 8;
 const X87_C2_BIT: u16 = 10;
 /// C3 — the equality indicator after a compare.
 const X87_C3_BIT: u16 = 14;
+
+/// Mnemonic prefix of the conditional-move family, whose suffix names
+/// an EFLAGS condition rather than being part of a fixed mnemonic.
+const X87_CONDITIONAL_MOVE_PREFIX: &str = "fcmov";
 
 /// Number of x87 data registers (Intel SDM Vol. 1 §8.1.2).
 const X87_STACK_DEPTH: usize = 8;
@@ -197,6 +238,14 @@ const X87_FLOAT_SHORT_WIDTHS: [u16; 2] = [32, 64];
 /// Memory widths `fild` / `fistp` accept: `m16int`, `m32int`, `m64int`.
 const X87_INT_WIDTHS: [u16; 3] = [16, 32, 64];
 
+/// Memory widths the integer-operand arithmetic family accepts.
+///
+/// Deliberately *not* [`X87_INT_WIDTHS`]: `FIADD` and its siblings are
+/// encoded by opcode `DE` (word) and `DA` (dword) only, and the SDM
+/// gives them no `m64int` form at all. Reusing the load table would
+/// accept a qword operand no encoding can produce.
+const X87_INT_ARITH_WIDTHS: [u16; 2] = [16, 32];
+
 /// Memory widths the *non-popping* `fist` accepts. The SDM gives it
 /// `m16int` and `m32int` only; the 64-bit integer store exists solely
 /// in the popping form.
@@ -206,6 +255,12 @@ const X87_INT_STORE_WIDTHS: [u16; 2] = [16, 32];
 /// the control word's reset value, round to nearest with ties to even
 /// (Intel SDM Vol. 1 §8.1.5.3).
 const X87_ROUNDING: RoundingMode = RoundingMode::NearestTiesEven;
+
+/// Rounding `fisttp` performs regardless of the control word: the SSE3
+/// store-and-pop family encodes round-toward-zero in the opcode, which
+/// is exactly what makes its chains survive an `fldcw` where an `fistp`
+/// chain truncates.
+const X87_TRUNCATING: RoundingMode = RoundingMode::TowardZero;
 
 /// The arithmetic x87 performs on its stack. Narrower than the SSE
 /// [`super::FpArithOp`] on purpose: x87 has no `max` / `min`, so there
@@ -372,9 +427,12 @@ enum MemFormat {
 enum ArithSrc {
     /// Another stack slot, `ST(i)`.
     Slot(usize),
-    /// A memory operand of this width, always floating-point — the
-    /// integer forms (`fiadd`, `fimul`, …) are not modelled.
-    Memory(u16),
+    /// A memory operand, in the width and value format the encoding
+    /// names. The format is carried rather than assumed because the
+    /// same operand shape spells both families: `fadd dword [eax]`
+    /// reads an `m32fp` and `fiadd dword [eax]` an `m32int`, and the
+    /// conversion into a slot differs accordingly.
+    Memory { width: u16, format: MemFormat },
 }
 
 /// The three IEEE predicates every x87 compare records, whichever
@@ -383,6 +441,70 @@ struct Compare {
     unordered: Expr,
     equal: Expr,
     less: Expr,
+}
+
+/// The condition an `FCMOV<cc>` tests, as the SDM states it: over the
+/// EFLAGS bits an integer `cmp` or the `fcomi` family leaves behind,
+/// never over the x87 status word.
+///
+/// The suffixes are the integer `cmov` ones with `u` / `nu` in place of
+/// `p` / `np`, because after a floating-point compare parity *is* the
+/// unordered indicator. That renaming is the only reason this cannot
+/// reuse [`crate::condition::BranchCondition::from_suffix`].
+#[derive(Clone, Copy)]
+enum X87Condition {
+    /// `fcmovb` — below, `CF = 1`.
+    Below,
+    /// `fcmove` — equal, `ZF = 1`.
+    Equal,
+    /// `fcmovbe` — below or equal, `CF = 1 or ZF = 1`.
+    BelowOrEqual,
+    /// `fcmovu` — unordered, `PF = 1`.
+    Unordered,
+    /// `fcmovnb` — not below, `CF = 0`.
+    NotBelow,
+    /// `fcmovne` — not equal, `ZF = 0`.
+    NotEqual,
+    /// `fcmovnbe` — neither below nor equal, `CF = 0 and ZF = 0`.
+    NotBelowOrEqual,
+    /// `fcmovnu` — not unordered, `PF = 0`.
+    NotUnordered,
+}
+
+impl X87Condition {
+    /// The condition spelled by a `fcmov` mnemonic's suffix.
+    fn from_suffix(suffix: &str) -> Option<Self> {
+        Some(match suffix {
+            "b" => Self::Below,
+            "e" => Self::Equal,
+            "be" => Self::BelowOrEqual,
+            "u" => Self::Unordered,
+            "nb" => Self::NotBelow,
+            "ne" => Self::NotEqual,
+            "nbe" => Self::NotBelowOrEqual,
+            "nu" => Self::NotUnordered,
+            _ => return None,
+        })
+    }
+
+    /// The condition as a boolean over the lifter's flag variables.
+    fn predicate(self) -> Expr {
+        let cf = || Expr::flag("CF");
+        let zf = || Expr::flag("ZF");
+        let pf = || Expr::flag("PF");
+        let set = |flag: Expr| Expr::eq(flag, Expr::konst(1, 1));
+        let clear = |flag: Expr| Expr::eq(flag, Expr::konst(0, 1));
+        match self {
+            Self::Below => set(cf()),
+            Self::Equal => set(zf()),
+            Self::BelowOrEqual => Expr::bool_or(set(cf()), set(zf())),
+            Self::Unordered => set(pf()),
+            Self::NotBelow => clear(cf()),
+            Self::NotEqual => clear(zf()),
+            Self::NotBelowOrEqual => Expr::bool_and(clear(cf()), clear(zf())),
+            Self::NotUnordered => clear(pf()),
+        }
+    }
 }
 
 /// In-place unary operations on `ST(0)`.
@@ -404,11 +526,17 @@ enum X87Form {
     PushMemory { width: u16, format: MemFormat },
     /// Push a copy of `ST(i)` (`fld st(i)`).
     PushSlot(usize),
-    /// Convert `ST(0)` into `operands[0]` (`fst`/`fstp`, `fist`/`fistp`).
+    /// Convert `ST(0)` into `operands[0]` (`fst`/`fstp`, `fist`/`fistp`,
+    /// `fisttp`).
     StoreMemory {
         width: u16,
         format: MemFormat,
         pop: bool,
+        /// How the conversion rounds. The control word's mode for the
+        /// whole family bar `fisttp`, which carries round-toward-zero
+        /// in its opcode — the one x87 store whose result does not
+        /// depend on the control word at all.
+        rounding: RoundingMode,
     },
     /// Copy `ST(0)` into `ST(i)` (`fst`/`fstp st(i)`).
     StoreSlot { index: usize, pop: bool },
@@ -427,6 +555,8 @@ enum X87Form {
     /// Compare `ST(0)` against `ST(src)` and write EFLAGS directly
     /// (`fcomi` family).
     CompareFlags { src: usize, pop: bool },
+    /// `ST(0) := ST(src)` when `condition` holds (`fcmov<cc>`).
+    ConditionalMove { src: usize, condition: X87Condition },
     /// Copy the status word into `operands[0]` (`fnstsw` / `fstsw`).
     StoreStatus,
     /// Swap `ST(0)` with `ST(i)` (`fxch`).
@@ -458,55 +588,62 @@ pub(crate) struct X87Effect {
     pub(crate) register_def: Option<&'static str>,
     /// Whether the instruction writes EFLAGS.
     pub(crate) defines_flags: bool,
+    /// Whether the instruction reads EFLAGS, and so needs whatever
+    /// defined them kept alive in the slice.
+    pub(crate) reads_flags: bool,
+}
+
+impl X87Effect {
+    /// The uniform footprint: the whole data-register file, both
+    /// defined and used.
+    fn stack() -> Self {
+        Self {
+            defs: vec![X87_STACK_REGISTER],
+            uses: vec![X87_STACK_REGISTER],
+            register_def: None,
+            defines_flags: false,
+            reads_flags: false,
+        }
+    }
 }
 
 /// The pseudo-register footprint of a modelled x87 instruction, or
 /// `None` when the instruction is not one.
 ///
 /// Most of the family is uniform — every instruction that touches the
-/// data registers both defines and uses the whole stack. Three shapes
-/// are not: the `fcom` family also defines the status word, the `fcomi`
-/// family writes EFLAGS instead of the status word, and `fnstsw` reads
-/// the status word into a register without touching the data registers
-/// at all.
+/// data registers both defines and uses the whole stack. Four shapes are
+/// not: the `fcom` family also defines the status word, the `fcomi`
+/// family writes EFLAGS instead of the status word, the `fcmov` family
+/// *reads* EFLAGS, and `fnstsw` reads the status word into a register
+/// without touching the data registers at all.
 pub(crate) fn x87_effect(insn: &Instruction) -> Option<X87Effect> {
-    let form = classify(insn)?;
-    let stack = || {
-        (
-            vec![X87_STACK_REGISTER],
-            vec![X87_STACK_REGISTER],
-            None,
-            false,
-        )
-    };
-    let (defs, uses, register_def, defines_flags) = match form {
-        X87Form::CompareStatus { .. } => (
-            vec![X87_STACK_REGISTER, X87_STATUS_REGISTER],
-            vec![X87_STACK_REGISTER],
-            None,
-            false,
-        ),
-        X87Form::CompareFlags { .. } => (
-            vec![X87_STACK_REGISTER],
-            vec![X87_STACK_REGISTER],
-            None,
-            true,
-        ),
-        X87Form::StoreStatus => (
-            Vec::new(),
-            vec![X87_STATUS_REGISTER],
-            insn.operands
+    Some(match classify(insn)? {
+        X87Form::CompareStatus { .. } => X87Effect {
+            defs: vec![X87_STACK_REGISTER, X87_STATUS_REGISTER],
+            ..X87Effect::stack()
+        },
+        X87Form::CompareFlags { .. } => X87Effect {
+            defines_flags: true,
+            ..X87Effect::stack()
+        },
+        // Without this the slicer would step over the `cmp` or `fcomi`
+        // that produced the condition, and the `Ite` would select on a
+        // free flag.
+        X87Form::ConditionalMove { .. } => X87Effect {
+            reads_flags: true,
+            ..X87Effect::stack()
+        },
+        X87Form::StoreStatus => X87Effect {
+            defs: Vec::new(),
+            uses: vec![X87_STATUS_REGISTER],
+            register_def: insn
+                .operands
                 .first()
                 .and_then(|op| crate::effect::canonical_register(&op.raw, Arch::X86_64)),
-            false,
-        ),
-        _ => stack(),
-    };
-    Some(X87Effect {
-        defs,
-        uses,
-        register_def,
-        defines_flags,
+            defines_flags: false,
+            reads_flags: false,
+        },
+        _ => X87Effect::stack(),
     })
 }
 
@@ -527,10 +664,35 @@ fn classify(insn: &Instruction) -> Option<X87Form> {
         "fxch" => classify_exchange(ops),
         "fld" => classify_load(ops, MemFormat::Float, &X87_FLOAT_WIDTHS),
         "fild" => classify_load(ops, MemFormat::Integer, &X87_INT_WIDTHS),
-        "fst" => classify_store(ops, MemFormat::Float, &X87_FLOAT_SHORT_WIDTHS, false),
-        "fstp" => classify_store(ops, MemFormat::Float, &X87_FLOAT_WIDTHS, true),
-        "fist" => classify_store(ops, MemFormat::Integer, &X87_INT_STORE_WIDTHS, false),
-        "fistp" => classify_store(ops, MemFormat::Integer, &X87_INT_WIDTHS, true),
+        "fst" => classify_store(
+            ops,
+            &StoreSpec::pinned(MemFormat::Float, &X87_FLOAT_SHORT_WIDTHS, false),
+        ),
+        "fstp" => classify_store(
+            ops,
+            &StoreSpec::pinned(MemFormat::Float, &X87_FLOAT_WIDTHS, true),
+        ),
+        "fist" => classify_store(
+            ops,
+            &StoreSpec::pinned(MemFormat::Integer, &X87_INT_STORE_WIDTHS, false),
+        ),
+        "fistp" => classify_store(
+            ops,
+            &StoreSpec::pinned(MemFormat::Integer, &X87_INT_WIDTHS, true),
+        ),
+        // `fisttp` (SSE3) is `fistp` with the rounding fixed by the
+        // opcode instead of read from the control word. It has no
+        // non-popping form, and no stack-slot destination — the
+        // truncation only makes sense against an integer format.
+        "fisttp" => classify_store(
+            ops,
+            &StoreSpec {
+                format: MemFormat::Integer,
+                widths: &X87_INT_WIDTHS,
+                pop: true,
+                rounding: X87_TRUNCATING,
+            },
+        ),
         // The ordered and unordered compares differ only in which NaN
         // raises the invalid-operation exception, which the value model
         // does not track — so they lift identically, and are told apart
@@ -547,8 +709,52 @@ fn classify(insn: &Instruction) -> Option<X87Form> {
         // given disassembler build chooses.
         "fcompi" | "fucompi" | "fcomip" | "fucomip" => classify_flag_compare(ops, true),
         "fnstsw" | "fstsw" => classify_store_status(ops),
+        other if other.starts_with(X87_CONDITIONAL_MOVE_PREFIX) => other
+            .strip_prefix(X87_CONDITIONAL_MOVE_PREFIX)
+            .and_then(|suffix| classify_conditional_move(suffix, ops)),
+        // The integer-operand family is dispatched *before*
+        // [`classify_arith`], which strips a trailing `p` to recognise
+        // the popping forms: `ficomp` would otherwise be mis-stripped
+        // to `ficom` and read as a non-popping compare.
+        "fiadd" | "fisub" | "fisubr" | "fimul" | "fidiv" | "fidivr" | "ficom" | "ficomp" => {
+            classify_integer_arith(mnemonic.as_str(), ops)
+        }
         other => classify_arith(other, ops),
     }
+}
+
+/// The integer-operand arithmetic and compare family (`fiadd`,
+/// `fisub`, `ficomp`, …).
+///
+/// Every member has exactly one memory operand of
+/// [`X87_INT_ARITH_WIDTHS`] and takes `ST(0)` as the other input; none
+/// has a register-to-register or popping-arithmetic encoding, so the
+/// operand shape is fixed and there is no `p` suffix to peel. The
+/// conversion into the extended sort is the same one `fild` performs.
+fn classify_integer_arith(mnemonic: &str, ops: &[Operand]) -> Option<X87Form> {
+    let op = only_operand(ops)?;
+    let src = ArithSrc::Memory {
+        width: modellable_memory_width(op, &X87_INT_ARITH_WIDTHS)?,
+        format: MemFormat::Integer,
+    };
+    let (arith, reversed) = match mnemonic {
+        "ficom" => return Some(X87Form::CompareStatus { src, pops: 0 }),
+        "ficomp" => return Some(X87Form::CompareStatus { src, pops: 1 }),
+        "fiadd" => (X87Arith::Add, false),
+        "fimul" => (X87Arith::Mul, false),
+        "fisub" => (X87Arith::Sub, false),
+        "fisubr" => (X87Arith::Sub, true),
+        "fidiv" => (X87Arith::Div, false),
+        "fidivr" => (X87Arith::Div, true),
+        _ => return None,
+    };
+    Some(X87Form::Arith {
+        op: arith,
+        dst: 0,
+        src,
+        reversed,
+        pop: false,
+    })
 }
 
 fn no_operands(ops: &[Operand], form: X87Form) -> Option<X87Form> {
@@ -584,22 +790,44 @@ fn classify_load(ops: &[Operand], format: MemFormat, widths: &[u16]) -> Option<X
     })
 }
 
+/// The fixed part of a store encoding: the value format the memory
+/// destination holds, the widths it accepts, whether it pops afterwards,
+/// and how the conversion rounds.
+struct StoreSpec {
+    format: MemFormat,
+    widths: &'static [u16],
+    pop: bool,
+    rounding: RoundingMode,
+}
+
+impl StoreSpec {
+    /// The ordinary case: rounding taken from the control word, whose
+    /// reset value this module pins.
+    const fn pinned(format: MemFormat, widths: &'static [u16], pop: bool) -> Self {
+        Self {
+            format,
+            widths,
+            pop,
+            rounding: X87_ROUNDING,
+        }
+    }
+}
+
 /// Same asymmetry as [`classify_load`]: `fst`/`fstp` can name a stack
 /// slot, `fist`/`fistp` cannot.
-fn classify_store(
-    ops: &[Operand],
-    format: MemFormat,
-    widths: &[u16],
-    pop: bool,
-) -> Option<X87Form> {
+fn classify_store(ops: &[Operand], spec: &StoreSpec) -> Option<X87Form> {
     let op = only_operand(ops)?;
     if let Some(index) = slot_index(op) {
-        return (format == MemFormat::Float).then_some(X87Form::StoreSlot { index, pop });
+        return (spec.format == MemFormat::Float).then_some(X87Form::StoreSlot {
+            index,
+            pop: spec.pop,
+        });
     }
     Some(X87Form::StoreMemory {
-        width: modellable_memory_width(op, widths)?,
-        format,
-        pop,
+        width: modellable_memory_width(op, spec.widths)?,
+        format: spec.format,
+        pop: spec.pop,
+        rounding: spec.rounding,
     })
 }
 
@@ -617,9 +845,10 @@ fn classify_status_compare(ops: &[Operand], pops: u8, memory: MemorySource) -> O
     let src = match ops {
         [] => ArithSrc::Slot(1),
         [op] if op.kind == OperandKind::Register => ArithSrc::Slot(slot_index(op)?),
-        [op] if memory == MemorySource::Allowed => {
-            ArithSrc::Memory(modellable_memory_width(op, &X87_FLOAT_SHORT_WIDTHS)?)
-        }
+        [op] if memory == MemorySource::Allowed => ArithSrc::Memory {
+            width: modellable_memory_width(op, &X87_FLOAT_SHORT_WIDTHS)?,
+            format: MemFormat::Float,
+        },
         _ => return None,
     };
     Some(X87Form::CompareStatus { src, pops })
@@ -647,6 +876,21 @@ fn classify_flag_compare(ops: &[Operand], pop: bool) -> Option<X87Form> {
         _ => return None,
     };
     Some(X87Form::CompareFlags { src, pop })
+}
+
+/// `fcmov<cc> st(0), st(i)` — move `ST(i)` into `ST(0)` when the
+/// condition holds, and leave `ST(0)` alone otherwise.
+///
+/// `db c9` disassembles as `fcmovne st(0), st(1)`: the encoding's
+/// destination is always the top of stack, so a spelling naming any
+/// other slot is not this instruction and declines.
+fn classify_conditional_move(suffix: &str, ops: &[Operand]) -> Option<X87Form> {
+    let condition = X87Condition::from_suffix(suffix)?;
+    let [dst, src] = ops else { return None };
+    (slot_index(dst)? == 0).then_some(X87Form::ConditionalMove {
+        src: slot_index(src)?,
+        condition,
+    })
 }
 
 /// `fnstsw` / `fstsw` — the status word into `AX` or a 16-bit memory
@@ -736,7 +980,10 @@ fn classify_arith(mnemonic: &str, ops: &[Operand]) -> Option<X87Form> {
             None if !pop => Some(X87Form::Arith {
                 op,
                 dst: 0,
-                src: ArithSrc::Memory(modellable_memory_width(only, &X87_FLOAT_SHORT_WIDTHS)?),
+                src: ArithSrc::Memory {
+                    width: modellable_memory_width(only, &X87_FLOAT_SHORT_WIDTHS)?,
+                    format: MemFormat::Float,
+                },
                 reversed,
                 pop,
             }),
@@ -881,25 +1128,21 @@ fn to_slot(raw: Expr, width: u16, format: MemFormat) -> Option<Expr> {
     })
 }
 
-/// Convert a slot value into the form a memory destination stores.
+/// Convert a slot value into the form a memory destination stores,
+/// under the rounding the encoding selects.
 ///
 /// This is where the narrowing rounding happens, once, at the store —
 /// exactly where the hardware performs it.
-fn from_slot(value: Expr, width: u16, format: MemFormat) -> Option<Expr> {
+fn from_slot(value: Expr, width: u16, format: MemFormat, rounding: RoundingMode) -> Option<Expr> {
     Some(match format {
         MemFormat::Float if width == X87_MEMORY_BITS => extended_to_memory(&value),
         MemFormat::Float => {
             let (dst_e, dst_s) = fp_sort_bits_checked(width)?;
-            from_extended(Expr::fp_to_fp(
-                as_extended(value),
-                X87_ROUNDING,
-                dst_e,
-                dst_s,
-            ))
+            from_extended(Expr::fp_to_fp(as_extended(value), rounding, dst_e, dst_s))
         }
-        // `fist` / `fistp` round per the control word, unlike SSE's
-        // `cvtt*` family which truncates by opcode.
-        MemFormat::Integer => Expr::fp_to_sbv(as_extended(value), X87_ROUNDING, width),
+        // `fist` / `fistp` round per the control word; `fisttp`
+        // truncates by opcode, the way SSE's `cvtt*` family does.
+        MemFormat::Integer => Expr::fp_to_sbv(as_extended(value), rounding, width),
     })
 }
 
@@ -925,9 +1168,12 @@ impl LiftCtx {
                 let value = self.x87_memory_read(insn, width, format)?;
                 self.x87.push(value)
             }
-            X87Form::StoreMemory { width, format, pop } => {
-                self.x87_store_memory(insn, width, format, pop)
-            }
+            X87Form::StoreMemory {
+                width,
+                format,
+                pop,
+                rounding,
+            } => self.x87_store_memory(insn, width, format, pop, rounding),
             X87Form::StoreSlot { index, pop } => {
                 let value = self.x87.read(0);
                 self.x87.write(index, value);
@@ -946,6 +1192,10 @@ impl LiftCtx {
             X87Form::CompareStatus { src, pops } => self.x87_compare_status(insn, src, pops),
             X87Form::CompareFlags { src, pop } => {
                 self.x87_compare_flags(src, pop);
+                Ok(())
+            }
+            X87Form::ConditionalMove { src, condition } => {
+                self.x87_conditional_move(src, condition);
                 Ok(())
             }
             X87Form::StoreStatus => self.x87_store_status(insn),
@@ -992,13 +1242,14 @@ impl LiftCtx {
         width: u16,
         format: MemFormat,
         pop: bool,
+        rounding: RoundingMode,
     ) -> Result<(), X87Error> {
         let value = if pop {
             self.x87.pop()
         } else {
             self.x87.read(0)
         };
-        let stored = from_slot(value, width, format).ok_or(X87Error::UnmodelledWidth)?;
+        let stored = from_slot(value, width, format, rounding).ok_or(X87Error::UnmodelledWidth)?;
         let op = insn.operands.first().ok_or(X87Error::MalformedOperands)?;
         if self.write_dst(op, stored, width) {
             Ok(())
@@ -1019,7 +1270,7 @@ impl LiftCtx {
         let a = self.x87.read(dst);
         let b = match src {
             ArithSrc::Slot(index) => self.x87.read(index),
-            ArithSrc::Memory(width) => self.x87_memory_read(insn, width, MemFormat::Float)?,
+            ArithSrc::Memory { width, format } => self.x87_memory_read(insn, width, format)?,
         };
         let (lhs, rhs) = if reversed { (b, a) } else { (a, b) };
         self.x87.write(dst, extended_arith(op, lhs, rhs));
@@ -1043,7 +1294,7 @@ impl LiftCtx {
         let a = as_extended(self.x87.read(0));
         let b = as_extended(match src {
             ArithSrc::Slot(index) => self.x87.read(index),
-            ArithSrc::Memory(width) => self.x87_memory_read(insn, width, MemFormat::Float)?,
+            ArithSrc::Memory { width, format } => self.x87_memory_read(insn, width, format)?,
         });
         Ok(Compare {
             unordered: Expr::bool_or(Expr::fisnan(a.clone()), Expr::fisnan(b.clone())),
@@ -1141,6 +1392,27 @@ impl LiftCtx {
         } else {
             Err(X87Error::UnwritableDestination)
         }
+    }
+
+    /// `fcmov<cc>` — select between two slot values on an EFLAGS
+    /// predicate.
+    ///
+    /// A select, not a branch: both slots are read unconditionally and
+    /// an `Ite` picks between them, so the slice stays linear and the
+    /// SSA pass and the encoder need nothing new. Total, because both
+    /// reads are of the modelled stack and neither can present an
+    /// unmodelled width.
+    fn x87_conditional_move(&mut self, src: usize, condition: X87Condition) {
+        let taken = self.x87.read(src);
+        let kept = self.x87.read(0);
+        self.x87.write(
+            0,
+            Expr::Ite {
+                cond: Box::new(condition.predicate()),
+                then_expr: Box::new(taken),
+                else_expr: Box::new(kept),
+            },
+        );
     }
 
     /// The in-place unaries. Total rather than fallible: `fabs` and

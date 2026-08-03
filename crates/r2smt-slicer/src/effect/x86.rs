@@ -447,7 +447,7 @@ fn x87_effect(insn: &Instruction, shape: &crate::lift::X87Effect) -> Instruction
         defines_flags: shape.defines_flags,
         has_memory_access: any_memory_operand(&insn.operands),
         is_call: false,
-        reads_flags: false,
+        reads_flags: shape.reads_flags,
     }
 }
 

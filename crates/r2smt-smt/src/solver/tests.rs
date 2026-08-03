@@ -2998,3 +2998,242 @@ fn x87_equality_after_a_free_compare_stays_undecided() {
     ]);
     assert_eq!(solve_first(&program), SmtResult::BothPossible);
 }
+
+/// `mov dword [rbp - 8], <seed> ; fld1 ; <mnemonic> dword [rbp - 8] ;
+/// fstp qword [rbp - 0x20] ; mov rax, … ; cmp rax, <expect> ; je`.
+///
+/// Seeds a definite integer in memory so the integer-operand family's
+/// conversion is observable as a value rather than as IR shape: read as
+/// an `m32fp` bit pattern instead, a small seed is a denormal that
+/// leaves `+1.0` unchanged, and every expectation below fails.
+fn x87_integer_operand_program(mnemonic: &str, seed: &str, expect: &str) -> Program {
+    one_block(vec![
+        insn(
+            0x40_1000,
+            7,
+            "mov",
+            vec![
+                op("dword [rbp - 0x8]", OperandKind::Memory),
+                op(seed, OperandKind::Immediate),
+            ],
+        ),
+        insn(0x40_1007, 2, "fld1", vec![]),
+        insn(
+            0x40_1009,
+            3,
+            mnemonic,
+            vec![op("dword [rbp - 0x8]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_100c,
+            3,
+            "fstp",
+            vec![op("qword [rbp - 0x20]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_100f,
+            4,
+            "mov",
+            vec![
+                op("rax", OperandKind::Register),
+                op("qword [rbp - 0x20]", OperandKind::Memory),
+            ],
+        ),
+        insn(
+            0x40_1013,
+            10,
+            "cmp",
+            vec![
+                op("rax", OperandKind::Register),
+                op(expect, OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_101d,
+            2,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ])
+}
+
+#[test]
+fn x87_integer_operand_add_converts_its_operand_as_an_integer() {
+    // `1.0 + 2` is `3.0` — binary64 `0x4008000000000000`. Reading the
+    // seed as a float bit pattern gives a denormal near 2.8e-45, whose
+    // sum with 1.0 rounds back to 1.0, so the mistake is a definite
+    // wrong number rather than a decline.
+    let program = x87_integer_operand_program("fiadd", "2", "0x4008000000000000");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_integer_operand_reverse_subtract_takes_the_memory_operand_first() {
+    // `fisubr m32int` is `m - ST(0)`: `4 - 1.0` is `3.0`. The
+    // non-reversed direction would give `-3.0`, which is the same
+    // magnitude with the sign bit set — a wrong value the shape of the
+    // expression alone would not catch.
+    let program = x87_integer_operand_program("fisubr", "4", "0x4008000000000000");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_integer_operand_source_is_two_s_complement() {
+    // `1.0 + (-2)` is `-1.0`. An unsigned reading of the same bytes
+    // would be 4294967294, so this pins the signedness of the
+    // conversion and not merely that some conversion happens.
+    let program = x87_integer_operand_program("fiadd", "-2", "0xbff0000000000000");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+/// `mov dword [rbp - 8], 0x40300000 ; fld dword [rbp - 8] ;
+/// <mnemonic> dword [rbp - 0x20] ; mov eax, dword [rbp - 0x20] ;
+/// cmp eax, <expect> ; je`.
+///
+/// `0x40300000` is binary32 `+2.75`, chosen because truncation and
+/// round-to-nearest disagree about it: `2` against `3`.
+fn x87_integer_store_program(mnemonic: &str, expect: &str) -> Program {
+    one_block(vec![
+        insn(
+            0x40_1000,
+            7,
+            "mov",
+            vec![
+                op("dword [rbp - 0x8]", OperandKind::Memory),
+                op("0x40300000", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1007,
+            3,
+            "fld",
+            vec![op("dword [rbp - 0x8]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_100a,
+            3,
+            mnemonic,
+            vec![op("dword [rbp - 0x20]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_100d,
+            3,
+            "mov",
+            vec![
+                op("eax", OperandKind::Register),
+                op("dword [rbp - 0x20]", OperandKind::Memory),
+            ],
+        ),
+        insn(
+            0x40_1010,
+            3,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op(expect, OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1013,
+            2,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ])
+}
+
+#[test]
+fn x87_truncating_integer_store_rounds_toward_zero() {
+    // `fisttp` of `+2.75` stores `2`. Reading the pinned control-word
+    // mode instead would store `3`, so this fails against exactly the
+    // mistake the mnemonic exists to avoid.
+    let program = x87_integer_store_program("fisttp", "2");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_rounding_integer_store_rounds_to_nearest() {
+    // The teeth: `fistp` of the same value stores `3`, which is what
+    // makes the pair a discrimination rather than a coincidence.
+    let program = x87_integer_store_program("fistp", "3");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+/// `xor eax, eax ; fldz ; fld1 ; <mnemonic> st(0), st(1) ;
+/// fstp qword [rbp - 0x20] ; mov rax, … ; cmp rax, <expect> ; je`.
+///
+/// The `xor` fixes `ZF = 1`, so the two polarities of the same
+/// conditional move select different slots: `ST(1)` holds `+0.0` and
+/// `ST(0)` holds `+1.0`.
+fn x87_conditional_move_program(mnemonic: &str, expect: &str) -> Program {
+    one_block(vec![
+        insn(
+            0x40_1000,
+            2,
+            "xor",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(0x40_1002, 2, "fldz", vec![]),
+        insn(0x40_1004, 2, "fld1", vec![]),
+        insn(
+            0x40_1006,
+            2,
+            mnemonic,
+            vec![
+                op("st(0)", OperandKind::Register),
+                op("st(1)", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            3,
+            "fstp",
+            vec![op("qword [rbp - 0x20]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_100b,
+            4,
+            "mov",
+            vec![
+                op("rax", OperandKind::Register),
+                op("qword [rbp - 0x20]", OperandKind::Memory),
+            ],
+        ),
+        insn(
+            0x40_100f,
+            10,
+            "cmp",
+            vec![
+                op("rax", OperandKind::Register),
+                op(expect, OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1019,
+            2,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ])
+}
+
+#[test]
+fn x87_conditional_move_takes_the_source_when_the_condition_holds() {
+    // `ZF = 1`, so `fcmove` overwrites the top of stack with `ST(1)`,
+    // which is `+0.0`.
+    let program = x87_conditional_move_program("fcmove", "0");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_conditional_move_keeps_the_destination_when_it_does_not() {
+    // The teeth, and the reason both polarities are pinned: with the
+    // condition inverted the same fixture must keep `+1.0`. A lowering
+    // whose `Ite` branches are swapped passes one of these two tests
+    // and fails the other.
+    let program = x87_conditional_move_program("fcmovne", "0x3ff0000000000000");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}

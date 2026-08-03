@@ -41,7 +41,7 @@ mod merge;
 mod simd;
 mod x86;
 mod x87;
-pub(crate) use aarch32::{VfpOp, neon_packed_op, vfp_scalar};
+pub(crate) use aarch32::{VfpOp, is_aarch32_packed_instruction, vfp_scalar};
 pub(crate) use aarch64::neon::structured::StructuredEffect;
 use merge::lower_merge;
 pub(crate) use simd::{
@@ -373,7 +373,18 @@ pub(crate) fn pins_rounding_mode(insn: &Instruction, arch: Arch) -> bool {
                     _
                 ))
             );
-            vfp_rounds || matches!(aarch32::neon_packed_op(&lower), Some((PackedOp::Fp(_), _)))
+            // Same narrowness as the scalar arm above: the packed
+            // `vmax` / `vmin` select an operand rather than computing
+            // one, so no rounding mode reaches them.
+            let neon_rounds = matches!(
+                aarch32::neon_packed_op(&lower),
+                Some((
+                    PackedOp::Fp(FpArithOp::Add | FpArithOp::Sub | FpArithOp::Mul | FpArithOp::Div)
+                        | PackedOp::Accumulate { float: true, .. },
+                    _
+                ))
+            );
+            vfp_rounds || neon_rounds
         }
         _ => false,
     }
@@ -920,6 +931,23 @@ impl LiftCtx {
             Arch::X86 | Arch::X86_64 => x86_memory_modellable(op),
             _ => false,
         }
+    }
+
+    /// Whether a floating-point max / min on this ISA **propagates**
+    /// NaN and combines signed-zero signs, rather than selecting an
+    /// operand on a bare comparison.
+    ///
+    /// Lives here rather than in the SIMD core for the same reason
+    /// [`Self::is_modellable_simd_memory`] does: it is an arch question,
+    /// and the core deliberately names no [`Arch`].
+    ///
+    /// The two answers are not degrees of precision, they are different
+    /// values. Intel's `MAXPS` returns its *second* operand when either
+    /// is NaN — so a NaN in the first yields an ordinary number — and
+    /// `MAXPS(+0, -0)` is `-0`. ARM's `FPMax` returns a NaN and `+0`.
+    /// Each is correct for its own architecture and wrong on the other.
+    const fn fp_max_min_propagates(&self) -> bool {
+        matches!(self.arch, Arch::Aarch64 | Arch::Arm)
     }
 
     fn binop_width(&self, lhs: &Operand, rhs: &Operand) -> u16 {

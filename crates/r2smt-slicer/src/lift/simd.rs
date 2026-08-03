@@ -45,6 +45,32 @@ pub(crate) enum PackedIntOp {
     Not,
     /// `mov` — copy, one source.
     Copy,
+    /// `vmin` / `vmax` — the lane-wise ordered select. The comparison
+    /// is the whole operation, so its signedness is carried here rather
+    /// than inferred: `max` of `0xff` and `0x01` is the first byte
+    /// unsigned and the second signed.
+    MinMax { max: bool, signed: bool },
+    /// `vabs` on integer lanes. Non-saturating, so the most negative
+    /// value maps to itself — which the two's-complement negation
+    /// already gives at a fixed width, with no special case.
+    Abs,
+    /// `vneg` on integer lanes — `0 - a`, wrapping for the same reason.
+    Neg,
+    /// `vabs` / `vneg` on floating-point lanes. Both are sign-bit
+    /// manipulations, so they are exact at every value including the
+    /// NaNs and the infinities and need no float sort at all.
+    SignBit { negate: bool },
+    /// `vqadd` / `vqsub` — saturating, clamped to the element's range
+    /// rather than wrapped.
+    Saturating { subtract: bool, signed: bool },
+    /// `vhadd` / `vhsub` / `vrhadd` — halving, the exact sum or
+    /// difference shifted down one bit. `rounding` adds a half first,
+    /// which only the add form (`vrhadd`) has an encoding for.
+    Halving {
+        subtract: bool,
+        signed: bool,
+        rounding: bool,
+    },
 }
 
 /// What a packed ARM vector data-processing instruction computes.
@@ -54,6 +80,38 @@ pub(crate) enum PackedOp {
     Int(PackedIntOp),
     /// IEEE floating-point lanes.
     Fp(FpArithOp),
+    /// Multiply-accumulate: `dst := dst ± a * b`, lane-wise.
+    ///
+    /// A variant of its own rather than a [`PackedIntOp`] or an
+    /// [`FpArithOp`], because both of those describe one lane operation
+    /// over at most two sources and this one reads its *destination* as
+    /// a third.
+    Accumulate {
+        /// Whether the lanes are floating-point.
+        float: bool,
+        /// `vmls` subtracts the product where `vmla` adds it.
+        subtract: bool,
+    },
+    /// A shift whose amount is the same for every lane, taken from the
+    /// instruction's last operand rather than from a vector register.
+    ///
+    /// `left` is `vshl`; the right-shifting forms are `vshr` and, when
+    /// they add the shifted value into the destination, `vsra`.
+    ShiftImmediate {
+        /// Direction. A left shift needs no signedness — the bits it
+        /// discards are the same either way.
+        left: bool,
+        /// Whether a right shift replicates the sign bit.
+        signed: bool,
+        /// `vsra` adds the shifted lane into the destination.
+        accumulate: bool,
+    },
+    /// `vshl` with a per-lane amount read from a vector register, whose
+    /// *sign* chooses the direction.
+    ShiftRegister {
+        /// Whether a right shift replicates the sign bit.
+        signed: bool,
+    },
 }
 
 impl PackedOp {
@@ -61,7 +119,13 @@ impl PackedOp {
     /// destination included.
     pub(super) const fn operand_count(self) -> usize {
         match self {
-            Self::Int(PackedIntOp::Not | PackedIntOp::Copy) => 2,
+            Self::Int(
+                PackedIntOp::Not
+                | PackedIntOp::Copy
+                | PackedIntOp::Abs
+                | PackedIntOp::Neg
+                | PackedIntOp::SignBit { .. },
+            ) => 2,
             _ => 3,
         }
     }
@@ -296,6 +360,185 @@ pub(super) fn all_ones(bits: u16) -> Expr {
     Expr::konst(mask, bits)
 }
 
+/// A `bits`-wide value with only the most significant bit set.
+///
+/// Built by concatenation rather than as a literal so it stays correct
+/// above the 128 bits a `Const` payload can carry.
+fn sign_bit(bits: u16) -> Option<Expr> {
+    Some(Expr::concat(
+        Expr::konst(1, 1),
+        Expr::konst(0, bits.checked_sub(1)?),
+    ))
+}
+
+/// A `bits`-wide value with every bit but the most significant set —
+/// the mask a floating-point `abs` applies.
+fn magnitude_mask(bits: u16) -> Option<Expr> {
+    Some(Expr::concat(
+        Expr::konst(0, 1),
+        all_ones(bits.checked_sub(1)?),
+    ))
+}
+
+/// Extra bits the saturating and halving lanes compute in.
+///
+/// **Two**, not one, and the difference is load-bearing. One extra bit
+/// holds the exact sum for either signedness, but not as a value the
+/// *signed* comparisons below can read: an unsigned `0xff + 0xff` fills
+/// nine bits, whose top bit a signed compare would take for a sign. Two
+/// bits let one set of signed comparisons serve both signednesses, which
+/// is what keeps the clamp from needing a second, mirrored copy.
+const WIDE_HEADROOM: u16 = 2;
+
+/// `value` as a `wide`-bit two's-complement constant.
+fn wide_const(value: i128, wide: u16) -> Option<Expr> {
+    let modulus = 1u128.checked_shl(u32::from(wide))?;
+    let pattern = u128::from_le_bytes(value.to_le_bytes());
+    Some(Expr::konst(pattern & (modulus - 1), wide))
+}
+
+/// Widen a lane to the headroom width, preserving its value under the
+/// element's own signedness.
+fn extend_lane(value: Expr, wide: u16, signed: bool) -> Expr {
+    if signed {
+        Expr::sign_ext(value, wide)
+    } else {
+        Expr::zero_ext(value, wide)
+    }
+}
+
+/// The exact sum or difference of two lanes, at the headroom width.
+fn wide_combination(subtract: bool, signed: bool, a: Expr, b: Expr, wide: u16) -> Expr {
+    let (x, y) = (extend_lane(a, wide, signed), extend_lane(b, wide, signed));
+    if subtract {
+        Expr::sub(x, y)
+    } else {
+        Expr::add(x, y)
+    }
+}
+
+/// The range an element of `bits` can represent, as headroom-width
+/// constants.
+fn element_bounds(signed: bool, bits: u16, wide: u16) -> Option<(Expr, Expr)> {
+    let span = 1i128.checked_shl(u32::from(bits))?;
+    let (min, max) = if signed {
+        (-(span / 2), span / 2 - 1)
+    } else {
+        (0, span - 1)
+    };
+    Some((wide_const(min, wide)?, wide_const(max, wide)?))
+}
+
+/// One destination lane of `vqadd` / `vqsub`.
+///
+/// The arithmetic happens where it cannot overflow and the clamp brings
+/// it back; doing it at the element width and clamping afterwards would
+/// be too late, since the overflow the instruction exists to detect
+/// would already have wrapped.
+fn saturating_lane(subtract: bool, signed: bool, a: Expr, b: Expr, bits: u16) -> Option<Expr> {
+    let wide = bits.checked_add(WIDE_HEADROOM)?;
+    let raw = wide_combination(subtract, signed, a, b, wide);
+    let (min, max) = element_bounds(signed, bits, wide)?;
+    let below_max = Expr::Ite {
+        cond: Box::new(Expr::sle(raw.clone(), max.clone())),
+        then_expr: Box::new(raw),
+        else_expr: Box::new(max),
+    };
+    let clamped = Expr::Ite {
+        cond: Box::new(Expr::sle(min.clone(), below_max.clone())),
+        then_expr: Box::new(below_max),
+        else_expr: Box::new(min),
+    };
+    Some(Expr::extract(clamped, bits - 1, 0))
+}
+
+/// One destination lane of `vhadd` / `vhsub` / `vrhadd`.
+///
+/// The shift is arithmetic at the headroom width because the value
+/// there is the exact integer in two's complement, and the architecture
+/// defines the result as its bit slice `[esize:1]` — which is the floor
+/// of the halved value, not a truncation toward zero.
+fn halving_lane(
+    subtract: bool,
+    signed: bool,
+    rounding: bool,
+    a: Expr,
+    b: Expr,
+    bits: u16,
+) -> Option<Expr> {
+    let wide = bits.checked_add(WIDE_HEADROOM)?;
+    let raw = wide_combination(subtract, signed, a, b, wide);
+    let exact = if rounding {
+        Expr::add(raw, wide_const(1, wide)?)
+    } else {
+        raw
+    };
+    let halved = Expr::ashr(exact, wide_const(1, wide)?);
+    Some(Expr::extract(halved, bits - 1, 0))
+}
+
+/// Width of the amount field a register-form vector shift reads.
+const SHIFT_AMOUNT_BITS: u16 = 8;
+
+/// A right shift of one lane, replicating the sign bit or not.
+fn shift_right_lane(signed: bool, value: Expr, amount: Expr) -> Expr {
+    if signed {
+        Expr::ashr(value, amount)
+    } else {
+        Expr::lshr(value, amount)
+    }
+}
+
+/// One destination lane of a register-form vector shift.
+///
+/// Only the low byte of the amount element is read, as a signed value
+/// whose sign chooses the direction — so both directions are built and
+/// an `Ite` picks between them. An out-of-range amount needs no special
+/// case: a bit-vector shift wider than the element already yields zero,
+/// or all sign bits for the arithmetic right shift, which is what the
+/// architecture specifies.
+fn shift_register_lane(signed: bool, value: Expr, raw_amount: Expr, bits: u16) -> Expr {
+    let amount = if bits > SHIFT_AMOUNT_BITS {
+        Expr::sign_ext(Expr::extract(raw_amount, SHIFT_AMOUNT_BITS - 1, 0), bits)
+    } else {
+        raw_amount
+    };
+    let left = Expr::shl(value.clone(), amount.clone());
+    let opposite = Expr::sub(Expr::konst(0, bits), amount.clone());
+    let right = shift_right_lane(signed, value, opposite);
+    Expr::Ite {
+        cond: Box::new(Expr::slt(amount, Expr::konst(0, bits))),
+        then_expr: Box::new(right),
+        else_expr: Box::new(left),
+    }
+}
+
+/// One destination lane of a multiply-accumulate.
+fn accumulate_lane(
+    float: bool,
+    subtract: bool,
+    acc: Expr,
+    a: Expr,
+    b: Expr,
+    bits: u16,
+) -> Option<Expr> {
+    if !float {
+        let product = Expr::mul(a, b);
+        return Some(if subtract {
+            Expr::sub(acc, product)
+        } else {
+            Expr::add(acc, product)
+        });
+    }
+    let product = fp_lane_result(FpArithOp::Mul, a, b, bits)?;
+    let combine = if subtract {
+        FpArithOp::Sub
+    } else {
+        FpArithOp::Add
+    };
+    fp_lane_result(combine, acc, product, bits)
+}
+
 fn packed_int_lane(op: PackedIntOp, a: Expr, b: Option<Expr>, bits: u16) -> Option<Expr> {
     Some(match op {
         PackedIntOp::Bin(bin) => bin.apply(a, b?),
@@ -303,6 +546,44 @@ fn packed_int_lane(op: PackedIntOp, a: Expr, b: Option<Expr>, bits: u16) -> Opti
         PackedIntOp::BitClear => Expr::bv_and(a, Expr::bv_xor(b?, all_ones(bits))),
         PackedIntOp::Not => Expr::bv_xor(a, all_ones(bits)),
         PackedIntOp::Copy => a,
+        PackedIntOp::MinMax { max, signed } => {
+            let other = b?;
+            // `max` keeps the first operand when the second is smaller;
+            // `min` keeps it when the second is larger. Written as one
+            // comparison with the operands swapped rather than four
+            // predicates, so the two directions cannot drift.
+            let (lo, hi) = if max {
+                (other.clone(), a.clone())
+            } else {
+                (a.clone(), other.clone())
+            };
+            let cond = if signed {
+                Expr::slt(lo, hi)
+            } else {
+                Expr::ult(lo, hi)
+            };
+            Expr::Ite {
+                cond: Box::new(cond),
+                then_expr: Box::new(a),
+                else_expr: Box::new(other),
+            }
+        }
+        PackedIntOp::Abs => Expr::Ite {
+            cond: Box::new(Expr::slt(a.clone(), Expr::konst(0, bits))),
+            then_expr: Box::new(Expr::sub(Expr::konst(0, bits), a.clone())),
+            else_expr: Box::new(a),
+        },
+        PackedIntOp::Neg => Expr::sub(Expr::konst(0, bits), a),
+        PackedIntOp::SignBit { negate: true } => Expr::bv_xor(a, sign_bit(bits)?),
+        PackedIntOp::SignBit { negate: false } => Expr::bv_and(a, magnitude_mask(bits)?),
+        PackedIntOp::Saturating { subtract, signed } => {
+            saturating_lane(subtract, signed, a, b?, bits)?
+        }
+        PackedIntOp::Halving {
+            subtract,
+            signed,
+            rounding,
+        } => halving_lane(subtract, signed, rounding, a, b?, bits)?,
     })
 }
 
@@ -519,11 +800,19 @@ impl LiftCtx {
     /// from that value, so a memory operand costs one load rather than
     /// one per lane.
     ///
-    /// Arch-neutral: every step below is expressed in views, lanes and
-    /// operand values, none of which is x86-specific. `addps xmm0, xmm1`
-    /// and `fadd v0.4s, v1.4s, v2.4s` are the same computation over the
-    /// same model, differing only in how the caller derived the lane
-    /// width — from the mnemonic on x86, from the arrangement on ARM.
+    /// Arch-neutral in shape: every step below is expressed in views,
+    /// lanes and operand values. `addps xmm0, xmm1` and `fadd v0.4s,
+    /// v1.4s, v2.4s` are the same computation over the same model,
+    /// differing only in how the caller derived the lane width — from
+    /// the mnemonic on x86, from the arrangement on ARM.
+    ///
+    /// **Max and min are the exception, and it is not cosmetic.**
+    /// [`fp_lane_result`] implements Intel's `MAXPS`, where the second
+    /// operand wins on NaN and on a signed-zero tie; ARM's `FPMax`
+    /// propagates NaN and combines the two signs. Both are right for
+    /// their own architecture and each is a wrong *value* on the other,
+    /// so the lane helper is chosen by [`LiftCtx::fp_max_min_propagates`]
+    /// rather than shared.
     pub(super) fn packed_fp_result(
         &mut self,
         dst: &Operand,
@@ -536,11 +825,18 @@ impl LiftCtx {
         let count = Self::packed_lane_count(view, lane_bits)?;
         let a_val = self.simd_operand_value(a_op, view)?;
         let b_val = self.simd_operand_value(b_op, view)?;
+        let propagating =
+            self.fp_max_min_propagates() && matches!(op, FpArithOp::Max | FpArithOp::Min);
         let mut lanes = Vec::with_capacity(usize::from(count));
         for index in 0..count {
             let a = Self::extract_lane(a_val.clone(), lane_bits, index)?;
             let b = Self::extract_lane(b_val.clone(), lane_bits, index)?;
-            lanes.push(fp_lane_result(op, a, b, lane_bits)?);
+            let lane = if propagating {
+                fp_propagating_max_min(a, b, lane_bits, matches!(op, FpArithOp::Max))?
+            } else {
+                fp_lane_result(op, a, b, lane_bits)?
+            };
+            lanes.push(lane);
         }
         Self::concat_lanes(lanes)
     }
@@ -582,6 +878,115 @@ impl LiftCtx {
         Self::concat_lanes(lanes)
     }
 
+    /// `dst := dst ± a * b`, lane-wise.
+    ///
+    /// The destination is materialised as a source like any other, so
+    /// the SSA pass turns the read into the previous version and the
+    /// write into a new one — nothing here has to know that the two
+    /// name the same register.
+    ///
+    /// The float form rounds **twice**: once at the product and once at
+    /// the sum. That is the architectural behaviour — `VMLA` is not a
+    /// fused multiply-add, which is `VFMA` and a different mnemonic —
+    /// and collapsing the two roundings into one would be a definite
+    /// wrong value at every operand where they differ.
+    fn packed_accumulate_result(
+        &mut self,
+        dst: &Operand,
+        a_op: &Operand,
+        b_op: &Operand,
+        float: bool,
+        subtract: bool,
+        lane_bits: u16,
+    ) -> Option<Expr> {
+        let view = self.simd_instruction_view_bits(&[dst, a_op, b_op])?;
+        let count = Self::packed_lane_count(view, lane_bits)?;
+        let acc_val = self.simd_operand_value(dst, view)?;
+        let a_val = self.simd_operand_value(a_op, view)?;
+        let b_val = self.simd_operand_value(b_op, view)?;
+        let mut lanes = Vec::with_capacity(usize::from(count));
+        for index in 0..count {
+            let acc = Self::extract_lane(acc_val.clone(), lane_bits, index)?;
+            let a = Self::extract_lane(a_val.clone(), lane_bits, index)?;
+            let b = Self::extract_lane(b_val.clone(), lane_bits, index)?;
+            lanes.push(accumulate_lane(float, subtract, acc, a, b, lane_bits)?);
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// A whole-vector shift by an amount every lane shares.
+    ///
+    /// The amount operand is deliberately kept out of the view
+    /// resolution: it is an immediate, not a vector, and reading it at
+    /// the *lane* width is what lets it flow straight into the shift
+    /// node the solver then constant-folds.
+    fn packed_shift_immediate_result(
+        &mut self,
+        dst: &Operand,
+        a_op: &Operand,
+        amount_op: &Operand,
+        shape: PackedOp,
+        lane_bits: u16,
+    ) -> Option<Expr> {
+        let PackedOp::ShiftImmediate {
+            left,
+            signed,
+            accumulate,
+        } = shape
+        else {
+            return None;
+        };
+        let view = self.simd_instruction_view_bits(&[dst, a_op])?;
+        let count = Self::packed_lane_count(view, lane_bits)?;
+        let a_val = self.simd_operand_value(a_op, view)?;
+        let acc_val = if accumulate {
+            Some(self.simd_operand_value(dst, view)?)
+        } else {
+            None
+        };
+        let amount = self.read_operand_at(amount_op, lane_bits);
+        let mut lanes = Vec::with_capacity(usize::from(count));
+        for index in 0..count {
+            let a = Self::extract_lane(a_val.clone(), lane_bits, index)?;
+            let shifted = if left {
+                Expr::shl(a, amount.clone())
+            } else {
+                shift_right_lane(signed, a, amount.clone())
+            };
+            lanes.push(match acc_val.as_ref() {
+                Some(value) => Expr::add(
+                    Self::extract_lane(value.clone(), lane_bits, index)?,
+                    shifted,
+                ),
+                None => shifted,
+            });
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// A whole-vector shift whose amount is itself a vector, one
+    /// element per lane.
+    fn packed_shift_register_result(
+        &mut self,
+        dst: &Operand,
+        a_op: &Operand,
+        amount_op: &Operand,
+        signed: bool,
+        lane_bits: u16,
+    ) -> Option<Expr> {
+        let view = self.simd_instruction_view_bits(&[dst, a_op, amount_op])?;
+        let count = Self::packed_lane_count(view, lane_bits)?;
+        let a_val = self.simd_operand_value(a_op, view)?;
+        let amount_val = self.simd_operand_value(amount_op, view)?;
+        let mut lanes = Vec::with_capacity(usize::from(count));
+        for index in 0..count {
+            let a = Self::extract_lane(a_val.clone(), lane_bits, index)?;
+            let amount = Self::extract_lane(amount_val.clone(), lane_bits, index)?;
+            lanes.push(shift_register_lane(signed, a, amount, lane_bits));
+        }
+        Self::concat_lanes(lanes)
+    }
+
     /// Lower one packed ARM vector data-processing instruction: the same
     /// lane operation applied independently to every lane of the
     /// destination's view.
@@ -615,6 +1020,22 @@ impl LiftCtx {
                 None => None,
             },
             PackedOp::Int(int) => self.packed_int_result(dst, a_op, b_op, int, lane_bits),
+            PackedOp::Accumulate { float, subtract } => match b_op {
+                Some(b) => self.packed_accumulate_result(dst, a_op, b, float, subtract, lane_bits),
+                None => None,
+            },
+            PackedOp::ShiftImmediate { .. } => match b_op {
+                Some(amount) => {
+                    self.packed_shift_immediate_result(dst, a_op, amount, op, lane_bits)
+                }
+                None => None,
+            },
+            PackedOp::ShiftRegister { signed } => match b_op {
+                Some(amount) => {
+                    self.packed_shift_register_result(dst, a_op, amount, signed, lane_bits)
+                }
+                None => None,
+            },
         };
         let Some(value) = result else {
             self.push_packed_unsupported(insn);
