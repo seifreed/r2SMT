@@ -591,12 +591,11 @@ fn aarch64_packed_vector_instruction_sets_no_flags() {
 #[test]
 fn aarch64_unmodelled_vector_mnemonic_declines() {
     // Not modelled, so the effect table has to fail closed — otherwise
-    // the slicer retains a definition the lifter drops. `fmla` is the
-    // canary now that `pmull` lifts: it is *fused*, rounding the
-    // product and the sum once, which no combination of the IR's
-    // separate multiply and add reproduces.
+    // the slicer retains a definition the lifter drops. `fmulx` is the
+    // canary now that `fmla` lifts: it is a float multiply extended,
+    // which no family claims.
     let i = insn(
-        "fmla",
+        "fmulx",
         vec![
             op("v0.4s", OperandKind::Register),
             op("v1.4s", OperandKind::Register),

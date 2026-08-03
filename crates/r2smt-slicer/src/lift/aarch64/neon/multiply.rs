@@ -13,7 +13,7 @@
 
 use r2smt_ir::program::Instruction;
 
-use super::super::super::BinOp;
+use super::super::super::{BinOp, FusedStep};
 use super::geometry::{
     BITS_PER_BYTE, dot_product_element, indexed_element, operand_arrangement, peel_upper,
     spans_full_register,
@@ -299,6 +299,49 @@ pub(super) fn dot_product_shape(insn: &Instruction, mnemonic: &str) -> Option<Ne
         lanes: destination.lanes,
         dest_index: 0,
         source_index,
+    })
+}
+
+// ===================== fused multiply steps =====================
+
+/// Destination element width the fused steps are exactly emulable at.
+const FUSED_STEP_LANE_BITS: u16 = 32;
+
+/// `fmla` / `fmls` / `frecps` / `frsqrts` over whole binary32-lane
+/// vectors.
+///
+/// All four round the product and the following combine together, once.
+/// Modelling them as a separate `fmul` then `fadd` would round twice and
+/// give a wrong value, so the lowering instead computes each lane in
+/// binary64 — exact for a binary32 lane — and rounds once back. Only the
+/// 32-bit arrangements (`.2s` / `.4s`) resolve: a 64-bit lane would need
+/// binary128 to stay exact, so `.2d` declines.
+pub(super) fn fused_step_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let step = match mnemonic {
+        "fmla" => FusedStep::MulAdd,
+        "fmls" => FusedStep::MulSub,
+        "frecps" => FusedStep::RecipStep,
+        "frsqrts" => FusedStep::RsqrtStep,
+        _ => return None,
+    };
+    if insn.operands.len() != 3 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    if destination.lane_bits != FUSED_STEP_LANE_BITS {
+        return None;
+    }
+    for operand in insn.operands.iter().skip(1) {
+        if operand_arrangement(operand)? != destination {
+            return None;
+        }
+    }
+    Some(NeonShape {
+        op: NeonOp::FusedStep(step),
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
     })
 }
 

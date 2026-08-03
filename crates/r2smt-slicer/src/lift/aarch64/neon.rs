@@ -24,7 +24,7 @@
 
 use r2smt_ir::program::Instruction;
 
-use super::super::PackedOp;
+use super::super::{FusedStep, PackedOp};
 use arith::{CompareKind, SaturatingKind, ShiftKind};
 use multiply::{AccumulateKind, ByElementKind};
 use permute::{PermuteKind, SelectRole};
@@ -127,6 +127,10 @@ enum NeonOp {
     /// product is the `XOR` of the shifted multiplicand over the set
     /// bits of the multiplier. `upper` is the `2` suffix.
     PolynomialMultiply { upper: bool },
+    /// `fmla` / `fmls` / `frecps` / `frsqrts` — a fused multiply step
+    /// over binary32 lanes, rounded once. `MulAdd` / `MulSub` read the
+    /// destination as an accumulator.
+    FusedStep(FusedStep),
     /// `frecpe` / `frsqrte` — the reciprocal and reciprocal-square-root
     /// estimates, whose result is a free value.
     ///
@@ -176,6 +180,7 @@ impl NeonShape {
                 ..
             } => true,
             NeonOp::ByElement { kind, .. } => kind.combines(),
+            NeonOp::FusedStep(step) => step.reads_accumulator(),
             // `tbx` preserves the destination byte for an out-of-range
             // index; `tbl` writes zero and reads nothing.
             NeonOp::TableLookup { keep, .. } => keep,
@@ -218,6 +223,7 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| multiply::dot_product_shape(insn, &mnemonic))
         .or_else(|| permute::table_lookup_shape(insn, &mnemonic))
         .or_else(|| multiply::polynomial_multiply_shape(insn, &mnemonic))
+        .or_else(|| multiply::fused_step_shape(insn, &mnemonic))
         .or_else(|| arith::estimate_shape(insn, &mnemonic))
 }
 

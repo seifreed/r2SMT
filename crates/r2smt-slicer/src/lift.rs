@@ -45,7 +45,8 @@ pub(crate) use aarch32::{VfpOp, is_aarch32_packed_instruction, vfp_scalar};
 pub(crate) use aarch64::neon::structured::StructuredEffect;
 use merge::lower_merge;
 pub(crate) use simd::{
-    FpArithOp, PackedIntOp, PackedOp, fp_lane_result, fp_propagating_max_min, fp_sort_bits_checked,
+    FpArithOp, FusedStep, PackedIntOp, PackedOp, fp_lane_result, fp_propagating_max_min,
+    fp_sort_bits_checked, fused_multiply_lane,
 };
 pub(crate) use x86::{is_fp_compare_mnemonic, sse_scalar_move_lane};
 use x87::X87Stack;

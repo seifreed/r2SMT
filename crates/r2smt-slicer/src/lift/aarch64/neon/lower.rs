@@ -9,7 +9,9 @@
 use r2smt_ir::expr::Expr;
 use r2smt_ir::program::{Instruction, Operand};
 
-use super::super::super::{FpArithOp, LiftCtx, fp_lane_result, fp_propagating_max_min};
+use super::super::super::{
+    FpArithOp, FusedStep, LiftCtx, fp_lane_result, fp_propagating_max_min, fused_multiply_lane,
+};
 use super::arith::{CompareKind, SaturateTo, SaturatingKind, ShiftKind};
 use super::geometry::{BITS_PER_BYTE, dot_product_element, operand_arrangement};
 use super::multiply::{AccumulateKind, AccumulateSources, ByElementKind, DOT_PRODUCT_TERMS};
@@ -95,6 +97,7 @@ impl LiftCtx {
             NeonOp::PolynomialMultiply { upper } => {
                 self.polynomial_multiply_lanes(insn, shape, upper)
             }
+            NeonOp::FusedStep(step) => self.fused_step_lanes(insn, shape, step),
             NeonOp::Estimate => self.estimate_value(insn, shape),
         }
     }
@@ -124,6 +127,43 @@ impl LiftCtx {
     fn estimate_value(&mut self, insn: &Instruction, shape: NeonShape) -> Option<Expr> {
         let view = shape.lane_bits.checked_mul(shape.lanes)?;
         Some(Expr::Var(self.new_temp(insn.address, view)))
+    }
+
+    /// `fmla` / `fmls` / `frecps` / `frsqrts` — each binary32 lane
+    /// computed as a single fused multiply step. `fmla` / `fmls` read the
+    /// destination lane as the accumulator; the reciprocal steps read
+    /// only their two sources.
+    fn fused_step_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        step: FusedStep,
+    ) -> Option<Expr> {
+        let view = shape.lane_bits.checked_mul(shape.lanes)?;
+        let a = self.simd_operand_value(&insn.operands.get(1)?.clone(), view)?;
+        let b = self.simd_operand_value(&insn.operands.get(2)?.clone(), view)?;
+        let accumulator = if step.reads_accumulator() {
+            Some(self.simd_operand_value(&insn.operands.first()?.clone(), view)?)
+        } else {
+            None
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let a_lane = Self::extract_lane(a.clone(), shape.lane_bits, index)?;
+            let b_lane = Self::extract_lane(b.clone(), shape.lane_bits, index)?;
+            let acc_lane = match &accumulator {
+                Some(acc) => Some(Self::extract_lane(acc.clone(), shape.lane_bits, index)?),
+                None => None,
+            };
+            lanes.push(fused_multiply_lane(
+                step,
+                &a_lane,
+                &b_lane,
+                acc_lane,
+                shape.lane_bits,
+            )?);
+        }
+        Self::concat_lanes(lanes)
     }
 
     /// `tbl` / `tbx` — each destination byte selected from the table by

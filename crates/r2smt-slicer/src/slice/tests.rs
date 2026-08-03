@@ -1889,10 +1889,10 @@ fn aarch64_packed_write_supersedes_the_earlier_definition_it_overwrites() {
 #[test]
 fn aarch64_unmodelled_packed_write_over_a_live_vector_register_truncates() {
     // The teeth for the shapes still outside the NEON handlers.
-    // `fmla` is a fused multiply-add, rounding the product and the sum
-    // once; the IR has only separate nodes, so the slice must truncate
-    // rather than step over a write to the register the branch reads.
-    let program = packed_over_live_vector_program("fmla", "v0.4s", "v1.4s", "v2.4s");
+    // `fmulx` is a float multiply extended with no family, so the slice
+    // must truncate rather than step over a write to the register the
+    // branch reads.
+    let program = packed_over_live_vector_program("fmulx", "v0.4s", "v1.4s", "v2.4s");
     let slice = slice_first(&program);
     assert!(
         matches!(slice.status, SliceStatus::Truncated { .. }),

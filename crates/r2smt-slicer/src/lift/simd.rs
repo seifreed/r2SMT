@@ -242,6 +242,129 @@ pub(crate) fn fp_lane_result(
     Some(Expr::fp_to_ieee_bv(arith))
 }
 
+/// An `AArch64` fused multiply step: the product and the following
+/// combine round together, once, where a separate `fmul` then `fadd`
+/// would round twice.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FusedStep {
+    /// `fmla` — accumulator + a·b.
+    MulAdd,
+    /// `fmls` — accumulator − a·b.
+    MulSub,
+    /// `frecps` — `2.0 − a·b`, the Newton–Raphson reciprocal step.
+    RecipStep,
+    /// `frsqrts` — `(3.0 − a·b) / 2.0`, the reciprocal-square-root step.
+    RsqrtStep,
+}
+
+impl FusedStep {
+    /// Whether the destination lane is an input (the accumulator).
+    pub(crate) const fn reads_accumulator(self) -> bool {
+        matches!(self, Self::MulAdd | Self::MulSub)
+    }
+}
+
+/// binary64 bit patterns of the step constants.
+const F64_TWO: u128 = 0x4000_0000_0000_0000;
+const F64_THREE: u128 = 0x4008_0000_0000_0000;
+/// binary32 bit patterns of the `(inf, 0)` special-case results.
+const F32_TWO: u128 = 0x4000_0000;
+const F32_ONE_POINT_FIVE: u128 = 0x3fc0_0000;
+/// binary32 magnitude mask and the infinity pattern with the sign
+/// cleared.
+const F32_ABS_MASK: u128 = 0x7fff_ffff;
+const F32_INFINITY: u128 = 0x7f80_0000;
+
+/// One binary32 lane of a fused multiply step, computed once in binary64
+/// and rounded once back to binary32.
+///
+/// The intermediate is exact: a binary32 product fits binary64's
+/// significand (`2·24 − 1 < 53`), and `53 ≥ 2·24 + 2` makes the single
+/// binary64 rounding of the sum equivalent to rounding the real result
+/// straight to binary32 — so this reproduces the architecture's single
+/// rounding rather than the double rounding a separate `fmul` + `fadd`
+/// would give. `acc_bits` is the accumulator lane for `fmla` / `fmls`;
+/// the step forms ignore it.
+///
+/// `frecps` / `frsqrts` return `2.0` / `1.5` when one operand is zero and
+/// the other infinite, where the fused arithmetic alone would give a NaN
+/// — the one input on which the naive lowering is a wrong *value* rather
+/// than a wider one, so it is guarded explicitly.
+///
+/// `None` for any lane width but binary32: a binary64 lane would need
+/// binary128 to stay exact, so the caller declines rather than round
+/// twice.
+pub(crate) fn fused_multiply_lane(
+    step: FusedStep,
+    a_bits: &Expr,
+    b_bits: &Expr,
+    acc_bits: Option<Expr>,
+    lane_bits: u16,
+) -> Option<Expr> {
+    const SINGLE: (u16, u16) = (8, 24);
+    const DOUBLE: (u16, u16) = (11, 53);
+    if lane_bits != FP_SINGLE_BITS {
+        return None;
+    }
+    let rm = RoundingMode::NearestTiesEven;
+    let widen = |bits: Expr| {
+        Expr::fp_to_fp(
+            Expr::bv_to_fp(bits, SINGLE.0, SINGLE.1),
+            rm,
+            DOUBLE.0,
+            DOUBLE.1,
+        )
+    };
+    let double_const = |bits: u128| Expr::FpConst {
+        bits,
+        ebits: DOUBLE.0,
+        sbits: DOUBLE.1,
+    };
+    let product = Expr::fmul(widen(a_bits.clone()), widen(b_bits.clone()), rm);
+    let value = match step {
+        FusedStep::MulAdd => Expr::fadd(widen(acc_bits?), product, rm),
+        FusedStep::MulSub => Expr::fsub(widen(acc_bits?), product, rm),
+        FusedStep::RecipStep => Expr::fsub(double_const(F64_TWO), product, rm),
+        FusedStep::RsqrtStep => Expr::fdiv(
+            Expr::fsub(double_const(F64_THREE), product, rm),
+            double_const(F64_TWO),
+            rm,
+        ),
+    };
+    let narrowed = Expr::fp_to_ieee_bv(Expr::fp_to_fp(value, rm, SINGLE.0, SINGLE.1));
+    Some(match step {
+        FusedStep::MulAdd | FusedStep::MulSub => narrowed,
+        FusedStep::RecipStep => zero_times_infinity_result(a_bits, b_bits, F32_TWO, narrowed),
+        FusedStep::RsqrtStep => {
+            zero_times_infinity_result(a_bits, b_bits, F32_ONE_POINT_FIVE, narrowed)
+        }
+    })
+}
+
+/// Select `result_bits` when one binary32 operand is zero and the other
+/// infinite, otherwise `otherwise` — the `frecps` / `frsqrts` special
+/// case, tested on the raw bit patterns since the IR has no is-infinite
+/// or is-zero predicate.
+fn zero_times_infinity_result(
+    a_bits: &Expr,
+    b_bits: &Expr,
+    result_bits: u128,
+    otherwise: Expr,
+) -> Expr {
+    let magnitude = |bits: &Expr| Expr::bv_and(bits.clone(), Expr::konst(F32_ABS_MASK, 32));
+    let is_zero = |bits: &Expr| Expr::eq(magnitude(bits), Expr::konst(0, 32));
+    let is_infinite = |bits: &Expr| Expr::eq(magnitude(bits), Expr::konst(F32_INFINITY, 32));
+    let special = Expr::bool_or(
+        Expr::bool_and(is_infinite(a_bits), is_zero(b_bits)),
+        Expr::bool_and(is_zero(a_bits), is_infinite(b_bits)),
+    );
+    Expr::Ite {
+        cond: Box::new(special),
+        then_expr: Box::new(Expr::konst(result_bits, 32)),
+        else_expr: Box::new(otherwise),
+    }
+}
+
 /// Lane result of a floating-point max / min that **propagates** NaN
 /// and resolves a signed-zero tie by combining the two signs, rather
 /// than selecting an operand on a bare comparison.

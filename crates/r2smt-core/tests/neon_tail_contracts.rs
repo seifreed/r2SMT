@@ -826,3 +826,111 @@ fn frecpe_keeps_the_slice_complete_rather_than_truncating() {
         SmtResult::Unsound,
     );
 }
+
+// ===================== fused multiply steps =====================
+//
+// The point of these: a fused step rounds the product and the following
+// combine once, together, where a separate fmul then fadd rounds twice.
+// The two give different values on real inputs, so a naive lowering
+// would compute a plausible wrong number rather than a wider one. These
+// bind inputs on which the single and double roundings disagree.
+
+/// Binary32 infinity, and the next float above 1.0 (`1 + 2^-12`), whose
+/// square carries a bit below the significand.
+const F32_INFINITY: u128 = 0x7f80_0000;
+const F32_ONE_PLUS: u128 = 0x3f80_0800;
+/// `-(1 + 2^-11)`, and `2^-24` — the accumulator and the exact answer of
+/// the single-rounding fmla below.
+const F32_MINUS_ONE_PLUS_2: u128 = 0xbf80_1000;
+const F32_TWO_POW_MINUS_24: u128 = 0x3380_0000;
+
+#[test]
+fn fmla_rounds_the_product_and_sum_once_not_twice() {
+    // (1 + 2^-12)^2 = 1 + 2^-11 + 2^-24; the 2^-24 falls below binary32,
+    // so rounding the product first drops it and `d + a*b` with
+    // d = -(1 + 2^-11) collapses to 0. The fused step keeps the bit and
+    // the lane is exactly 2^-24. The whole contract is that difference.
+    assert_computes(
+        "fmla",
+        &["v0.4s", "v1.4s", "v2.4s"],
+        &[
+            ("v0", packed(32, &[F32_MINUS_ONE_PLUS_2; 4])),
+            ("v1", packed(32, &[F32_ONE_PLUS; 4])),
+            ("v2", packed(32, &[F32_ONE_PLUS; 4])),
+        ],
+        packed(32, &[F32_TWO_POW_MINUS_24; 4]),
+    );
+}
+
+#[test]
+fn fmls_subtracts_the_product_from_the_accumulator() {
+    // 5 - 2*3 = -1, a plain case that pins the subtract direction.
+    assert_computes(
+        "fmls",
+        &["v0.2s", "v1.2s", "v2.2s"],
+        &[
+            ("v0", packed(32, &[F32_FIVE; 2])),
+            ("v1", packed(32, &[F32_TWO; 2])),
+            ("v2", packed(32, &[F32_THREE; 2])),
+        ],
+        packed(32, &[0xbf80_0000; 2]),
+    );
+}
+
+#[test]
+fn frecps_computes_two_minus_the_product() {
+    // 2.0 - 1.0*1.0 = 1.0.
+    assert_computes(
+        "frecps",
+        &["v0.4s", "v1.4s", "v2.4s"],
+        &[
+            ("v1", packed(32, &[F32_ONE; 4])),
+            ("v2", packed(32, &[F32_ONE; 4])),
+        ],
+        packed(32, &[F32_ONE; 4]),
+    );
+}
+
+#[test]
+fn frecps_returns_two_for_zero_times_infinity() {
+    // The ARM special case: inf * 0 is 2.0, not the NaN the fused
+    // arithmetic alone would produce. Getting this wrong is a fabricated
+    // value, which is why it is guarded rather than left to the maths.
+    assert_computes(
+        "frecps",
+        &["v0.4s", "v1.4s", "v2.4s"],
+        &[
+            ("v1", packed(32, &[F32_INFINITY; 4])),
+            ("v2", packed(32, &[0; 4])),
+        ],
+        packed(32, &[F32_TWO; 4]),
+    );
+}
+
+#[test]
+fn frsqrts_computes_three_minus_the_product_over_two() {
+    // (3.0 - 1.0*1.0) / 2.0 = 1.0.
+    assert_computes(
+        "frsqrts",
+        &["v0.4s", "v1.4s", "v2.4s"],
+        &[
+            ("v1", packed(32, &[F32_ONE; 4])),
+            ("v2", packed(32, &[F32_ONE; 4])),
+        ],
+        packed(32, &[F32_ONE; 4]),
+    );
+}
+
+#[test]
+fn frsqrts_returns_one_point_five_for_zero_times_infinity() {
+    // The mirror special case: inf * 0 gives 1.5.
+    assert_computes(
+        "frsqrts",
+        &["v0.4s", "v1.4s", "v2.4s"],
+        &[
+            ("v1", packed(32, &[0; 4])),
+            ("v2", packed(32, &[F32_INFINITY; 4])),
+        ],
+        packed(32, &[0x3fc0_0000; 4]),
+    );
+}

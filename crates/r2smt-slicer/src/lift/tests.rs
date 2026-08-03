@@ -2736,14 +2736,14 @@ fn aarch64_half_width_arrangement_write_zeroes_the_upper_half() {
 
 #[test]
 fn aarch64_unmodelled_vector_mnemonic_declines() {
-    // `fmla` is *fused*: the product and the sum round once, together,
-    // which no combination of the IR's separate multiply and add
-    // reproduces. A mnemonic no family claims must decline rather than
-    // fall into a same-width handler.
+    // `fmulx` is the canary now that `fmla` lifts: it is a float
+    // multiply extended (`0 * inf` gives 2.0, not NaN), which no family
+    // claims. A mnemonic no family claims must decline rather than fall
+    // into a same-width handler.
     let i = insn(
         0x1000,
         4,
-        "fmla",
+        "fmulx",
         vec![reg("v0.4s"), reg("v1.4s"), reg("v2.4s")],
     );
     let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
@@ -3741,13 +3741,21 @@ fn aarch64_by_element_long_form_lifts() {
 }
 
 #[test]
-fn aarch64_by_element_declines_a_fused_multiply_add() {
-    // `fmla` / `fmls` round the product and the sum together, once.
-    // `fadd(d, fmul(a, b))` rounds twice, and the two differ in real
-    // cases, so the IR having no fused node is a decline rather than a
-    // licence to approximate.
+fn aarch64_whole_vector_fused_multiply_add_lifts_for_single_lanes() {
+    // The whole-vector `fmla` / `fmls` over binary32 lanes lower through
+    // the binary64 fused step; the by-element spelling stays declining
+    // (it needs the float accumulate wiring the integer forms have).
+    assert!(!neon_declines("fmla", &["v0.4s", "v1.4s", "v2.4s"]));
+    assert!(!neon_declines("fmls", &["v0.2s", "v1.2s", "v2.2s"]));
     assert!(neon_declines("fmla", &["v0.4s", "v1.4s", "v2.s[1]"]));
-    assert!(neon_declines("fmls", &["v0.4s", "v1.4s", "v2.s[1]"]));
+}
+
+#[test]
+fn aarch64_fused_multiply_add_declines_double_lanes() {
+    // A binary64 lane would need binary128 to stay exact, so the `.2d`
+    // arrangement declines rather than round twice.
+    assert!(neon_declines("fmla", &["v0.2d", "v1.2d", "v2.2d"]));
+    assert!(neon_declines("frecps", &["v0.2d", "v1.2d", "v2.2d"]));
 }
 
 #[test]
@@ -3923,11 +3931,11 @@ fn aarch64_reciprocal_estimate_declines_a_non_ieee_lane() {
 }
 
 #[test]
-fn aarch64_reciprocal_step_declines_as_a_fused_operation() {
+fn aarch64_reciprocal_step_lifts_for_single_lanes() {
     // `frecps` / `frsqrts` are `2.0 - x*y` and `(3.0 - x*y) / 2.0`
     // computed through `FPRecipStepFused` — one rounding over the whole
-    // expression, where a separate `fmul` and `fsub` round twice. Same
-    // objection as `fmla`.
-    assert!(neon_declines("frecps", &["v0.4s", "v1.4s", "v2.4s"]));
-    assert!(neon_declines("frsqrts", &["v0.4s", "v1.4s", "v2.4s"]));
+    // expression, which the binary64 fused step reproduces for binary32
+    // lanes.
+    assert!(!neon_declines("frecps", &["v0.4s", "v1.4s", "v2.4s"]));
+    assert!(!neon_declines("frsqrts", &["v0.4s", "v1.4s", "v2.4s"]));
 }
