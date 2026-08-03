@@ -98,12 +98,14 @@ impl LiftCtx {
             "cinc" => self.lift_aarch64_cs_arith(insn, CsArithOp::Inc, true),
             "cinv" => self.lift_aarch64_cs_arith(insn, CsArithOp::Inv, true),
             "cneg" => self.lift_aarch64_cs_arith(insn, CsArithOp::Neg, true),
-            // P26 — memory loads / stores in offset form `[Xn]` /
-            // `[Xn, #imm]`. Pre / post-index writeback (`[Xn, #imm]!`
-            // / `[Xn], #imm`) and register-offset addressing
-            // (`[Xn, Xm]`) decline to `Unsupported` so the slice's
-            // confidence path picks them up — soundness in lowering,
-            // not detection.
+            // Memory loads / stores in offset form `[Xn]` /
+            // `[Xn, #imm]` and in the pre / post-index writeback forms
+            // (`[Xn, #imm]!` / `[Xn], #imm` / `[Xn], Xm`), which
+            // `aarch64_mem_access` resolves and `emit_writeback` then
+            // applies to the base. Register-*offset* addressing
+            // (`[Xn, Xm]`) still declines to `Unsupported`, so the
+            // slice's confidence path picks it up — soundness in
+            // lowering, not detection.
             "ldr" => self.lift_aarch64_load(insn, None, false),
             // Sub-word loads zero-extend (`ldrb`/`ldrh`) or sign-extend
             // (`ldrsb`/`ldrsh`/`ldrsw`) into the destination register.
@@ -117,8 +119,10 @@ impl LiftCtx {
             "strh" => self.lift_aarch64_store(insn, Some(16)),
             // Paired load / store `ldp`/`stp Rt, Rt2, [Xn{, #imm}]`:
             // the second element sits one register-width above the
-            // first. Pre / post-index writeback forms still decline
-            // via `aarch64_address_expr` returning `None`.
+            // first. Unlike the single-register forms above, the pair
+            // goes through `aarch64_pair_addresses`, which builds two
+            // addresses and no writeback — so the pre / post-index
+            // pair forms still decline.
             "ldp" => self.lift_aarch64_ldp(insn),
             "stp" => self.lift_aarch64_stp(insn),
             // Scalar floating point. The lane width comes from the
