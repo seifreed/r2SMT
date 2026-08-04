@@ -43,7 +43,8 @@ mod x86;
 mod x87;
 pub(crate) use aarch32::{
     VfpOp, aarch32_neon_writes_operand_pair, aarch32_structured_effect,
-    is_aarch32_neon_instruction, is_aarch32_packed_instruction, vfp_scalar,
+    aarch32_vmrs_transfers_flags, is_aarch32_neon_instruction, is_aarch32_packed_instruction,
+    vfp_scalar,
 };
 pub(crate) use aarch64::neon::structured::StructuredEffect;
 use merge::lower_merge;
@@ -133,6 +134,10 @@ fn is_simd_instruction(insn: &Instruction, arch: Arch) -> bool {
             vfp_scalar(&mnem).is_some()
                 || aarch32::neon_packed_op(&mnem).is_some()
                 || is_aarch32_neon_instruction(insn)
+                // `vmrs APSR_nzcv, FPSCR` carries no `.f` type and is not
+                // NEON, but its per-mnemonic identity must win over any
+                // ESIL lowering that would clobber the flags `vcmp` set.
+                || aarch32_vmrs_transfers_flags(insn)
         }
         _ => false,
     }

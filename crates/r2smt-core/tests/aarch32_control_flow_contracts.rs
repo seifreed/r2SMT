@@ -8,7 +8,7 @@
 use r2smt_common::smt::{SmtResult, SolveOptions};
 use r2smt_common::{Address, Arch};
 use r2smt_ir::program::{BasicBlock, Function, Instruction, Operand, OperandKind, Program};
-use r2smt_slicer::{SliceLimits, collect_branches, lift_slice, slice_branch};
+use r2smt_slicer::{SliceLimits, SliceStatus, collect_branches, lift_slice, slice_branch};
 use r2smt_smt::solve_branch;
 use r2smt_ssa::ssa_convert;
 
@@ -86,6 +86,78 @@ fn solve_first_branch(program: &Program) -> SmtResult {
     let slice = slice_branch(candidate, function, &SliceLimits::default(), Arch::Arm);
     let lifted = lift_slice(&slice, Arch::Arm);
     solve_branch(&ssa_convert(&lifted), solve_opts())
+}
+
+/// `vcmp.f32 s0, s1; vmrs APSR_nzcv, FPSCR; b<cond> tgt`.
+fn vcmp_vmrs_branch_program(branch_mnemonic: &str) -> Program {
+    Program {
+        arch: Arch::Arm,
+        bits: 32,
+        entry: Some(Address(0x1000)),
+        functions: vec![Function {
+            address: Address(0x1000),
+            name: Some("sym.main".into()),
+            blocks: vec![BasicBlock {
+                address: Address(0x1000),
+                instructions: vec![
+                    insn(
+                        0x1000,
+                        "vcmp.f32",
+                        vec![
+                            op("s0", OperandKind::Register),
+                            op("s1", OperandKind::Register),
+                        ],
+                    ),
+                    insn(
+                        0x1004,
+                        "vmrs",
+                        vec![
+                            op("APSR_nzcv", OperandKind::Register),
+                            op("FPSCR", OperandKind::Register),
+                        ],
+                    ),
+                    insn(
+                        0x1008,
+                        branch_mnemonic,
+                        vec![op("0x1080", OperandKind::Immediate)],
+                    ),
+                ],
+                successors: vec![],
+            }],
+            is_thumb: true,
+        }],
+    }
+}
+
+fn slice_status_and_verdict(program: &Program) -> (SliceStatus, SmtResult) {
+    let candidates = collect_branches(program);
+    let candidate = candidates.first().expect("one branch candidate");
+    let function = &program.functions[0];
+    let slice = slice_branch(candidate, function, &SliceLimits::default(), Arch::Arm);
+    let status = slice.status.clone();
+    let lifted = lift_slice(&slice, Arch::Arm);
+    (status, solve_branch(&ssa_convert(&lifted), solve_opts()))
+}
+
+#[test]
+fn aarch32_vcmp_vmrs_branch_resolves_instead_of_truncating() {
+    // The float-compare predicate must reach the branch through the
+    // `vmrs` transfer: `vcmp.f32 s0, s1; vmrs APSR_nzcv, FPSCR; beq`.
+    // With free operands the verdict is BothPossible — the point is that
+    // it is NOT Unsound: an unmodelled `vmrs` truncates the slice at the
+    // transfer, which reports Unsound without ever reaching the `vcmp`.
+    let program = vcmp_vmrs_branch_program("beq");
+    let (status, verdict) = slice_status_and_verdict(&program);
+    assert_eq!(
+        status,
+        SliceStatus::Complete,
+        "slice must not truncate at vmrs"
+    );
+    assert_eq!(
+        verdict,
+        SmtResult::BothPossible,
+        "free-operand float compare is BothPossible, never Unsound",
+    );
 }
 
 #[test]

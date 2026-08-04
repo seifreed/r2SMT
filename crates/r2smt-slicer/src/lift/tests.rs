@@ -815,6 +815,26 @@ fn aarch32_rsb_swaps_operands_and_subtracts() {
 }
 
 #[test]
+fn aarch32_vmrs_flag_transfer_is_a_modelled_nop() {
+    // `vmrs APSR_nzcv, FPSCR` is an identity in this model (vcmp wrote
+    // NZCV directly), lifted as a Nop so the slice keeps walking past it
+    // rather than declining.
+    let stmts = lift_aarch32("vmrs", vec![reg("APSR_nzcv"), reg("FPSCR")]);
+    assert_eq!(stmts, vec![IrStmt::Nop]);
+}
+
+#[test]
+fn aarch32_vmrs_gpr_read_declines() {
+    // `vmrs r0, FPSCR` reads the status word into a GPR — not modelled.
+    let stmts = lift_aarch32("vmrs", vec![reg("r0"), reg("FPSCR")]);
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. }))
+    );
+}
+
+#[test]
 fn aarch32_movs_sets_zero_flag_from_the_moved_value() {
     // `movs` is a flag-setting move: N/Z come from the value, C/V are
     // untouched. `movs r0, #0` must set ZF, unlike plain `mov`.

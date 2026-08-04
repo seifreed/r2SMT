@@ -84,6 +84,7 @@ impl LiftCtx {
         match mnem.as_str() {
             "mov" => self.lift_aarch64_mov(insn),
             "movs" => self.lift_aarch32_movs(insn),
+            "vmrs" => self.lift_aarch32_vmrs(insn),
             "mvn" => self.lift_aarch32_mvn(insn),
             "add" => self.lift_aarch64_arith3(insn, BinOp::Add, false),
             "adds" => self.lift_aarch64_arith3(insn, BinOp::Add, true),
@@ -357,6 +358,25 @@ impl LiftCtx {
                 comment: "non-register destination (mvn)".into(),
             });
         }
+    }
+
+    /// `vmrs APSR_nzcv, FPSCR` — transfer the FP compare flags into the
+    /// integer condition flags, the ARM analogue of x86 `fnstsw` +
+    /// `sahf`. Our `vcmp` writes NZCV directly, so in this model the
+    /// transfer is an identity: it emits a `Nop` rather than declining,
+    /// which keeps it out of `InstructionKind::Other` so the slice walks
+    /// past it to the `vcmp` that actually defined the flags. Any other
+    /// `vmrs` form (`vmrs r0, FPSCR`, a GPR read of the status word) is
+    /// not modelled and declines.
+    fn lift_aarch32_vmrs(&mut self, insn: &Instruction) {
+        if aarch32_vmrs_transfers_flags(insn) {
+            self.stmts.push(IrStmt::Nop);
+            return;
+        }
+        self.stmts.push(IrStmt::Unsupported {
+            mnemonic: insn.mnemonic.clone(),
+            comment: format!("at {addr} (vmrs)", addr = insn.address),
+        });
     }
 
     /// `movs Rd, Op` — a move that also sets N/Z from the moved value.
@@ -1006,6 +1026,22 @@ impl LiftCtx {
 /// disagree about which instructions the slicer may retain.
 pub(crate) fn is_aarch32_neon_instruction(insn: &Instruction) -> bool {
     neon::resolve(insn).is_some()
+}
+
+/// Whether `insn` is the `vmrs APSR_nzcv, FPSCR` flag-transfer form —
+/// the destination names the application status register's condition
+/// flags and the source is `FPSCR`. The GPR-destination form
+/// (`vmrs r0, FPSCR`) is not this and is not modelled.
+pub(crate) fn aarch32_vmrs_transfers_flags(insn: &Instruction) -> bool {
+    if !insn.mnemonic.trim().eq_ignore_ascii_case("vmrs") {
+        return false;
+    }
+    let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
+        return false;
+    };
+    let dst = dst.raw.trim().to_ascii_lowercase();
+    let src = src.raw.trim().to_ascii_lowercase();
+    dst.starts_with("apsr") && src == "fpscr"
 }
 
 /// Whether `insn` is a NEON form that writes both of its named

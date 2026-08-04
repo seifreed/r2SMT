@@ -178,6 +178,14 @@ fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> Instruct
         // vector write preserves the rest of the register file (`d1`
         // survives a write to `d0`, both halves of `q0`), so the
         // destination is a use as well as a def.
+        // `vmrs APSR_nzcv, FPSCR` transfers the FP compare flags into the
+        // integer flags. `vcmp` wrote NZCV directly in this model, so the
+        // transfer is an identity — but it must be kept (defines and
+        // reads the flags) rather than falling to `other_effect`, or the
+        // slice truncates here instead of walking to the `vcmp`.
+        "vmrs" if crate::lift::aarch32_vmrs_transfers_flags(insn) => {
+            aarch32_vmrs_flag_transfer_effect()
+        }
         m if crate::lift::vfp_scalar(m).is_some()
             || crate::lift::is_aarch32_packed_instruction(insn)
             || crate::lift::is_aarch32_neon_instruction(insn) =>
@@ -310,6 +318,18 @@ fn aarch32_str_effect(insn: &Instruction) -> InstructionEffect {
         has_memory_access: true,
         is_call: false,
         reads_flags: false,
+    }
+}
+
+fn aarch32_vmrs_flag_transfer_effect() -> InstructionEffect {
+    InstructionEffect {
+        kind: InstructionKind::Cmp,
+        defs: Vec::new(),
+        uses: Vec::new(),
+        defines_flags: true,
+        has_memory_access: false,
+        is_call: false,
+        reads_flags: true,
     }
 }
 

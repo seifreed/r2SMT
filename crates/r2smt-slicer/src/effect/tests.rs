@@ -826,6 +826,33 @@ fn aarch32_thumb_wide_suffix_keeps_the_base_effect() {
 }
 
 #[test]
+fn aarch32_vmrs_flag_transfer_is_kept_not_truncated() {
+    // `vmrs APSR_nzcv, FPSCR` must define and read the flags so the
+    // slice walks past it to the `vcmp`, rather than falling to `Other`
+    // (which truncates a pending slice).
+    let vmrs = insn(
+        "vmrs",
+        vec![
+            op("APSR_nzcv", OperandKind::Register),
+            op("FPSCR", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&vmrs, Arch::Arm);
+    assert_ne!(effect.kind, InstructionKind::Other);
+    assert!(effect.defines_flags && effect.reads_flags);
+
+    // The GPR-read form is not modelled and truncates.
+    let gpr = insn(
+        "vmrs",
+        vec![
+            op("r0", OperandKind::Register),
+            op("FPSCR", OperandKind::Register),
+        ],
+    );
+    assert_eq!(analyze(&gpr, Arch::Arm).kind, InstructionKind::Other);
+}
+
+#[test]
 fn aarch32_cbz_reads_the_compared_register() {
     // `cbz r0, 0x1000` is a Jcc that reads r0 (so the slicer keeps its
     // definition) and touches no flags or register defs.
