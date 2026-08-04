@@ -549,13 +549,6 @@ impl LiftCtx {
             });
             return;
         }
-        if aarch32_mem_base_is_pc(mem) {
-            self.stmts.push(IrStmt::Unsupported {
-                mnemonic: insn.mnemonic.clone(),
-                comment: "vldr/vstr pc-relative literal pool not modelled".into(),
-            });
-            return;
-        }
         let Some(bits) = nonzero_width(self.operand_width(reg)) else {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
@@ -563,9 +556,12 @@ impl LiftCtx {
             });
             return;
         };
-        let Some(access) =
-            aarch32_mem_access(mem, insn.operands.get(2..).unwrap_or_default(), self.bits)
-        else {
+        let Some(access) = aarch32_mem_access(
+            mem,
+            insn.operands.get(2..).unwrap_or_default(),
+            self.bits,
+            aarch32_pc_value(insn),
+        ) else {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("vldr/vstr addressing mode not modelled: {}", mem.raw),
@@ -848,9 +844,12 @@ impl LiftCtx {
             return;
         };
         let load_width = width_override.unwrap_or(dst_width);
-        let Some(access) =
-            aarch32_mem_access(mem, insn.operands.get(2..).unwrap_or_default(), self.bits)
-        else {
+        let Some(access) = aarch32_mem_access(
+            mem,
+            insn.operands.get(2..).unwrap_or_default(),
+            self.bits,
+            aarch32_pc_value(insn),
+        ) else {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("ldr addressing mode not yet modelled: {}", mem.raw),
@@ -889,7 +888,12 @@ impl LiftCtx {
         if mem.kind != OperandKind::Memory {
             return None;
         }
-        aarch32_mem_access(mem, insn.operands.get(3..).unwrap_or_default(), self.bits)
+        aarch32_mem_access(
+            mem,
+            insn.operands.get(3..).unwrap_or_default(),
+            self.bits,
+            aarch32_pc_value(insn),
+        )
     }
 
     /// `ldrd Rt, Rt2, [mem]` — two consecutive words, `Rt` at the
@@ -978,9 +982,12 @@ impl LiftCtx {
             return;
         };
         let store_width = width_override.unwrap_or(src_width);
-        let Some(access) =
-            aarch32_mem_access(mem, insn.operands.get(2..).unwrap_or_default(), self.bits)
-        else {
+        let Some(access) = aarch32_mem_access(
+            mem,
+            insn.operands.get(2..).unwrap_or_default(),
+            self.bits,
+            aarch32_pc_value(insn),
+        ) else {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("str addressing mode not yet modelled: {}", mem.raw),
@@ -1297,7 +1304,12 @@ fn aarch32_base_writeback(raw: &str) -> Option<(String, bool)> {
 /// (`[Rn, #imm]!`) and post-index (`[Rn], #imm`) writeback forms.
 /// Mirrors the `AArch64` resolver but validates the base through the
 /// `Arch::Arm` register table. Unrecognised shapes still return `None`.
-fn aarch32_mem_access(mem: &Operand, post: &[Operand], ptr_bits: u16) -> Option<MemAccess> {
+fn aarch32_mem_access(
+    mem: &Operand,
+    post: &[Operand],
+    ptr_bits: u16,
+    pc: u64,
+) -> Option<MemAccess> {
     if mem.kind != OperandKind::Memory {
         return None;
     }
@@ -1307,7 +1319,7 @@ fn aarch32_mem_access(mem: &Operand, post: &[Operand], ptr_bits: u16) -> Option<
         let parent = register_layout(&base, Arch::Arm).map(|l| l.parent)?;
         let delta = aarch32_offset_expr(&offset, ptr_bits)?;
         return Some(MemAccess {
-            address: aarch32_addr_from_offset(parent, &offset, ptr_bits)?,
+            address: aarch32_addr_from_offset(parent, &offset, ptr_bits, pc)?,
             writeback: Some(Writeback {
                 base: parent.to_string(),
                 delta,
@@ -1324,7 +1336,7 @@ fn aarch32_mem_access(mem: &Operand, post: &[Operand], ptr_bits: u16) -> Option<
         }
         let delta = parse_aarch32_offset(post)?;
         return Some(MemAccess {
-            address: Expr::Var(Var::new(parent, ptr_bits)),
+            address: aarch32_base_expr(parent, ptr_bits, pc),
             writeback: Some(Writeback {
                 base: parent.to_string(),
                 delta: aarch32_offset_expr(&delta, ptr_bits)?,
@@ -1332,10 +1344,29 @@ fn aarch32_mem_access(mem: &Operand, post: &[Operand], ptr_bits: u16) -> Option<
         });
     }
     Some(MemAccess {
-        address: aarch32_addr_from_offset(parent, &offset, ptr_bits)?,
+        address: aarch32_addr_from_offset(parent, &offset, ptr_bits, pc)?,
         writeback: None,
     })
 }
+
+/// The architectural value of `pc` while `insn` executes: two
+/// instructions ahead of its own address, and word-aligned.
+///
+/// ARM fixes this at `address + 8` and Thumb at `address + 4`; a Thumb
+/// literal access reads `Align(PC, 4)`, while every ARM instruction is
+/// already word-aligned so the mask is a no-op there.
+fn aarch32_pc_value(insn: &Instruction) -> u64 {
+    let ahead = if insn.is_thumb {
+        THUMB_PC_AHEAD
+    } else {
+        ARM_PC_AHEAD
+    };
+    insn.address.0.wrapping_add(ahead) & !3
+}
+
+/// How far ahead of its own address `pc` reads, per ISA.
+const ARM_PC_AHEAD: u64 = 8;
+const THUMB_PC_AHEAD: u64 = 4;
 
 /// Byte distance between the two words of a doubleword transfer, and
 /// the stride of a register-list transfer.
@@ -1464,10 +1495,29 @@ fn aarch32_offset_expr(offset: &MemOffset, ptr_bits: u16) -> Option<Expr> {
     }
 }
 
+/// The base register as an expression, substituting the concrete
+/// program counter for `r15`.
+///
+/// `pc` is architecturally defined during any instruction that names
+/// it, so this is exact rather than an approximation — and it turns a
+/// literal-pool access into a resolvable address instead of an offset
+/// from a free variable.
+fn aarch32_base_expr(parent: &str, ptr_bits: u16, pc: u64) -> Expr {
+    if parent == "r15" {
+        return Expr::konst(u128::from(pc), ptr_bits);
+    }
+    Expr::Var(Var::new(parent, ptr_bits))
+}
+
 /// Build `base + offset` at the pointer width, keeping a zero
 /// immediate as the bare base so the common shape is unchanged.
-fn aarch32_addr_from_offset(parent: &str, offset: &MemOffset, ptr_bits: u16) -> Option<Expr> {
-    let base_var = Expr::Var(Var::new(parent, ptr_bits));
+fn aarch32_addr_from_offset(
+    parent: &str,
+    offset: &MemOffset,
+    ptr_bits: u16,
+    pc: u64,
+) -> Option<Expr> {
+    let base_var = aarch32_base_expr(parent, ptr_bits, pc);
     if *offset == MemOffset::Immediate(0) {
         return Some(base_var);
     }
@@ -1517,14 +1567,6 @@ fn parse_aarch32_offset_parts(parts: &[&str]) -> Option<MemOffset> {
         subtract,
         shift,
     })
-}
-
-/// Whether a memory operand's base register is the program counter — a
-/// PC-relative literal pool this model cannot resolve (no live PC value).
-fn aarch32_mem_base_is_pc(mem: &Operand) -> bool {
-    let raw = mem.raw.trim();
-    let body = raw.strip_suffix('!').unwrap_or(raw);
-    parse_aarch32_memory(body).is_some_and(|(base, _)| matches!(base.as_str(), "pc" | "r15"))
 }
 
 /// Build `base ± offset` at the pointer width (base alone if zero).

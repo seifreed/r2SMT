@@ -1394,13 +1394,66 @@ fn aarch32_store_register_offset_addresses_base_plus_index() {
 }
 
 #[test]
-fn aarch32_vldr_pc_relative_literal_pool_declines() {
-    // A PC-relative literal load has no live PC value in this model.
+fn aarch32_vldr_pc_relative_literal_pool_resolves_its_address() {
+    // A PC-relative literal load used to decline for want of a PC
+    // value. The architecture fixes PC, so the address is now a
+    // constant and the load reads free bytes instead of truncating the
+    // slice — sound either way, but Complete rather than Unsound.
     let stmts = lift_aarch32("vldr", vec![reg("s0"), op("[pc, #8]", OperandKind::Memory)]);
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
     assert!(
         stmts
             .iter()
-            .any(|s| matches!(s, IrStmt::Unsupported { .. }))
+            .any(|s| matches!(s, IrStmt::LoadMem { address, .. } if !format!("{address:?}").contains("Var"))),
+        "the literal address must be constant: {stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_thumb_pc_reads_one_word_ahead_and_word_aligned() {
+    // Thumb fixes PC at address + 4, and a literal access reads
+    // Align(PC, 4). At 0x1002 that is 0x1004, not 0x1006 — using the
+    // ARM offset or skipping the alignment would give a wrong address
+    // rather than a decline.
+    let mut thumb = insn(
+        0x1002,
+        2,
+        "ldr",
+        vec![reg("r0"), op("[pc]", OperandKind::Memory)],
+    );
+    thumb.is_thumb = true;
+    let stmts = lift_per_mnemonic(&thumb, Arch::Arm);
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::LoadMem { address, .. } if format!("{address:?}").contains("4100"))),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_arm_pc_reads_two_instructions_ahead() {
+    // ARM fixes PC at address + 8. `lift_aarch32` places the
+    // instruction at 0x1000, so `[pc]` addresses 0x1008.
+    let stmts = lift_aarch32("ldr", vec![reg("r0"), op("[pc]", OperandKind::Memory)]);
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::LoadMem { address, .. } if format!("{address:?}").contains("4104"))),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_pc_relative_load_no_longer_reads_a_free_register() {
+    // Before the PC model this lifted with `r15` as a free symbolic
+    // input: sound, but the address could alias anything.
+    let stmts = lift_aarch32("ldr", vec![reg("r0"), op("[pc, 8]", OperandKind::Memory)]);
+    assert!(
+        !stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::LoadMem { address, .. } if format!("{address:?}").contains("r15"))),
+        "{stmts:?}"
     );
 }
 
