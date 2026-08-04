@@ -893,7 +893,7 @@ fn extract_collapsing(value: Expr, hi: u16, lo: u16) -> Expr {
 
 impl LiftCtx {
     /// The vector-register layout `op` names, if it names one.
-    fn simd_layout(&self, op: &Operand) -> Option<RegisterLayout> {
+    pub(super) fn simd_layout(&self, op: &Operand) -> Option<RegisterLayout> {
         if op.kind != OperandKind::Register {
             return None;
         }

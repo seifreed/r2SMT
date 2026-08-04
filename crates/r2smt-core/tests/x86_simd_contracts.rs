@@ -221,3 +221,115 @@ fn vpcmpeqb_three_operand_form_reads_its_two_explicit_sources() {
         mask_except(8, 16, &[]),
     );
 }
+
+/// Solve for a *general* register rather than the vector parent.
+fn solve_gpr(
+    mnemonic: &str,
+    operands: &[&str],
+    sources: &[(&str, u128)],
+    gpr: &str,
+    gpr_bits: u16,
+    expected: u128,
+) -> SmtResult {
+    let insn = Instruction {
+        address: Address::new(0x1000),
+        size: 4,
+        bytes: vec![],
+        mnemonic: mnemonic.into(),
+        operands: operands.iter().map(|o| operand(o)).collect(),
+        esil: None,
+        pcode: None,
+        is_thumb: false,
+    };
+    let lifted = lift_per_mnemonic(&insn, Arch::X86_64);
+    assert!(
+        lifted
+            .iter()
+            .all(|s| !matches!(s, IrStmt::Unsupported { .. })),
+        "{mnemonic} declined: {lifted:?}"
+    );
+    let mut statements: Vec<IrStmt> = sources
+        .iter()
+        .map(|(name, value)| IrStmt::Assign {
+            dst: Var::new(*name, VECTOR_BITS),
+            src: Expr::konst(*value, VECTOR_BITS),
+        })
+        .collect();
+    statements.extend(lifted);
+    let slice = LiftedSlice {
+        branch: branch(),
+        statements,
+        condition: Expr::eq(
+            Expr::Var(Var::new(gpr, gpr_bits)),
+            Expr::konst(expected, gpr_bits),
+        ),
+        status: SliceStatus::Complete,
+        treat_truncation_as_inputs: false,
+        arch: Arch::X86_64,
+    };
+    solve_branch(
+        &ssa_convert(&slice),
+        SolveOptions {
+            timeout_ms: TEST_SOLVE_TIMEOUT_MS,
+            ..SolveOptions::default()
+        },
+    )
+}
+
+#[test]
+fn pmovmskb_gathers_the_sign_bit_of_every_byte() {
+    // Bytes 0 and 2 have their top bit set, byte 1 does not, and the
+    // remaining 13 are zero — so the mask is 0b101.
+    assert_eq!(
+        solve_gpr(
+            "pmovmskb",
+            &["eax", "xmm1"],
+            &[("zmm1", packed(8, &[0x80, 0x7f, 0xff]))],
+            "rax",
+            64,
+            0b101,
+        ),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn pmovmskb_takes_the_sign_bit_not_the_low_bit() {
+    // 0x01 has its low bit set and its sign bit clear; 0x80 the
+    // reverse. Sampling the wrong end would invert this mask and still
+    // look entirely plausible.
+    assert_eq!(
+        solve_gpr(
+            "pmovmskb",
+            &["eax", "xmm1"],
+            &[("zmm1", packed(8, &[0x01, 0x80]))],
+            "rax",
+            64,
+            0b10,
+        ),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn movd_into_a_vector_zeroes_the_rest_of_the_register() {
+    // `movd xmm0, eax` clears bits 127:32. Merging instead would leave
+    // whatever the register held, which is the wrong-value failure this
+    // pins.
+    assert_computes(
+        "movd",
+        &["xmm0", "eax"],
+        &[("zmm0", u128::MAX), ("rax", 0)],
+        0,
+    );
+}
+
+#[test]
+fn movq_into_a_vector_keeps_the_low_quadword_and_zeroes_above_it() {
+    assert_computes(
+        "movq",
+        &["xmm0", "xmm1"],
+        &[("zmm0", u128::MAX), ("zmm1", 0x1234_5678_9abc_def0)],
+        0x1234_5678_9abc_def0,
+    );
+}

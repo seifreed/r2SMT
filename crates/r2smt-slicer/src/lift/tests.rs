@@ -3119,14 +3119,25 @@ fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
         "sqrtss", "sqrtsd", "movss", "movsd", "pcmpeqb", "pcmpeqw", "pcmpeqd", "pcmpeqq",
         "pcmpgtb", "pcmpgtw", "pcmpgtd", "pcmpgtq", "vpcmpeqb", "vpcmpeqd", "vpcmpgtb", "vpcmpgtd",
     ];
-    for m in mnemonics {
+    // The vector-to-general transfers need realistic operands: their
+    // destination is a GPR, not a vector register.
+    let transfers = [
+        ("pmovmskb", "eax", "xmm1"),
+        ("movd", "eax", "xmm1"),
+        ("movq", "xmm0", "xmm1"),
+    ];
+    let cases = mnemonics
+        .iter()
+        .map(|m| (*m, "xmm0", "xmm1"))
+        .chain(transfers);
+    for (m, dst, src) in cases {
         let i = insn(
             0x1000,
             4,
             m,
             vec![
-                op("xmm0", OperandKind::Register),
-                op("xmm1", OperandKind::Register),
+                op(dst, OperandKind::Register),
+                op(src, OperandKind::Register),
             ],
         );
         assert!(
@@ -3138,13 +3149,21 @@ fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
             crate::effect::InstructionKind::Simd,
             "{m}: effect table does not classify it as Simd"
         );
+        // The invariant that matters: whatever the effect table claims
+        // the instruction defines, the lifter must actually define.
+        // A mnemonic the slicer retains but no handler writes leaves
+        // its destination undefined, and a later read binds to a stale
+        // value — the `pandn` bug, and the shape of the ARM def/use
+        // gaps that fabricated verdicts.
         let stmts = lift_per_mnemonic(&i, Arch::X86_64);
-        assert!(
-            stmts
-                .iter()
-                .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name.starts_with("zmm"))),
-            "{m}: lifter did not define the vector parent"
-        );
+        for def in crate::effect::analyze(&i, Arch::X86_64).defs {
+            assert!(
+                stmts
+                    .iter()
+                    .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == def)),
+                "{m}: effect table claims it defines {def}, lifter does not"
+            );
+        }
         assert!(
             !stmts
                 .iter()

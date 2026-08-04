@@ -71,6 +71,9 @@ impl LiftCtx {
             "divsd" => self.lift_simd_scalar_fp(insn, FpArithOp::Div, 64),
             // Packed integer compares. `pcmpgt*` is signed; x86 has no
             // unsigned form.
+            "pmovmskb" | "vpmovmskb" => self.lift_simd_move_mask(insn),
+            "movd" | "vmovd" => self.lift_simd_gpr_transfer(insn, 32),
+            "movq" | "vmovq" => self.lift_simd_gpr_transfer(insn, 64),
             "pcmpeqb" | "vpcmpeqb" => self.lift_simd_packed_compare(insn, EQUAL, 8),
             "pcmpeqw" | "vpcmpeqw" => self.lift_simd_packed_compare(insn, EQUAL, 16),
             "pcmpeqd" | "vpcmpeqd" => self.lift_simd_packed_compare(insn, EQUAL, 32),
@@ -644,6 +647,108 @@ impl LiftCtx {
         }
     }
 
+    /// `pmovmskb r32, xmm` — the sign bit of each source byte,
+    /// concatenated into the low bits of a general register with the
+    /// rest zeroed (16 bits from an `xmm` source, 32 from a `ymm`).
+    ///
+    /// This is the instruction that carries a vector compare's result
+    /// into the integer world, so it is the hinge of the SSE
+    /// strlen/memcmp idiom: without it the mask never reaches a flag
+    /// and the branch stays unresolved.
+    fn lift_simd_move_mask(&mut self, insn: &Instruction) {
+        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
+            return;
+        };
+        let (dst, src) = (dst.clone(), src.clone());
+        let (Some(view), Some(width)) = (
+            self.simd_view_bits(&src),
+            nonzero_width(self.operand_width(&dst)),
+        ) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let Some(value) = self.simd_operand_value(&src, view) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let Some(lanes) = Self::packed_lane_count(view, BITS_PER_BYTE) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        // Most significant byte first: `concat_lanes` takes its input
+        // least-significant first, and byte `i`'s sign bit lands at bit
+        // `i` of the result.
+        let mut bits = Vec::with_capacity(usize::from(lanes));
+        for index in 0..lanes {
+            let Some(byte) = Self::extract_lane(value.clone(), BITS_PER_BYTE, index) else {
+                self.push_simd_unsupported(insn);
+                return;
+            };
+            bits.push(Expr::extract(byte, BITS_PER_BYTE - 1, BITS_PER_BYTE - 1));
+        }
+        let Some(mask) = Self::concat_lanes(bits) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        if !self.write_register_to(&dst, Expr::zero_ext(mask, width)) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
+    /// `movd` / `movq` between a vector register and a general register
+    /// or memory, at `width` bits.
+    ///
+    /// Both directions **zero** everything above the transferred value
+    /// rather than merging: `movd xmm0, eax` clears bits 127:32 of the
+    /// destination, and the general-register direction zero-extends
+    /// into the full register. Merging instead would leave whatever the
+    /// vector held before, which is a wrong value rather than a
+    /// decline.
+    fn lift_simd_gpr_transfer(&mut self, insn: &Instruction, width: u16) {
+        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
+            return;
+        };
+        let (dst, src) = (dst.clone(), src.clone());
+        let to_vector = self.simd_layout(&dst).is_some();
+        let value = if self.simd_layout(&src).is_some() {
+            let Some(view) = self.simd_view_bits(&src) else {
+                self.push_simd_unsupported(insn);
+                return;
+            };
+            let Some(whole) = self.simd_operand_value(&src, view) else {
+                self.push_simd_unsupported(insn);
+                return;
+            };
+            if view <= width {
+                whole
+            } else {
+                Expr::extract(whole, width - 1, 0)
+            }
+        } else {
+            self.read_operand_at(&src, width)
+        };
+        if to_vector {
+            // `zero_upper = true` regardless of VEX: the legacy forms
+            // zero the vector register too.
+            if !self.write_simd_dst(&dst, value, true) {
+                self.push_simd_unsupported(insn);
+            }
+            return;
+        }
+        let Some(dst_width) = nonzero_width(self.operand_width(&dst)) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let widened = if dst_width > width {
+            Expr::zero_ext(value, dst_width)
+        } else {
+            value
+        };
+        if !self.write_register_to(&dst, widened) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
     /// The packed integer compares: `pcmpeq{b,w,d,q}` and
     /// `pcmpgt{b,w,d,q}`.
     ///
@@ -1102,6 +1207,9 @@ fn same_xmm_register(a: &Operand, b: &Operand) -> bool {
     }
 }
 
+/// Bits in a byte — the lane width `pmovmskb` samples.
+const BITS_PER_BYTE: u16 = 8;
+
 /// `pcmpeq*` — lane equality.
 const EQUAL: CompareKind = CompareKind::Equal { float: false };
 
@@ -1149,9 +1257,12 @@ pub(crate) fn x86_simd_shape(mnemonic: &str) -> Option<X86SimdShape> {
         // Whole-destination writes.
         "movaps" | "movups" | "movapd" | "movupd" | "movdqa" | "movdqu" | "vmovaps" | "vmovups"
         | "vmovapd" | "vmovupd" | "vmovdqa" | "vmovdqu" | "cvtss2si" | "cvtsd2si" | "cvttss2si"
-        | "cvttsd2si" | "sqrtps" | "sqrtpd" | "vsqrtps" | "vsqrtpd" | "vcvtph2ps" | "vcvtps2ph" => {
-            X86SimdShape::Move
-        }
+        | "cvttsd2si" | "sqrtps" | "sqrtpd" | "vsqrtps" | "vsqrtpd" | "vcvtph2ps" | "vcvtps2ph"
+        // `pmovmskb` writes a general register; `movd`/`movq` go either
+        // way. All three overwrite the whole destination — the vector
+        // direction zeroes above the transferred value rather than
+        // merging.
+        | "pmovmskb" | "vpmovmskb" | "movd" | "vmovd" | "movq" | "vmovq" => X86SimdShape::Move,
         // 2-operand read-modify-write (or its 3-operand VEX form).
         "pxor" | "vpxor" | "pand" | "vpand" | "por" | "vpor" | "pandn" | "vpandn" | "addss"
         | "subss" | "mulss" | "divss" | "addsd" | "subsd" | "mulsd" | "divsd" | "addps"
