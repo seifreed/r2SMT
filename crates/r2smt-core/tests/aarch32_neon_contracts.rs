@@ -1830,6 +1830,66 @@ fn the_pairwise_forms_decline_float_and_a_quad() {
 }
 
 // ---------------------------------------------------------------
+// `vcnt` / `vclz` — per-element bit counts
+//
+// `vcnt` counts the set bits of each byte; `vclz` counts leading zeros.
+// Both are sign-agnostic.
+// ---------------------------------------------------------------
+
+#[test]
+fn vcnt_counts_the_set_bits_of_each_byte() {
+    assert_computes_into(
+        "vcnt.8",
+        &["d0", "d2"],
+        &[("v0", 0), ("v1", 0x0000_0000_0000_0000_037f_aa01_800f_ff00)],
+        "v0",
+        0x0000_0000_0000_0000_0207_0401_0104_0800,
+    );
+}
+
+#[test]
+fn vclz_counts_leading_zeros_per_byte() {
+    // An all-zero byte yields the full width (8); the top-bit byte
+    // yields 0.
+    assert_computes_into(
+        "vclz.i8",
+        &["d0", "d2"],
+        &[("v0", 0), ("v1", 0x0000_0000_0000_0000_087f_4001_800f_ff00)],
+        "v0",
+        0x0000_0000_0000_0000_0401_0107_0004_0008,
+    );
+}
+
+#[test]
+fn vclz_counts_leading_zeros_per_halfword() {
+    assert_computes_into(
+        "vclz.i16",
+        &["d0", "d2"],
+        &[("v0", 0), ("v1", 0x0000_0000_0000_0000_8000_0001_ffff_0000)],
+        "v0",
+        0x0000_0000_0000_0000_0000_000f_0000_0010,
+    );
+}
+
+#[test]
+fn vclz_counts_leading_zeros_per_word() {
+    assert_computes_into(
+        "vclz.i32",
+        &["d0", "d2"],
+        &[("v0", 0), ("v1", 0x0000_0000_0000_0000_0000_8000_0000_0000)],
+        "v0",
+        0x0000_0000_0000_0000_0000_0010_0000_0020,
+    );
+}
+
+#[test]
+fn vcnt_declines_a_non_byte_element() {
+    // Population count is defined only at byte width.
+    assert!(declines("vcnt.16", &["d0", "d2"]));
+    assert!(declines("vclz.i64", &["d0", "d2"]));
+}
+
+// ---------------------------------------------------------------
 // Structured loads and stores
 //
 // `vld1`–`vld4` / `vst1`–`vst4` move bytes rather than computing them,

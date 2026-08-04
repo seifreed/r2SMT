@@ -20,6 +20,12 @@ use super::{NeonOp, NeonShape, bare_element_bits, uniform_vector_view, vector_vi
 /// Width of a `d` register — the only view the pairwise forms take.
 const DOUBLEWORD_BITS: u16 = 64;
 
+/// Ceiling on the primitive operations a per-element count may expand
+/// into (`lanes * lane_bits`). The widest real form is a 128-bit `vclz`
+/// over four 32-bit lanes, 128 operations, so no encoding can bind this;
+/// it is a backstop against a malformed geometry, not a real limit.
+const COUNT_EXPANSION_CAP: u32 = 2048;
+
 /// Which lane-wise predicate a compare mnemonic names.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::lift::aarch32) enum CompareKind {
@@ -122,6 +128,42 @@ pub(super) fn pairwise_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonS
     }
     Some(NeonShape {
         op: NeonOp::Pairwise { op, signed },
+        lane_bits,
+        lanes,
+    })
+}
+
+/// `vcnt` / `vclz` — the per-element bit counts.
+///
+/// `vcnt` counts the set bits of each byte and exists only at byte
+/// width; `vclz` counts leading zeros and exists at 8, 16 and 32 bits.
+/// Both are sign-agnostic — the count does not depend on the value's
+/// signedness — so they spell a bare width or the `i` class.
+pub(super) fn count_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (base, ty) = mnemonic.split_once('.')?;
+    let leading = match base {
+        "vcnt" => false,
+        "vclz" => true,
+        _ => return None,
+    };
+    let lane_bits =
+        bare_element_bits(ty).or_else(|| neon_element_type(ty).map(|(_, bits)| bits))?;
+    // `vcnt` is byte-only; `vclz` covers 8 / 16 / 32.
+    let ok = if leading {
+        matches!(lane_bits, 8 | 16 | 32)
+    } else {
+        lane_bits == 8
+    };
+    if !ok || insn.operands.len() != 2 {
+        return None;
+    }
+    let view = uniform_vector_view(insn, 2)?;
+    let lanes = view.checked_div(lane_bits)?;
+    if lanes == 0 || u32::from(lanes).checked_mul(u32::from(lane_bits))? > COUNT_EXPANSION_CAP {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::CountBits { leading },
         lane_bits,
         lanes,
     })
@@ -314,6 +356,65 @@ impl LiftCtx {
         }
         Self::concat_lanes(lanes)
     }
+}
+
+impl LiftCtx {
+    /// Lower a per-element bit count: population count (`vcnt`) or
+    /// leading-zero count (`vclz`), one destination lane per source
+    /// lane.
+    pub(in crate::lift::aarch32::neon) fn aarch32_count_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        leading: bool,
+    ) -> Option<Expr> {
+        let view = shape.view_bits()?;
+        let source = self.simd_operand_value(&insn.operands.get(1)?.clone(), view)?;
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let element = Self::extract_lane(source.clone(), shape.lane_bits, index)?;
+            lanes.push(if leading {
+                count_leading_zeros_lane(&element, shape.lane_bits)
+            } else {
+                population_count_lane(&element, shape.lane_bits)
+            });
+        }
+        Self::concat_lanes(lanes)
+    }
+}
+
+/// One destination lane of `vcnt`: the number of set bits, as the sum of
+/// each bit zero-extended to the lane width.
+fn population_count_lane(element: &Expr, bits: u16) -> Expr {
+    let mut acc = Expr::zero_ext(Expr::extract(element.clone(), 0, 0), bits);
+    for bit in 1..bits {
+        acc = Expr::add(
+            acc,
+            Expr::zero_ext(Expr::extract(element.clone(), bit, bit), bits),
+        );
+    }
+    acc
+}
+
+/// One destination lane of `vclz`: the number of leading zeros, as an
+/// `Ite` ladder from the least-significant bit upward so the
+/// most-significant bit's test is the outermost — and therefore
+/// highest-priority — decision. An all-zero element yields the full
+/// width.
+fn count_leading_zeros_lane(element: &Expr, bits: u16) -> Expr {
+    let mut result = Expr::konst(u128::from(bits), bits);
+    for bit in 0..bits {
+        // A set bit at position `bit` (from the LSB) is the highest set
+        // bit seen so far once the loop reaches it, and leaves
+        // `bits - 1 - bit` zeros above it.
+        let is_set = Expr::eq(Expr::extract(element.clone(), bit, bit), Expr::konst(1, 1));
+        result = Expr::Ite {
+            cond: Box::new(is_set),
+            then_expr: Box::new(Expr::konst(u128::from(bits - 1 - bit), bits)),
+            else_expr: Box::new(result),
+        };
+    }
+    result
 }
 
 /// One destination lane of a pairwise reduction.

@@ -89,6 +89,9 @@ pub(super) enum NeonOp {
         op: lanewise::PairwiseOp,
         signed: bool,
     },
+    /// `vcnt` / `vclz` — a per-element bit count. `leading` is `vclz`
+    /// (count leading zeros) against `vcnt` (population count).
+    CountBits { leading: bool },
 }
 
 /// A resolved `AArch32` NEON instruction: what to compute, and at what
@@ -147,6 +150,7 @@ pub(super) fn resolve(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| table::table_lookup_shape(insn, &mnemonic))
         .or_else(|| lanewise::compare_shape(insn, &mnemonic))
         .or_else(|| lanewise::pairwise_shape(insn, &mnemonic))
+        .or_else(|| lanewise::count_shape(insn, &mnemonic))
 }
 
 /// Architectural width of the `AArch32` vector register parent, which
