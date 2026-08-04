@@ -907,6 +907,106 @@ fn aarch32_register_post_index_updates_its_base_by_the_delta_register() {
     );
 }
 
+/// The store addresses a register-list transfer touches, in order.
+fn aarch32_store_offsets(stmts: &[IrStmt]) -> Vec<String> {
+    stmts
+        .iter()
+        .filter_map(|s| match s {
+            IrStmt::StoreMem { address, .. } => Some(format!("{address:?}")),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn aarch32_stmdb_starts_a_full_word_below_the_base() {
+    // Two registers, decrement-before: the run starts at base-8, which
+    // is also what `push` computes.
+    let stmts = lift_aarch32(
+        "stmdb",
+        vec![reg("r0!"), op("{r1, r2}", OperandKind::Unknown)],
+    );
+    let offsets = aarch32_store_offsets(&stmts);
+    assert_eq!(offsets.len(), 2, "{stmts:?}");
+    assert!(offsets[0].contains("4294967288"), "{offsets:?}");
+}
+
+#[test]
+fn aarch32_stmia_starts_at_the_base() {
+    let stmts = lift_aarch32(
+        "stmia",
+        vec![reg("r0!"), op("{r1, r2}", OperandKind::Unknown)],
+    );
+    let offsets = aarch32_store_offsets(&stmts);
+    assert_eq!(offsets.len(), 2, "{stmts:?}");
+    assert!(!offsets[0].contains("Add"), "{offsets:?}");
+}
+
+#[test]
+fn aarch32_stmib_starts_one_word_above_the_base() {
+    let stmts = lift_aarch32(
+        "stmib",
+        vec![reg("r0!"), op("{r1, r2}", OperandKind::Unknown)],
+    );
+    let offsets = aarch32_store_offsets(&stmts);
+    assert!(offsets[0].contains("value: 4"), "{offsets:?}");
+}
+
+#[test]
+fn aarch32_stmda_ends_at_the_base() {
+    // Decrement-after: the *last* word lands on the base itself, so the
+    // run starts at base-4 for two registers.
+    let stmts = lift_aarch32(
+        "stmda",
+        vec![reg("r0!"), op("{r1, r2}", OperandKind::Unknown)],
+    );
+    let offsets = aarch32_store_offsets(&stmts);
+    assert!(offsets[0].contains("4294967292"), "{offsets:?}");
+}
+
+#[test]
+fn aarch32_stmfd_is_the_descending_stack_push() {
+    // The stack synonyms are direction-relative: `stmfd` is `stmdb`.
+    let full_descending = lift_aarch32(
+        "stmfd",
+        vec![reg("sp!"), op("{r1, r2}", OperandKind::Unknown)],
+    );
+    let decrement_before = lift_aarch32(
+        "stmdb",
+        vec![reg("sp!"), op("{r1, r2}", OperandKind::Unknown)],
+    );
+    assert_eq!(
+        aarch32_store_offsets(&full_descending),
+        aarch32_store_offsets(&decrement_before)
+    );
+}
+
+#[test]
+fn aarch32_ldmfd_is_the_ascending_pop_not_the_descending_push() {
+    // The same suffix means the opposite thing on a load: `ldmfd` pops,
+    // so it is `ldmia`. Resolving it as `ldmdb` would walk memory the
+    // wrong way — a wrong value, not a decline.
+    let full_descending = lift_aarch32(
+        "ldmfd",
+        vec![reg("sp!"), op("{r1, r2}", OperandKind::Unknown)],
+    );
+    let increment_after = lift_aarch32(
+        "ldmia",
+        vec![reg("sp!"), op("{r1, r2}", OperandKind::Unknown)],
+    );
+    let loads = |stmts: &[IrStmt]| {
+        stmts
+            .iter()
+            .filter_map(|s| match s {
+                IrStmt::LoadMem { address, .. } => Some(format!("{address:?}")),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(loads(&full_descending), loads(&increment_after));
+    assert!(!loads(&full_descending).is_empty());
+}
+
 #[test]
 fn aarch32_ldrsb_sign_extends_the_loaded_byte() {
     // The whole difference from `ldrb` is the extension: a byte of

@@ -205,8 +205,9 @@ fn aarch32_dispatch_mnemonic(insn: &Instruction, dispatch_mnemonic: &str) -> Ins
         // keeps them.
         "push" => aarch32_push_pop_effect(insn, false),
         "pop" => aarch32_push_pop_effect(insn, true),
-        "ldm" | "ldmia" => aarch32_ldm_stm_effect(insn, true),
-        "stm" | "stmia" => aarch32_ldm_stm_effect(insn, false),
+        _ if let Some(is_load) = crate::lift::aarch32_multiple_is_load(dispatch_mnemonic) => {
+            aarch32_ldm_stm_effect(insn, is_load)
+        }
         // VFP scalar floating point and NEON packed data processing.
         // `vcmp` writes the flags and defines no register; everything
         // else defines its destination. Unlike AArch64, an AArch32

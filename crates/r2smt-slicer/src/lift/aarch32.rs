@@ -175,8 +175,12 @@ impl LiftCtx {
             // not in this match and decline soundly.
             "push" => self.lift_aarch32_push(insn),
             "pop" => self.lift_aarch32_pop(insn),
-            "ldm" | "ldmia" => self.lift_aarch32_ldm(insn),
-            "stm" | "stmia" => self.lift_aarch32_stm(insn),
+            _ if let Some(mode) = aarch32_multiple_mode(mnem, true) => {
+                self.lift_aarch32_ldm(insn, mode);
+            }
+            _ if let Some(mode) = aarch32_multiple_mode(mnem, false) => {
+                self.lift_aarch32_stm(insn, mode);
+            }
             // The NEON families the element-typed mnemonic dispatch
             // cannot resolve. Tried first because they constrain their
             // operands most tightly — the shape resolver checks operand
@@ -781,9 +785,10 @@ impl LiftCtx {
         self.emit_writeback(Some(Writeback::by_constant("sp", total, self.bits)));
     }
 
-    /// `ldm{ia} Rn{!}, {regs}` — increment-after load multiple from the
-    /// explicit base register, with optional writeback.
-    fn lift_aarch32_ldm(&mut self, insn: &Instruction) {
+    /// `ldm<mode> Rn{!}, {regs}` — load multiple from the explicit base
+    /// register in any of the four addressing modes, with optional
+    /// writeback.
+    fn lift_aarch32_ldm(&mut self, insn: &Instruction, mode: MultipleMode) {
         let (Some(base_op), Some(list_op)) = (insn.operands.first(), insn.operands.get(1)) else {
             self.unsupported_aarch32(insn, "ldm expects base and register list");
             return;
@@ -795,16 +800,17 @@ impl LiftCtx {
             self.unsupported_aarch32(insn, "ldm base or list not modelled");
             return;
         };
-        let n = i64::try_from(regs.len()).unwrap_or(0);
-        self.emit_load_multiple(insn, &base, &regs, 0);
+        let (start, delta) = mode.span(regs.len());
+        self.emit_load_multiple(insn, &base, &regs, start);
         if writeback {
-            self.emit_writeback(Some(Writeback::by_constant(&base, 4 * n, self.bits)));
+            self.emit_writeback(Some(Writeback::by_constant(&base, delta, self.bits)));
         }
     }
 
-    /// `stm{ia} Rn{!}, {regs}` — increment-after store multiple to the
-    /// explicit base register, with optional writeback.
-    fn lift_aarch32_stm(&mut self, insn: &Instruction) {
+    /// `stm<mode> Rn{!}, {regs}` — store multiple to the explicit base
+    /// register in any of the four addressing modes, with optional
+    /// writeback.
+    fn lift_aarch32_stm(&mut self, insn: &Instruction, mode: MultipleMode) {
         let (Some(base_op), Some(list_op)) = (insn.operands.first(), insn.operands.get(1)) else {
             self.unsupported_aarch32(insn, "stm expects base and register list");
             return;
@@ -816,10 +822,10 @@ impl LiftCtx {
             self.unsupported_aarch32(insn, "stm base or list not modelled");
             return;
         };
-        let n = i64::try_from(regs.len()).unwrap_or(0);
-        self.emit_store_multiple(&base, &regs, 0);
+        let (start, delta) = mode.span(regs.len());
+        self.emit_store_multiple(&base, &regs, start);
         if writeback {
-            self.emit_writeback(Some(Writeback::by_constant(&base, 4 * n, self.bits)));
+            self.emit_writeback(Some(Writeback::by_constant(&base, delta, self.bits)));
         }
     }
 
@@ -1035,8 +1041,74 @@ fn aarch32_mem_access(mem: &Operand, post: &[Operand], ptr_bits: u16) -> Option<
     })
 }
 
-/// Byte distance between the two words of a doubleword transfer.
+/// Byte distance between the two words of a doubleword transfer, and
+/// the stride of a register-list transfer.
 const AARCH32_WORD_BYTES: i64 = 4;
+
+/// Which way a multi-register transfer walks memory.
+///
+/// The lowest-numbered register always takes the lowest address; the
+/// mode decides only where the run of addresses starts relative to the
+/// base and which way the base moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MultipleMode {
+    increment: bool,
+    before: bool,
+}
+
+impl MultipleMode {
+    /// `(first offset from the base, writeback delta)` for `count`
+    /// registers.
+    fn span(self, count: usize) -> (i64, i64) {
+        let total = AARCH32_WORD_BYTES * i64::try_from(count).unwrap_or(0);
+        if self.increment {
+            let start = if self.before { AARCH32_WORD_BYTES } else { 0 };
+            return (start, total);
+        }
+        let start = if self.before {
+            -total
+        } else {
+            -total + AARCH32_WORD_BYTES
+        };
+        (start, -total)
+    }
+}
+
+/// `Some(true)` for a load-multiple, `Some(false)` for a store-multiple,
+/// `None` for anything else — in any addressing mode or stack spelling.
+///
+/// Every one of them shares a single def/use shape, so the effect table
+/// needs only the direction; which way the addresses run is the
+/// lifter's question.
+pub(crate) fn aarch32_multiple_is_load(mnemonic: &str) -> Option<bool> {
+    [true, false]
+        .into_iter()
+        .find(|&is_load| aarch32_multiple_mode(mnemonic, is_load).is_some())
+}
+
+/// The addressing mode a load/store-multiple mnemonic spells, or `None`
+/// when it is not one.
+///
+/// The stack spellings are direction-relative, so the same suffix means
+/// different things on a load and a store: `stmfd` (full descending
+/// push) is `stmdb`, while `ldmfd` (the matching pop) is `ldmia`.
+/// Resolving them without `is_load` would silently walk memory the
+/// wrong way.
+fn aarch32_multiple_mode(mnemonic: &str, is_load: bool) -> Option<MultipleMode> {
+    let suffix = mnemonic.strip_prefix(if is_load { "ldm" } else { "stm" })?;
+    let (increment, before) = match suffix {
+        "" | "ia" => (true, false),
+        "ib" => (true, true),
+        "da" => (false, false),
+        "db" => (false, true),
+        "fd" => (is_load, !is_load),
+        "ea" => (!is_load, is_load),
+        "fa" => (!is_load, !is_load),
+        "ed" => (is_load, is_load),
+        _ => return None,
+    };
+    Some(MultipleMode { increment, before })
+}
 
 /// The offset part of an `AArch32` memory operand.
 ///
