@@ -13,6 +13,7 @@
 
 use r2smt_ir::program::{Instruction, Operand};
 
+use crate::lift::simd::CompareKind;
 use crate::registers::Arrangement;
 
 use super::super::super::{BinOp, FpArithOp, PackedIntOp, PackedOp, parse_immediate};
@@ -169,25 +170,6 @@ pub(super) fn shift_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShap
 }
 
 // ===================== lane-wise compares =====================
-
-/// The lane-wise compares.
-///
-/// Each writes a mask, not a condition flag: the whole point is that the
-/// result feeds another vector operation.
-#[derive(Debug, Clone, Copy)]
-pub(super) enum CompareKind {
-    /// `cmeq` / `fcmeq` — equality.
-    Equal { float: bool },
-    /// `cmgt` / `cmge` / `cmhi` / `cmhs` and the float `fcmgt` /
-    /// `fcmge` — ordered comparison. `or_equal` picks `ge` over `gt`.
-    Ordered {
-        float: bool,
-        signed: bool,
-        or_equal: bool,
-    },
-    /// `cmtst` — true where the bitwise AND of the lanes is non-zero.
-    TestBits,
-}
 
 /// The lane-wise compare family.
 ///

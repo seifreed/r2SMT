@@ -514,6 +514,82 @@ pub(super) fn all_ones(bits: u16) -> Expr {
     Expr::konst(mask, bits)
 }
 
+/// The lane-wise compares.
+///
+/// Each writes a mask, not a condition flag: the whole point is that the
+/// result feeds another vector operation.
+///
+/// Arch-neutral because both ISAs need the same axes: `AArch64` spells
+/// them `cmeq` / `cmgt` / `cmhi` / `cmtst`, x86 `pcmpeqb` / `pcmpgtb`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CompareKind {
+    /// `cmeq` / `fcmeq` / `pcmpeq*` — equality.
+    Equal { float: bool },
+    /// `cmgt` / `cmge` / `cmhi` / `cmhs` / `pcmpgt*` and the float
+    /// `fcmgt` / `fcmge` — ordered comparison. `or_equal` picks `ge`
+    /// over `gt`.
+    Ordered {
+        float: bool,
+        signed: bool,
+        or_equal: bool,
+    },
+    /// `cmtst` — true where the bitwise AND of the lanes is non-zero.
+    TestBits,
+}
+
+/// One destination lane of a compare: an all-ones mask where the
+/// predicate holds and all-zeros where it does not.
+///
+/// A vector compare produces a *value*, not a flag, because its result
+/// feeds another vector operation — which is why this cannot reuse the
+/// scalar compare path that writes NZCV.
+pub(crate) fn compare_lane(kind: CompareKind, a: Expr, b: Expr, lane_bits: u16) -> Option<Expr> {
+    let predicate = match kind {
+        CompareKind::Equal { float: false } => Expr::eq(a, b),
+        CompareKind::Equal { float: true } => {
+            let (ebits, sbits) = fp_sort_bits_checked(lane_bits)?;
+            Expr::feq(
+                Expr::bv_to_fp(a, ebits, sbits),
+                Expr::bv_to_fp(b, ebits, sbits),
+            )
+        }
+        CompareKind::Ordered {
+            float: true,
+            or_equal,
+            ..
+        } => {
+            let (ebits, sbits) = fp_sort_bits_checked(lane_bits)?;
+            let (x, y) = (
+                Expr::bv_to_fp(a, ebits, sbits),
+                Expr::bv_to_fp(b, ebits, sbits),
+            );
+            // `fcmgt`/`fcmge` are *ordered*: unordered compares false,
+            // which `fp.lt` / `fp.leq` already give.
+            if or_equal {
+                Expr::fle(y, x)
+            } else {
+                Expr::flt(y, x)
+            }
+        }
+        CompareKind::Ordered {
+            float: false,
+            signed,
+            or_equal,
+        } => match (signed, or_equal) {
+            (true, false) => Expr::slt(b, a),
+            (true, true) => Expr::sle(b, a),
+            (false, false) => Expr::ult(b, a),
+            (false, true) => Expr::ule(b, a),
+        },
+        CompareKind::TestBits => Expr::ne(Expr::bv_and(a, b), Expr::konst(0, lane_bits)),
+    };
+    Some(Expr::Ite {
+        cond: Box::new(predicate),
+        then_expr: Box::new(all_ones(lane_bits)),
+        else_expr: Box::new(Expr::konst(0, lane_bits)),
+    })
+}
+
 /// A `bits`-wide value with only the most significant bit set.
 ///
 /// Built by concatenation rather than as a literal so it stays correct
@@ -1052,7 +1128,7 @@ impl LiftCtx {
     ///
     /// A lane-independent operation is emitted once over the whole view
     /// instead of once per lane — see [`PackedOp::is_lane_independent`].
-    fn packed_int_result(
+    pub(super) fn packed_int_result(
         &mut self,
         dst: &Operand,
         a_op: &Operand,

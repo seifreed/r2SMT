@@ -25,7 +25,8 @@
 use r2smt_ir::program::Instruction;
 
 use super::super::{FusedStep, PackedOp};
-use arith::{CompareKind, SaturatingKind, ShiftKind};
+use crate::lift::simd::CompareKind;
+use arith::{SaturatingKind, ShiftKind};
 use multiply::{AccumulateKind, ByElementKind};
 use permute::{PermuteKind, SelectRole};
 use width::{ConvertKind, ReduceKind, WidenKind};

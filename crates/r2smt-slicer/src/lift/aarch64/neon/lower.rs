@@ -12,12 +12,13 @@ use r2smt_ir::program::{Instruction, Operand};
 use super::super::super::{
     FpArithOp, FusedStep, LiftCtx, fp_lane_result, fp_propagating_max_min, fused_multiply_lane,
 };
-use super::arith::{CompareKind, SaturateTo, SaturatingKind, ShiftKind};
+use super::arith::{SaturateTo, SaturatingKind, ShiftKind};
 use super::geometry::{BITS_PER_BYTE, dot_product_element, operand_arrangement};
 use super::multiply::{AccumulateKind, AccumulateSources, ByElementKind, DOT_PRODUCT_TERMS};
 use super::permute::{PermuteKind, PermuteSource, SelectRole, table_registers};
 use super::width::{ConvertKind, ReduceKind, WidenKind};
 use super::{NeonOp, NeonShape};
+use crate::lift::simd::{CompareKind, compare_lane};
 
 impl LiftCtx {
     /// Lower a resolved NEON instruction.
@@ -1194,59 +1195,6 @@ fn shift_lane(
             })
         }
     }
-}
-
-/// One destination lane of a compare: an all-ones mask where the
-/// predicate holds and all-zeros where it does not.
-///
-/// A vector compare produces a *value*, not a flag, because its result
-/// feeds another vector operation — which is why this cannot reuse the
-/// scalar compare path that writes NZCV.
-fn compare_lane(kind: CompareKind, a: Expr, b: Expr, lane_bits: u16) -> Option<Expr> {
-    let predicate = match kind {
-        CompareKind::Equal { float: false } => Expr::eq(a, b),
-        CompareKind::Equal { float: true } => {
-            let (ebits, sbits) = fp_sort(lane_bits)?;
-            Expr::feq(
-                Expr::bv_to_fp(a, ebits, sbits),
-                Expr::bv_to_fp(b, ebits, sbits),
-            )
-        }
-        CompareKind::Ordered {
-            float: true,
-            or_equal,
-            ..
-        } => {
-            let (ebits, sbits) = fp_sort(lane_bits)?;
-            let (x, y) = (
-                Expr::bv_to_fp(a, ebits, sbits),
-                Expr::bv_to_fp(b, ebits, sbits),
-            );
-            // `fcmgt`/`fcmge` are *ordered*: unordered compares false,
-            // which `fp.lt` / `fp.leq` already give.
-            if or_equal {
-                Expr::fle(y, x)
-            } else {
-                Expr::flt(y, x)
-            }
-        }
-        CompareKind::Ordered {
-            float: false,
-            signed,
-            or_equal,
-        } => match (signed, or_equal) {
-            (true, false) => Expr::slt(b, a),
-            (true, true) => Expr::sle(b, a),
-            (false, false) => Expr::ult(b, a),
-            (false, true) => Expr::ule(b, a),
-        },
-        CompareKind::TestBits => Expr::ne(Expr::bv_and(a, b), Expr::konst(0, lane_bits)),
-    };
-    Some(Expr::Ite {
-        cond: Box::new(predicate),
-        then_expr: Box::new(all_ones(lane_bits)?),
-        else_expr: Box::new(Expr::konst(0, lane_bits)),
-    })
 }
 
 /// An all-ones bit-vector of `bits`.
