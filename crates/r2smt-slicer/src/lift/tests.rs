@@ -3103,132 +3103,79 @@ fn aarch32_families_are_covered_by_both_effect_and_lifter() {
     }
 }
 
-/// Every x86 SIMD mnemonic whose register-register 2-operand
-/// form the parity guard below exercises.
-const SIMD_PARITY_MNEMONICS: &[&str] = &[
-    "movaps",
-    "movups",
-    "movapd",
-    "movupd",
-    "movdqa",
-    "movdqu",
-    "vmovaps",
-    "vmovups",
-    "vmovapd",
-    "vmovupd",
-    "vmovdqa",
-    "vmovdqu",
-    "pxor",
-    "vpxor",
-    "pand",
-    "vpand",
-    "por",
-    "vpor",
-    "pandn",
-    "vpandn",
-    "addss",
-    "subss",
-    "mulss",
-    "divss",
-    "addsd",
-    "subsd",
-    "mulsd",
-    "divsd",
-    "addps",
-    "subps",
-    "mulps",
-    "divps",
-    "addpd",
-    "subpd",
-    "mulpd",
-    "divpd",
-    "maxps",
-    "minps",
-    "maxpd",
-    "minpd",
-    "maxss",
-    "minss",
-    "maxsd",
-    "minsd",
-    "sqrtps",
-    "sqrtpd",
-    "sqrtss",
-    "sqrtsd",
-    "movss",
-    "movsd",
-    "pcmpeqb",
-    "pcmpeqw",
-    "pcmpeqd",
-    "pcmpeqq",
-    "pcmpgtb",
-    "pcmpgtw",
-    "pcmpgtd",
-    "pcmpgtq",
-    "vpcmpeqb",
-    "vpcmpeqd",
-    "vpcmpgtb",
-    "vpcmpgtd",
-    "paddb",
-    "paddw",
-    "paddd",
-    "paddq",
-    "psubb",
-    "psubw",
-    "psubd",
-    "psubq",
-    "pmullw",
-    "pmulld",
-    "vpaddd",
-    "vpsubb",
-    "paddsb",
-    "paddsw",
-    "paddusb",
-    "paddusw",
-    "psubsb",
-    "psubsw",
-    "psubusb",
-    "psubusw",
-    "pavgb",
-    "pavgw",
-    "pmaxsb",
-    "pmaxsw",
-    "pmaxsd",
-    "pmaxub",
-    "pmaxuw",
-    "pmaxud",
-    "pminsb",
-    "pminsw",
-    "pminsd",
-    "pminub",
-    "pminuw",
-    "pminud",
-    "pabsb",
-    "pabsw",
-    "pabsd",
-    "vpaddsw",
-    "vpavgb",
-    "vpmaxub",
-    "vpminsd",
-    "vpabsd",
-    "punpcklbw",
-    "punpcklwd",
-    "punpckldq",
-    "punpcklqdq",
-    "punpckhbw",
-    "punpckhwd",
-    "punpckhdq",
-    "punpckhqdq",
-    "vpunpcklbw",
-    "vpunpckhqdq",
-    "pshufb",
-    "vpshufb",
-    "packsswb",
-    "packssdw",
-    "packuswb",
-    "packusdw",
-    "vpacksswb",
-    "vpackusdw",
+/// The mnemonics whose second source is an immediate shift count
+/// rather than a vector register.
+const SIMD_IMMEDIATE_COUNT: &[&str] = &[
+    "pslldq", "psrldq", "psllw", "pslld", "psllq", "psrlw", "psrld", "psrlq", "psraw", "psrad",
+    "vpslldq", "vpsrldq", "vpsllw", "vpslld", "vpsllq", "vpsrlw", "vpsrld", "vpsrlq", "vpsraw",
+    "vpsrad",
 ];
+
+/// The mnemonics carrying a genuine third operand — an immediate
+/// selector — so the 2-operand shape cannot stand in for them.
+///
+/// Listed rather than matched on a `pshuf` prefix: `pshufb` takes its
+/// selector from a *register*, and giving it an immediate would build
+/// an instruction that does not exist.
+const SIMD_IMMEDIATE_SELECTOR: &[&str] = &[
+    "pshufd",
+    "pshuflw",
+    "pshufhw",
+    "vpshufd",
+    "vpshuflw",
+    "vpshufhw",
+    "vcvtps2ph",
+];
+
+/// The mnemonics whose destination is a general register.
+const SIMD_GENERAL_DESTINATION: &[&str] = &[
+    "pmovmskb",
+    "vpmovmskb",
+    "cvtss2si",
+    "cvtsd2si",
+    "cvttss2si",
+    "cvttsd2si",
+];
+
+/// The mnemonics whose source is a general register.
+const SIMD_GENERAL_SOURCE: &[&str] = &["cvtsi2ss", "cvtsi2sd"];
+
+/// The register-register operand shapes to exercise for `mnemonic`.
+///
+/// Derived rather than retyped: the parity guard iterates the
+/// membership table itself, and this supplies the one thing the table
+/// does not carry — which operands a realistic encoding of each
+/// mnemonic takes. A mnemonic with no entry here gets the plain
+/// `xmm0, xmm1` shape.
+fn simd_parity_operands(mnemonic: &str) -> Vec<Vec<Operand>> {
+    let reg = |raw: &str| op(raw, OperandKind::Register);
+    let imm = |raw: &str| op(raw, OperandKind::Immediate);
+    // `movd` / `movq` transfer in both directions, and the two
+    // directions take different effect-table paths — a vector
+    // destination is a SIMD def, a general one is not. Both are
+    // exercised.
+    match mnemonic {
+        "movd" | "vmovd" => {
+            return vec![vec![reg("eax"), reg("xmm1")], vec![reg("xmm0"), reg("eax")]];
+        }
+        "movq" | "vmovq" => {
+            return vec![vec![reg("rax"), reg("xmm1")], vec![reg("xmm0"), reg("rax")]];
+        }
+        _ => {}
+    }
+    let operands = if SIMD_GENERAL_DESTINATION.contains(&mnemonic) {
+        vec![reg("eax"), reg("xmm1")]
+    } else if SIMD_GENERAL_SOURCE.contains(&mnemonic) {
+        vec![reg("xmm0"), reg("eax")]
+    } else if SIMD_IMMEDIATE_COUNT.contains(&mnemonic) {
+        vec![reg("xmm0"), imm("3")]
+    } else if SIMD_IMMEDIATE_SELECTOR.contains(&mnemonic) {
+        vec![reg("xmm0"), reg("xmm1"), imm("0x1b")]
+    } else {
+        vec![reg("xmm0"), reg("xmm1")]
+    };
+    vec![operands]
+}
 
 #[test]
 fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
@@ -3237,48 +3184,37 @@ fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
     // from the lifter (the historical `pandn` bug) leaves the vector
     // parent undefined — a stale-def fabrication. Assert both directions
     // stay in lockstep for every SIMD mnemonic.
-    let mnemonics = SIMD_PARITY_MNEMONICS;
-    // The vector-to-general transfers need realistic operands: their
-    // destination is a GPR, not a vector register.
-    let transfers = [
-        ("pmovmskb", "eax", "xmm1"),
-        ("movd", "eax", "xmm1"),
-        ("movq", "xmm0", "xmm1"),
-        ("pslldq", "xmm0", "4"),
-        ("psrldq", "xmm0", "4"),
-        ("psllw", "xmm0", "3"),
-        ("psrld", "xmm0", "3"),
-        ("psraw", "xmm0", "3"),
-    ];
-    // The `pshuf*` family carries a genuine third operand — the
-    // immediate selector — so it cannot be built from the 2-operand
-    // shape above.
-    let selected = ["pshufd", "pshuflw", "pshufhw", "vpshufd", "vpshufhw"];
-    let cases = mnemonics
+    //
+    // The cases come from the membership table itself. A hand-retyped
+    // list drifts: it once covered 133 of the table's 216 entries, and
+    // the untested remainder is where both the `pandn` and the
+    // `ucomiss` regressions lived.
+    for mnemonic in x86::X86_SIMD_MOVES
         .iter()
-        .map(|m| (*m, "xmm0", "xmm1", None))
-        .chain(transfers.map(|(m, dst, src)| (m, dst, src, None)))
-        .chain(selected.map(|m| (m, "xmm0", "xmm1", Some("0x1b"))));
-    for (m, dst, src, selector) in cases {
-        assert_simd_parity(m, dst, src, selector);
+        .chain(x86::X86_SIMD_READ_MODIFY_WRITES.iter())
+    {
+        for operands in simd_parity_operands(mnemonic) {
+            assert_simd_parity(mnemonic, operands);
+        }
     }
 }
 
+#[test]
+fn the_simd_membership_table_covers_every_modelled_mnemonic() {
+    // A guard on the guard. The test above iterates the table, so a
+    // mnemonic deleted from the table also vanishes from the test and
+    // the deletion passes silently. Pin the count so shrinking the
+    // table is a deliberate act.
+    assert_eq!(
+        x86::X86_SIMD_MOVES.len() + x86::X86_SIMD_READ_MODIFY_WRITES.len(),
+        216,
+        "the x86 SIMD membership table changed size"
+    );
+}
+
 /// One case of the SIMD parity guard: the effect table and the lifter
-/// must agree about `mnemonic dst, src[, selector]`.
-fn assert_simd_parity(m: &str, dst: &str, src: &str, selector: Option<&str>) {
-    let mut operands = vec![
-        op(dst, OperandKind::Register),
-        op(
-            src,
-            if src.starts_with(|c: char| c.is_ascii_digit()) {
-                OperandKind::Immediate
-            } else {
-                OperandKind::Register
-            },
-        ),
-    ];
-    operands.extend(selector.map(|s| op(s, OperandKind::Immediate)));
+/// must agree about `mnemonic operands`.
+fn assert_simd_parity(m: &str, operands: Vec<Operand>) {
     let i = insn(0x1000, 4, m, operands);
     assert!(
         is_x86_simd_instruction(&i),
@@ -3309,6 +3245,119 @@ fn assert_simd_parity(m: &str, dst: &str, src: &str, selector: Option<&str>) {
             .iter()
             .any(|s| matches!(s, IrStmt::Unsupported { .. })),
         "{m}: lifter emitted Unsupported"
+    );
+}
+
+#[test]
+fn every_vector_flag_compare_reaches_the_lifter_and_writes_flags() {
+    // The guard above visits only instructions the effect table calls
+    // `Simd`, and this family is `Cmp` — it writes flags and defines no
+    // register. That is how `ucomiss` was lost from the dispatch gate
+    // without a single test failing: unclaimed by the gate, it fell to
+    // the ESIL ladder, which models no floating point and drops the
+    // flags entirely, turning a resolved verdict into `both_possible`.
+    for mnemonic in x86::X86_VECTOR_FLAG_COMPARES {
+        let i = insn(
+            0x1000,
+            4,
+            mnemonic,
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        );
+        assert!(
+            is_x86_simd_instruction(&i),
+            "{mnemonic}: not recognised by is_x86_simd_instruction"
+        );
+        let effect = crate::effect::analyze(&i, Arch::X86_64);
+        assert_eq!(
+            effect.kind,
+            crate::effect::InstructionKind::Cmp,
+            "{mnemonic}: effect table does not classify it as Cmp"
+        );
+        assert!(
+            effect.defs.is_empty(),
+            "{mnemonic}: effect table claims a register definition; routing it \
+             through the SIMD shape would drop whatever produced that vector"
+        );
+        assert!(
+            effect.defines_flags,
+            "{mnemonic}: effect table does not record the flag write"
+        );
+        let stmts = lift_per_mnemonic(&i, Arch::X86_64);
+        assert!(
+            stmts
+                .iter()
+                .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == "ZF")),
+            "{mnemonic}: lifter does not define ZF"
+        );
+    }
+}
+
+#[test]
+fn every_generated_fp_mask_compare_is_covered_by_both_effect_and_lifter() {
+    // The packed FP compares are 64 mnemonics once eight predicates
+    // cross ps/pd/ss/sd and VEX, so they are recognised structurally
+    // rather than listed. Enumerating the same cross product keeps the
+    // parser and the handlers in lockstep.
+    let predicates = ["eq", "lt", "le", "unord", "neq", "nlt", "nle", "ord"];
+    let suffixes = ["ps", "pd", "ss", "sd"];
+    let mut count = 0;
+    for prefix in ["cmp", "vcmp"] {
+        for predicate in predicates {
+            for suffix in suffixes {
+                let mnemonic = format!("{prefix}{predicate}{suffix}");
+                assert!(
+                    is_fp_compare_mnemonic(&mnemonic),
+                    "{mnemonic}: not parsed as an FP mask compare"
+                );
+                assert_simd_parity(
+                    &mnemonic,
+                    vec![
+                        op("xmm0", OperandKind::Register),
+                        op("xmm1", OperandKind::Register),
+                    ],
+                );
+                count += 1;
+            }
+        }
+    }
+    assert_eq!(count, 64, "the FP mask compare cross product changed size");
+}
+
+#[test]
+fn every_sse_scalar_move_is_covered_by_both_effect_and_lifter() {
+    // The register-to-register form is 2-operand in legacy SSE and
+    // 3-operand under VEX — the 2-operand VEX encoding takes a memory
+    // source, so `vmovss xmm0, xmm1` is not an instruction. Building it
+    // anyway is what the lifter declines at `lift_sse_scalar_move`.
+    let reg = |raw: &str| op(raw, OperandKind::Register);
+    for mnemonic in ["movss", "movsd"] {
+        assert_simd_parity(mnemonic, vec![reg("xmm0"), reg("xmm1")]);
+    }
+    for mnemonic in ["vmovss", "vmovsd"] {
+        assert_simd_parity(mnemonic, vec![reg("xmm0"), reg("xmm1"), reg("xmm2")]);
+    }
+}
+
+#[test]
+fn the_movsd_string_instruction_is_not_claimed_as_a_scalar_move() {
+    // `movsd` names two unrelated instructions, told apart by operand
+    // shape. Claiming the string form would route it away from the ESIL
+    // ladder that models it correctly.
+    let string_form = insn(
+        0x1000,
+        1,
+        "movsd",
+        vec![
+            op("dword [rdi]", OperandKind::Memory),
+            op("dword [rsi]", OperandKind::Memory),
+        ],
+    );
+    assert!(
+        sse_scalar_move_lane(&string_form).is_none(),
+        "the movsd string instruction was claimed as an SSE scalar move"
     );
 }
 

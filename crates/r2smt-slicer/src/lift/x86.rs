@@ -592,11 +592,18 @@ const VECTOR_TEST_CLEARED_FLAGS: [&str; 3] = ["OF", "SF", "PF"];
 /// into `both_possible`. Sound, since a free flag only widens, but it
 /// silently discards the analysis.
 pub(crate) fn is_x86_vector_flag_compare(mnemonic: &str) -> bool {
-    matches!(
-        mnemonic.trim().to_ascii_lowercase().as_str(),
-        "ptest" | "vptest" | "comiss" | "ucomiss" | "comisd" | "ucomisd"
-    )
+    let lower = mnemonic.trim().to_ascii_lowercase();
+    X86_VECTOR_FLAG_COMPARES.contains(&lower.as_str())
 }
+
+/// The mnemonics [`is_x86_vector_flag_compare`] claims.
+///
+/// A slice rather than a `matches!` so the parity guard can iterate it.
+/// The `ucomiss` regression these instructions carry was invisible
+/// precisely because the guard's membership list was retyped by hand
+/// and this family was never on it.
+pub(crate) const X86_VECTOR_FLAG_COMPARES: &[&str] =
+    &["ptest", "vptest", "comiss", "ucomiss", "comisd", "ucomisd"];
 
 /// The lane-wise arithmetic `PackedIntOp`s x86 spells.
 const ADD: PackedIntOp = PackedIntOp::Bin(BinOp::Add);
@@ -703,72 +710,261 @@ pub(crate) enum X86SimdShape {
 /// `ss`/`sd` and VEX, and `movsd` needs its operands inspected because
 /// the name is also the string instruction.
 pub(crate) fn x86_simd_shape(mnemonic: &str) -> Option<X86SimdShape> {
-    let shape = match mnemonic {
-        // Whole-destination writes.
-        "movaps" | "movups" | "movapd" | "movupd" | "movdqa" | "movdqu" | "vmovaps" | "vmovups"
-        | "vmovapd" | "vmovupd" | "vmovdqa" | "vmovdqu" | "cvtss2si" | "cvtsd2si" | "cvttss2si"
-        | "cvttsd2si" | "sqrtps" | "sqrtpd" | "vsqrtps" | "vsqrtpd" | "vcvtph2ps" | "vcvtps2ph"
-        // `pmovmskb` writes a general register; `movd`/`movq` go either
-        // way. All three overwrite the whole destination — the vector
-        // direction zeroes above the transferred value rather than
-        // merging.
-        | "pmovmskb" | "vpmovmskb" | "movd" | "vmovd" | "movq" | "vmovq"
-        // `pabs*` is the one packed integer arithmetic form whose
-        // 2-operand shape is not read-modify-write: it writes the
-        // destination from its single source.
-        | "pabsb" | "pabsw" | "pabsd" | "vpabsb" | "vpabsw" | "vpabsd"
-        // The `pshuf*` family has three operands, but the third is the
-        // immediate selector rather than a second source, and every
-        // destination lane comes from the one source.
-        | "pshufd" | "pshuflw" | "pshufhw" | "vpshufd" | "vpshuflw"
-        | "vpshufhw" => X86SimdShape::Move,
-        // 2-operand read-modify-write (or its 3-operand VEX form).
-        "pxor" | "vpxor" | "pand" | "vpand" | "por" | "vpor" | "pandn" | "vpandn" | "addss"
-        | "subss" | "mulss" | "divss" | "addsd" | "subsd" | "mulsd" | "divsd" | "addps"
-        | "subps" | "mulps" | "divps" | "vaddps" | "vsubps" | "vmulps" | "vdivps" | "addpd"
-        | "subpd" | "mulpd" | "divpd" | "vaddpd" | "vsubpd" | "vmulpd" | "vdivpd" | "maxps"
-        | "minps" | "maxpd" | "minpd" | "vmaxps" | "vminps" | "vmaxpd" | "vminpd" | "maxss"
-        | "minss" | "maxsd" | "minsd" | "cvtsi2ss" | "cvtsi2sd" | "cvtss2sd" | "cvtsd2ss"
-        | "sqrtss" | "sqrtsd"
-        // The packed integer compares overwrite every lane, but the
-        // 2-operand form still reads the destination as its first
-        // source, so they share the arithmetic's shape.
-        | "pcmpeqb" | "pcmpeqw" | "pcmpeqd" | "pcmpeqq" | "pcmpgtb" | "pcmpgtw" | "pcmpgtd"
-        | "pcmpgtq" | "vpcmpeqb" | "vpcmpeqw" | "vpcmpeqd" | "vpcmpeqq" | "vpcmpgtb"
-        | "vpcmpgtw" | "vpcmpgtd" | "vpcmpgtq"
-        // Packed integer arithmetic and the shifts, same shape again.
-        | "paddb" | "paddw" | "paddd" | "paddq" | "psubb" | "psubw" | "psubd" | "psubq"
-        | "pmullw" | "pmulld" | "pslldq" | "psrldq" | "psllw" | "pslld" | "psllq" | "psrlw"
-        | "psrld" | "psrlq" | "psraw" | "psrad" | "vpaddb" | "vpaddw" | "vpaddd" | "vpaddq"
-        | "vpsubb" | "vpsubw" | "vpsubd" | "vpsubq" | "vpmullw" | "vpmulld" | "vpslldq"
-        | "vpsrldq" | "vpsllw" | "vpslld" | "vpsllq" | "vpsrlw" | "vpsrld" | "vpsrlq"
-        | "vpsraw" | "vpsrad"
-        // The saturating, averaging and min/max families. Same
-        // read-modify-write shape as the wrapping arithmetic above —
-        // only the lane operation differs.
-        | "paddsb" | "paddsw" | "paddusb" | "paddusw" | "psubsb" | "psubsw" | "psubusb"
-        | "psubusw" | "pavgb" | "pavgw" | "pmaxsb" | "pmaxsw" | "pmaxsd" | "pmaxub" | "pmaxuw"
-        | "pmaxud" | "pminsb" | "pminsw" | "pminsd" | "pminub" | "pminuw" | "pminud"
-        | "vpaddsb" | "vpaddsw" | "vpaddusb" | "vpaddusw" | "vpsubsb" | "vpsubsw" | "vpsubusb"
-        | "vpsubusw" | "vpavgb" | "vpavgw" | "vpmaxsb" | "vpmaxsw" | "vpmaxsd" | "vpmaxub"
-        | "vpmaxuw" | "vpmaxud" | "vpminsb" | "vpminsw" | "vpminsd" | "vpminub" | "vpminuw"
-        | "vpminud"
-        // The interleaves read the destination as their first source in
-        // the 2-operand form, like the arithmetic.
-        | "punpcklbw" | "punpcklwd" | "punpckldq" | "punpcklqdq" | "punpckhbw" | "punpckhwd"
-        | "punpckhdq" | "punpckhqdq" | "vpunpcklbw" | "vpunpcklwd" | "vpunpckldq"
-        | "vpunpcklqdq" | "vpunpckhbw" | "vpunpckhwd" | "vpunpckhdq"
-        | "vpunpckhqdq"
-        // `pshufb` shuffles the destination itself, indexed by the
-        // source, so the destination is a use as well; the packs fill
-        // their destination from both operands.
-        | "pshufb" | "vpshufb" | "packsswb" | "packssdw" | "packuswb" | "packusdw"
-        | "vpacksswb" | "vpackssdw" | "vpackuswb"
-        | "vpackusdw" => X86SimdShape::ReadModifyWrite,
-        _ => return None,
-    };
-    Some(shape)
+    if X86_SIMD_MOVES.contains(&mnemonic) {
+        return Some(X86SimdShape::Move);
+    }
+    X86_SIMD_READ_MODIFY_WRITES
+        .contains(&mnemonic)
+        .then_some(X86SimdShape::ReadModifyWrite)
 }
+
+/// The [`X86SimdShape::Move`] half of the membership table: the
+/// destination is fully overwritten, so it is a def and not also a use.
+pub(crate) const X86_SIMD_MOVES: &[&str] = &[
+    "movaps",
+    "movups",
+    "movapd",
+    "movupd",
+    "movdqa",
+    "movdqu",
+    "vmovaps",
+    "vmovups",
+    "vmovapd",
+    "vmovupd",
+    "vmovdqa",
+    "vmovdqu",
+    "cvtss2si",
+    "cvtsd2si",
+    "cvttss2si",
+    "cvttsd2si",
+    "sqrtps",
+    "sqrtpd",
+    "vsqrtps",
+    "vsqrtpd",
+    "vcvtph2ps",
+    "vcvtps2ph",
+    // `pmovmskb` writes a general register; `movd`/`movq` go either
+    // way. All three overwrite the whole destination — the vector
+    // direction zeroes above the transferred value rather than merging.
+    "pmovmskb",
+    "vpmovmskb",
+    "movd",
+    "vmovd",
+    "movq",
+    "vmovq",
+    // `pabs*` is the one packed integer arithmetic form whose
+    // 2-operand shape is not read-modify-write: it writes the
+    // destination from its single source.
+    "pabsb",
+    "pabsw",
+    "pabsd",
+    "vpabsb",
+    "vpabsw",
+    "vpabsd",
+    // The `pshuf*` family has three operands, but the third is the
+    // immediate selector rather than a second source, and every
+    // destination lane comes from the one source.
+    "pshufd",
+    "pshuflw",
+    "pshufhw",
+    "vpshufd",
+    "vpshuflw",
+    "vpshufhw",
+];
+
+/// The [`X86SimdShape::ReadModifyWrite`] half of the membership table:
+/// the 2-operand form reads its destination as a source, while the
+/// 3-operand VEX form reads its two explicit sources instead.
+pub(crate) const X86_SIMD_READ_MODIFY_WRITES: &[&str] = &[
+    "pxor",
+    "vpxor",
+    "pand",
+    "vpand",
+    "por",
+    "vpor",
+    "pandn",
+    "vpandn",
+    "addss",
+    "subss",
+    "mulss",
+    "divss",
+    "addsd",
+    "subsd",
+    "mulsd",
+    "divsd",
+    "addps",
+    "subps",
+    "mulps",
+    "divps",
+    "vaddps",
+    "vsubps",
+    "vmulps",
+    "vdivps",
+    "addpd",
+    "subpd",
+    "mulpd",
+    "divpd",
+    "vaddpd",
+    "vsubpd",
+    "vmulpd",
+    "vdivpd",
+    "maxps",
+    "minps",
+    "maxpd",
+    "minpd",
+    "vmaxps",
+    "vminps",
+    "vmaxpd",
+    "vminpd",
+    "maxss",
+    "minss",
+    "maxsd",
+    "minsd",
+    "cvtsi2ss",
+    "cvtsi2sd",
+    "cvtss2sd",
+    "cvtsd2ss",
+    "sqrtss",
+    "sqrtsd",
+    // The packed integer compares overwrite every lane, but the
+    // 2-operand form still reads the destination as its first source,
+    // so they share the arithmetic's shape.
+    "pcmpeqb",
+    "pcmpeqw",
+    "pcmpeqd",
+    "pcmpeqq",
+    "pcmpgtb",
+    "pcmpgtw",
+    "pcmpgtd",
+    "pcmpgtq",
+    "vpcmpeqb",
+    "vpcmpeqw",
+    "vpcmpeqd",
+    "vpcmpeqq",
+    "vpcmpgtb",
+    "vpcmpgtw",
+    "vpcmpgtd",
+    "vpcmpgtq",
+    // Packed integer arithmetic and the shifts, same shape again.
+    "paddb",
+    "paddw",
+    "paddd",
+    "paddq",
+    "psubb",
+    "psubw",
+    "psubd",
+    "psubq",
+    "pmullw",
+    "pmulld",
+    "pslldq",
+    "psrldq",
+    "psllw",
+    "pslld",
+    "psllq",
+    "psrlw",
+    "psrld",
+    "psrlq",
+    "psraw",
+    "psrad",
+    "vpaddb",
+    "vpaddw",
+    "vpaddd",
+    "vpaddq",
+    "vpsubb",
+    "vpsubw",
+    "vpsubd",
+    "vpsubq",
+    "vpmullw",
+    "vpmulld",
+    "vpslldq",
+    "vpsrldq",
+    "vpsllw",
+    "vpslld",
+    "vpsllq",
+    "vpsrlw",
+    "vpsrld",
+    "vpsrlq",
+    "vpsraw",
+    "vpsrad",
+    // The saturating, averaging and min/max families. Same
+    // read-modify-write shape as the wrapping arithmetic above — only
+    // the lane operation differs.
+    "paddsb",
+    "paddsw",
+    "paddusb",
+    "paddusw",
+    "psubsb",
+    "psubsw",
+    "psubusb",
+    "psubusw",
+    "pavgb",
+    "pavgw",
+    "pmaxsb",
+    "pmaxsw",
+    "pmaxsd",
+    "pmaxub",
+    "pmaxuw",
+    "pmaxud",
+    "pminsb",
+    "pminsw",
+    "pminsd",
+    "pminub",
+    "pminuw",
+    "pminud",
+    "vpaddsb",
+    "vpaddsw",
+    "vpaddusb",
+    "vpaddusw",
+    "vpsubsb",
+    "vpsubsw",
+    "vpsubusb",
+    "vpsubusw",
+    "vpavgb",
+    "vpavgw",
+    "vpmaxsb",
+    "vpmaxsw",
+    "vpmaxsd",
+    "vpmaxub",
+    "vpmaxuw",
+    "vpmaxud",
+    "vpminsb",
+    "vpminsw",
+    "vpminsd",
+    "vpminub",
+    "vpminuw",
+    "vpminud",
+    // The interleaves read the destination as their first source in the
+    // 2-operand form, like the arithmetic.
+    "punpcklbw",
+    "punpcklwd",
+    "punpckldq",
+    "punpcklqdq",
+    "punpckhbw",
+    "punpckhwd",
+    "punpckhdq",
+    "punpckhqdq",
+    "vpunpcklbw",
+    "vpunpcklwd",
+    "vpunpckldq",
+    "vpunpcklqdq",
+    "vpunpckhbw",
+    "vpunpckhwd",
+    "vpunpckhdq",
+    "vpunpckhqdq",
+    // `pshufb` shuffles the destination itself, indexed by the source,
+    // so the destination is a use as well; the packs fill their
+    // destination from both operands.
+    "pshufb",
+    "vpshufb",
+    "packsswb",
+    "packssdw",
+    "packuswb",
+    "packusdw",
+    "vpacksswb",
+    "vpackssdw",
+    "vpackuswb",
+    "vpackusdw",
+];
 
 /// Whether `insn` is a VEX/EVEX-encoded (`v`-prefixed) SIMD form, whose
 /// destination write zeroes the vector-register bits above the view.
