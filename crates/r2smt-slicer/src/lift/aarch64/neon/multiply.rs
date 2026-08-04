@@ -136,13 +136,18 @@ pub(super) enum ByElementKind {
         combine: Option<BinOp>,
     },
     /// `fmul` — one IEEE lane product.
-    ///
-    /// The fused `fmla` / `fmls` are deliberately not here. They round
-    /// the product and the sum together, once; `fadd(d, fmul(a, b))`
-    /// rounds twice, and the two differ in real cases. The IR has no
-    /// fused node, so modelling them that way would be a definite wrong
-    /// value rather than a wider one, and they decline instead.
     Float,
+    /// `fmla` / `fmls` — the product and the accumulate rounded
+    /// **together**, once.
+    ///
+    /// `fadd(d, fmul(a, b))` rounds twice and the two differ in real
+    /// cases, so this cannot go through the `Float` arm with a `combine`
+    /// bolted on: that composition would be a definite wrong value
+    /// rather than a wider one. The lowering routes to
+    /// [`crate::lift::simd::fused_multiply_lane`], which computes the
+    /// whole step in binary64 and rounds once back — exact for a
+    /// binary32 lane and the reason this kind is gated to that width.
+    Fused { step: FusedStep },
 }
 
 impl ByElementKind {
@@ -151,13 +156,15 @@ impl ByElementKind {
     pub(super) const fn combine(self) -> Option<BinOp> {
         match self {
             Self::Integer { combine } | Self::Long { combine, .. } => combine,
-            Self::Float => None,
+            // The fused forms accumulate inside the single rounding, so
+            // there is no separate combine step to name here.
+            Self::Float | Self::Fused { .. } => None,
         }
     }
 
     /// Whether the destination's prior value is an input.
     pub(super) const fn combines(self) -> bool {
-        self.combine().is_some()
+        self.combine().is_some() || matches!(self, Self::Fused { .. })
     }
 
     /// Whether the sources are half the destination's element width.
@@ -175,6 +182,12 @@ fn by_element_kind(base: &str) -> Option<ByElementKind> {
         "mla" => integer(Some(BinOp::Add)),
         "mls" => integer(Some(BinOp::Sub)),
         "fmul" => ByElementKind::Float,
+        "fmla" => ByElementKind::Fused {
+            step: FusedStep::MulAdd,
+        },
+        "fmls" => ByElementKind::Fused {
+            step: FusedStep::MulSub,
+        },
         "umull" => long(false, None),
         "smull" => long(true, None),
         "umlal" => long(false, Some(BinOp::Add)),
@@ -215,6 +228,9 @@ pub(super) fn by_element_shape(insn: &Instruction, mnemonic: &str) -> Option<Neo
     // byte-element form, which is what the dot products exist for.
     let encodable = match kind {
         ByElementKind::Float => matches!(source_bits, 16 | 32 | 64),
+        // A binary64 lane would need binary128 to keep the fused step
+        // exact, so the whole-vector spelling declines there too.
+        ByElementKind::Fused { .. } => source_bits == FUSED_STEP_LANE_BITS,
         ByElementKind::Integer { .. } | ByElementKind::Long { .. } => {
             matches!(source_bits, 16 | 32)
         }

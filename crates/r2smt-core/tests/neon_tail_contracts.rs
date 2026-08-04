@@ -471,6 +471,57 @@ fn fmul_by_element_multiplies_every_lane_by_the_named_float() {
 }
 
 #[test]
+fn fmla_by_element_rounds_the_product_and_the_sum_together() {
+    // The discriminator between a fused step and `fadd(d, fmul(a, b))`.
+    // a = b = 1 + 2^-23 (0x3f800001), so a*b is 1 + 2^-22 + 2^-46 —
+    // exact in binary64, but binary32 rounds it to 1 + 2^-22. With the
+    // accumulator at -(1 + 2^-22), the fused answer is the surviving
+    // 2^-46 (0x28800000); rounding the product first gives exactly 0.
+    assert_computes(
+        "fmla",
+        &["v0.4s", "v1.4s", "v2.s[0]"],
+        &[
+            ("v0", packed(32, &[0xbf80_0002])),
+            ("v1", packed(32, &[0x3f80_0001])),
+            ("v2", packed(32, &[0x3f80_0001])),
+        ],
+        packed(32, &[0x2880_0000]),
+    );
+}
+
+#[test]
+fn fmls_by_element_subtracts_the_fused_product() {
+    // 5.0 - 2.0*3.0 = -1.0. `v2` lane 1 is the 3.0.
+    assert_computes(
+        "fmls",
+        &["v0.2s", "v1.2s", "v2.s[1]"],
+        &[
+            ("v0", packed(32, &[0x40a0_0000])),
+            ("v1", packed(32, &[0x4000_0000])),
+            ("v2", packed(32, &[0x3f80_0000, 0x4040_0000])),
+        ],
+        packed(32, &[0xbf80_0000]),
+    );
+}
+
+#[test]
+fn fmla_by_element_broadcasts_the_named_lane_to_every_lane() {
+    // Picking lane 0 instead of lane 1 would give a perfectly plausible
+    // result, which is why this is solved rather than asserted on shape.
+    assert_computes(
+        "fmla",
+        &["v0.2s", "v1.2s", "v2.s[1]"],
+        &[
+            ("v0", packed(32, &[0x0000_0000, 0x0000_0000])),
+            ("v1", packed(32, &[0x4000_0000, 0x4080_0000])),
+            ("v2", packed(32, &[0x3f80_0000, 0x4040_0000])),
+        ],
+        // 2.0*3.0 = 6.0, 4.0*3.0 = 12.0.
+        packed(32, &[0x40c0_0000, 0x4140_0000]),
+    );
+}
+
+#[test]
 fn sdot_sums_four_byte_products_onto_the_destination_lane() {
     // 1*10 + 2*20 + 3*30 + 4*40 is 300, on top of a prior lane of 5.
     assert_computes(

@@ -4735,13 +4735,20 @@ fn aarch64_by_element_long_form_lifts() {
 }
 
 #[test]
-fn aarch64_whole_vector_fused_multiply_add_lifts_for_single_lanes() {
-    // The whole-vector `fmla` / `fmls` over binary32 lanes lower through
-    // the binary64 fused step; the by-element spelling stays declining
-    // (it needs the float accumulate wiring the integer forms have).
+fn aarch64_fused_multiply_add_lifts_for_single_lanes() {
+    // `fmla` / `fmls` over binary32 lanes lower through the binary64
+    // fused step, in both the whole-vector and the by-element spelling.
     assert!(!neon_declines("fmla", &["v0.4s", "v1.4s", "v2.4s"]));
     assert!(!neon_declines("fmls", &["v0.2s", "v1.2s", "v2.2s"]));
-    assert!(neon_declines("fmla", &["v0.4s", "v1.4s", "v2.s[1]"]));
+    assert!(!neon_declines("fmla", &["v0.4s", "v1.4s", "v2.s[1]"]));
+    assert!(!neon_declines("fmls", &["v0.2s", "v1.2s", "v2.s[0]"]));
+}
+
+#[test]
+fn aarch64_by_element_fused_multiply_declines_double_lanes() {
+    // The by-element form inherits the whole-vector width gate: a
+    // binary64 lane would need binary128 to keep the fused step exact.
+    assert!(neon_declines("fmla", &["v0.2d", "v1.2d", "v2.d[0]"]));
 }
 
 #[test]

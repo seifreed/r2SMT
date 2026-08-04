@@ -301,9 +301,10 @@ impl LiftCtx {
             shape.source_index,
         )?;
         let view = shape.lane_bits.checked_mul(shape.lanes)?;
-        let accumulator = match kind.combine() {
-            Some(_) => Some(self.simd_operand_value(&insn.operands.first()?.clone(), view)?),
-            None => None,
+        let accumulator = if kind.combines() {
+            Some(self.simd_operand_value(&insn.operands.first()?.clone(), view)?)
+        } else {
+            None
         };
         let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
         for index in 0..shape.lanes {
@@ -323,6 +324,23 @@ impl LiftCtx {
                 ByElementKind::Integer { .. } => Expr::mul(a, element.clone()),
                 ByElementKind::Float => {
                     fp_lane_result(FpArithOp::Mul, a, element.clone(), shape.lane_bits)?
+                }
+                // The accumulate happens inside the single rounding, so
+                // this arm consumes the destination lane itself rather
+                // than leaving it to the combine below.
+                ByElementKind::Fused { step } => {
+                    let previous = LiftCtx::extract_lane(
+                        accumulator.as_ref()?.clone(),
+                        shape.lane_bits,
+                        index,
+                    )?;
+                    crate::lift::simd::fused_multiply_lane(
+                        step,
+                        &a,
+                        &element,
+                        Some(previous),
+                        shape.lane_bits,
+                    )?
                 }
             };
             lanes.push(match (kind.combine(), accumulator.as_ref()) {
