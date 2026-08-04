@@ -9,6 +9,7 @@ use r2smt_ir::stmt::IrStmt;
 
 use crate::registers::{is_simd_parent, register_layout};
 
+use super::simd::{CompareKind, compare_lane};
 use super::{
     BitwiseOp, ExtendKind, FpArithOp, LiftCtx, ShiftOp, fp_lane_result, fp_sort_bits_checked,
     nonzero_width,
@@ -68,6 +69,16 @@ impl LiftCtx {
             "subsd" => self.lift_simd_scalar_fp(insn, FpArithOp::Sub, 64),
             "mulsd" => self.lift_simd_scalar_fp(insn, FpArithOp::Mul, 64),
             "divsd" => self.lift_simd_scalar_fp(insn, FpArithOp::Div, 64),
+            // Packed integer compares. `pcmpgt*` is signed; x86 has no
+            // unsigned form.
+            "pcmpeqb" | "vpcmpeqb" => self.lift_simd_packed_compare(insn, EQUAL, 8),
+            "pcmpeqw" | "vpcmpeqw" => self.lift_simd_packed_compare(insn, EQUAL, 16),
+            "pcmpeqd" | "vpcmpeqd" => self.lift_simd_packed_compare(insn, EQUAL, 32),
+            "pcmpeqq" | "vpcmpeqq" => self.lift_simd_packed_compare(insn, EQUAL, 64),
+            "pcmpgtb" | "vpcmpgtb" => self.lift_simd_packed_compare(insn, GREATER, 8),
+            "pcmpgtw" | "vpcmpgtw" => self.lift_simd_packed_compare(insn, GREATER, 16),
+            "pcmpgtd" | "vpcmpgtd" => self.lift_simd_packed_compare(insn, GREATER, 32),
+            "pcmpgtq" | "vpcmpgtq" => self.lift_simd_packed_compare(insn, GREATER, 64),
             "addps" | "vaddps" => self.lift_simd_packed_fp(insn, FpArithOp::Add, 32),
             "subps" | "vsubps" => self.lift_simd_packed_fp(insn, FpArithOp::Sub, 32),
             "mulps" | "vmulps" => self.lift_simd_packed_fp(insn, FpArithOp::Mul, 32),
@@ -633,6 +644,62 @@ impl LiftCtx {
         }
     }
 
+    /// The packed integer compares: `pcmpeq{b,w,d,q}` and
+    /// `pcmpgt{b,w,d,q}`.
+    ///
+    /// Each writes an all-ones mask into a lane where the predicate
+    /// holds and zeros where it does not — a *value*, not a flag, which
+    /// is why it cannot reuse the scalar compare path that writes
+    /// EFLAGS. `pcmpgt*` is signed on x86; there is no unsigned form.
+    ///
+    /// The mask is what feeds `pmovmskb` in the SSE string idiom, so
+    /// this family is the one the corpus measurement puts in a
+    /// conditional-branch block essentially every time it appears.
+    fn lift_simd_packed_compare(&mut self, insn: &Instruction, kind: CompareKind, lane_bits: u16) {
+        let ops = &insn.operands;
+        let Some(dst) = ops.first() else {
+            return;
+        };
+        let (a_op, b_op) = match ops.len() {
+            2 => (dst, &ops[1]),
+            3 => (&ops[1], &ops[2]),
+            _ => {
+                self.push_simd_unsupported(insn);
+                return;
+            }
+        };
+        let (a_op, b_op) = (a_op.clone(), b_op.clone());
+        let Some(result) = self.packed_compare_result(dst, &a_op, &b_op, kind, lane_bits) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        if !self.write_simd_dst(dst, result, is_vex(insn)) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
+    /// Lane-wise compare of two SIMD operands, materialising each once.
+    fn packed_compare_result(
+        &mut self,
+        dst: &Operand,
+        a_op: &Operand,
+        b_op: &Operand,
+        kind: CompareKind,
+        lane_bits: u16,
+    ) -> Option<Expr> {
+        let view = self.simd_instruction_view_bits(&[dst, a_op, b_op])?;
+        let a_val = self.simd_operand_value(a_op, view)?;
+        let b_val = self.simd_operand_value(b_op, view)?;
+        let count = Self::packed_lane_count(view, lane_bits)?;
+        let mut lanes = Vec::with_capacity(usize::from(count));
+        for index in 0..count {
+            let a = Self::extract_lane(a_val.clone(), lane_bits, index)?;
+            let b = Self::extract_lane(b_val.clone(), lane_bits, index)?;
+            lanes.push(compare_lane(kind, a, b, lane_bits)?);
+        }
+        Self::concat_lanes(lanes)
+    }
+
     /// Packed floating-point arithmetic: the same lane operation applied
     /// independently to every `lane_bits`-wide lane of the destination's
     /// vector view (`addps` → 4 single lanes over 128 bits, `vaddps ymm`
@@ -1035,6 +1102,16 @@ fn same_xmm_register(a: &Operand, b: &Operand) -> bool {
     }
 }
 
+/// `pcmpeq*` — lane equality.
+const EQUAL: CompareKind = CompareKind::Equal { float: false };
+
+/// `pcmpgt*` — signed lane greater-than. x86 spells no unsigned form.
+const GREATER: CompareKind = CompareKind::Ordered {
+    float: false,
+    signed: true,
+    or_equal: false,
+};
+
 /// How an x86 SIMD instruction's destination relates to its sources —
 /// the one fact the effect table needs that the lifter's own dispatch
 /// does not carry.
@@ -1082,7 +1159,13 @@ pub(crate) fn x86_simd_shape(mnemonic: &str) -> Option<X86SimdShape> {
         | "subpd" | "mulpd" | "divpd" | "vaddpd" | "vsubpd" | "vmulpd" | "vdivpd" | "maxps"
         | "minps" | "maxpd" | "minpd" | "vmaxps" | "vminps" | "vmaxpd" | "vminpd" | "maxss"
         | "minss" | "maxsd" | "minsd" | "cvtsi2ss" | "cvtsi2sd" | "cvtss2sd" | "cvtsd2ss"
-        | "sqrtss" | "sqrtsd" => X86SimdShape::ReadModifyWrite,
+        | "sqrtss" | "sqrtsd"
+        // The packed integer compares overwrite every lane, but the
+        // 2-operand form still reads the destination as its first
+        // source, so they share the arithmetic's shape.
+        | "pcmpeqb" | "pcmpeqw" | "pcmpeqd" | "pcmpeqq" | "pcmpgtb" | "pcmpgtw" | "pcmpgtd"
+        | "pcmpgtq" | "vpcmpeqb" | "vpcmpeqw" | "vpcmpeqd" | "vpcmpeqq" | "vpcmpgtb"
+        | "vpcmpgtw" | "vpcmpgtd" | "vpcmpgtq" => X86SimdShape::ReadModifyWrite,
         _ => return None,
     };
     Some(shape)

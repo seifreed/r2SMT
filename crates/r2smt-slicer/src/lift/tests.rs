@@ -3116,7 +3116,8 @@ fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
         "vpor", "pandn", "vpandn", "addss", "subss", "mulss", "divss", "addsd", "subsd", "mulsd",
         "divsd", "addps", "subps", "mulps", "divps", "addpd", "subpd", "mulpd", "divpd", "maxps",
         "minps", "maxpd", "minpd", "maxss", "minss", "maxsd", "minsd", "sqrtps", "sqrtpd",
-        "sqrtss", "sqrtsd", "movss", "movsd",
+        "sqrtss", "sqrtsd", "movss", "movsd", "pcmpeqb", "pcmpeqw", "pcmpeqd", "pcmpeqq",
+        "pcmpgtb", "pcmpgtw", "pcmpgtd", "pcmpgtq", "vpcmpeqb", "vpcmpeqd", "vpcmpgtb", "vpcmpgtd",
     ];
     for m in mnemonics {
         let i = insn(
