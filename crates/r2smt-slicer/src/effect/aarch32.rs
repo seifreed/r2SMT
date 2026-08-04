@@ -306,6 +306,42 @@ fn aarch32_ldm_stm_effect(insn: &Instruction, is_load: bool) -> InstructionEffec
     }
 }
 
+/// The base register of an `AArch32` memory operand — the first
+/// register named inside the brackets.
+fn aarch32_memory_base(mem: &Operand) -> Option<&'static str> {
+    let raw = mem.raw.trim();
+    let body = raw.strip_suffix('!').unwrap_or(raw);
+    let body = body.strip_prefix('[')?.strip_suffix(']')?;
+    canonical_register(body.split(',').next()?.trim(), Arch::Arm)
+}
+
+/// The base register a memory access writes back to, when it has a
+/// pre-index (`[Rn, #imm]!`) or post-index (`[Rn], #imm`) form.
+///
+/// The lifter emits `Rn := Rn + delta` for both, so the effect table
+/// has to report `Rn` as a definition. Without it the walk steps past
+/// this instruction while `Rn` is live, binds the read to an earlier
+/// definition, and the slice carries a base value the machine never
+/// held.
+fn aarch32_writeback_base(insn: &Instruction) -> Option<&'static str> {
+    let mem = insn.operands.get(1)?;
+    if !mem.raw.trim().ends_with('!') && insn.operands.len() <= 2 {
+        return None;
+    }
+    aarch32_memory_base(mem)
+}
+
+/// Registers named by the operands *after* the bracketed one — the
+/// post-index delta lives outside the brackets (`ldr r0, [r1], r2`), so
+/// `registers_in_operand` over the memory operand alone misses it.
+fn aarch32_post_index_uses(insn: &Instruction) -> Vec<&'static str> {
+    insn.operands
+        .iter()
+        .skip(2)
+        .flat_map(|op| registers_in_operand(op, Arch::Arm))
+        .collect()
+}
+
 fn aarch32_ldr_effect(insn: &Instruction) -> InstructionEffect {
     let mut defs = Vec::new();
     if let Some(dst) = insn.operands.first()
@@ -313,12 +349,22 @@ fn aarch32_ldr_effect(insn: &Instruction) -> InstructionEffect {
     {
         defs.push(reg);
     }
+    if let Some(base) = aarch32_writeback_base(insn)
+        && !defs.contains(&base)
+    {
+        defs.push(base);
+    }
     let mut uses = Vec::new();
     if let Some(mem) = insn.operands.get(1) {
         for r in registers_in_operand(mem, Arch::Arm) {
             if !uses.contains(&r) {
                 uses.push(r);
             }
+        }
+    }
+    for r in aarch32_post_index_uses(insn) {
+        if !uses.contains(&r) {
+            uses.push(r);
         }
     }
     InstructionEffect {
@@ -346,9 +392,14 @@ fn aarch32_str_effect(insn: &Instruction) -> InstructionEffect {
             }
         }
     }
+    for r in aarch32_post_index_uses(insn) {
+        if !uses.contains(&r) {
+            uses.push(r);
+        }
+    }
     InstructionEffect {
         kind: InstructionKind::Mov,
-        defs: Vec::new(),
+        defs: aarch32_writeback_base(insn).into_iter().collect(),
         uses,
         defines_flags: false,
         has_memory_access: true,

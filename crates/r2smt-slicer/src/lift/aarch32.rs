@@ -916,10 +916,15 @@ fn aarch32_mem_access(mem: &Operand, post: Option<&Operand>, ptr_bits: u16) -> O
     }
     let (base, offset) = parse_aarch32_memory(raw)?;
     let parent = register_layout(&base, Arch::Arm).map(|l| l.parent)?;
-    if let Some(op) = post
-        && op.kind == OperandKind::Immediate
-        && offset == 0
-    {
+    if let Some(op) = post {
+        // A post-index operand the immediate form does not claim is a
+        // register delta (`ldr r0, [r1], r2`). Falling through to the
+        // plain arm below would lift the load correctly and drop the
+        // base update entirely, leaving a later read of `r1` bound to a
+        // value the machine never held. Decline instead.
+        if op.kind != OperandKind::Immediate || offset != 0 {
+            return None;
+        }
         let delta = parse_aarch32_immediate(op.raw.strip_prefix('#').unwrap_or(&op.raw).trim())?;
         return Some(MemAccess {
             address: Expr::Var(Var::new(parent, ptr_bits)),

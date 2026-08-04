@@ -883,6 +883,24 @@ fn aarch32_vstr_stores_the_register_width() {
 }
 
 #[test]
+fn aarch32_register_post_index_declines_rather_than_dropping_the_writeback() {
+    // `ldr r0, [r1], r2` updates `r1` by `r2`. The immediate post-index
+    // guard does not claim this shape, and falling through to the plain
+    // offset arm would lift the load correctly while silently dropping
+    // the base update — a wrong `r1` for every later read.
+    let stmts = lift_aarch32(
+        "ldr",
+        vec![reg("r0"), op("[r1]", OperandKind::Memory), reg("r2")],
+    );
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+        "{stmts:?}"
+    );
+}
+
+#[test]
 fn aarch32_vldr_pc_relative_literal_pool_declines() {
     // A PC-relative literal load has no live PC value in this model.
     let stmts = lift_aarch32("vldr", vec![reg("s0"), op("[pc, #8]", OperandKind::Memory)]);

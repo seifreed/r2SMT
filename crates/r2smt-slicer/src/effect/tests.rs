@@ -944,6 +944,75 @@ fn aarch32_bfi_is_not_a_conditional_branch() {
 }
 
 #[test]
+fn aarch32_pre_index_writeback_defines_its_base_register() {
+    // The lifter emits `r1 := r1 + 4` for the `!` form. Without the
+    // matching def the walk steps past this instruction while `r1` is
+    // live and binds the read to an earlier definition.
+    let ldr = insn(
+        "ldr",
+        vec![
+            op("r0", OperandKind::Register),
+            op("[r1, 4]!", OperandKind::Memory),
+        ],
+    );
+    assert!(analyze(&ldr, Arch::Arm).defs.contains(&"r1"));
+}
+
+#[test]
+fn aarch32_post_index_writeback_defines_its_base_register() {
+    let ldr = insn(
+        "ldr",
+        vec![
+            op("r0", OperandKind::Register),
+            op("[r1]", OperandKind::Memory),
+            op("4", OperandKind::Immediate),
+        ],
+    );
+    assert!(analyze(&ldr, Arch::Arm).defs.contains(&"r1"));
+}
+
+#[test]
+fn aarch32_plain_offset_load_does_not_define_its_base_register() {
+    // The companion direction: no writeback, no def, or every load
+    // would keep its base's prior definition alive for nothing.
+    let ldr = insn(
+        "ldr",
+        vec![
+            op("r0", OperandKind::Register),
+            op("[r1, 4]", OperandKind::Memory),
+        ],
+    );
+    assert!(!analyze(&ldr, Arch::Arm).defs.contains(&"r1"));
+}
+
+#[test]
+fn aarch32_register_post_index_reads_its_delta_register() {
+    // `r2` is named outside the brackets, so scanning the memory
+    // operand alone misses it.
+    let ldr = insn(
+        "ldr",
+        vec![
+            op("r0", OperandKind::Register),
+            op("[r1]", OperandKind::Memory),
+            op("r2", OperandKind::Register),
+        ],
+    );
+    assert!(analyze(&ldr, Arch::Arm).uses.contains(&"r2"));
+}
+
+#[test]
+fn aarch32_store_writeback_defines_its_base_register() {
+    let str_insn = insn(
+        "str",
+        vec![
+            op("r0", OperandKind::Register),
+            op("[r1, 4]!", OperandKind::Memory),
+        ],
+    );
+    assert!(analyze(&str_insn, Arch::Arm).defs.contains(&"r1"));
+}
+
+#[test]
 fn aarch32_predicated_instruction_also_reads_its_destination() {
     // `moveq r2, 7` lifts to `Ite(ZF, 7, Var(r2))`: on the false path
     // the destination keeps its previous value, so it is a use as well
