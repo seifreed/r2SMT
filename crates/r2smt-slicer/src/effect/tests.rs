@@ -769,6 +769,34 @@ fn aarch32_general_purpose_register_list_is_not_a_vector_shape() {
 }
 
 #[test]
+fn aarch32_bfi_is_not_a_conditional_branch() {
+    // `bfi` / `bfc` are 3-char `b`-words that *define* `Rd`. A length
+    // gate on the `b<cond>` arm swallowed them as flag-free `Jcc`, so
+    // the slicer walked over the definition and a later read bound a
+    // stale value. They must classify as `Other` (which truncates),
+    // never `Jcc`.
+    let bfi = insn(
+        "bfi",
+        vec![
+            op("r0", OperandKind::Register),
+            op("r1", OperandKind::Register),
+            op("0", OperandKind::Immediate),
+            op("8", OperandKind::Immediate),
+        ],
+    );
+    assert_eq!(analyze(&bfi, Arch::Arm).kind, InstructionKind::Other);
+}
+
+#[test]
+fn aarch32_bcond_is_still_a_conditional_branch() {
+    // The precise condition check must still recognise `b<cond>`.
+    let beq = insn("beq", vec![op("0x1000", OperandKind::Immediate)]);
+    assert_eq!(analyze(&beq, Arch::Arm).kind, InstructionKind::Jcc);
+    let blt = insn("blt", vec![op("0x1000", OperandKind::Immediate)]);
+    assert_eq!(analyze(&blt, Arch::Arm).kind, InstructionKind::Jcc);
+}
+
+#[test]
 fn aarch64_contiguous_load_defines_its_listed_register() {
     let i = insn(
         "ld1",

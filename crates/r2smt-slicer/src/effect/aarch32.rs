@@ -128,17 +128,27 @@ fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> Instruct
             is_call: false,
             reads_flags: false,
         },
-        m if m.starts_with('b') && m.len() == 3 => InstructionEffect {
-            // `b<cond>` family — recognised by the classifier; here
-            // we just tag it as a Jcc with no reg side effects.
-            kind: InstructionKind::Jcc,
-            defs: Vec::new(),
-            uses: Vec::new(),
-            defines_flags: false,
-            has_memory_access: false,
-            is_call: false,
-            reads_flags: false,
-        },
+        m if m.starts_with('b')
+            && crate::lift::strip_aarch32_cond_suffix(m).is_some_and(|(base, _)| base == "b") =>
+        {
+            // `b<cond>` family — `b` plus a recognised condition suffix
+            // (`beq`, `bls`, `blt`, …). Recognised by the classifier;
+            // here we just tag it as a Jcc with no reg side effects.
+            // The precise condition check keeps the 3-char bitfield
+            // mnemonics `bfi` / `bfc` (which define `Rd`) out — a length
+            // gate would swallow them as flag-free jumps and let the
+            // slicer step over a definition, binding a later read to a
+            // stale value.
+            InstructionEffect {
+                kind: InstructionKind::Jcc,
+                defs: Vec::new(),
+                uses: Vec::new(),
+                defines_flags: false,
+                has_memory_access: false,
+                is_call: false,
+                reads_flags: false,
+            }
+        }
         // Memory: `ldr` defines its destination register and reads the
         // base; `str` reads its source plus the base. Both flag
         // `has_memory_access` so the memory-aware slice walker keeps
