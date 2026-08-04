@@ -2487,6 +2487,59 @@ fn vcvtps2ph_narrows_with_an_explicit_rounding_immediate() {
 }
 
 #[test]
+fn aarch32_families_are_covered_by_both_effect_and_lifter() {
+    // Parity guard for the AArch32 seam: a mnemonic the effect table
+    // keeps (any kind other than `Other`, which truncates) must be
+    // modelled by the lifter, or the slicer retains an instruction that
+    // lowers to `Unsupported` and the vector parent is left a stale def.
+    // Branch mnemonics are excluded — they are lowered by the branch
+    // machinery, not this per-mnemonic dispatch.
+    let cases: &[(&str, &[&str])] = &[
+        ("add", &["r0", "r1", "r2"]),
+        ("add.w", &["r0", "r1", "r2"]),
+        ("movs", &["r0", "0x0"]),
+        ("vmrs", &["APSR_nzcv", "FPSCR"]),
+        ("vldr", &["s0", "[r0]"]),
+        ("vstr", &["s0", "[r0]"]),
+        ("vpush", &["{d8, d9}"]),
+        ("vpop", &["{d0-d3}"]),
+        ("vadd.i32", &["d0", "d1", "d2"]),
+        ("vpadd.f32", &["d0", "d2", "d4"]),
+        ("vpmax.f32", &["d0", "d2", "d4"]),
+    ];
+    for (mnem, operands) in cases {
+        let ops: Vec<Operand> = operands
+            .iter()
+            .map(|o| {
+                let kind = if o.starts_with('[') {
+                    OperandKind::Memory
+                } else if o.starts_with('{') {
+                    OperandKind::Unknown
+                } else if o.starts_with("0x") {
+                    OperandKind::Immediate
+                } else {
+                    OperandKind::Register
+                };
+                op(o, kind)
+            })
+            .collect();
+        let i = insn(0x1000, 4, mnem, ops);
+        assert_ne!(
+            crate::effect::analyze(&i, Arch::Arm).kind,
+            crate::effect::InstructionKind::Other,
+            "{mnem}: effect table declined a modelled mnemonic"
+        );
+        let stmts = lift_per_mnemonic(&i, Arch::Arm);
+        assert!(
+            !stmts
+                .iter()
+                .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+            "{mnem}: lifter emitted Unsupported: {stmts:?}"
+        );
+    }
+}
+
+#[test]
 fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
     // Parity guard: the effect table keeps an instruction iff the lifter
     // models it. A mnemonic classified `Simd` by `analyze` but absent

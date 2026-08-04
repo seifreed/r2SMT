@@ -50,8 +50,12 @@ fn arch_from_str(name: &str, bits: u16) -> Result<Arch> {
         ("x86", 32) => Ok(Arch::X86),
         ("x86", 64) => Ok(Arch::X86_64),
         // radare2 reports both AArch32 and AArch64 with arch="arm" and
-        // discriminates via the bits field.
-        ("arm", 32) => Ok(Arch::Arm),
+        // discriminates via the bits field. A Thumb-entry ARM32 binary
+        // is reported as 16-bit but is still AArch32 — `Arch::Arm` covers
+        // both the ARM and Thumb instruction sets, and per-function
+        // `is_thumb` (from `func.bits == Some(16)`) flows downstream to
+        // the patcher.
+        ("arm", 32 | 16) => Ok(Arch::Arm),
         ("arm", 64) => Ok(Arch::Aarch64),
         _ => Err(Error::Unsupported(format!(
             "unsupported arch '{name}' ({bits} bits)"

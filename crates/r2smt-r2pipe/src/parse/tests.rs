@@ -59,8 +59,18 @@ fn parse_info_extracts_arch_and_bits() {
 fn parse_info_rejects_unsupported_arch() {
     let bad = r#"{"bin": {"arch": "mips", "bits": 32}}"#;
     assert!(parse_info(bad).is_err());
-    let bad_bits = r#"{"bin": {"arch": "arm", "bits": 16}}"#;
+    let bad_bits = r#"{"bin": {"arch": "x86", "bits": 16}}"#;
     assert!(parse_info(bad_bits).is_err());
+}
+
+#[test]
+fn parse_info_accepts_thumb_arm_as_aarch32() {
+    // radare2 reports a Thumb-entry ARM32 binary as 16-bit; it is still
+    // AArch32, and `Arch::Arm` covers both instruction sets.
+    let thumb = r#"{"bin": {"arch": "arm", "bits": 16}}"#;
+    let info = parse_info(thumb).unwrap();
+    assert_eq!(info.arch, Arch::Arm);
+    assert_eq!(info.bits, 16);
 }
 
 #[test]
