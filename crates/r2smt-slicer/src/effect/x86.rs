@@ -354,14 +354,13 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
         _ if let Some(shape) = crate::lift::x86_simd_shape(&mnemonic) => simd_effect(insn, shape),
         // The scalar FP compares share `cmp`'s shape, not the SIMD one:
         // they read both operands, define no register, and write flags.
-        "comiss" | "ucomiss" | "comisd" | "ucomisd" => {
+        // `ptest` and the scalar FP compares share `cmp`'s shape: they
+        // read both operands, define no register and write flags.
+        // Routing them through `simd_effect` instead would claim operand
+        // 0 as a definition and drop whatever produced that vector.
+        m if crate::lift::is_x86_vector_flag_compare(m) => {
             cmp_or_test_effect(insn, InstructionKind::Cmp)
         }
-        // `ptest` shares `cmp`'s shape too: it reads both vector
-        // operands, defines no register and writes flags. Routing it
-        // through `simd_effect` instead would claim its first operand as
-        // a definition and drop whatever produced that vector.
-        m if crate::lift::is_x86_vector_test(m) => cmp_or_test_effect(insn, InstructionKind::Cmp),
         // The compare family writes a mask into its destination, so it
         // is a SIMD def like the arithmetic — not a flag-setting `cmp`.
         m if crate::lift::is_fp_compare_mnemonic(m) => {

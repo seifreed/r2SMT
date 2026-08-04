@@ -570,19 +570,31 @@ const BITS_PER_BYTE: u16 = 8;
 /// and are written separately.
 const VECTOR_TEST_CLEARED_FLAGS: [&str; 3] = ["OF", "SF", "PF"];
 
-/// Whether `mnemonic` is a vector bitwise test — an instruction that
-/// reads two vector operands, writes flags, and defines no register.
+/// Whether `mnemonic` reads vector operands, writes flags, and defines
+/// no register — the vector bitwise test `ptest` and the scalar
+/// floating-point compares.
 ///
-/// Deliberately **not** in [`x86_simd_shape`]. That table's effect-side
-/// arm runs before the compare arms and would make operand 0 a
-/// definition, so the slicer would treat `ptest xmm0, xmm0` as
+/// These are deliberately **not** in [`x86_simd_shape`]. That table's
+/// effect-side arm runs before the compare arms and would make operand 0
+/// a definition, so the slicer would treat `ptest xmm0, xmm0` as
 /// redefining `xmm0` and drop whatever actually produced it — the
-/// def/use asymmetry that fabricates verdicts. It follows `comiss`'s
-/// path instead, which is the shape it genuinely shares.
-pub(crate) fn is_x86_vector_test(mnemonic: &str) -> bool {
+/// def/use asymmetry that fabricates verdicts. Membership therefore has
+/// to live here, and the dispatch gate and the effect table consult this
+/// one predicate rather than each keeping a list.
+///
+/// The compares are load-bearing in the *gate*, and were lost there when
+/// the two hand-maintained lists were folded into `x86_simd_shape`: they
+/// have no register destination, so nothing else in
+/// `is_x86_simd_instruction` claims them, and an unclaimed mnemonic
+/// falls to the ESIL ladder — which models no floating point at all and
+/// so drops the flags entirely. `ucomiss xmm0, xmm0 ; jne` then lifts to
+/// an *empty* slice with a free `ZF`, turning a correct `always_false`
+/// into `both_possible`. Sound, since a free flag only widens, but it
+/// silently discards the analysis.
+pub(crate) fn is_x86_vector_flag_compare(mnemonic: &str) -> bool {
     matches!(
         mnemonic.trim().to_ascii_lowercase().as_str(),
-        "ptest" | "vptest"
+        "ptest" | "vptest" | "comiss" | "ucomiss" | "comisd" | "ucomisd"
     )
 }
 

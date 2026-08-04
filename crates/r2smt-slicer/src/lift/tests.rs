@@ -5101,6 +5101,45 @@ fn aarch64_reciprocal_step_lifts_for_single_lanes() {
 }
 
 #[test]
+fn vector_flag_compares_are_claimed_by_the_gate_so_esil_does_not_win() {
+    // Regression for a mnemonic silently lost from the dispatch gate.
+    // These write flags and define no register, so nothing else in
+    // `is_x86_simd_instruction` claims them; an unclaimed mnemonic falls
+    // to the ESIL ladder, which models no floating point and drops the
+    // flags entirely. The branch then lifts to an *empty* slice with a
+    // free ZF, and `ucomiss xmm0, xmm0 ; jne` — always-false, since a
+    // value compares equal or unordered against itself — reports
+    // `both_possible` instead. Sound, but the analysis is gone.
+    for mnemonic in ["ptest", "vptest", "comiss", "ucomiss", "comisd", "ucomisd"] {
+        let i = insn(
+            0x1000,
+            4,
+            mnemonic,
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        );
+        assert!(
+            is_x86_simd_instruction(&i),
+            "{mnemonic}: gate must claim it, or ESIL lowers it instead"
+        );
+        let effect = crate::effect::analyze(&i, Arch::X86_64);
+        assert!(
+            effect.defs.is_empty() && effect.defines_flags,
+            "{mnemonic}: must write flags and define no register, got {effect:?}"
+        );
+        let stmts = lift_per_mnemonic(&i, Arch::X86_64);
+        assert!(
+            stmts
+                .iter()
+                .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == "ZF")),
+            "{mnemonic}: must define ZF, got {stmts:?}"
+        );
+    }
+}
+
+#[test]
 fn ptest_defines_flags_and_no_vector_register() {
     // `ptest` reads two vectors and writes only flags. If it went
     // through the SIMD membership table instead, `simd_effect` would
