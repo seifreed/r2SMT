@@ -44,6 +44,16 @@ pub(in crate::lift::aarch32) enum WidenKind {
     Narrow,
     /// `vshrn` — shift right, then truncate.
     ShiftNarrow { shift: u16 },
+    /// `vqmovn` / `vqmovun` — clamp each double-width source element into
+    /// the narrow range instead of truncating it. `source_signed` says
+    /// how the source is read and which comparisons the clamp uses;
+    /// `to_unsigned` selects the destination range — `vqmovun` reads a
+    /// signed source but saturates into `[0, 2^n - 1]`, so a negative
+    /// source becomes zero.
+    SaturatingNarrow {
+        source_signed: bool,
+        to_unsigned: bool,
+    },
 }
 
 /// `vmovl` / `vaddl` / `vsubl` / `vmull` / `vaddw` / `vsubw` — a
@@ -154,6 +164,58 @@ pub(super) fn narrow_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonSha
         op: NeonOp::Widen {
             kind,
             signed: false,
+        },
+        lane_bits,
+        lanes,
+    })
+}
+
+/// `vqmovn` / `vqmovun` — a destination element half the width of its
+/// source, saturated rather than truncated.
+///
+/// `vqmovn.s16` / `vqmovn.u16` keep the source's signedness on both
+/// sides; `vqmovun.s16` reads a signed source but clamps into the
+/// unsigned destination range, so it has no unsigned-source spelling.
+pub(super) fn saturating_narrow_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (base, ty) = mnemonic.split_once('.')?;
+    let to_unsigned = match base {
+        "vqmovn" => false,
+        "vqmovun" => true,
+        _ => return None,
+    };
+    let (element, source_bits) = neon_element_type(ty)?;
+    let source_signed = match element {
+        ElementKind::Signed => true,
+        // `vqmovn.u` narrows an unsigned source; `vqmovun` has no
+        // unsigned-source encoding.
+        ElementKind::Unsigned if !to_unsigned => false,
+        _ => return None,
+    };
+    if insn.operands.len() != 2 {
+        return None;
+    }
+    let lane_bits = source_bits.checked_div(2)?;
+    if lane_bits < 8 {
+        return None;
+    }
+    let source_view = vector_parent_bits()?;
+    let destination_view = vector_view_bits(insn.operands.first()?)?;
+    if destination_view != source_view / 2 {
+        return None;
+    }
+    let lanes = destination_view.checked_div(lane_bits)?;
+    if vector_view_bits(insn.operands.get(1)?)? != source_view
+        || source_bits.checked_mul(lanes)? != source_view
+    {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::Widen {
+            kind: WidenKind::SaturatingNarrow {
+                source_signed,
+                to_unsigned,
+            },
+            signed: source_signed,
         },
         lane_bits,
         lanes,

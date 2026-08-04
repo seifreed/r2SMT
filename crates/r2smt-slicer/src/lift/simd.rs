@@ -601,7 +601,7 @@ fn wide_combination(subtract: bool, signed: bool, a: Expr, b: Expr, wide: u16) -
 
 /// The range an element of `bits` can represent, as headroom-width
 /// constants.
-fn element_bounds(signed: bool, bits: u16, wide: u16) -> Option<(Expr, Expr)> {
+pub(super) fn element_bounds(signed: bool, bits: u16, wide: u16) -> Option<(Expr, Expr)> {
     let span = 1i128.checked_shl(u32::from(bits))?;
     let (min, max) = if signed {
         (-(span / 2), span / 2 - 1)

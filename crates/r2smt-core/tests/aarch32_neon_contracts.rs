@@ -1301,6 +1301,79 @@ fn vmull_declines_the_polynomial_element_type() {
     assert!(declines("vmull.p8", &["q0", "d2", "d4"]));
 }
 
+// --- the saturating narrows ---
+//
+// `vqmovn` / `vqmovun` clamp each double-width source element into the
+// destination range rather than truncating it, so a value outside the
+// range lands on the nearest endpoint instead of wrapping. The three
+// spellings differ in what "the range" is: `vqmovn.s` keeps the signed
+// destination range, `vqmovn.u` the unsigned one, and `vqmovun.s` reads
+// a signed source but clamps into the unsigned range, so a negative
+// source becomes zero.
+
+#[test]
+fn vqmovn_signed_clamps_each_element_to_the_signed_byte_range() {
+    // Lanes 2, 3 exceed `+127` and lanes 6, 7 fall below `-128`; each
+    // saturates to the nearest endpoint (`0x7f` / `0x80`) rather than
+    // truncating, which would keep the wrong low byte.
+    assert_computes(
+        "vqmovn.s16",
+        &["d0", "q1"],
+        &[("v0", 0), ("v1", 0x8000_ff00_ff80_ffff_7fff_0080_007f_0000)],
+        0x8080_80ff_7f7f_7f00,
+    );
+}
+
+#[test]
+fn vqmovn_unsigned_clamps_each_element_to_the_unsigned_byte_range() {
+    assert_computes(
+        "vqmovn.u16",
+        &["d0", "q1"],
+        &[("v0", 0), ("v1", 0x1000_00ab_0080_0001_ffff_0100_00ff_0000)],
+        0xffab_8001_ffff_ff00,
+    );
+}
+
+#[test]
+fn vqmovun_sends_a_negative_source_to_zero() {
+    // The signed source's negative lanes (4, 5) clamp to `0`, not to the
+    // unsigned wrap `0xff`; the positive lanes above `255` clamp to
+    // `0xff`.
+    assert_computes(
+        "vqmovun.s16",
+        &["d0", "q1"],
+        &[("v0", 0), ("v1", 0x7fff_00ab_8000_ffff_0100_00ff_007f_0000)],
+        0xffab_0000_ffff_7f00,
+    );
+}
+
+#[test]
+fn vqmovn_on_a_half_register_preserves_the_other_half() {
+    // The write to `d0` merges into `v0`, so the upper doubleword
+    // survives.
+    assert_computes(
+        "vqmovn.s16",
+        &["d0", "q1"],
+        &[
+            ("v0", 0xdead_beef_0000_0000_0000_0000_0000_0000),
+            ("v1", 0x8000_ff00_ff80_ffff_7fff_0080_007f_0000),
+        ],
+        0xdead_beef_0000_0000_8080_80ff_7f7f_7f00,
+    );
+}
+
+#[test]
+fn vqmovun_declines_an_unsigned_source() {
+    // `vqmovun` reads a signed source and clamps into the unsigned
+    // range; there is no unsigned-source encoding.
+    assert!(declines("vqmovun.u16", &["d0", "q1"]));
+}
+
+#[test]
+fn vqmovn_declines_a_destination_that_is_not_narrow() {
+    assert!(declines("vqmovn.s16", &["q0", "q1"]));
+}
+
 // ---------------------------------------------------------------
 // The by-element forms
 //

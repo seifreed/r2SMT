@@ -122,6 +122,7 @@ pub(super) fn resolve(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| permute::permute_pair_shape(insn, &mnemonic))
         .or_else(|| width::widen_long_shape(insn, &mnemonic))
         .or_else(|| width::narrow_shape(insn, &mnemonic))
+        .or_else(|| width::saturating_narrow_shape(insn, &mnemonic))
         .or_else(|| element::by_element_shape(insn, &mnemonic))
 }
 

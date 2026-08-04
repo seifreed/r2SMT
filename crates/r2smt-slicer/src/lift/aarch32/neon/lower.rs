@@ -68,6 +68,10 @@ impl LiftCtx {
             NeonOp::Widen { kind, signed } => match kind {
                 WidenKind::Narrow => self.aarch32_narrow_lanes(insn, shape, 0),
                 WidenKind::ShiftNarrow { shift } => self.aarch32_narrow_lanes(insn, shape, shift),
+                WidenKind::SaturatingNarrow {
+                    source_signed,
+                    to_unsigned,
+                } => self.aarch32_saturating_narrow_lanes(insn, shape, source_signed, to_unsigned),
                 WidenKind::Long => self.aarch32_long_lanes(insn, shape, None, false, signed),
                 WidenKind::LongArith { op, wide_first } => {
                     self.aarch32_long_lanes(insn, shape, Some(op), wide_first, signed)
@@ -213,6 +217,55 @@ impl LiftCtx {
                 element = Expr::lshr(element, Expr::konst(u128::from(shift), source_bits));
             }
             lanes.push(Expr::extract(element, shape.lane_bits.checked_sub(1)?, 0));
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// `vqmovn` / `vqmovun` — each source element clamped into the
+    /// destination range instead of truncated.
+    ///
+    /// The clamp compares at the source width, where the source value is
+    /// already exact, so no headroom bit is needed the way an addition
+    /// would need one. The comparison signedness follows the *source*
+    /// (`vqmovun` reads a signed source); the range follows the
+    /// *destination* (`vqmovun` clamps into `[0, 2^n - 1]`, so a negative
+    /// source lands at zero).
+    fn aarch32_saturating_narrow_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        source_signed: bool,
+        to_unsigned: bool,
+    ) -> Option<Expr> {
+        let source_bits = shape.lane_bits.checked_mul(2)?;
+        let source_view = source_bits.checked_mul(shape.lanes)?;
+        let source = self.simd_operand_value(&insn.operands.get(1)?.clone(), source_view)?;
+        // The destination range is signed only for `vqmovn.s`: `vqmovn.u`
+        // and `vqmovun` both clamp into the unsigned range.
+        let dest_signed = source_signed && !to_unsigned;
+        let (min, max) =
+            crate::lift::simd::element_bounds(dest_signed, shape.lane_bits, source_bits)?;
+        let le = |left: Expr, right: Expr| {
+            if source_signed {
+                Expr::sle(left, right)
+            } else {
+                Expr::ule(left, right)
+            }
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let element = Self::extract_lane(source.clone(), source_bits, index)?;
+            let below_max = Expr::Ite {
+                cond: Box::new(le(element.clone(), max.clone())),
+                then_expr: Box::new(element),
+                else_expr: Box::new(max.clone()),
+            };
+            let clamped = Expr::Ite {
+                cond: Box::new(le(min.clone(), below_max.clone())),
+                then_expr: Box::new(below_max),
+                else_expr: Box::new(min.clone()),
+            };
+            lanes.push(Expr::extract(clamped, shape.lane_bits.checked_sub(1)?, 0));
         }
         Self::concat_lanes(lanes)
     }
