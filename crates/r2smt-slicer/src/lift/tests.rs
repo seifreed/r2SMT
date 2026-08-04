@@ -3688,6 +3688,54 @@ fn aarch32_vcvt_pins_the_rounding_mode_only_where_fpscr_supplies_it() {
 }
 
 #[test]
+fn aarch32_packed_vcvt_is_not_lowered_as_a_scalar_conversion() {
+    // `vcvt.s32.f32 q0, q1` converts four lanes. The scalar VFP arm
+    // recognises the identical mnemonic, so a packed form the NEON
+    // resolver missed would be lowered as a conversion of lane zero
+    // with the rest of the register left standing — a wrong value, not
+    // a decline. The whole 128-bit destination must depend on the
+    // source.
+    let stmts = lift_aarch32("vcvt.s32.f32", vec![reg("q0"), reg("q1")]);
+    let rendered = format!("{:?}", simd_parent_src(&stmts, "v0"));
+    assert!(
+        !rendered.contains(r#""v0""#),
+        "packed vcvt kept part of its destination, so a lane went unconverted: {rendered}"
+    );
+}
+
+#[test]
+fn aarch32_packed_vcvt_resolves_at_both_register_classes() {
+    // `d` is two lanes and `q` is four — the view is what `AArch32`
+    // spells instead of an arrangement suffix.
+    for (view, lanes) in [("d", 2usize), ("q", 4usize)] {
+        let stmts = lift_aarch32(
+            "vcvt.u32.f32",
+            vec![reg(&format!("{view}0")), reg(&format!("{view}1"))],
+        );
+        let rendered = format!("{:?}", simd_parent_src(&stmts, "v0"));
+        assert_eq!(
+            rendered.matches("FpToSbv").count(),
+            lanes,
+            "{view} form should convert {lanes} lanes: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn aarch32_packed_half_precision_vcvt_declines() {
+    // `vcvt.f16.f32` halves the lane count, a geometry nothing here
+    // models, and it renders only on Z3. It must decline rather than
+    // being taken for a same-width conversion.
+    let stmts = lift_aarch32("vcvt.f16.f32", vec![reg("d0"), reg("q1")]);
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+        "{stmts:?}"
+    );
+}
+
+#[test]
 fn aarch64_scalar_arithmetic_is_unaffected_by_the_shape_guard() {
     let i = insn(0x1000, 4, "add", vec![reg("x0"), reg("x1"), reg("x2")]);
     let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);

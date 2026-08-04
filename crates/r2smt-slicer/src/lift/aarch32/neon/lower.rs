@@ -19,6 +19,8 @@ use super::permute::{PairKind, PairSource, paired_source};
 use super::width::WidenKind;
 use super::{BITS_PER_BYTE, NeonOp, NeonShape};
 use crate::lift::BinOp;
+use crate::lift::aarch64::neon::lower::convert_lane;
+use crate::lift::aarch64::neon::width::ConvertKind;
 use crate::lift::{FpArithOp, fp_lane_result};
 
 /// Widen `value` to `target` bits, replicating the sign bit or not.
@@ -66,6 +68,11 @@ impl LiftCtx {
                 self.aarch32_reverse_lanes(insn, shape, container_bits)
             }
             NeonOp::Duplicate => self.aarch32_duplicate_lanes(insn, shape),
+            NeonOp::Convert {
+                kind,
+                fbits,
+                rounding,
+            } => self.aarch32_convert_lanes(insn, shape, kind, fbits, rounding),
             NeonOp::Widen { kind, signed } => match kind {
                 WidenKind::Narrow => self.aarch32_narrow_lanes(insn, shape, 0, false),
                 WidenKind::ShiftNarrow { shift, rounding } => {
@@ -475,6 +482,37 @@ impl LiftCtx {
             Ordering::Less => return None,
         };
         Self::concat_lanes(vec![element; usize::from(shape.lanes)])
+    }
+
+    /// `vcvt` over every lane of the source view.
+    ///
+    /// Source and destination elements are both 32 bits here — the
+    /// resolver admits no other packed geometry — so one lane index
+    /// serves both sides and `convert_lane` is called with equal
+    /// widths.
+    fn aarch32_convert_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        kind: ConvertKind,
+        fbits: u16,
+        rounding: r2smt_ir::expr::RoundingMode,
+    ) -> Option<Expr> {
+        let source = insn.operands.get(1)?.clone();
+        let value = self.simd_operand_value(&source, shape.view_bits()?)?;
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let element = Self::extract_lane(value.clone(), shape.lane_bits, index)?;
+            lanes.push(convert_lane(
+                kind,
+                element,
+                shape.lane_bits,
+                shape.lane_bits,
+                fbits,
+                rounding,
+            )?);
+        }
+        Self::concat_lanes(lanes)
     }
 
     pub(in crate::lift::aarch32::neon) fn push_aarch32_neon_unsupported(

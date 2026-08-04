@@ -246,6 +246,33 @@ fn vcvt_between_float_widths_converts_the_value_not_the_bits() {
 }
 
 #[test]
+fn packed_vcvt_converts_every_lane_not_just_the_first() {
+    // The scalar VFP arm recognises the same mnemonic, so a packed form
+    // the NEON resolver missed would convert lane zero and leave the
+    // rest of the register standing. Two different lanes with two
+    // different values is what tells the two lowerings apart: 1.5 and
+    // 2.5 truncate to 1 and 2.
+    assert_computes(
+        "vcvt.s32.f32",
+        &["d0", "d2"],
+        &[("v0", 0), ("v1", 0x4020_0000_3fc0_0000)],
+        0x0000_0002_0000_0001,
+    );
+}
+
+#[test]
+fn packed_vcvt_from_integer_reads_lanes_as_signed() {
+    // -1 and 2 in adjacent lanes: reading them unsigned would make the
+    // low lane 4294967296.0 rather than -1.0.
+    assert_computes(
+        "vcvt.f32.s32",
+        &["d0", "d2"],
+        &[("v0", 0), ("v1", 0x0000_0002_ffff_ffff)],
+        0x4000_0000_bf80_0000,
+    );
+}
+
+#[test]
 fn vcvt_fixed_point_scales_by_the_fraction_width() {
     // The fixed-point form reads the low 16 bits as a signed value
     // scaled by 2^-8: 384 / 256 = 1.5. Ignoring the third operand would

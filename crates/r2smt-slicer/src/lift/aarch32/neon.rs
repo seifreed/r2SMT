@@ -84,6 +84,21 @@ pub(super) enum NeonOp {
         kind: lanewise::CompareKind,
         zero: bool,
     },
+    /// `vcvt` — a lane-wise conversion between the 32-bit float and
+    /// integer formats, optionally by a fixed-point fraction width.
+    ///
+    /// Shares [`crate::lift::aarch64::neon::width::ConvertKind`] and
+    /// the `AArch64` lowering rather than restating them: the two ISAs
+    /// differ in how they *spell* the conversion, not in what it
+    /// computes.
+    Convert {
+        kind: crate::lift::aarch64::neon::width::ConvertKind,
+        /// Fraction width of the fixed-point form, zero for the plain
+        /// register form.
+        fbits: u16,
+        /// The mode a float-to-integer conversion rounds with.
+        rounding: r2smt_ir::expr::RoundingMode,
+    },
     /// `vpadd` / `vpmax` / `vpmin` — a pairwise reduction of adjacent
     /// source lanes. `float` selects the `.f32` forms, whose `vpmax` /
     /// `vpmin` follow ARM `FPMax` NaN / signed-zero semantics.
@@ -153,6 +168,12 @@ pub(super) fn resolve(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| width::widen_long_shape(insn, &mnemonic))
         .or_else(|| width::narrow_shape(insn, &mnemonic))
         .or_else(|| width::saturating_narrow_shape(insn, &mnemonic))
+        // Ahead of the mnemonic families below and, more importantly,
+        // ahead of the scalar VFP arm in the dispatcher: `vcvt` is
+        // spelled identically in both, and the scalar handler would
+        // convert lane zero and leave the rest of the register
+        // standing — a wrong value rather than a decline.
+        .or_else(|| width::convert_shape(insn, &mnemonic))
         .or_else(|| element::by_element_shape(insn, &mnemonic))
         .or_else(|| table::table_lookup_shape(insn, &mnemonic))
         .or_else(|| lanewise::compare_shape(insn, &mnemonic))

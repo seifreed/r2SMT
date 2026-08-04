@@ -28,9 +28,78 @@ use crate::lift::aarch32::ElementKind;
 use crate::lift::aarch32::neon_element_type;
 use crate::lift::parse_immediate;
 
-use super::{NeonOp, NeonShape, vector_parent_bits, vector_view_bits};
+use super::{NeonOp, NeonShape, uniform_vector_view, vector_parent_bits, vector_view_bits};
+use crate::lift::aarch64::neon::width::ConvertKind;
 
-/// How a widening or narrowing form relates its two geometries.
+/// The packed lane-wise conversions `vcvt.{s32,u32}.f32` and
+/// `vcvt.f32.{s32,u32}`, plain or by a fixed-point fraction width.
+///
+/// Resolved here rather than by [`super::super::neon_packed_op`] for
+/// the same reason the scalar form needed its own parser: a conversion
+/// names two element types, so the single `split_once('.')` both that
+/// function and [`neon_element_type`] perform sees `"s32.f32"` and
+/// matches nothing.
+///
+/// Claiming these is load-bearing beyond coverage. The scalar VFP arm
+/// of the dispatcher recognises the identical mnemonic, so a packed
+/// form this resolver misses is not declined — it is lowered as a
+/// scalar conversion of lane zero with the rest of the register left
+/// standing. Same hazard as the by-element multiplies, and the reason
+/// both sit ahead of the families whose operand shape they overlap.
+///
+/// The half-precision pair `vcvt.f16.f32` / `vcvt.f32.f16` declines:
+/// it halves or doubles the lane count, which is a different geometry
+/// from everything here, and it renders only on Z3.
+pub(super) fn convert_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (base, ty) = mnemonic.split_once('.')?;
+    let (convert, dest_bits) = crate::lift::aarch32::vfp_convert(base, ty)?;
+    let (source_kind, source_bits) = convert.source;
+    // NEON spells only the 32-bit conversions between float and
+    // integer; there is no packed `.f64` form and no packed integer to
+    // integer one.
+    if dest_bits != 32 || source_bits != 32 {
+        return None;
+    }
+    let kind = match (convert.dest_kind, source_kind) {
+        (ElementKind::Float, ElementKind::Float) => return None,
+        (ElementKind::Float, signedness) => ConvertKind::IntToFloat {
+            signed: signedness == ElementKind::Signed,
+        },
+        (signedness, ElementKind::Float) => ConvertKind::FloatToInt {
+            signed: signedness == ElementKind::Signed,
+        },
+        // `vfp_convert` requires a float on one side, so this arm is
+        // unreachable through the parser.
+        _ => return None,
+    };
+    let fbits = match insn.operands.get(2) {
+        // The fraction width is bounded by the element it scales, which
+        // is 32 for every form reaching here.
+        Some(operand) => {
+            let amount = u16::try_from(parse_immediate(&operand.raw)?).ok()?;
+            if amount == 0 || amount > dest_bits {
+                return None;
+            }
+            amount
+        }
+        None => 0,
+    };
+    if insn.operands.len() != usize::from(fbits > 0) + 2 {
+        return None;
+    }
+    let view = uniform_vector_view(insn, 2)?;
+    Some(NeonShape {
+        op: NeonOp::Convert {
+            kind,
+            fbits,
+            rounding: convert.to_int_rounding,
+        },
+        lane_bits: dest_bits,
+        lanes: view.checked_div(dest_bits)?,
+    })
+}
+
+/// How a widening or narrowing form relates two geometries.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::lift::aarch32) enum WidenKind {
     /// `vmovl` — extend each source element into one twice as wide.

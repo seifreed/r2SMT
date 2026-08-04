@@ -1673,7 +1673,7 @@ fn vfp_convert_fraction_bits(
 /// hands the whole `"f32.s32"` tail to [`neon_element_type`], which
 /// matches nothing: the reason the entire family declined before this
 /// existed rather than lifting wrongly.
-fn vfp_convert(base: &str, ty: &str) -> Option<(VfpConvert, u16)> {
+pub(in crate::lift::aarch32) fn vfp_convert(base: &str, ty: &str) -> Option<(VfpConvert, u16)> {
     // `vcvtr` differs from `vcvt` only in taking its rounding from
     // FPSCR instead of the opcode; `vcvtb` / `vcvtt` address the halves
     // of a half-precision pair and are a different operand shape, so
@@ -1808,6 +1808,23 @@ impl LiftCtx {
         };
         let fbits = vfp_convert_fraction_bits(insn, kind, dest_bits, source_bits)?;
         let src = insn.operands.get(1)?.clone();
+        // A conversion is scalar only if each operand's register class
+        // holds exactly one element. `vfp_convert` reads the mnemonic
+        // alone, and the packed forms spell the same one — `vcvt.s32.f32
+        // q0, q1` converts four lanes where this would convert lane
+        // zero and leave the rest of the register standing. That is a
+        // wrong value rather than a decline, so the check is here and
+        // not in the parser, which cannot see the operands.
+        let dst = insn.operands.first()?.clone();
+        for (operand, bits) in [(&dst, dest_bits), (&src, source_bits)] {
+            // The fixed-point forms hold a 16-bit element in an `s`
+            // register, so the rule is the register class the width
+            // needs, not equality with the element.
+            let expected = if bits > 32 { bits } else { 32 };
+            if self.simd_view_bits(operand)? != expected {
+                return None;
+            }
+        }
         let element = self.read_simd_lane_bits(&src, source_bits, 0)?;
         convert_lane(
             kind,
