@@ -8,7 +8,10 @@ use r2smt_common::Arch;
 use r2smt_ir::program::{Instruction, Operand};
 
 pub(super) fn analyze_aarch32(insn: &Instruction) -> InstructionEffect {
-    let mnemonic = insn.mnemonic.trim().to_ascii_lowercase();
+    let mnemonic_full = insn.mnemonic.trim().to_ascii_lowercase();
+    // Peel a Thumb-2 `.w` / `.n` encoding-width hint so `add.w` follows
+    // the same def / use chain as `add`; mirrors the lifter dispatch.
+    let mnemonic = crate::lift::strip_thumb_width_suffix(&mnemonic_full).to_string();
     // Conditional-execution suffix: `<base><cond>` (e.g. `addeq`,
     // `moveq`) collapses for slicing purposes to the base mnemonic.
     // The actual predication lives in the lifter via Ite-wrapping

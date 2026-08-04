@@ -203,6 +203,9 @@ fn classify_aarch32(normalized: &str) -> Option<(BranchKind, BranchCondition)> {
     // is unconditional; `bl` / `bx` / `blx` are calls. Conditional
     // execution on non-branch mnemonics (`addeq` …) is deliberately
     // unsupported here — predicated data flow is out of scope.
+    // Peel a Thumb-2 `.w` / `.n` encoding-width hint first, or `bne.w`
+    // (a wide conditional branch) would not be recognised as a branch.
+    let normalized = crate::lift::strip_thumb_width_suffix(normalized);
     match normalized {
         "b" | "bl" | "blx" | "bx" => return None,
         _ => {}
@@ -514,6 +517,18 @@ mod tests {
         assert!(classify("b", Arch::Arm).is_none());
         assert!(classify("bl", Arch::Arm).is_none());
         assert!(classify("bx", Arch::Arm).is_none());
+    }
+
+    #[test]
+    fn aarch32_thumb_wide_conditional_branch_classifies() {
+        // Thumb-2 spells the wide encoding `bne.w`; the `.w` hint must
+        // be peeled or the branch is not recognised at all.
+        assert_eq!(
+            classify("bne.w", Arch::Arm),
+            Some((BranchKind::Jcc, BranchCondition::NotEqual))
+        );
+        // The wide unconditional form is still not a Jcc.
+        assert!(classify("b.w", Arch::Arm).is_none());
     }
 
     #[test]

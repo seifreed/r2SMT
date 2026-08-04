@@ -769,6 +769,24 @@ fn aarch32_general_purpose_register_list_is_not_a_vector_shape() {
 }
 
 #[test]
+fn aarch32_thumb_wide_suffix_keeps_the_base_effect() {
+    // `add.w` must produce the same def / use chain as `add`, or the
+    // slicer truncates at every wide-encoded data-processing instruction.
+    let wide = insn(
+        "add.w",
+        vec![
+            op("r0", OperandKind::Register),
+            op("r1", OperandKind::Register),
+            op("r2", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&wide, Arch::Arm);
+    assert_eq!(effect.kind, InstructionKind::Add);
+    assert_eq!(effect.defs, vec!["r0"]);
+    assert_eq!(effect.uses, vec!["r1", "r2"]);
+}
+
+#[test]
 fn aarch32_bfi_is_not_a_conditional_branch() {
     // `bfi` / `bfc` are 3-char `b`-words that *define* `Rd`. A length
     // gate on the `b<cond>` arm swallowed them as flag-free `Jcc`, so

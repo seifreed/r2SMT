@@ -815,6 +815,35 @@ fn aarch32_rsb_swaps_operands_and_subtracts() {
 }
 
 #[test]
+fn aarch32_thumb_wide_suffix_dispatches_as_the_base_mnemonic() {
+    // `.w` is a Thumb-2 encoding-width hint, not semantics: `add.w`
+    // must lift exactly as `add`, and `ldr.w` / `mov.w` must not
+    // decline to `Unsupported`.
+    let wide = lift_aarch32(
+        "add.w",
+        vec![reg("r0"), reg("r1"), op("0x4", OperandKind::Immediate)],
+    );
+    let base = lift_aarch32(
+        "add",
+        vec![reg("r0"), reg("r1"), op("0x4", OperandKind::Immediate)],
+    );
+    assert_eq!(format!("{wide:?}"), format!("{base:?}"));
+
+    for mnem in ["ldr.w", "mov.w"] {
+        let stmts = match mnem {
+            "ldr.w" => lift_aarch32(mnem, vec![reg("r0"), op("[r1]", OperandKind::Memory)]),
+            _ => lift_aarch32(mnem, vec![reg("r0"), op("0x1", OperandKind::Immediate)]),
+        };
+        assert!(
+            !stmts
+                .iter()
+                .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+            "{mnem} should lift, got {stmts:?}"
+        );
+    }
+}
+
+#[test]
 fn aarch32_lsls_sets_flags_and_is_not_a_conditional_lsl() {
     // `lsls` ends in the `ls` condition spelling, so a cond-suffix peel
     // that runs before the exact match would strip it to a supported

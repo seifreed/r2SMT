@@ -14,7 +14,8 @@ pub(super) mod neon;
 use super::{
     BinOp, FpArithOp, LiftCtx, MemAccess, PackedIntOp, PackedOp, VectorShape, Writeback,
     aarch64_cond_suffix_to_predicate, fp_lane_result, fp_propagating_max_min, fp_sort_bits_checked,
-    is_aarch32_base_supported, nonzero_width, strip_aarch32_cond_suffix, vector_shape, width_mask,
+    is_aarch32_base_supported, nonzero_width, strip_aarch32_cond_suffix, strip_thumb_width_suffix,
+    vector_shape, width_mask,
 };
 
 impl LiftCtx {
@@ -38,7 +39,11 @@ impl LiftCtx {
             });
             return;
         }
-        let mnem = insn.mnemonic.trim().to_ascii_lowercase();
+        // Peel a Thumb-2 `.w` / `.n` encoding-width suffix first: it is
+        // an assembler hint, so `add.w` dispatches as `add`. Done before
+        // the cond peel so a wide predicated form (`addne.w`) composes.
+        let mnem_full = insn.mnemonic.trim().to_ascii_lowercase();
+        let mnem = strip_thumb_width_suffix(&mnem_full).to_string();
         // Conditional execution suffix: `<base><cond>` such as `addeq`
         // or `subne`. Strip the recognised tail, look up the cond
         // predicate, and wrap every assignment the base handler emits

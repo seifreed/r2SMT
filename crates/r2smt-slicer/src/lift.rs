@@ -1153,6 +1153,18 @@ pub(crate) fn is_aarch32_base_supported(base: &str) -> bool {
     AARCH32_BASE_MNEMONICS.contains(&base)
 }
 
+/// Strip a Thumb-2 encoding-width suffix (`.w` wide / `.n` narrow) from
+/// a mnemonic. These are assembler hints selecting the 32- vs 16-bit
+/// encoding; the semantics are the base mnemonic's, so `add.w` must
+/// dispatch exactly as `add`. Only an exact trailing `.w` / `.n` is
+/// removed — a NEON / VFP type suffix (`.f32`, `.i32`, `.8`) never ends
+/// in `.w` or `.n`, so it is left intact.
+pub(crate) fn strip_thumb_width_suffix(mnem: &str) -> &str {
+    mnem.strip_suffix(".w")
+        .or_else(|| mnem.strip_suffix(".n"))
+        .unwrap_or(mnem)
+}
+
 /// If `mnem` ends with a recognised condition-code suffix and the
 /// remaining prefix is non-empty, return `(base, cond_suffix)`.
 /// Otherwise return `None` so the caller dispatches the mnem as-is.
