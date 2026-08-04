@@ -907,6 +907,72 @@ fn aarch32_register_post_index_updates_its_base_by_the_delta_register() {
     );
 }
 
+#[test]
+fn aarch32_adc_adds_the_carry_flag() {
+    let stmts = lift_aarch32("adc", vec![reg("r0"), reg("r1"), reg("r2")]);
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Assign { src, .. } if format!("{src:?}").contains("CF"))),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_sbc_subtracts_the_borrow_not_the_carry() {
+    // `sbc` subtracts `NOT C`, so the lowering must carry a `1 - CF`
+    // term. Subtracting `CF` directly would be off by one whenever the
+    // carry is clear — a wrong value, not a decline.
+    let stmts = lift_aarch32("sbc", vec![reg("r0"), reg("r1"), reg("r2")]);
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    let assigns = format!("{stmts:?}");
+    assert!(assigns.contains("CF"), "{stmts:?}");
+    assert!(assigns.contains("value: 1"), "{stmts:?}");
+}
+
+#[test]
+fn aarch32_adcs_leaves_carry_and_overflow_imprecise() {
+    // N and Z come from the carry-inclusive result; C and V would need
+    // a wider computation, so they are Unknown rather than a wrong
+    // value borrowed from the plain add formula.
+    let stmts = lift_aarch32("adcs", vec![reg("r0"), reg("r1"), reg("r2")]);
+    let carry = stmts.iter().find_map(|s| match s {
+        IrStmt::Assign { dst, src } if dst.name == "CF" => Some(format!("{src:?}")),
+        _ => None,
+    });
+    assert_eq!(carry.as_deref(), Some("Unknown(\"\")"), "{stmts:?}");
+}
+
+#[test]
+fn aarch32_movw_clears_the_top_half() {
+    let stmts = lift_aarch32(
+        "movw",
+        vec![reg("r0"), op("0x1234", OperandKind::Immediate)],
+    );
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    assert!(
+        stmts.iter().any(
+            |s| matches!(s, IrStmt::Assign { src, .. } if format!("{src:?}").contains("ZeroExtend"))
+        ),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_movt_preserves_the_bottom_half() {
+    // `movt` is a partial write. Overwriting the whole register would
+    // discard the `movw` that almost always precedes it.
+    let stmts = lift_aarch32(
+        "movt",
+        vec![reg("r0"), op("0x5678", OperandKind::Immediate)],
+    );
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    let assigns = format!("{stmts:?}");
+    assert!(assigns.contains("Concat"), "{stmts:?}");
+    assert!(assigns.contains("\"r0\""), "{stmts:?}");
+}
+
 /// The store addresses a register-list transfer touches, in order.
 fn aarch32_store_offsets(stmts: &[IrStmt]) -> Vec<String> {
     stmts

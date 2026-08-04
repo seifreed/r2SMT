@@ -92,8 +92,12 @@ fn aarch32_dispatch_mnemonic(insn: &Instruction, dispatch_mnemonic: &str) -> Ins
     match dispatch_mnemonic {
         // 2-operand `mov Rd, Rn/imm` and `mvn Rd, Op` (bitwise NOT).
         // `movs` is the Thumb flag-setting move (N/Z from the value).
-        "mov" | "mvn" => aarch32_mov_effect(insn, false),
+        // `movw` overwrites the whole register, like `mov`; `movt`
+        // replaces only the top half, so it reads `Rd` too.
+        "mov" | "mvn" | "movw" => aarch32_mov_effect(insn, false),
         "movs" => aarch32_mov_effect(insn, true),
+        "movt" => aarch32_mov_half_top_effect(insn),
+        "adc" | "sbc" | "adcs" | "sbcs" => aarch32_carry_arith_effect(insn, dispatch_mnemonic),
         // 3-operand arithmetic / logical. The `s` suffix sets flags.
         "add" => aarch32_arith_effect(insn, InstructionKind::Add, false),
         "adds" => aarch32_arith_effect(insn, InstructionKind::Add, true),
@@ -579,6 +583,37 @@ fn aarch32_mov_effect(insn: &Instruction, sets_flags: bool) -> InstructionEffect
         uses,
         defines_flags: sets_flags,
         has_memory_access: any_memory_operand(&insn.operands),
+        is_call: false,
+        reads_flags: false,
+    }
+}
+
+/// `adc` / `sbc` read C on top of their register operands.
+fn aarch32_carry_arith_effect(insn: &Instruction, mnemonic: &str) -> InstructionEffect {
+    let kind = if mnemonic.starts_with("adc") {
+        InstructionKind::Add
+    } else {
+        InstructionKind::Sub
+    };
+    let mut effect = aarch32_arith_effect(insn, kind, mnemonic.ends_with('s'));
+    effect.reads_flags = true;
+    effect
+}
+
+/// `movt Rd, #imm16` is a partial write: the bottom half of `Rd`
+/// survives, so the destination is a use as well as a def. Reporting
+/// only the def would let the walk drop whatever set the low half.
+fn aarch32_mov_half_top_effect(insn: &Instruction) -> InstructionEffect {
+    let dst = insn
+        .operands
+        .first()
+        .and_then(|op| canonical_register(&op.raw, Arch::Arm));
+    InstructionEffect {
+        kind: InstructionKind::Mov,
+        defs: dst.into_iter().collect(),
+        uses: dst.into_iter().collect(),
+        defines_flags: false,
+        has_memory_access: false,
         is_call: false,
         reads_flags: false,
     }

@@ -112,6 +112,13 @@ impl LiftCtx {
             "vldr" => self.lift_aarch32_vfp_mem(insn, true),
             "vstr" => self.lift_aarch32_vfp_mem(insn, false),
             "mvn" => self.lift_aarch32_mvn(insn),
+            // Add / subtract with carry, and the 16-bit halves.
+            "adc" => self.lift_aarch32_carry_arith(insn, BinOp::Add, false),
+            "adcs" => self.lift_aarch32_carry_arith(insn, BinOp::Add, true),
+            "sbc" => self.lift_aarch32_carry_arith(insn, BinOp::Sub, false),
+            "sbcs" => self.lift_aarch32_carry_arith(insn, BinOp::Sub, true),
+            "movw" => self.lift_aarch32_mov_half(insn, false),
+            "movt" => self.lift_aarch32_mov_half(insn, true),
             "add" => self.lift_aarch64_arith3(insn, BinOp::Add, false),
             "adds" => self.lift_aarch64_arith3(insn, BinOp::Add, true),
             "sub" => self.lift_aarch64_arith3(insn, BinOp::Sub, false),
@@ -526,6 +533,84 @@ impl LiftCtx {
             });
         }
         self.emit_writeback(writeback);
+    }
+
+    /// `adc Rd, Rn, Op` = `Rn + Op + C`; `sbc Rd, Rn, Op` =
+    /// `Rn - Op - NOT C`. `op` is [`BinOp::Add`] or [`BinOp::Sub`].
+    ///
+    /// The `s` forms set N and Z from the carry-inclusive result and
+    /// leave C and V `Unknown`. The shared `aarch64_set_arith_flags`
+    /// cannot be reused for the subtract direction: its `CF` is
+    /// `Ult(lhs, rhs)`, which ignores the borrow-in and so would be a
+    /// definite *wrong* carry rather than an imprecise one.
+    fn lift_aarch32_carry_arith(&mut self, insn: &Instruction, op: BinOp, sets_flags: bool) {
+        let (Some(dst), Some(src1), Some(src2)) = (
+            insn.operands.first(),
+            insn.operands.get(1),
+            insn.operands.get(2),
+        ) else {
+            self.unsupported_aarch32(insn, "adc/sbc expect Rd, Rn, Op");
+            return;
+        };
+        if dst.kind != OperandKind::Register {
+            self.unsupported_aarch32(insn, "adc/sbc non-register destination");
+            return;
+        }
+        let Some(width) = nonzero_width(self.operand_width(dst)) else {
+            self.unsupported_aarch32(insn, "adc/sbc zero-width destination");
+            return;
+        };
+        let lhs = self.read_operand_at(src1, width);
+        let rhs = self.read_operand_at(src2, width);
+        let carry = Expr::zero_ext(Expr::Var(Var::new("CF", 1)), width);
+        let term = match op {
+            // `sbc` subtracts the *borrow*, which is `NOT C`.
+            BinOp::Sub => Expr::sub(Expr::konst(1, width), carry),
+            _ => carry,
+        };
+        let tmp = self.new_temp(insn.address, width);
+        self.assign(tmp.clone(), op.apply(op.apply(lhs, rhs), term));
+        let result = Expr::Var(tmp);
+        if sets_flags {
+            self.set_flag("ZF", Expr::eq(result.clone(), Expr::konst(0, width)));
+            self.set_flag("SF", Expr::slt(result.clone(), Expr::konst(0, width)));
+            self.set_flag("CF", Expr::Unknown(String::new()));
+            self.set_flag("OF", Expr::Unknown(String::new()));
+        }
+        if !self.write_register_to(dst, result) {
+            self.unsupported_aarch32(insn, "adc/sbc destination not a supported register");
+        }
+    }
+
+    /// `movw Rd, #imm16` writes the immediate and clears the top half;
+    /// `movt Rd, #imm16` replaces the top half and *preserves* the
+    /// bottom one, which makes `Rd` a source as well as a destination.
+    fn lift_aarch32_mov_half(&mut self, insn: &Instruction, top: bool) {
+        let (Some(dst), Some(imm)) = (insn.operands.first(), insn.operands.get(1)) else {
+            self.unsupported_aarch32(insn, "movw/movt expect Rd, #imm16");
+            return;
+        };
+        if dst.kind != OperandKind::Register {
+            self.unsupported_aarch32(insn, "movw/movt non-register destination");
+            return;
+        }
+        let Some(width) = nonzero_width(self.operand_width(dst)) else {
+            self.unsupported_aarch32(insn, "movw/movt zero-width destination");
+            return;
+        };
+        let half = width / 2;
+        let value = self.read_operand_at(imm, half);
+        let result = if top {
+            Expr::concat(
+                value,
+                Expr::extract(self.read_operand_at(dst, width), half - 1, 0),
+            )
+        } else {
+            Expr::zero_ext(value, width)
+        };
+        if !self.write_register_to(dst, result) {
+            self.unsupported_aarch32(insn, "movw/movt destination not a supported register");
+        }
     }
 
     /// Lift an `AArch32` load. `width_override` is `Some(8)` for

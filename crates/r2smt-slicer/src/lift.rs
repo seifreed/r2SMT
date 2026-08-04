@@ -1156,7 +1156,8 @@ const AARCH_COND_SUFFIXES: &[&str] = &[
 const AARCH32_BASE_MNEMONICS: &[&str] = &[
     "mov", "movs", "mvn", "add", "adds", "sub", "subs", "rsb", "rsbs", "and", "ands", "bic",
     "bics", "orr", "orrs", "eor", "eors", "mul", "muls", "udiv", "sdiv", "lsl", "lsls", "lsr",
-    "lsrs", "asr", "asrs", "cmp", "cmn", "tst", "teq",
+    "lsrs", "asr", "asrs", "cmp", "cmn", "tst", "teq", "adc", "adcs", "sbc", "sbcs", "movw",
+    "movt",
 ];
 
 pub(crate) fn is_aarch32_base_supported(base: &str) -> bool {
