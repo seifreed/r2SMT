@@ -230,8 +230,8 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
 
 mod arith;
 mod geometry;
-mod lower;
+pub(in crate::lift) mod lower;
 mod multiply;
 mod permute;
 pub(crate) mod structured;
-mod width;
+pub(in crate::lift) mod width;

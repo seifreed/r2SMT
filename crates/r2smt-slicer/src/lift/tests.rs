@@ -3590,6 +3590,104 @@ fn aarch32_vfp_arithmetic_reads_its_destination() {
 }
 
 #[test]
+fn aarch32_vcvt_int_to_float_lifts() {
+    let stmts = lift_aarch32("vcvt.f32.s32", vec![reg("s0"), reg("s1")]);
+    assert!(
+        !stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_vcvt_float_to_int_lifts() {
+    let stmts = lift_aarch32("vcvt.s32.f32", vec![reg("s0"), reg("s1")]);
+    assert!(
+        !stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_vcvt_between_float_widths_reads_the_narrower_source() {
+    // `vcvt.f64.f32 d0, s0` names both widths, and the source view is
+    // the 32-bit one. Reading it at the destination's width would take
+    // half of `d0` as a binary64 pattern.
+    let stmts = lift_aarch32("vcvt.f64.f32", vec![reg("d0"), reg("s2")]);
+    let rendered = format!("{:?}", simd_parent_src(&stmts, "v0"));
+    assert!(rendered.contains("ebits: 8"), "{rendered}");
+}
+
+#[test]
+fn aarch32_vcvt_is_recognised_by_the_dispatch_gate_and_the_effect_table() {
+    // Both consult `vfp_scalar`, so a form it parses cannot be retained
+    // by one and dropped by the other. Before this parser existed the
+    // whole family fell to the ESIL ladder, which models no floating
+    // point at all.
+    let i = insn(0x1000, 4, "vcvt.s32.f32", vec![reg("s0"), reg("s1")]);
+    assert!(crate::lift::is_simd_instruction(&i, Arch::Arm));
+    let e = crate::effect::analyze(&i, Arch::Arm);
+    assert!(e.defs.contains(&"v0") && e.uses.contains(&"v0"), "{e:?}");
+}
+
+#[test]
+fn aarch32_vcvt_without_a_float_end_declines() {
+    // An integer-to-integer `vcvt` is not an instruction, and `i32`
+    // names no signedness a conversion could use.
+    assert!(crate::lift::vfp_scalar("vcvt.s32.u32").is_none());
+    assert!(crate::lift::vfp_scalar("vcvt.i32.f32").is_none());
+}
+
+#[test]
+fn aarch32_vcvt_fixed_point_amount_is_bounded_by_the_fixed_side() {
+    // ARM ARM F6.1.35 bounds the fraction width by the fixed-point
+    // element, 16 here. Clamping an out-of-range amount into a legal
+    // one would lift an encoding that does not exist.
+    let stmts = lift_aarch32(
+        "vcvt.f32.s16",
+        vec![reg("s0"), reg("s0"), op("0x11", OperandKind::Immediate)],
+    );
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_vcvt_fixed_point_lifts_at_a_legal_amount() {
+    let stmts = lift_aarch32(
+        "vcvt.f32.s16",
+        vec![reg("s0"), reg("s0"), op("0x10", OperandKind::Immediate)],
+    );
+    assert!(
+        !stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_vcvt_pins_the_rounding_mode_only_where_fpscr_supplies_it() {
+    // `vcvt.s32.f32` carries round-toward-zero in the opcode and the
+    // directed forms each name their own, so neither depends on a
+    // control field. Every conversion into a float does, and so does
+    // `vcvtr`, whose whole difference from `vcvt` is reading FPSCR.
+    let pins = |m: &str| {
+        crate::lift::pins_rounding_mode(&insn(0x1000, 4, m, vec![reg("s0"), reg("s1")]), Arch::Arm)
+    };
+    assert!(pins("vcvt.f32.s32"), "int-to-float rounds per FPSCR");
+    assert!(pins("vcvtr.s32.f32"), "vcvtr reads FPSCR outright");
+    assert!(!pins("vcvt.s32.f32"), "round-toward-zero is in the opcode");
+    assert!(!pins("vcvtm.s32.f32"), "vcvtm names its own mode");
+}
+
+#[test]
 fn aarch64_scalar_arithmetic_is_unaffected_by_the_shape_guard() {
     let i = insn(0x1000, 4, "add", vec![reg("x0"), reg("x1"), reg("x2")]);
     let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);

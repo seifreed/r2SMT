@@ -181,7 +181,7 @@ pub(super) fn widen_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShap
 
 /// The lane-wise conversions.
 #[derive(Debug, Clone, Copy)]
-pub(super) enum ConvertKind {
+pub(in crate::lift) enum ConvertKind {
     /// `scvtf` / `ucvtf` — integer lane to float of the same width.
     IntToFloat { signed: bool },
     /// `fcvtzs` / `fcvtzu` — float lane to integer, rounding toward
@@ -198,7 +198,7 @@ impl ConvertKind {
     ///
     /// Only the integer conversions do: `fcvtl` / `fcvtn` change the
     /// float format, and there is no fixed point on either side.
-    const fn scales(self) -> bool {
+    pub(in crate::lift) const fn scales(self) -> bool {
         matches!(self, Self::IntToFloat { .. } | Self::FloatToInt { .. })
     }
 }

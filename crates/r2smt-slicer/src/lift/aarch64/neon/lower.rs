@@ -524,12 +524,16 @@ impl LiftCtx {
                     index
                 };
             let element = LiftCtx::extract_lane(source.clone(), source_bits, source_lane)?;
+            // The `z` in `fcvtzs` / `fcvtzu` is round-toward-zero, so
+            // no control register is assumed. `AArch64` spells no
+            // other packed float-to-integer rounding.
             lanes.push(convert_lane(
                 kind,
                 element,
                 source_bits,
                 shape.lane_bits,
                 fbits,
+                r2smt_ir::expr::RoundingMode::TowardZero,
             )?);
         }
         let converted = Self::concat_lanes(lanes)?;
@@ -1286,12 +1290,20 @@ fn scale_by_fraction(
 /// register forms. It reads the integer side as `Int(lane) / 2^fbits`,
 /// so the conversion into float multiplies by that factor and the
 /// conversion out of float divides by it.
-fn convert_lane(
+/// `to_int_rounding` is the mode a float-to-integer conversion rounds
+/// with. `AArch64` always passes round-toward-zero, the `z` its only
+/// packed spelling carries in the opcode; `AArch32` also reaches here
+/// with the directed forms `vcvta` / `vcvtn` / `vcvtp` / `vcvtm` and
+/// with `vcvtr`, whose mode is the FPSCR default. The other two
+/// directions round to the control word's default on both ISAs and so
+/// take no parameter.
+pub(in crate::lift) fn convert_lane(
     kind: ConvertKind,
     element: Expr,
     source_bits: u16,
     lane_bits: u16,
     fbits: u16,
+    to_int_rounding: r2smt_ir::expr::RoundingMode,
 ) -> Option<Expr> {
     let round = r2smt_ir::expr::RoundingMode::NearestTiesEven;
     match kind {
@@ -1316,14 +1328,11 @@ fn convert_lane(
                 sbits,
                 true,
             )?;
-            // The `z` in the mnemonic is round-toward-zero, so no
-            // control register is assumed.
-            let toward_zero = r2smt_ir::expr::RoundingMode::TowardZero;
             Some(if signed {
-                Expr::fp_to_sbv(value, toward_zero, lane_bits)
+                Expr::fp_to_sbv(value, to_int_rounding, lane_bits)
             } else {
                 Expr::extract(
-                    Expr::fp_to_sbv(value, toward_zero, lane_bits.checked_add(1)?),
+                    Expr::fp_to_sbv(value, to_int_rounding, lane_bits.checked_add(1)?),
                     lane_bits - 1,
                     0,
                 )

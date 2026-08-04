@@ -344,6 +344,16 @@ pub(crate) fn pins_rounding_mode(insn: &Instruction, arch: Arch) -> bool {
                         | VfpOp::Sqrt,
                     _
                 ))
+            ) || matches!(
+                vfp_scalar(&lower),
+                // A conversion depends on FPSCR unless the encoding
+                // fixes its rounding: `vcvt.s32.f32` carries
+                // round-toward-zero in the opcode and `vcvta` / `vcvtn`
+                // / `vcvtp` / `vcvtm` each name their own, while every
+                // conversion *into* a float rounds to the control
+                // word's default and `vcvtr` reads it outright.
+                Some((VfpOp::Convert(convert), _))
+                    if convert.reads_control || convert.dest_kind == aarch32::ElementKind::Float
             );
             // Same narrowness as the scalar arm above: the packed
             // `vmax` / `vmin` select an operand rather than computing
