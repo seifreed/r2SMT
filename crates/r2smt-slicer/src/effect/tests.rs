@@ -944,6 +944,50 @@ fn aarch32_bfi_is_not_a_conditional_branch() {
 }
 
 #[test]
+fn aarch32_ldrd_defines_both_named_registers() {
+    // Reporting only the first would let the walk step past this
+    // instruction while `r1` is live and bind the read elsewhere.
+    let ldrd = insn(
+        "ldrd",
+        vec![
+            op("r0", OperandKind::Register),
+            op("r1", OperandKind::Register),
+            op("[r2, 8]", OperandKind::Memory),
+        ],
+    );
+    let effect = analyze(&ldrd, Arch::Arm);
+    assert!(effect.defs.contains(&"r0") && effect.defs.contains(&"r1"));
+}
+
+#[test]
+fn aarch32_strd_reads_both_named_registers() {
+    let strd = insn(
+        "strd",
+        vec![
+            op("r0", OperandKind::Register),
+            op("r1", OperandKind::Register),
+            op("[r2, 8]", OperandKind::Memory),
+        ],
+    );
+    let effect = analyze(&strd, Arch::Arm);
+    assert!(effect.uses.contains(&"r0") && effect.uses.contains(&"r1"));
+}
+
+#[test]
+fn aarch32_ldrsb_is_a_modelled_load_not_an_opaque_other() {
+    // `Other` truncates a pending slice, so the effect table is the
+    // gate that decides whether the lifter is ever reached.
+    let ldrsb = insn(
+        "ldrsb",
+        vec![
+            op("r0", OperandKind::Register),
+            op("[r1]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(analyze(&ldrsb, Arch::Arm).kind, InstructionKind::Mov);
+}
+
+#[test]
 fn aarch32_pre_index_writeback_defines_its_base_register() {
     // The lifter emits `r1 := r1 + 4` for the `!` form. Without the
     // matching def the walk steps past this instruction while `r1` is

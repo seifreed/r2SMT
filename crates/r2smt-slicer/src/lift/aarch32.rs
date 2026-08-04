@@ -154,9 +154,17 @@ impl LiftCtx {
             // (`ldreq`), and the sign-extending `ldrsb`/`ldrsh` forms
             // are not in this match and decline to `Unsupported` —
             // sound, the confidence path widens rather than mis-lifting.
-            "ldr" => self.lift_aarch32_load(insn, None),
-            "ldrb" => self.lift_aarch32_load(insn, Some(8)),
-            "ldrh" => self.lift_aarch32_load(insn, Some(16)),
+            "ldr" => self.lift_aarch32_load(insn, None, false),
+            "ldrb" => self.lift_aarch32_load(insn, Some(8), false),
+            "ldrh" => self.lift_aarch32_load(insn, Some(16), false),
+            // The sign-extending forms differ from `ldrb`/`ldrh` only in
+            // how the loaded bits reach the 32-bit register.
+            "ldrsb" => self.lift_aarch32_load(insn, Some(8), true),
+            "ldrsh" => self.lift_aarch32_load(insn, Some(16), true),
+            // `ldrd`/`strd` name two registers before the memory
+            // operand, so they carry their own operand shape.
+            "ldrd" => self.lift_aarch32_load_pair(insn),
+            "strd" => self.lift_aarch32_store_pair(insn),
             "str" => self.lift_aarch32_store(insn, None),
             "strb" => self.lift_aarch32_store(insn, Some(8)),
             "strh" => self.lift_aarch32_store(insn, Some(16)),
@@ -516,10 +524,12 @@ impl LiftCtx {
         self.emit_writeback(writeback);
     }
 
-    /// Lift an `AArch32` load. `width_override` is `Some(8)` for `ldrb`
-    /// and `Some(16)` for `ldrh` (zero-extended into the 32-bit
-    /// register); `None` for the word-sized `ldr`.
-    fn lift_aarch32_load(&mut self, insn: &Instruction, width_override: Option<u16>) {
+    /// Lift an `AArch32` load. `width_override` is `Some(8)` for
+    /// `ldrb`/`ldrsb` and `Some(16)` for `ldrh`/`ldrsh`; `None` for the
+    /// word-sized `ldr`. `signed` selects the sign-extending `ldrs*`
+    /// family, which is the only difference between the two — the
+    /// address, the width and the writeback are identical.
+    fn lift_aarch32_load(&mut self, insn: &Instruction, width_override: Option<u16>, signed: bool) {
         let (Some(dst), Some(mem)) = (insn.operands.first(), insn.operands.get(1)) else {
             return;
         };
@@ -555,7 +565,11 @@ impl LiftCtx {
             bits: load_width,
         });
         let value = if load_width < dst_width {
-            Expr::zero_ext(Expr::Var(tmp), dst_width)
+            if signed {
+                Expr::sign_ext(Expr::Var(tmp), dst_width)
+            } else {
+                Expr::zero_ext(Expr::Var(tmp), dst_width)
+            }
         } else {
             Expr::Var(tmp)
         };
@@ -566,6 +580,80 @@ impl LiftCtx {
             });
         }
         self.emit_writeback(writeback);
+    }
+
+    /// Resolve the memory operand of an `AArch32` doubleword transfer,
+    /// which radare2 writes third (`ldrd r0, r1, [r2, 8]`).
+    fn aarch32_pair_access(&mut self, insn: &Instruction) -> Option<MemAccess> {
+        let mem = insn.operands.get(2)?;
+        if mem.kind != OperandKind::Memory {
+            return None;
+        }
+        aarch32_mem_access(mem, insn.operands.get(3..).unwrap_or_default(), self.bits)
+    }
+
+    /// `ldrd Rt, Rt2, [mem]` — two consecutive words, `Rt` at the
+    /// address and `Rt2` one word above it.
+    fn lift_aarch32_load_pair(&mut self, insn: &Instruction) {
+        let (Some(first), Some(second)) = (insn.operands.first(), insn.operands.get(1)) else {
+            self.unsupported_aarch32(insn, "ldrd expects Rt, Rt2, [mem]");
+            return;
+        };
+        if first.kind != OperandKind::Register || second.kind != OperandKind::Register {
+            self.unsupported_aarch32(insn, "ldrd operand shape (non-Register pair)");
+            return;
+        }
+        let Some(access) = self.aarch32_pair_access(insn) else {
+            self.unsupported_aarch32(insn, "ldrd addressing mode not yet modelled");
+            return;
+        };
+        let high = Expr::add(
+            access.address.clone(),
+            constant_delta(AARCH32_WORD_BYTES, self.bits),
+        );
+        for (dst, address) in [(first, access.address), (second, high)] {
+            let tmp = self.new_temp(insn.address, self.bits);
+            self.stmts.push(IrStmt::LoadMem {
+                dst: tmp.clone(),
+                address,
+                bits: self.bits,
+            });
+            if !self.write_register_to(dst, Expr::Var(tmp)) {
+                self.unsupported_aarch32(insn, "ldrd destination not a supported register");
+                return;
+            }
+        }
+        self.emit_writeback(access.writeback);
+    }
+
+    /// `strd Rt, Rt2, [mem]` — the store direction of
+    /// [`Self::lift_aarch32_load_pair`].
+    fn lift_aarch32_store_pair(&mut self, insn: &Instruction) {
+        let (Some(first), Some(second)) = (insn.operands.first(), insn.operands.get(1)) else {
+            self.unsupported_aarch32(insn, "strd expects Rt, Rt2, [mem]");
+            return;
+        };
+        if first.kind != OperandKind::Register || second.kind != OperandKind::Register {
+            self.unsupported_aarch32(insn, "strd operand shape (non-Register pair)");
+            return;
+        }
+        let Some(access) = self.aarch32_pair_access(insn) else {
+            self.unsupported_aarch32(insn, "strd addressing mode not yet modelled");
+            return;
+        };
+        let high = Expr::add(
+            access.address.clone(),
+            constant_delta(AARCH32_WORD_BYTES, self.bits),
+        );
+        for (src, address) in [(first, access.address), (second, high)] {
+            let value = self.read_operand_at(src, self.bits);
+            self.stmts.push(IrStmt::StoreMem {
+                address,
+                value,
+                bits: self.bits,
+            });
+        }
+        self.emit_writeback(access.writeback);
     }
 
     /// Lift an `AArch32` store. `width_override` is `Some(8)` for `strb`
@@ -946,6 +1034,9 @@ fn aarch32_mem_access(mem: &Operand, post: &[Operand], ptr_bits: u16) -> Option<
         writeback: None,
     })
 }
+
+/// Byte distance between the two words of a doubleword transfer.
+const AARCH32_WORD_BYTES: i64 = 4;
 
 /// The offset part of an `AArch32` memory operand.
 ///

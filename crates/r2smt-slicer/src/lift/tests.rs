@@ -908,6 +908,100 @@ fn aarch32_register_post_index_updates_its_base_by_the_delta_register() {
 }
 
 #[test]
+fn aarch32_ldrsb_sign_extends_the_loaded_byte() {
+    // The whole difference from `ldrb` is the extension: a byte of
+    // 0xff must reach the register as -1, not as 255.
+    let stmts = lift_aarch32("ldrsb", vec![reg("r0"), op("[r1, 4]", OperandKind::Memory)]);
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    assert!(
+        stmts.iter().any(
+            |s| matches!(s, IrStmt::Assign { src, .. } if format!("{src:?}").contains("SignExtend"))
+        ),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_ldrsh_sign_extends_the_loaded_halfword() {
+    let stmts = lift_aarch32("ldrsh", vec![reg("r0"), op("[r1]", OperandKind::Memory)]);
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::LoadMem { bits: 16, .. })),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_ldrb_still_zero_extends() {
+    // Companion direction: the unsigned form must not have picked up
+    // the sign extension.
+    let stmts = lift_aarch32("ldrb", vec![reg("r0"), op("[r1]", OperandKind::Memory)]);
+    assert!(
+        !stmts.iter().any(
+            |s| matches!(s, IrStmt::Assign { src, .. } if format!("{src:?}").contains("SignExtend"))
+        ),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_ldrd_loads_two_consecutive_words() {
+    // `ldrd r0, r1, [r2, 8]` — radare2 writes the memory operand third.
+    let stmts = lift_aarch32(
+        "ldrd",
+        vec![reg("r0"), reg("r1"), op("[r2, 8]", OperandKind::Memory)],
+    );
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    assert_eq!(
+        stmts
+            .iter()
+            .filter(|s| matches!(s, IrStmt::LoadMem { bits: 32, .. }))
+            .count(),
+        2,
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_ldrd_puts_the_second_register_one_word_higher() {
+    // Both words at the same address would be a wrong value rather than
+    // a decline, so the offset is what this pins.
+    let stmts = lift_aarch32(
+        "ldrd",
+        vec![reg("r0"), reg("r1"), op("[r2]", OperandKind::Memory)],
+    );
+    let addresses: Vec<String> = stmts
+        .iter()
+        .filter_map(|s| match s {
+            IrStmt::LoadMem { address, .. } => Some(format!("{address:?}")),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(addresses.len(), 2, "{stmts:?}");
+    assert_ne!(addresses[0], addresses[1], "{stmts:?}");
+    assert!(addresses[1].contains("value: 4"), "{addresses:?}");
+}
+
+#[test]
+fn aarch32_strd_stores_two_consecutive_words() {
+    let stmts = lift_aarch32(
+        "strd",
+        vec![reg("r0"), reg("r1"), op("[r2, 8]", OperandKind::Memory)],
+    );
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    assert_eq!(
+        stmts
+            .iter()
+            .filter(|s| matches!(s, IrStmt::StoreMem { bits: 32, .. }))
+            .count(),
+        2,
+        "{stmts:?}"
+    );
+}
+
+#[test]
 fn aarch32_register_offset_load_addresses_base_plus_index() {
     // `ldr r0, [r1, r2]` — the index is a register, not an immediate.
     let stmts = lift_aarch32("ldr", vec![reg("r0"), op("[r1, r2]", OperandKind::Memory)]);

@@ -193,8 +193,12 @@ fn aarch32_dispatch_mnemonic(insn: &Instruction, dispatch_mnemonic: &str) -> Ins
         // base; `str` reads its source plus the base. Both flag
         // `has_memory_access` so the memory-aware slice walker keeps
         // them under `--allow-memory`.
-        "ldr" | "ldrb" | "ldrh" => aarch32_ldr_effect(insn),
+        "ldr" | "ldrb" | "ldrh" | "ldrsb" | "ldrsh" => aarch32_ldr_effect(insn),
         "str" | "strb" | "strh" => aarch32_str_effect(insn),
+        // The doubleword forms name two registers before the memory
+        // operand, so the single-register shape above cannot read them.
+        "ldrd" => aarch32_pair_effect(insn, true),
+        "strd" => aarch32_pair_effect(insn, false),
         // Register-list multiple: `push`/`pop` use the implicit `sp`
         // base; `ldm`/`stm` an explicit base (index 0) plus the list
         // (index 1). Both touch memory so the memory-aware slice walker
@@ -323,12 +327,55 @@ fn aarch32_memory_base(mem: &Operand) -> Option<&'static str> {
 /// this instruction while `Rn` is live, binds the read to an earlier
 /// definition, and the slice carries a base value the machine never
 /// held.
-fn aarch32_writeback_base(insn: &Instruction) -> Option<&'static str> {
-    let mem = insn.operands.get(1)?;
-    if !mem.raw.trim().ends_with('!') && insn.operands.len() <= 2 {
+fn aarch32_writeback_base_at(insn: &Instruction, memory_index: usize) -> Option<&'static str> {
+    let mem = insn.operands.get(memory_index)?;
+    if !mem.raw.trim().ends_with('!') && insn.operands.len() <= memory_index + 1 {
         return None;
     }
     aarch32_memory_base(mem)
+}
+
+fn aarch32_writeback_base(insn: &Instruction) -> Option<&'static str> {
+    aarch32_writeback_base_at(insn, 1)
+}
+
+/// `ldrd Rt, Rt2, [mem]` / `strd Rt, Rt2, [mem]`: both named registers
+/// are defined (load) or read (store), and the memory operand sits at
+/// index 2 rather than 1.
+fn aarch32_pair_effect(insn: &Instruction, is_load: bool) -> InstructionEffect {
+    const MEMORY_INDEX: usize = 2;
+    let pair: Vec<&'static str> = insn
+        .operands
+        .iter()
+        .take(MEMORY_INDEX)
+        .filter_map(|op| canonical_register(&op.raw, Arch::Arm))
+        .collect();
+    let mut uses: Vec<&'static str> = Vec::new();
+    if !is_load {
+        uses.extend(pair.iter().copied());
+    }
+    for op in insn.operands.iter().skip(MEMORY_INDEX) {
+        for r in registers_in_operand(op, Arch::Arm) {
+            if !uses.contains(&r) {
+                uses.push(r);
+            }
+        }
+    }
+    let mut defs: Vec<&'static str> = if is_load { pair } else { Vec::new() };
+    if let Some(base) = aarch32_writeback_base_at(insn, MEMORY_INDEX)
+        && !defs.contains(&base)
+    {
+        defs.push(base);
+    }
+    InstructionEffect {
+        kind: InstructionKind::Mov,
+        defs,
+        uses,
+        defines_flags: false,
+        has_memory_access: true,
+        is_call: false,
+        reads_flags: false,
+    }
 }
 
 /// Registers named by the operands *after* the bracketed one — the
