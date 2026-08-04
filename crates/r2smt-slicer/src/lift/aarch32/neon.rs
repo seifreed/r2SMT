@@ -26,6 +26,7 @@ mod element;
 pub(super) mod lower;
 mod permute;
 pub(super) mod structured;
+mod table;
 mod width;
 
 /// Bits in a byte, named because `vext` measures its window in them.
@@ -69,6 +70,11 @@ pub(super) enum NeonOp {
         kind: element::ByElementKind,
         index: u16,
     },
+    /// `vtbl` / `vtbx` — each destination byte selected from a table of
+    /// `table_lanes` bytes. `keep` is `vtbx`, which preserves the
+    /// destination byte for an out-of-range index where `vtbl` writes
+    /// zero.
+    TableLookup { keep: bool, table_lanes: u16 },
 }
 
 /// A resolved `AArch32` NEON instruction: what to compute, and at what
@@ -124,6 +130,7 @@ pub(super) fn resolve(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| width::narrow_shape(insn, &mnemonic))
         .or_else(|| width::saturating_narrow_shape(insn, &mnemonic))
         .or_else(|| element::by_element_shape(insn, &mnemonic))
+        .or_else(|| table::table_lookup_shape(insn, &mnemonic))
 }
 
 /// Architectural width of the `AArch32` vector register parent, which

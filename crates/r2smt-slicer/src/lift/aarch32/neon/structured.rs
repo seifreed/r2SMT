@@ -136,7 +136,10 @@ fn family(base: &str) -> Option<(u16, bool)> {
 /// shapes, which transfer one element rather than whole registers, and
 /// any list whose members are not consecutive — the stride-two forms
 /// are a separate encoding.
-fn parse_members(op: &Operand) -> Option<Vec<Operand>> {
+///
+/// Shared with the `vtbl` / `vtbx` table parser, whose register list is
+/// the same shape (consecutive whole `d` registers).
+pub(in crate::lift::aarch32::neon) fn parse_members(op: &Operand) -> Option<Vec<Operand>> {
     if op.kind != OperandKind::Register && op.kind != OperandKind::Memory {
         return None;
     }

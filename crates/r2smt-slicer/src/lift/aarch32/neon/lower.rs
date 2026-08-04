@@ -81,6 +81,9 @@ impl LiftCtx {
             NeonOp::ByElement { kind, index } => {
                 self.aarch32_by_element_lanes(insn, shape, kind, index)
             }
+            NeonOp::TableLookup { keep, table_lanes } => {
+                self.aarch32_table_lookup_lanes(insn, shape, keep, table_lanes)
+            }
             // Handled by the caller; it writes two destinations and so
             // does not fit the one-value contract here.
             NeonOp::PermutePair(_) => None,

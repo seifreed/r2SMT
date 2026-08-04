@@ -1587,6 +1587,80 @@ fn an_indexed_operand_outside_this_family_still_declines() {
 }
 
 // ---------------------------------------------------------------
+// `vtbl` / `vtbx` — table lookup
+//
+// Each destination byte selects a table byte by index. `vtbl` writes
+// zero for an out-of-range index; `vtbx` preserves the destination byte
+// there. The table `{d2, d3}` is `v1` in full, the index register `d4`
+// is the low half of `v2`, and the destination `d0` the low half of
+// `v0`, so nothing aliases.
+// ---------------------------------------------------------------
+
+#[test]
+fn vtbl_selects_table_bytes_and_zeroes_out_of_range_indices() {
+    // Table byte `i` holds `i`. Indices 16 and 255 name no byte and
+    // become zero; the rest select their own value.
+    assert_computes_into(
+        "vtbl.8",
+        &["d0", "{d2, d3}", "d4"],
+        &[
+            ("v0", 0),
+            ("v1", 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100),
+            ("v2", 0x0000_0000_0000_0000_0aff_0308_100f_0500),
+        ],
+        "v0",
+        0x0000_0000_0000_0000_0a00_0308_000f_0500,
+    );
+}
+
+#[test]
+fn vtbx_preserves_the_destination_byte_for_out_of_range_indices() {
+    // The same indices, but the out-of-range lanes 3 and 6 keep `d0`'s
+    // prior bytes (`0xf3`, `0xf6`) instead of becoming zero.
+    assert_computes_into(
+        "vtbx.8",
+        &["d0", "{d2, d3}", "d4"],
+        &[
+            ("v0", 0x0000_0000_0000_0000_f7f6_f5f4_f3f2_f1f0),
+            ("v1", 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100),
+            ("v2", 0x0000_0000_0000_0000_0aff_0308_100f_0500),
+        ],
+        "v0",
+        0x0000_0000_0000_0000_0af6_0308_f30f_0500,
+    );
+}
+
+#[test]
+fn vtbl_reads_a_single_register_table() {
+    // A one-register table has eight bytes, so index 8 already falls off
+    // the end.
+    assert_computes_into(
+        "vtbl.8",
+        &["d0", "{d2}", "d4"],
+        &[
+            ("v0", 0),
+            ("v1", 0x0000_0000_0000_0000_0706_0504_0302_0100),
+            ("v2", 0x0000_0000_0000_0000_0807_0605_0403_0201),
+        ],
+        "v0",
+        0x0000_0000_0000_0000_0007_0605_0403_0201,
+    );
+}
+
+#[test]
+fn vtbl_declines_a_quad_destination() {
+    // The destination is a `d` register; a `q` is not a table-lookup
+    // shape.
+    assert!(declines("vtbl.8", &["q0", "{d2, d3}", "d4"]));
+}
+
+#[test]
+fn vtbl_declines_a_table_of_five_registers() {
+    // The architecture lists at most four.
+    assert!(declines("vtbl.8", &["d0", "{d2, d3, d4, d5, d6}", "d7"]));
+}
+
+// ---------------------------------------------------------------
 // Structured loads and stores
 //
 // `vld1`–`vld4` / `vst1`–`vst4` move bytes rather than computing them,
