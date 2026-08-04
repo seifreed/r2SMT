@@ -36,10 +36,22 @@ pub(super) fn analyze_aarch32(insn: &Instruction) -> InstructionEffect {
         effect.reads_flags = true;
         // A predicated instruction lifts to `Ite(cond, new, Var(dst))`,
         // so on the false path the destination keeps the value it
-        // already held — it is read as well as written. Without saying
-        // so, the walk treats the first predicated definition as
+        // already held — it is read as well as written.
+        //
+        // Omitting this **fabricates verdicts**; it does not merely lose
+        // precision. The walk treats the predicated definition as
         // satisfying the destination's liveness, drops whatever defined
-        // the previous value, and the else-arm binds to a free input.
+        // the previous value, and SSA then binds the else-arm to the
+        // *same* free input that earlier instructions in the slice read
+        // from that register. Widening to a free value is only sound
+        // when the value is fresh; here it collapses onto an existing
+        // one and asserts an equality the machine does not have. A real
+        // ARM sample carried a `High`-confidence `dead_branch` from
+        // exactly this — `Ite(cond, 1, r0)` where the architecture says
+        // the else-arm is the 0 an intervening `mov r0, #0` had stored,
+        // and the spurious `r0 == r0` is what let the solver prove the
+        // branch never taken.
+        //
         // The same def/use asymmetry the `AArch64` table documents.
         for def in effect.defs.clone() {
             if !effect.uses.contains(&def) {

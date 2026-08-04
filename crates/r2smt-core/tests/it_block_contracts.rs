@@ -18,6 +18,7 @@ use r2smt_common::smt::{SmtResult, SolveOptions};
 use r2smt_common::{Address, Arch};
 use r2smt_core::prepare_ssa;
 use r2smt_ir::program::Function;
+use r2smt_ir::stmt::IrStmt;
 use r2smt_r2pipe::parse::parse_function_blocks;
 use r2smt_slicer::{SliceLimits, SliceStatus, collect_function_branches};
 use r2smt_smt::solve_branch;
@@ -116,5 +117,112 @@ fn test_it_block_fold_rewrites_the_bare_mnemonic_radare2_emitted() {
     assert_eq!(
         mnemonics,
         vec!["cmp", "nop", "moveq", "movne", "cmp", "beq"]
+    );
+}
+
+/// The predicated-move idiom that fabricated a `dead_branch` on a real
+/// ARM sample.
+///
+/// `cmp r3, r0` reads `r0` from before the slice; `mov r0, 0` then
+/// overwrites it; `movcc r0, 1` keeps that 0 on its false path. If the
+/// effect table does not report a predicated instruction as *reading*
+/// its destination, the walk drops the `mov r0, 0`, and SSA binds the
+/// else-arm to the very same free `r0` the compare used — asserting
+/// `r0 == r0` across a write that changed it.
+const PREDICATED_ELSE_ARM_AGFJ: &str = r#"[
+    {
+        "name": "fcn.arm",
+        "addr": 4096,
+        "blocks": [
+            {
+                "addr": 4096,
+                "jump": 4200,
+                "fail": 4116,
+                "ops": [
+                    { "addr": 4096, "size": 4, "bytes": "030050e1", "opcode": "cmp r3, r0" },
+                    { "addr": 4100, "size": 4, "bytes": "0000a0e3", "opcode": "mov r0, 0" },
+                    { "addr": 4104, "size": 4, "bytes": "0100a033", "opcode": "movcc r0, 1" },
+                    { "addr": 4108, "size": 4, "bytes": "000050e3", "opcode": "cmp r0, 0" },
+                    { "addr": 4112, "size": 4, "bytes": "0000000a", "opcode": "beq 0x1068" }
+                ]
+            }
+        ]
+    }
+]"#;
+
+#[test]
+fn test_predicated_else_arm_resolves_to_the_stored_constant() {
+    // The else-arm must be the 0 the `mov` stored, not the free `r0`
+    // the compare reads. Binding it to that free input asserts
+    // `r0 == r0` across a write that changed it — which is how a real
+    // ARM sample produced a `High`-confidence `dead_branch` that the
+    // machine does not have.
+    let function = parse_function_blocks(PREDICATED_ELSE_ARM_AGFJ).unwrap();
+    let branches = collect_function_branches(&function, Arch::Arm);
+    let candidate = branches
+        .iter()
+        .find(|b| b.address == Address::new(4112))
+        .expect("the beq should be collected");
+    let ssa = prepare_ssa(
+        &function,
+        candidate,
+        &SliceLimits {
+            max_instructions: 32,
+            ..SliceLimits::default()
+        },
+        Arch::Arm,
+    );
+    let ite = ssa
+        .statements
+        .iter()
+        .find_map(|s| match s {
+            IrStmt::Assign { src, .. } if format!("{src:?}").contains("Ite") => {
+                Some(format!("{src:?}"))
+            }
+            _ => None,
+        })
+        .expect("the predicated move must lower to an Ite");
+    let else_arm = ite
+        .split("else_expr: ")
+        .nth(1)
+        .expect("an Ite has an else arm")
+        .to_string();
+    assert!(
+        else_arm.starts_with("Const"),
+        "else-arm must be the stored constant, not a register read: {else_arm}"
+    );
+}
+
+#[test]
+fn test_predicated_move_keeps_the_preceding_definition_in_the_slice() {
+    // The mechanism itself: `mov r0, 0` must survive the walk. It is
+    // dropped exactly when the predicated move fails to report `r0` as
+    // a use.
+    let function = parse_function_blocks(PREDICATED_ELSE_ARM_AGFJ).unwrap();
+    let branches = collect_function_branches(&function, Arch::Arm);
+    let candidate = branches
+        .iter()
+        .find(|b| b.address == Address::new(4112))
+        .expect("the beq should be collected");
+    let slice = r2smt_slicer::slice_branch(
+        candidate,
+        &function,
+        &SliceLimits {
+            max_instructions: 32,
+            ..SliceLimits::default()
+        },
+        Arch::Arm,
+    );
+    assert!(
+        slice
+            .instructions
+            .iter()
+            .any(|i| i.address == Address::new(4100)),
+        "the `mov r0, 0` at 0x1004 must be retained: {:?}",
+        slice
+            .instructions
+            .iter()
+            .map(|i| (i.address, &i.mnemonic))
+            .collect::<Vec<_>>()
     );
 }
