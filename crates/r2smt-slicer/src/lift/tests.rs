@@ -815,6 +815,33 @@ fn aarch32_rsb_swaps_operands_and_subtracts() {
 }
 
 #[test]
+fn aarch32_thumb_two_operand_arith_expands_the_destination() {
+    // `add r0, r1` is the Thumb narrow form of `add r0, r0, r1`. Both
+    // must lift identically.
+    let short = lift_aarch32("add", vec![reg("r0"), reg("r1")]);
+    let full = lift_aarch32("add", vec![reg("r0"), reg("r0"), reg("r1")]);
+    assert_eq!(format!("{short:?}"), format!("{full:?}"));
+}
+
+#[test]
+fn aarch32_thumb_two_operand_subs_sets_flags_from_the_destination() {
+    // `subs r0, r1` computes `r0 - r1` and sets flags; the flag terms
+    // must read the pre-op `r0`, so ZF is present and non-Ite.
+    let stmts = lift_aarch32("subs", vec![reg("r0"), reg("r1")]);
+    let zf = stmts
+        .iter()
+        .find(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == "ZF"))
+        .expect("subs must set ZF");
+    assert!(matches!(
+        zf,
+        IrStmt::Assign {
+            src: Expr::Eq(..),
+            ..
+        }
+    ));
+}
+
+#[test]
 fn aarch32_thumb_wide_suffix_dispatches_as_the_base_mnemonic() {
     // `.w` is a Thumb-2 encoding-width hint, not semantics: `add.w`
     // must lift exactly as `add`, and `ldr.w` / `mov.w` must not

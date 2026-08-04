@@ -1165,6 +1165,38 @@ pub(crate) fn strip_thumb_width_suffix(mnem: &str) -> &str {
         .unwrap_or(mnem)
 }
 
+/// The `AArch32` 3-operand data-processing mnemonics that also have a
+/// Thumb 2-operand narrow encoding where the destination doubles as the
+/// first source (`add r0, r1` ≡ `add r0, r0, r1`). Restricted to the
+/// bases that dispatch through the shared 3-operand handler; `mov` /
+/// `mvn` / the compares are genuinely 2-operand and excluded, and
+/// `rsb` / `bic` have no standard 2-operand narrow form.
+pub(crate) fn is_aarch32_arith_short_form(base: &str) -> bool {
+    matches!(
+        base,
+        "add"
+            | "adds"
+            | "sub"
+            | "subs"
+            | "and"
+            | "ands"
+            | "orr"
+            | "orrs"
+            | "eor"
+            | "eors"
+            | "mul"
+            | "muls"
+            | "udiv"
+            | "sdiv"
+            | "lsl"
+            | "lsls"
+            | "lsr"
+            | "lsrs"
+            | "asr"
+            | "asrs"
+    )
+}
+
 /// If `mnem` ends with a recognised condition-code suffix and the
 /// remaining prefix is non-empty, return `(base, cond_suffix)`.
 /// Otherwise return `None` so the caller dispatches the mnem as-is.

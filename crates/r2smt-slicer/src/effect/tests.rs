@@ -769,6 +769,22 @@ fn aarch32_general_purpose_register_list_is_not_a_vector_shape() {
 }
 
 #[test]
+fn aarch32_thumb_two_operand_arith_reads_its_destination() {
+    // `add r0, r1` ≡ `add r0, r0, r1`, so the destination is also a
+    // source — the slicer must keep r0 alive.
+    let short = insn(
+        "add",
+        vec![
+            op("r0", OperandKind::Register),
+            op("r1", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&short, Arch::Arm);
+    assert_eq!(effect.defs, vec!["r0"]);
+    assert_eq!(effect.uses, vec!["r0", "r1"]);
+}
+
+#[test]
 fn aarch32_thumb_wide_suffix_keeps_the_base_effect() {
     // `add.w` must produce the same def / use chain as `add`, or the
     // slicer truncates at every wide-encoded data-processing instruction.

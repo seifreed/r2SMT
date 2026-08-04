@@ -340,6 +340,13 @@ fn aarch32_arith_effect(
         && let Some(reg) = canonical_register(&dst.raw, Arch::Arm)
     {
         defs.push(reg);
+        // Thumb 2-operand narrow form: `add r0, r1` ≡ `add r0, r0, r1`,
+        // so the destination is also a source. In the 3-operand ISA
+        // form these mnemonics always carry three operands, so a
+        // 2-operand shape is unambiguously the short form.
+        if insn.operands.len() == 2 {
+            uses.push(reg);
+        }
     }
     for src in insn.operands.iter().skip(1) {
         for r in registers_in_operand(src, Arch::Arm) {
