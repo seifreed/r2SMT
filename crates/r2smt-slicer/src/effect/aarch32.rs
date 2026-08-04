@@ -34,6 +34,18 @@ pub(super) fn analyze_aarch32(insn: &Instruction) -> InstructionEffect {
     let mut effect = analyze_aarch32_base(insn, &dispatch_mnemonic);
     if is_predicated {
         effect.reads_flags = true;
+        // A predicated instruction lifts to `Ite(cond, new, Var(dst))`,
+        // so on the false path the destination keeps the value it
+        // already held — it is read as well as written. Without saying
+        // so, the walk treats the first predicated definition as
+        // satisfying the destination's liveness, drops whatever defined
+        // the previous value, and the else-arm binds to a free input.
+        // The same def/use asymmetry the `AArch64` table documents.
+        for def in effect.defs.clone() {
+            if !effect.uses.contains(&def) {
+                effect.uses.push(def);
+            }
+        }
     }
     effect
 }

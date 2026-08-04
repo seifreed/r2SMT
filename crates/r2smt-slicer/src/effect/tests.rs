@@ -944,6 +944,39 @@ fn aarch32_bfi_is_not_a_conditional_branch() {
 }
 
 #[test]
+fn aarch32_predicated_instruction_also_reads_its_destination() {
+    // `moveq r2, 7` lifts to `Ite(ZF, 7, Var(r2))`: on the false path
+    // the destination keeps its previous value, so it is a use as well
+    // as a def. Without that the backward walk treats this instruction
+    // as satisfying `r2`'s liveness, drops whatever defined the old
+    // value, and the else-arm binds to a free input.
+    let moveq = insn(
+        "moveq",
+        vec![
+            op("r2", OperandKind::Register),
+            op("7", OperandKind::Immediate),
+        ],
+    );
+    let effect = analyze(&moveq, Arch::Arm);
+    assert!(effect.uses.contains(&"r2"));
+}
+
+#[test]
+fn aarch32_unpredicated_move_does_not_read_its_destination() {
+    // The companion direction: an unconditional `mov` overwrites, so
+    // adding the destination as a use would keep dead definitions alive.
+    let mov = insn(
+        "mov",
+        vec![
+            op("r2", OperandKind::Register),
+            op("7", OperandKind::Immediate),
+        ],
+    );
+    let effect = analyze(&mov, Arch::Arm);
+    assert!(!effect.uses.contains(&"r2"));
+}
+
+#[test]
 fn aarch32_bcond_is_still_a_conditional_branch() {
     // The precise condition check must still recognise `b<cond>`.
     let beq = insn("beq", vec![op("0x1000", OperandKind::Immediate)]);
