@@ -3220,6 +3220,14 @@ const SIMD_PARITY_MNEMONICS: &[&str] = &[
     "punpckhqdq",
     "vpunpcklbw",
     "vpunpckhqdq",
+    "pshufb",
+    "vpshufb",
+    "packsswb",
+    "packssdw",
+    "packuswb",
+    "packusdw",
+    "vpacksswb",
+    "vpackusdw",
 ];
 
 #[test]

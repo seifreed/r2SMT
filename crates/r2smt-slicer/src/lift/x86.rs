@@ -725,7 +725,13 @@ pub(crate) fn x86_simd_shape(mnemonic: &str) -> Option<X86SimdShape> {
         | "punpcklbw" | "punpcklwd" | "punpckldq" | "punpcklqdq" | "punpckhbw" | "punpckhwd"
         | "punpckhdq" | "punpckhqdq" | "vpunpcklbw" | "vpunpcklwd" | "vpunpckldq"
         | "vpunpcklqdq" | "vpunpckhbw" | "vpunpckhwd" | "vpunpckhdq"
-        | "vpunpckhqdq" => X86SimdShape::ReadModifyWrite,
+        | "vpunpckhqdq"
+        // `pshufb` shuffles the destination itself, indexed by the
+        // source, so the destination is a use as well; the packs fill
+        // their destination from both operands.
+        | "pshufb" | "vpshufb" | "packsswb" | "packssdw" | "packuswb" | "packusdw"
+        | "vpacksswb" | "vpackssdw" | "vpackuswb"
+        | "vpackusdw" => X86SimdShape::ReadModifyWrite,
         _ => return None,
     };
     Some(shape)

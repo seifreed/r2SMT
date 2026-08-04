@@ -17,7 +17,7 @@ use r2smt_ir::expr::{Expr, RoundingMode};
 use r2smt_ir::program::{Instruction, Operand, OperandKind};
 use r2smt_ir::stmt::IrStmt;
 
-use crate::lift::simd::{CompareKind, FpArithOp, compare_lane};
+use crate::lift::simd::{CompareKind, FpArithOp, clamp_to_element, compare_lane};
 use crate::lift::{
     LiftCtx, PackedIntOp, ShiftOp, fp_lane_result, fp_sort_bits_checked, nonzero_width,
 };
@@ -246,6 +246,14 @@ impl LiftCtx {
             "punpckhwd" | "vpunpckhwd" => self.lift_simd_unpack(insn, true, 16),
             "punpckhdq" | "vpunpckhdq" => self.lift_simd_unpack(insn, true, 32),
             "punpckhqdq" | "vpunpckhqdq" => self.lift_simd_unpack(insn, true, 64),
+            // The variable byte shuffle, whose table is a register.
+            "pshufb" | "vpshufb" => self.lift_simd_shuffle_bytes(insn),
+            // Saturating narrows. The `s`/`u` infix names the
+            // *destination* range; both read their sources signed.
+            "packsswb" | "vpacksswb" => self.lift_simd_pack(insn, 16, true),
+            "packssdw" | "vpackssdw" => self.lift_simd_pack(insn, 32, true),
+            "packuswb" | "vpackuswb" => self.lift_simd_pack(insn, 16, false),
+            "packusdw" | "vpackusdw" => self.lift_simd_pack(insn, 32, false),
             // Whole-view byte slides, not lane shifts.
             "pslldq" | "vpslldq" => self.lift_simd_byte_shift(insn, true),
             "psrldq" | "vpsrldq" => self.lift_simd_byte_shift(insn, false),
@@ -335,6 +343,175 @@ impl LiftCtx {
         if !self.write_simd_dst(&dst, result, is_vex(insn)) {
             self.push_simd_unsupported(insn);
         }
+    }
+
+    /// `pshufb` — a byte shuffle whose indices come from a *register*
+    /// rather than an immediate, so the table cannot be resolved at lift
+    /// time and each destination byte becomes a select over every
+    /// candidate.
+    ///
+    /// Two rules separate it from the constant shuffles. A source byte
+    /// whose index has bit 7 set writes zero rather than selecting
+    /// anything, and only the low four index bits are used — which is
+    /// also what confines the lookup to its own 128-bit block on a
+    /// 256-bit view.
+    fn lift_simd_shuffle_bytes(&mut self, insn: &Instruction) {
+        let ops = &insn.operands;
+        let Some(dst) = ops.first() else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let (a_op, b_op) = match ops.len() {
+            2 => (dst, &ops[1]),
+            3 => (&ops[1], &ops[2]),
+            _ => {
+                self.push_simd_unsupported(insn);
+                return;
+            }
+        };
+        let (dst, a_op, b_op) = (dst.clone(), a_op.clone(), b_op.clone());
+        let Some(view) = self.simd_instruction_view_bits(&[&dst, &a_op, &b_op]) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let Some(result) = self.shuffled_bytes(&a_op, &b_op, view) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        if !self.write_simd_dst(&dst, result, is_vex(insn)) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
+    /// The `Ite` chain `pshufb` lowers to: one select ladder per
+    /// destination byte over the sixteen candidates in its block.
+    ///
+    /// Capped like the `AArch64` table lookup it mirrors, and for the
+    /// same reason — the formula is quadratic in the block size, so a
+    /// wide view would hand the solver a term nobody wants to see.
+    fn shuffled_bytes(&mut self, a_op: &Operand, b_op: &Operand, view: u16) -> Option<Expr> {
+        let bytes = view.checked_div(BITS_PER_BYTE)?;
+        let per_block = permute_blocks(view).and(Some(PERMUTE_BLOCK_BITS / BITS_PER_BYTE))?;
+        if u32::from(bytes).checked_mul(u32::from(per_block))? > SHUFFLE_BYTE_SELECT_CAP {
+            tracing::debug!(
+                view,
+                cap = SHUFFLE_BYTE_SELECT_CAP,
+                "declining pshufb: select count over cap"
+            );
+            return None;
+        }
+        let source = self.simd_operand_value(a_op, view)?;
+        let indices = self.simd_operand_value(b_op, view)?;
+        let mut lanes = Vec::with_capacity(usize::from(bytes));
+        for byte in 0..bytes {
+            let index = Self::extract_lane(indices.clone(), BITS_PER_BYTE, byte)?;
+            let base = (byte / per_block).checked_mul(per_block)?;
+            // Only the low four bits select, so the ladder is built over
+            // the masked index and every candidate is reachable — the
+            // value it bottoms out on is unreachable rather than
+            // meaningful.
+            let selector = Expr::bv_and(
+                index.clone(),
+                Expr::konst(u128::from(per_block - 1), BITS_PER_BYTE),
+            );
+            let mut chosen = Expr::konst(0, BITS_PER_BYTE);
+            for candidate in 0..per_block {
+                let selected = Self::extract_lane(
+                    source.clone(),
+                    BITS_PER_BYTE,
+                    base.checked_add(candidate)?,
+                )?;
+                chosen = Expr::Ite {
+                    cond: Box::new(Expr::eq(
+                        selector.clone(),
+                        Expr::konst(u128::from(candidate), BITS_PER_BYTE),
+                    )),
+                    then_expr: Box::new(selected),
+                    else_expr: Box::new(chosen),
+                };
+            }
+            // A set bit 7 clears the byte outright, whatever the low
+            // bits would have selected.
+            lanes.push(Expr::Ite {
+                cond: Box::new(Expr::eq(
+                    Expr::extract(index, BITS_PER_BYTE - 1, BITS_PER_BYTE - 1),
+                    Expr::konst(1, 1),
+                )),
+                then_expr: Box::new(Expr::konst(0, BITS_PER_BYTE)),
+                else_expr: Box::new(chosen),
+            });
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// `pack{ss,us}{wb,dw}` — narrow two sources into one destination,
+    /// saturating each element into the destination's range.
+    ///
+    /// The first source fills the low half of every 128-bit block and
+    /// the second the high half, so on a 256-bit view the halves
+    /// interleave per block rather than the first source filling the
+    /// whole low 128 bits.
+    fn lift_simd_pack(&mut self, insn: &Instruction, source_bits: u16, signed_dst: bool) {
+        let ops = &insn.operands;
+        let Some(dst) = ops.first() else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let (a_op, b_op) = match ops.len() {
+            2 => (dst, &ops[1]),
+            3 => (&ops[1], &ops[2]),
+            _ => {
+                self.push_simd_unsupported(insn);
+                return;
+            }
+        };
+        let (dst, a_op, b_op) = (dst.clone(), a_op.clone(), b_op.clone());
+        let Some(view) = self.simd_instruction_view_bits(&[&dst, &a_op, &b_op]) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let Some(result) = self.packed_narrow(&a_op, &b_op, view, source_bits, signed_dst) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        if !self.write_simd_dst(&dst, result, is_vex(insn)) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
+    /// The saturating narrow itself, block by block.
+    fn packed_narrow(
+        &mut self,
+        a_op: &Operand,
+        b_op: &Operand,
+        view: u16,
+        source_bits: u16,
+        signed_dst: bool,
+    ) -> Option<Expr> {
+        let dest_bits = source_bits.checked_div(2).filter(|b| *b > 0)?;
+        let blocks = permute_blocks(view)?;
+        let per_block = PERMUTE_BLOCK_BITS
+            .checked_div(source_bits)
+            .filter(|n| *n > 0)?;
+        let a = self.simd_operand_value(a_op, view)?;
+        let b = self.simd_operand_value(b_op, view)?;
+        let mut lanes = Vec::with_capacity(usize::from(blocks) * 2 * usize::from(per_block));
+        for block in 0..blocks {
+            let base = block.checked_mul(per_block)?;
+            for source in [&a, &b] {
+                for lane in 0..per_block {
+                    let element =
+                        Self::extract_lane(source.clone(), source_bits, base.checked_add(lane)?)?;
+                    lanes.push(clamp_to_element(
+                        element,
+                        source_bits,
+                        dest_bits,
+                        signed_dst,
+                    )?);
+                }
+            }
+        }
+        Self::concat_lanes(lanes)
     }
 
     /// Build a whole view from a constant table of lane sources.
@@ -1057,6 +1234,15 @@ type LanePick = (bool, u16);
 /// one flat vector of lanes would move bytes between halves — a wrong
 /// value, not a decline.
 const PERMUTE_BLOCK_BITS: u16 = 128;
+
+/// Ceiling on the selects a `pshufb` may expand to.
+///
+/// The lowering is one `Ite` per destination byte per candidate, so the
+/// term is quadratic in the block size: 256 selects for an `xmm`, 512
+/// for a `ymm`, 1024 for a `zmm`. Past the cap it declines and says so,
+/// rather than handing the solver a formula nobody wants to see. Mirrors
+/// the `AArch64` table-lookup cap this construction is borrowed from.
+const SHUFFLE_BYTE_SELECT_CAP: u32 = 1024;
 
 /// Which constant shuffle a `pshuf*` mnemonic names.
 #[derive(Clone, Copy)]

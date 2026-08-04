@@ -726,3 +726,87 @@ fn vpunpcklqdq_interleaves_within_each_128_bit_block() {
         "vpunpcklqdq should pair the low quadwords of each source's upper block"
     );
 }
+
+#[test]
+fn pshufb_zeroes_a_byte_whose_index_has_bit_seven_set() {
+    // The clear-on-negative rule is the whole difference between
+    // `pshufb` and an ordinary table lookup: an index of 0x80 writes
+    // zero rather than selecting source byte 0.
+    //
+    // Every index byte the test does not name is zero, and a zero index
+    // *selects source byte 0* rather than writing zero — so the tail of
+    // the expectation is 0xaa, not 0x00. Getting that wrong looks
+    // exactly like a lifter bug and is not one.
+    let mut expected = vec![0xcc, 0x00];
+    expected.resize(16, 0xaa);
+    assert_computes(
+        "pshufb",
+        &["xmm0", "xmm1"],
+        &[
+            ("zmm0", packed(8, &[0xaa, 0xbb, 0xcc])),
+            ("zmm1", packed(8, &[0x02, 0x80, 0x00])),
+        ],
+        packed(8, &expected),
+    );
+}
+
+#[test]
+fn pshufb_uses_only_the_low_four_index_bits() {
+    // Index 0x11 selects source byte 1, not byte 17 — the masking is
+    // what confines the lookup to its own block.
+    // The unnamed index bytes are zero and so select source byte 0.
+    let mut expected = vec![0x11];
+    expected.resize(16, 0x10);
+    assert_computes(
+        "pshufb",
+        &["xmm0", "xmm1"],
+        &[
+            ("zmm0", packed(8, &[0x10, 0x11, 0x12])),
+            ("zmm1", packed(8, &[0x11])),
+        ],
+        packed(8, &expected),
+    );
+}
+
+#[test]
+fn packuswb_saturates_a_negative_word_to_zero() {
+    // The trap in the family: PACKUSWB reads its sources as *signed*
+    // words and saturates them into the *unsigned* byte range, so
+    // 0xffff (-1) becomes 0x00. Reading the source unsigned would give
+    // 0xff, and clamping to the signed byte range would give 0x80.
+    // 0x0140 (320) clamps to 0xff at the top of that range.
+    assert_computes(
+        "packuswb",
+        &["xmm0", "xmm1"],
+        &[("zmm0", packed(16, &[0xffff, 0x0140, 0x0012])), ("zmm1", 0)],
+        packed(8, &[0x00, 0xff, 0x12]),
+    );
+}
+
+#[test]
+fn packsswb_saturates_into_the_signed_byte_range() {
+    // The same lanes under signed destination bounds: -1 stays -1
+    // (0xff as a byte) and 320 clamps to 0x7f.
+    assert_computes(
+        "packsswb",
+        &["xmm0", "xmm1"],
+        &[("zmm0", packed(16, &[0xffff, 0x0140, 0x0012])), ("zmm1", 0)],
+        packed(8, &[0xff, 0x7f, 0x12]),
+    );
+}
+
+#[test]
+fn packssdw_fills_the_low_half_from_the_first_source_and_the_high_from_the_second() {
+    // The operand order is observable: the first source's four
+    // doublewords become the low four words and the second's the high
+    // four.
+    assert_computes(
+        "packssdw",
+        &["xmm0", "xmm1"],
+        &[
+            ("zmm0", packed(32, &[0x0000_0001, 0x0000_0002, 0, 0])),
+            ("zmm1", packed(32, &[0x0000_0003, 0x0000_0004, 0, 0])),
+        ],
+        packed(16, &[1, 2, 0, 0, 3, 4, 0, 0]),
+    );
+}

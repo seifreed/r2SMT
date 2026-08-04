@@ -687,6 +687,29 @@ pub(super) fn element_bounds(signed: bool, bits: u16, wide: u16) -> Option<(Expr
     Some((wide_const(min, wide)?, wide_const(max, wide)?))
 }
 
+/// Clamp a `wide`-bit **signed** value into the range of a `narrow`-bit
+/// element and truncate it to that width.
+///
+/// The comparisons are signed whatever `signed` says, because that flag
+/// describes the *destination* range and not how the incoming value
+/// reads. x86's `packuswb` is exactly that combination — it interprets
+/// its sources as signed words and saturates them into the unsigned byte
+/// range, so a negative source has to land on `0` rather than on `0xff`.
+pub(super) fn clamp_to_element(value: Expr, wide: u16, narrow: u16, signed: bool) -> Option<Expr> {
+    let (min, max) = element_bounds(signed, narrow, wide)?;
+    let below_max = Expr::Ite {
+        cond: Box::new(Expr::sle(value.clone(), max.clone())),
+        then_expr: Box::new(value),
+        else_expr: Box::new(max),
+    };
+    let clamped = Expr::Ite {
+        cond: Box::new(Expr::sle(min.clone(), below_max.clone())),
+        then_expr: Box::new(below_max),
+        else_expr: Box::new(min),
+    };
+    Some(Expr::extract(clamped, narrow.checked_sub(1)?, 0))
+}
+
 /// One destination lane of `vqadd` / `vqsub`.
 ///
 /// The arithmetic happens where it cannot overflow and the clamp brings
