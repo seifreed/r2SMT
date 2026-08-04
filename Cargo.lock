@@ -635,6 +635,7 @@ version = "0.1.0"
 dependencies = [
  "r2smt-common",
  "r2smt-ir",
+ "r2smt-r2pipe",
  "r2smt-slicer",
  "r2smt-smt",
  "r2smt-ssa",
