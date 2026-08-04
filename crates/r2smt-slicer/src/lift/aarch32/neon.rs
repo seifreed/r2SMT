@@ -23,6 +23,7 @@ use r2smt_ir::program::{Instruction, Operand, OperandKind};
 use crate::registers::{has_vector_arrangement, is_simd_parent, register_layout};
 
 mod element;
+mod estimate;
 mod lanewise;
 pub(super) mod lower;
 mod permute;
@@ -92,6 +93,10 @@ pub(super) enum NeonOp {
     /// `vcnt` / `vclz` — a per-element bit count. `leading` is `vclz`
     /// (count leading zeros) against `vcnt` (population count).
     CountBits { leading: bool },
+    /// `vrecpe` / `vrsqrte` — the reciprocal and reciprocal-square-root
+    /// estimates, whose result is a free value: the architecture fixes
+    /// only an error bound, so there is no definite value to compute.
+    Estimate,
 }
 
 /// A resolved `AArch32` NEON instruction: what to compute, and at what
@@ -151,6 +156,7 @@ pub(super) fn resolve(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| lanewise::compare_shape(insn, &mnemonic))
         .or_else(|| lanewise::pairwise_shape(insn, &mnemonic))
         .or_else(|| lanewise::count_shape(insn, &mnemonic))
+        .or_else(|| estimate::estimate_shape(insn, &mnemonic))
 }
 
 /// Architectural width of the `AArch32` vector register parent, which

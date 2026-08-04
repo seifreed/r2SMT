@@ -1890,6 +1890,60 @@ fn vcnt_declines_a_non_byte_element() {
 }
 
 // ---------------------------------------------------------------
+// `vrecpe` / `vrsqrte` — reciprocal estimates
+//
+// The architecture fixes only an error bound, so the result is a free
+// value, never a computed reciprocal. The two contracts below are the
+// anti-fabrication pair: the exact reciprocal must NOT be provable, and
+// the slice must stay sound (Complete) rather than truncating.
+// ---------------------------------------------------------------
+
+#[test]
+fn vrecpe_does_not_fabricate_the_true_reciprocal() {
+    // `d2` = [2.0, 4.0]; the exact reciprocal would be [0.5, 0.25]. The
+    // estimate is a free value, so that specific answer is not provable.
+    let result = solve_lowering(
+        "vrecpe.f32",
+        &["d0", "d2"],
+        &[("v0", 0), ("v1", 0x0000_0000_0000_0000_4080_0000_4000_0000)],
+        // [0.5, 0.25] as f32 lanes.
+        0x0000_0000_0000_0000_3e80_0000_3f00_0000,
+    );
+    assert_eq!(result, SmtResult::BothPossible);
+}
+
+#[test]
+fn vrecpe_keeps_the_slice_sound() {
+    // A free value keeps the slice Complete; a decline would have made
+    // every verdict Unsound.
+    let result = solve_lowering(
+        "vrecpe.f32",
+        &["d0", "d2"],
+        &[("v0", 0), ("v1", 0x0000_0000_0000_0000_4080_0000_4000_0000)],
+        0,
+    );
+    assert_ne!(result, SmtResult::Unsound);
+}
+
+#[test]
+fn vrsqrte_is_also_a_free_value() {
+    let result = solve_lowering(
+        "vrsqrte.f32",
+        &["d0", "d2"],
+        &[("v0", 0), ("v1", 0x0000_0000_0000_0000_4080_0000_4000_0000)],
+        0,
+    );
+    assert_ne!(result, SmtResult::Unsound);
+}
+
+#[test]
+fn the_estimates_decline_a_signed_or_double_element() {
+    // Only `.f16` / `.f32` / `.u32` estimates exist.
+    assert!(declines("vrecpe.s32", &["d0", "d2"]));
+    assert!(declines("vrsqrte.f64", &["d0", "d2"]));
+}
+
+// ---------------------------------------------------------------
 // Structured loads and stores
 //
 // `vld1`–`vld4` / `vst1`–`vst4` move bytes rather than computing them,
