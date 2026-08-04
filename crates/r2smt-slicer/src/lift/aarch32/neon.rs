@@ -83,6 +83,12 @@ pub(super) enum NeonOp {
         kind: lanewise::CompareKind,
         zero: bool,
     },
+    /// `vpadd` / `vpmax` / `vpmin` — a pairwise reduction of adjacent
+    /// source lanes.
+    Pairwise {
+        op: lanewise::PairwiseOp,
+        signed: bool,
+    },
 }
 
 /// A resolved `AArch32` NEON instruction: what to compute, and at what
@@ -140,6 +146,7 @@ pub(super) fn resolve(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| element::by_element_shape(insn, &mnemonic))
         .or_else(|| table::table_lookup_shape(insn, &mnemonic))
         .or_else(|| lanewise::compare_shape(insn, &mnemonic))
+        .or_else(|| lanewise::pairwise_shape(insn, &mnemonic))
 }
 
 /// Architectural width of the `AArch32` vector register parent, which

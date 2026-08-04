@@ -17,6 +17,9 @@ use crate::lift::simd::all_ones;
 
 use super::{NeonOp, NeonShape, bare_element_bits, uniform_vector_view, vector_view_bits};
 
+/// Width of a `d` register — the only view the pairwise forms take.
+const DOUBLEWORD_BITS: u16 = 64;
+
 /// Which lane-wise predicate a compare mnemonic names.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::lift::aarch32) enum CompareKind {
@@ -32,6 +35,17 @@ pub(in crate::lift::aarch32) enum CompareKind {
     },
     /// `vtst` — true where the bitwise AND of the two lanes is non-zero.
     TestBits,
+}
+
+/// Which reduction a pairwise mnemonic applies to each adjacent pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::lift::aarch32) enum PairwiseOp {
+    /// `vpadd`.
+    Add,
+    /// `vpmax`.
+    Max,
+    /// `vpmin`.
+    Min,
 }
 
 /// `vceq` / `vcgt` / `vcge` / `vtst` — the lane-wise compares, whose
@@ -60,6 +74,57 @@ pub(super) fn compare_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonSh
         _ => return None,
     };
     build_compare(insn, kind, lane_bits, true)
+}
+
+/// `vpadd` / `vpmax` / `vpmin` — the pairwise reductions, which combine
+/// each adjacent pair of source lanes into one destination lane.
+///
+/// The two sources fill the destination in order: the first source's
+/// pairwise results occupy the low half of the destination, the
+/// second's the high half. Doubleword-only, as the architecture has no
+/// quadword pairwise form, and integer-only here — the float forms
+/// carry the `FPMax` NaN hazard and decline.
+pub(super) fn pairwise_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (base, ty) = mnemonic.split_once('.')?;
+    let op = match base {
+        "vpadd" => PairwiseOp::Add,
+        "vpmax" => PairwiseOp::Max,
+        "vpmin" => PairwiseOp::Min,
+        _ => return None,
+    };
+    let (element, lane_bits) = neon_element_type(ty)?;
+    // Float pairwise carries the `FPMax` NaN hazard and is out of scope.
+    if element == ElementKind::Float {
+        return None;
+    }
+    let signed = match op {
+        // Addition is sign-agnostic; `vpadd` is spelled `i`.
+        PairwiseOp::Add => false,
+        // Max / min need a signedness class; the `i` spelling has no
+        // ordered encoding.
+        PairwiseOp::Max | PairwiseOp::Min => match element {
+            ElementKind::Signed => true,
+            ElementKind::Unsigned => false,
+            _ => return None,
+        },
+    };
+    if insn.operands.len() != 3 {
+        return None;
+    }
+    let view = uniform_vector_view(insn, 3)?;
+    // Pairwise is doubleword-only.
+    if view != DOUBLEWORD_BITS {
+        return None;
+    }
+    let lanes = view.checked_div(lane_bits)?;
+    if lanes < 2 || lanes % 2 != 0 {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::Pairwise { op, signed },
+        lane_bits,
+        lanes,
+    })
 }
 
 /// Width of an `i`-spelled bare element, for the `vtst.i8` spelling some
@@ -215,4 +280,63 @@ fn compare_lane(kind: CompareKind, a: Expr, b: Expr, lane_bits: u16) -> Option<E
         then_expr: Box::new(all_ones(lane_bits)),
         else_expr: Box::new(Expr::konst(0, lane_bits)),
     })
+}
+
+impl LiftCtx {
+    /// Lower a pairwise reduction: each adjacent pair of one source's
+    /// lanes combined into a destination lane, the first source filling
+    /// the low half of the destination and the second the high half.
+    pub(in crate::lift::aarch32::neon) fn aarch32_pairwise_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        op: PairwiseOp,
+        signed: bool,
+    ) -> Option<Expr> {
+        let view = shape.view_bits()?;
+        let first = self.simd_operand_value(&insn.operands.get(1)?.clone(), view)?;
+        let second = self.simd_operand_value(&insn.operands.get(2)?.clone(), view)?;
+        let half = shape.lanes / 2;
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let (source, pair) = if index < half {
+                (&first, index)
+            } else {
+                (&second, index - half)
+            };
+            let a = Self::extract_lane(source.clone(), shape.lane_bits, pair.checked_mul(2)?)?;
+            let b = Self::extract_lane(
+                source.clone(),
+                shape.lane_bits,
+                pair.checked_mul(2)?.checked_add(1)?,
+            )?;
+            lanes.push(pairwise_combine(op, signed, a, b));
+        }
+        Self::concat_lanes(lanes)
+    }
+}
+
+/// One destination lane of a pairwise reduction.
+fn pairwise_combine(op: PairwiseOp, signed: bool, a: Expr, b: Expr) -> Expr {
+    match op {
+        PairwiseOp::Add => Expr::add(a, b),
+        PairwiseOp::Max | PairwiseOp::Min => {
+            let less = if signed {
+                Expr::slt(a.clone(), b.clone())
+            } else {
+                Expr::ult(a.clone(), b.clone())
+            };
+            let (then_expr, else_expr) = if op == PairwiseOp::Max {
+                // `a < b` selects `b` for the maximum.
+                (b, a)
+            } else {
+                (a, b)
+            };
+            Expr::Ite {
+                cond: Box::new(less),
+                then_expr: Box::new(then_expr),
+                else_expr: Box::new(else_expr),
+            }
+        }
+    }
 }

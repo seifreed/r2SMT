@@ -1766,6 +1766,70 @@ fn the_ordered_compares_decline_the_sign_agnostic_spelling() {
 }
 
 // ---------------------------------------------------------------
+// `vpadd` / `vpmax` / `vpmin` — pairwise
+//
+// Each adjacent pair of source lanes is reduced to one destination
+// lane; the first source fills the low half of the destination and the
+// second the high half. Doubleword-only, integer-only.
+// ---------------------------------------------------------------
+
+#[test]
+fn vpadd_reduces_adjacent_byte_pairs_of_each_source() {
+    assert_computes_into(
+        "vpadd.i8",
+        &["d0", "d2", "d4"],
+        &[
+            ("v0", 0),
+            ("v1", 0x0000_0000_0000_0000_5046_3c32_281e_140a),
+            ("v2", 0x0000_0000_0000_0000_0807_0605_0403_0201),
+        ],
+        "v0",
+        0x0000_0000_0000_0000_0f0b_0703_966e_461e,
+    );
+}
+
+#[test]
+fn vpmax_signed_selects_the_larger_of_each_pair() {
+    assert_computes_into(
+        "vpmax.s8",
+        &["d0", "d2", "d4"],
+        &[
+            ("v0", 0),
+            ("v1", 0x0000_0000_0000_0000_f010_ff00_807f_fb05),
+            ("v2", 0x0000_0000_0000_0000_0807_0605_0403_0201),
+        ],
+        "v0",
+        0x0000_0000_0000_0000_0806_0402_1000_7f05,
+    );
+}
+
+#[test]
+fn vpmin_unsigned_selects_the_smaller_of_each_halfword_pair() {
+    assert_computes_into(
+        "vpmin.u16",
+        &["d0", "d2", "d4"],
+        &[
+            ("v0", 0),
+            ("v1", 0x0000_0000_0000_0000_0001_8000_ffff_0005),
+            ("v2", 0x0000_0000_0000_0000_5678_00ff_0002_1234),
+        ],
+        "v0",
+        0x0000_0000_0000_0000_00ff_0002_0001_0005,
+    );
+}
+
+#[test]
+fn the_pairwise_forms_decline_float_and_a_quad() {
+    // Float pairwise carries the `FPMax` NaN hazard and is out of scope;
+    // and there is no quadword pairwise encoding.
+    assert!(declines("vpadd.f32", &["d0", "d2", "d4"]));
+    assert!(declines("vpmax.f32", &["d0", "d2", "d4"]));
+    assert!(declines("vpadd.i8", &["q0", "q1", "q2"]));
+    // `vpmax` / `vpmin` need a signedness class.
+    assert!(declines("vpmax.i8", &["d0", "d2", "d4"]));
+}
+
+// ---------------------------------------------------------------
 // Structured loads and stores
 //
 // `vld1`–`vld4` / `vst1`–`vst4` move bytes rather than computing them,

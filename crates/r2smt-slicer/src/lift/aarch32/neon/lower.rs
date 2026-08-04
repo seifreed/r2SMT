@@ -85,6 +85,7 @@ impl LiftCtx {
                 self.aarch32_table_lookup_lanes(insn, shape, keep, table_lanes)
             }
             NeonOp::Compare { kind, zero } => self.aarch32_compare_lanes(insn, shape, kind, zero),
+            NeonOp::Pairwise { op, signed } => self.aarch32_pairwise_lanes(insn, shape, op, signed),
             // Handled by the caller; it writes two destinations and so
             // does not fit the one-value contract here.
             NeonOp::PermutePair(_) => None,
