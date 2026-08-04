@@ -1035,6 +1035,59 @@ fn same_xmm_register(a: &Operand, b: &Operand) -> bool {
     }
 }
 
+/// How an x86 SIMD instruction's destination relates to its sources —
+/// the one fact the effect table needs that the lifter's own dispatch
+/// does not carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum X86SimdShape {
+    /// The destination is fully overwritten (`movaps`, `sqrtps`,
+    /// `cvtss2si`), so it is a def and not also a use.
+    Move,
+    /// The 2-operand form is a read-modify-write, so the destination is
+    /// a source too; the 3-operand VEX form reads its two explicit
+    /// sources instead, which the effect table tells apart by operand
+    /// count.
+    ReadModifyWrite,
+}
+
+/// The x86 SIMD mnemonics this crate models, with each one's operand
+/// shape.
+///
+/// Single source of truth for *membership*. `is_x86_simd_instruction`
+/// — which pre-empts the ESIL / P-code ladder — and the effect table
+/// both consult this, so a mnemonic cannot be retained by the slicer
+/// while the lifter drops it. That asymmetry is the historical `pandn`
+/// bug, and the same shape as the ARM def/use gaps that fabricated
+/// verdicts: an instruction the effect table keeps but no handler
+/// models leaves its destination undefined, and a later read binds to a
+/// stale value.
+///
+/// Two families are recognised structurally instead of listed, by
+/// `is_fp_compare_mnemonic` and `sse_scalar_move_lane`: the packed FP
+/// compares are 64 mnemonics once eight predicates cross `ps`/`pd`/
+/// `ss`/`sd` and VEX, and `movsd` needs its operands inspected because
+/// the name is also the string instruction.
+pub(crate) fn x86_simd_shape(mnemonic: &str) -> Option<X86SimdShape> {
+    let shape = match mnemonic {
+        // Whole-destination writes.
+        "movaps" | "movups" | "movapd" | "movupd" | "movdqa" | "movdqu" | "vmovaps" | "vmovups"
+        | "vmovapd" | "vmovupd" | "vmovdqa" | "vmovdqu" | "cvtss2si" | "cvtsd2si" | "cvttss2si"
+        | "cvttsd2si" | "sqrtps" | "sqrtpd" | "vsqrtps" | "vsqrtpd" | "vcvtph2ps" | "vcvtps2ph" => {
+            X86SimdShape::Move
+        }
+        // 2-operand read-modify-write (or its 3-operand VEX form).
+        "pxor" | "vpxor" | "pand" | "vpand" | "por" | "vpor" | "pandn" | "vpandn" | "addss"
+        | "subss" | "mulss" | "divss" | "addsd" | "subsd" | "mulsd" | "divsd" | "addps"
+        | "subps" | "mulps" | "divps" | "vaddps" | "vsubps" | "vmulps" | "vdivps" | "addpd"
+        | "subpd" | "mulpd" | "divpd" | "vaddpd" | "vsubpd" | "vmulpd" | "vdivpd" | "maxps"
+        | "minps" | "maxpd" | "minpd" | "vmaxps" | "vminps" | "vmaxpd" | "vminpd" | "maxss"
+        | "minss" | "maxsd" | "minsd" | "cvtsi2ss" | "cvtsi2sd" | "cvtss2sd" | "cvtsd2ss"
+        | "sqrtss" | "sqrtsd" => X86SimdShape::ReadModifyWrite,
+        _ => return None,
+    };
+    Some(shape)
+}
+
 /// Whether `insn` is a VEX/EVEX-encoded (`v`-prefixed) SIMD form, whose
 /// destination write zeroes the vector-register bits above the view.
 /// Legacy SSE forms preserve those bits.

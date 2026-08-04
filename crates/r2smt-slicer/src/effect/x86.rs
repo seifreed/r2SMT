@@ -4,6 +4,7 @@ use super::{
     InstructionEffect, InstructionKind, any_memory_operand, canonical_register, first_register,
     other_effect, registers_in_operand,
 };
+use crate::lift::X86SimdShape;
 use r2smt_common::Arch;
 use r2smt_ir::program::{Instruction, OperandKind};
 
@@ -227,16 +228,6 @@ fn cmovcc_effect(insn: &Instruction) -> InstructionEffect {
     }
 }
 
-/// Operand shape of an integer-SIMD instruction.
-#[derive(Clone, Copy)]
-enum SimdShape {
-    /// `movaps dst, src` — dst fully overwritten by src (not RMW).
-    Move,
-    /// `pxor`/`pand`/`por`/`pandn` — 2-operand RMW (`dst := dst OP src`)
-    /// or 3-operand VEX (`dst := src1 OP src2`).
-    Bitwise,
-}
-
 /// `pxor`/`vpxor` of a register with itself is a zero idiom — the
 /// result is 0 independent of the register's prior contents. The two
 /// XOR'd operands are `[0],[1]` in the 2-operand form and `[1],[2]` in
@@ -254,7 +245,7 @@ fn xor_zero_idiom(insn: &Instruction) -> bool {
     }
 }
 
-fn simd_effect(insn: &Instruction, shape: SimdShape) -> InstructionEffect {
+fn simd_effect(insn: &Instruction, shape: X86SimdShape) -> InstructionEffect {
     // SIMD memory resolves through the byte-granular model, but only
     // where the lifter can build the address. An operand it would
     // decline must fall back to `Other` so the slicer truncates instead
@@ -282,7 +273,7 @@ fn simd_effect(insn: &Instruction, shape: SimdShape) -> InstructionEffect {
             // A 2-operand bitwise op reads its destination (RMW).
             // Moves, 3-operand VEX forms, and the zero idiom write the
             // destination without depending on its prior value.
-            if matches!(shape, SimdShape::Bitwise) && !three_op && !zero_idiom {
+            if matches!(shape, X86SimdShape::ReadModifyWrite) && !three_op && !zero_idiom {
                 uses.push(reg);
             }
         } else {
@@ -357,25 +348,10 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
             is_call: false,
             reads_flags: false,
         },
-        // The float-to-integer converts share the move shape: like a
-        // move they overwrite the whole destination register, so it is
-        // a def and not also a use.
-        "movaps" | "movups" | "movapd" | "movupd" | "movdqa" | "movdqu" | "vmovaps" | "vmovups"
-        | "vmovapd" | "vmovupd" | "vmovdqa" | "vmovdqu" | "cvtss2si" | "cvtsd2si" | "cvttss2si"
-        | "cvttsd2si" | "sqrtps" | "sqrtpd" | "vsqrtps" | "vsqrtpd" | "vcvtph2ps" | "vcvtps2ph" => {
-            simd_effect(insn, SimdShape::Move)
-        }
-        // Everything here is a 2-operand RMW (or its 3-operand VEX
-        // form, which `simd_effect` distinguishes): the scalar and
-        // lane-writing forms preserve the bits they do not write, so
-        // the destination is a use as well as a def.
-        "pxor" | "vpxor" | "pand" | "vpand" | "por" | "vpor" | "pandn" | "vpandn" | "addss"
-        | "subss" | "mulss" | "divss" | "addsd" | "subsd" | "mulsd" | "divsd" | "addps"
-        | "subps" | "mulps" | "divps" | "vaddps" | "vsubps" | "vmulps" | "vdivps" | "addpd"
-        | "subpd" | "mulpd" | "divpd" | "vaddpd" | "vsubpd" | "vmulpd" | "vdivpd" | "maxps"
-        | "minps" | "maxpd" | "minpd" | "vmaxps" | "vminps" | "vmaxpd" | "vminpd" | "maxss"
-        | "minss" | "maxsd" | "minsd" | "cvtsi2ss" | "cvtsi2sd" | "cvtss2sd" | "cvtsd2ss"
-        | "sqrtss" | "sqrtsd" => simd_effect(insn, SimdShape::Bitwise),
+        // Membership and operand shape both come from the lifter's
+        // table, so the slicer cannot retain a mnemonic no handler
+        // models. See `x86_simd_shape`.
+        _ if let Some(shape) = crate::lift::x86_simd_shape(&mnemonic) => simd_effect(insn, shape),
         // The scalar FP compares share `cmp`'s shape, not the SIMD one:
         // they read both operands, define no register, and write flags.
         "comiss" | "ucomiss" | "comisd" | "ucomisd" => {
@@ -383,7 +359,9 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
         }
         // The compare family writes a mask into its destination, so it
         // is a SIMD def like the arithmetic — not a flag-setting `cmp`.
-        m if crate::lift::is_fp_compare_mnemonic(m) => simd_effect(insn, SimdShape::Bitwise),
+        m if crate::lift::is_fp_compare_mnemonic(m) => {
+            simd_effect(insn, X86SimdShape::ReadModifyWrite)
+        }
         // The scalar moves merge one lane and leave the rest of the
         // destination standing, so the destination is a use as well as a
         // def — the `Bitwise` shape, not `Move`. The 3-operand VEX form
@@ -391,7 +369,7 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
         // distinguishes. Recognised through the lifter's predicate
         // because `movsd` also names the string instruction.
         _ if crate::lift::sse_scalar_move_lane(insn).is_some() => {
-            simd_effect(insn, SimdShape::Bitwise)
+            simd_effect(insn, X86SimdShape::ReadModifyWrite)
         }
         "sahf" => sahf_effect(),
         m if m.starts_with('j') => jcc_effect(insn),

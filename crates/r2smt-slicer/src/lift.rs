@@ -52,7 +52,7 @@ pub(crate) use simd::{
     FpArithOp, FusedStep, PackedIntOp, PackedOp, fp_lane_result, fp_propagating_max_min,
     fp_sort_bits_checked, fused_multiply_lane,
 };
-pub(crate) use x86::{is_fp_compare_mnemonic, sse_scalar_move_lane};
+pub(crate) use x86::{X86SimdShape, is_fp_compare_mnemonic, sse_scalar_move_lane, x86_simd_shape};
 use x87::X87Stack;
 pub(crate) use x87::{X87Effect, is_modelled_x87, x87_effect};
 
@@ -185,85 +185,7 @@ fn is_x86_simd_instruction(insn: &Instruction) -> bool {
     if x86::is_fp_compare_mnemonic(&insn.mnemonic) || x86::sse_scalar_move_lane(insn).is_some() {
         return true;
     }
-    matches!(
-        insn.mnemonic.trim().to_ascii_lowercase().as_str(),
-        "movaps"
-            | "movups"
-            | "movapd"
-            | "movupd"
-            | "movdqa"
-            | "movdqu"
-            | "vmovaps"
-            | "vmovups"
-            | "vmovapd"
-            | "vmovupd"
-            | "vmovdqa"
-            | "vmovdqu"
-            | "pxor"
-            | "vpxor"
-            | "pand"
-            | "vpand"
-            | "por"
-            | "vpor"
-            | "pandn"
-            | "vpandn"
-            | "addss"
-            | "subss"
-            | "mulss"
-            | "divss"
-            | "addsd"
-            | "subsd"
-            | "mulsd"
-            | "divsd"
-            | "addps"
-            | "subps"
-            | "mulps"
-            | "divps"
-            | "vaddps"
-            | "vsubps"
-            | "vmulps"
-            | "vdivps"
-            | "addpd"
-            | "subpd"
-            | "mulpd"
-            | "divpd"
-            | "vaddpd"
-            | "vsubpd"
-            | "vmulpd"
-            | "vdivpd"
-            | "maxps"
-            | "minps"
-            | "maxpd"
-            | "minpd"
-            | "vmaxps"
-            | "vminps"
-            | "vmaxpd"
-            | "vminpd"
-            | "maxss"
-            | "minss"
-            | "maxsd"
-            | "minsd"
-            | "sqrtps"
-            | "sqrtpd"
-            | "vsqrtps"
-            | "vsqrtpd"
-            | "sqrtss"
-            | "sqrtsd"
-            | "comiss"
-            | "ucomiss"
-            | "comisd"
-            | "ucomisd"
-            | "cvtsi2ss"
-            | "cvtsi2sd"
-            | "cvtss2si"
-            | "cvtsd2si"
-            | "cvttss2si"
-            | "cvttsd2si"
-            | "cvtss2sd"
-            | "cvtsd2ss"
-            | "vcvtph2ps"
-            | "vcvtps2ph"
-    )
+    x86::x86_simd_shape(insn.mnemonic.trim().to_ascii_lowercase().as_str()).is_some()
 }
 
 /// How the lifter handles an instruction whose operands carry ARM vector
