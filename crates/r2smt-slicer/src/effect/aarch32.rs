@@ -437,6 +437,15 @@ fn aarch32_structured_effect(
         .unwrap_or_default();
     let mut defs: Vec<&'static str> = Vec::new();
     let mut uses: Vec<&'static str> = base.clone();
+    // A register post-index (`[r0], r1`) reads `r1` to advance the base,
+    // so any operand past the base is a use.
+    for op in insn.operands.iter().skip(2) {
+        for register in registers_in_operand(op, Arch::Arm) {
+            if !uses.contains(&register) {
+                uses.push(register);
+            }
+        }
+    }
     if effect.reads_list {
         for register in &listed {
             if !uses.contains(register) {

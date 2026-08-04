@@ -2146,27 +2146,90 @@ fn a_four_register_access_advances_the_base_by_thirty_two() {
 // --- the boundary of the structured seam ---
 
 #[test]
-fn a_structured_access_declines_an_alignment_specifier() {
-    // Disassemblers spell alignment more than one way (`[r0:64]`,
-    // `[r0@64]`), and it constrains the address rather than describing
-    // the transfer, so anything but a bare register inside the brackets
-    // fails closed rather than being guessed at.
-    assert!(declines("vld1.8", &["{d0, d1}", "[r0:64]"]));
-    assert!(declines("vld1.8", &["{d0, d1}", "[r0@128]"]));
+fn a_structured_access_ignores_an_alignment_specifier() {
+    // Alignment (`[r0:64]`, `[r0@128]`) constrains the address but does
+    // not change which byte lands where, so the round-trip is unchanged.
+    assert_sequence(
+        &[
+            ("vst1.8", &["{d0, d1}", "[r0]"]),
+            ("vld1.8", &["{d2, d3}", "[r0:64]"]),
+        ],
+        &RAMP_SOURCES,
+        ("v1", 128),
+        BYTE_RAMP,
+    );
 }
 
 #[test]
-fn a_structured_access_declines_the_single_element_shape() {
-    // `{d0[3]}` transfers one element rather than whole registers.
-    assert!(declines("vld1.8", &["{d0[3]}", "[r0]"]));
-    assert!(declines("vld2.8", &["{d0[1], d1[1]}", "[r0]"]));
+fn a_single_element_load_writes_one_lane_per_register() {
+    // `vld2.8 {d2[3], d4[3]}` loads two consecutive bytes into lane 3 of
+    // two registers, leaving the other lanes untouched.
+    assert_sequence(
+        &[
+            ("vst1.8", &["{d0, d1}", "[r0]"]),
+            ("vld2.8", &["{d2[3], d4[3]}", "[r0]"]),
+        ],
+        &[
+            ("r0", 0x1000, 32),
+            ("v0", BYTE_RAMP_HIGH, 128),
+            ("v1", 0, 128),
+            ("v2", 0, 128),
+        ],
+        ("v1", 128),
+        // Memory byte 0 (`0x10`) lands in lane 3 of `d2` = low half of
+        // `v1`.
+        0x0000_0000_0000_0000_0000_0000_1000_0000,
+    );
 }
 
 #[test]
-fn a_structured_access_declines_a_non_consecutive_list() {
-    // The stride-two spellings are a different encoding; reading them
-    // as consecutive would send the bytes to the wrong registers.
-    assert!(declines("vld2.8", &["{d0, d2}", "[r0]"]));
+fn a_replicating_load_broadcasts_one_element_to_every_lane() {
+    // `vld1.8 {d2[]}` loads one byte and fills all eight lanes with it.
+    assert_sequence(
+        &[
+            ("vst1.8", &["{d0, d1}", "[r0]"]),
+            ("vld1.8", &["{d2[]}", "[r0]"]),
+        ],
+        &[
+            ("r0", 0x1000, 32),
+            ("v0", BYTE_RAMP_HIGH, 128),
+            ("v1", 0, 128),
+        ],
+        ("v1", 128),
+        // Memory byte 0 is `0x10`, broadcast across `d2`.
+        0x0000_0000_0000_0000_1010_1010_1010_1010,
+    );
+}
+
+#[test]
+fn a_stride_two_interleaved_load_uses_alternate_registers() {
+    // `vld2.8 {d4, d6}` de-interleaves exactly as `{d4, d5}` would, but
+    // into the stride-two register pair: even bytes to `d4`, odd to `d6`.
+    assert_sequence(
+        &[
+            ("vst1.8", &["{d0, d1}", "[r0]"]),
+            ("vld2.8", &["{d4, d6}", "[r0]"]),
+        ],
+        &[
+            ("r0", 0x1000, 32),
+            ("v0", BYTE_RAMP, 128),
+            ("v2", 0, 128),
+            ("v3", 0, 128),
+        ],
+        ("v2", 128),
+        0x0000_0000_0000_0000_0e0c_0a08_0604_0200,
+    );
+}
+
+#[test]
+fn a_register_post_index_advances_the_base_by_the_register() {
+    // `[r0], r1` advances the base by the run-time value of `r1`.
+    assert_sequence(
+        &[("vld1.8", &["{d2, d3}", "[r0]", "r1"])],
+        &[("r0", 0x1000, 32), ("r1", 0x40, 32)],
+        ("r0", 32),
+        0x1040,
+    );
 }
 
 #[test]
@@ -2186,10 +2249,16 @@ fn an_interleaved_access_declines_a_doubleword_element() {
 }
 
 #[test]
-fn a_structured_access_declines_a_register_post_index() {
-    // `[r0], r1` advances the base by a run-time value, which the
-    // constant writeback cannot spell.
-    assert!(declines("vld1.8", &["{d0, d1}", "[r0]", "r1"]));
+fn a_structured_store_declines_the_replicating_shape() {
+    // A replicating access reads one element and broadcasts it, which
+    // has no store dual.
+    assert!(declines("vst1.8", &["{d0[]}", "[r0]"]));
+}
+
+#[test]
+fn a_single_element_load_declines_an_index_past_the_register() {
+    // `d0` holds eight bytes, so lane 8 addresses nothing.
+    assert!(declines("vld1.8", &["{d0[8]}", "[r0]"]));
 }
 
 #[test]
