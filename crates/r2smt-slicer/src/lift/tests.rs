@@ -815,6 +815,39 @@ fn aarch32_rsb_swaps_operands_and_subtracts() {
 }
 
 #[test]
+fn aarch32_lsls_sets_flags_and_is_not_a_conditional_lsl() {
+    // `lsls` ends in the `ls` condition spelling, so a cond-suffix peel
+    // that runs before the exact match would strip it to a supported
+    // base `lsl` and mis-lift `lsls r0, r1, #2` as a *conditional* `lsl`
+    // under LS — no flags, and the write wrapped in `Ite`. The
+    // flag-setting arm must win: ZF is a direct comparison, not an Ite.
+    let stmts = {
+        let mut ctx = LiftCtx::new(Arch::Arm);
+        ctx.lift_instruction(&insn(
+            0x40_1000,
+            4,
+            "lsls",
+            vec![
+                op("r0", OperandKind::Register),
+                op("r1", OperandKind::Register),
+                op("0x2", OperandKind::Immediate),
+            ],
+        ));
+        ctx.stmts
+    };
+    let zf = stmts
+        .iter()
+        .find(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == "ZF"))
+        .expect("lsls must set ZF (a conditional lsl would set no flags)");
+    match zf {
+        IrStmt::Assign {
+            src: Expr::Eq(..), ..
+        } => {}
+        other => panic!("expected ZF := Eq(.., ..), got {other:?}"),
+    }
+}
+
+#[test]
 fn aarch32_bic_emits_and_not_pattern() {
     // `bic r0, r1, r2` should compute `r1 & ~r2`, encoded as
     // `r1 & (r2 ^ all_ones)`.

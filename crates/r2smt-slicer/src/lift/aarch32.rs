@@ -46,7 +46,14 @@ impl LiftCtx {
         // become predicated. `al` (always) is the unmodified base;
         // `nv` (never) is reserved and treated as predicated with a
         // constant-false condition for soundness.
-        if let Some((base, cond_suffix)) = strip_aarch32_cond_suffix(&mnem)
+        //
+        // Only peel when the full mnemonic is not itself a supported
+        // base. Several flag-setting `s`-forms end in a cond spelling —
+        // `lsls`/`lsrs`/`asrs` end in `ls`/`rs`... `ls`, `bics` in `cs`
+        // — so peeling first would mis-lift `lsls` as a conditional
+        // `lsl` and shadow its own exact match arm.
+        if !is_aarch32_base_supported(mnem.as_str())
+            && let Some((base, cond_suffix)) = strip_aarch32_cond_suffix(&mnem)
             && is_aarch32_base_supported(base)
             && let Some(cond_expr) = aarch64_cond_suffix_to_predicate(cond_suffix)
         {

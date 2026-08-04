@@ -16,8 +16,12 @@ pub(super) fn analyze_aarch32(insn: &Instruction) -> InstructionEffect {
     // same register def / use chain as the unpredicated instruction
     // *and* keep the upstream flag-defining instruction alive so the
     // predicate is sound.
-    let (dispatch_mnemonic, is_predicated) = if let Some((base, _)) =
-        crate::lift::strip_aarch32_cond_suffix(&mnemonic)
+    // Only peel when the full mnemonic is not itself a supported base:
+    // flag-setting `s`-forms like `lsls`/`bics` end in a cond spelling
+    // (`ls`/`cs`), so peeling first mis-dispatches them as a predicated
+    // base. Mirrors the guard in `lift_instruction_aarch32`.
+    let (dispatch_mnemonic, is_predicated) = if !crate::lift::is_aarch32_base_supported(&mnemonic)
+        && let Some((base, _)) = crate::lift::strip_aarch32_cond_suffix(&mnemonic)
         && crate::lift::is_aarch32_base_supported(base)
     {
         (base.to_string(), true)
