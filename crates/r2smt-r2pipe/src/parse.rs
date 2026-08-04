@@ -9,6 +9,7 @@ use r2smt_ir::program::{BasicBlock, Function, Instruction, Operand, OperandKind}
 use serde::Deserialize;
 
 mod info;
+mod it_block;
 mod sections;
 pub use info::{BinaryInfo, parse_entry, parse_info};
 pub use sections::{
@@ -134,6 +135,8 @@ pub fn parse_function_blocks_opt(json: &str) -> Result<Option<Function>> {
             successors,
         });
     }
+
+    it_block::fold_it_blocks(&mut blocks);
 
     Ok(Some(Function {
         address: Address(func.addr),

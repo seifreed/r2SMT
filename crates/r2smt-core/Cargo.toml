@@ -22,4 +22,5 @@ tracing      = { workspace = true }
 [dev-dependencies]
 r2smt-ir = { workspace = true, features = ["testing"] }
 r2smt-smt = { workspace = true }
+r2smt-r2pipe = { workspace = true }
 serde_json = { workspace = true }
