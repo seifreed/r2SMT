@@ -59,13 +59,55 @@ fn program_with_arch(insns: Vec<Instruction>, arch: Arch) -> Program {
 /// (500 ms): `cargo test --all` runs every crate's test binary
 /// concurrently, and multiplication-heavy opaque predicates can exceed
 /// a tight budget under that CPU saturation, flaking into `Timeout`.
-/// A correct solve completes in well under a second even loaded, so
-/// this only bounds a genuinely stuck solver — it never masks a real
-/// "cannot decide" failure.
+///
+/// Almost every solve here completes in a few milliseconds, so this
+/// only bounds a genuinely stuck solver. The exceptions are the two
+/// x87 free-operand contracts, which are seconds rather than
+/// milliseconds and take [`solve_first_within_rlimit`] instead — a
+/// wall clock cannot bound those without depending on host load.
 const TEST_SOLVE_TIMEOUT_MS: u32 = 10_000;
+
+/// Deterministic resource budget for the solves a wall clock cannot
+/// bound fairly.
+///
+/// Sized by bisecting the budget until each contract flips between a
+/// verdict and `Timeout`, on an otherwise quiet host: the free-operand
+/// equality needs between 2 M and 4 M units, its extended-load sibling
+/// between 1 M and 2 M. This is 5× the larger requirement — a genuinely
+/// stuck solver still fails, in bounded *work* rather than bounded
+/// time.
+///
+/// Why not simply a bigger wall clock: the budget would still be
+/// measured in host seconds, so whether the contract passes would keep
+/// depending on what else is running. Measured under 2× CPU
+/// oversubscription, the old 10 s clock failed 2 runs in 3 while this
+/// budget passed 3 in 3. Setting `rlimit` costs no wall time — the same
+/// solve takes ~7.1 s either way — because it bounds the search rather
+/// than steering it.
+const TEST_SOLVE_RLIMIT: u32 = 20_000_000;
+
+/// A wall clock chosen only so it never binds when
+/// [`TEST_SOLVE_RLIMIT`] is the intended budget. `timeout` is set on
+/// the Z3 solver unconditionally, so an rlimit-bounded solve needs one
+/// that cannot fire first.
+const TEST_SOLVE_UNBOUNDED_MS: u32 = 600_000;
 
 fn solve_first(program: &Program) -> SmtResult {
     solve_first_with_timeout(program, TEST_SOLVE_TIMEOUT_MS)
+}
+
+/// Solve under a deterministic resource budget rather than a wall
+/// clock. For the handful of contracts whose queries are genuinely
+/// expensive; see [`TEST_SOLVE_RLIMIT`].
+fn solve_first_within_rlimit(program: &Program) -> SmtResult {
+    solve_first_with_options(
+        program,
+        SolveOptions {
+            timeout_ms: TEST_SOLVE_UNBOUNDED_MS,
+            rlimit: TEST_SOLVE_RLIMIT,
+            ..SolveOptions::default()
+        },
+    )
 }
 
 fn solve_first_with_timeout(program: &Program, timeout_ms: u32) -> SmtResult {
@@ -2853,7 +2895,9 @@ fn x87_extended_sort_keeps_a_free_extended_load_undecided() {
             vec![op("0x401080", OperandKind::Immediate)],
         ),
     ]);
-    assert_eq!(solve_first(&program), SmtResult::BothPossible);
+    // Needs 1–2 M rlimit units, orders of magnitude above every other
+    // solve in this file, so it takes the resource budget.
+    assert_eq!(solve_first_within_rlimit(&program), SmtResult::BothPossible);
 }
 
 /// `fld1 ; fldz` leaves `ST(0) = +0.0` above `ST(1) = +1.0`, so a
@@ -2996,7 +3040,10 @@ fn x87_equality_after_a_free_compare_stays_undecided() {
             vec![op("0x401080", OperandKind::Immediate)],
         ),
     ]);
-    assert_eq!(solve_first(&program), SmtResult::BothPossible);
+    // The most expensive solve in the suite: 2–4 M rlimit units, some
+    // seconds of Z3 work on the `(15, 64)` sort. A wall clock cannot
+    // bound this fairly; see `TEST_SOLVE_RLIMIT`.
+    assert_eq!(solve_first_within_rlimit(&program), SmtResult::BothPossible);
 }
 
 /// `mov dword [rbp - 8], <seed> ; fld1 ; <mnemonic> dword [rbp - 8] ;

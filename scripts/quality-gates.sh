@@ -89,7 +89,14 @@ gate_solver_contracts() {
   # value and its 80-bit stored image, and a free extended load must
   # stay undecided rather than resolve a non-canonical encoding to its
   # canonical counterpart.
-  cargo test -p r2smt-smt --lib -- \
+  # `--test-threads=1` for the same reason the determinism gate uses it:
+  # two of the x87 contracts are seconds of Z3 work rather than
+  # milliseconds, and running them beside the rest of the file on a
+  # contended host is what turned them into a flaky gate. Their budget
+  # is now a resource limit rather than a wall clock, so this is belt
+  # and braces — but it also keeps the gate honest if a future contract
+  # arrives with a wall-clock budget.
+  cargo test -p r2smt-smt --lib -- --test-threads=1 \
     combine_table_contract_is_exhaustive_and_sound \
     truncated_slice_is_reported_unsound \
     slice_with_unknown_is_declined_without_spawning_cvc5 \
