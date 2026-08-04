@@ -67,12 +67,23 @@ impl LiftCtx {
             }
             NeonOp::Duplicate => self.aarch32_duplicate_lanes(insn, shape),
             NeonOp::Widen { kind, signed } => match kind {
-                WidenKind::Narrow => self.aarch32_narrow_lanes(insn, shape, 0),
-                WidenKind::ShiftNarrow { shift } => self.aarch32_narrow_lanes(insn, shape, shift),
+                WidenKind::Narrow => self.aarch32_narrow_lanes(insn, shape, 0, false),
+                WidenKind::ShiftNarrow { shift, rounding } => {
+                    self.aarch32_narrow_lanes(insn, shape, shift, rounding)
+                }
                 WidenKind::SaturatingNarrow {
                     source_signed,
                     to_unsigned,
-                } => self.aarch32_saturating_narrow_lanes(insn, shape, source_signed, to_unsigned),
+                    shift,
+                    rounding,
+                } => self.aarch32_saturating_narrow_lanes(
+                    insn,
+                    shape,
+                    source_signed,
+                    to_unsigned,
+                    shift,
+                    rounding,
+                ),
                 WidenKind::Long => self.aarch32_long_lanes(insn, shape, None, false, signed),
                 WidenKind::LongArith { op, wide_first } => {
                     self.aarch32_long_lanes(insn, shape, Some(op), wide_first, signed)
@@ -260,17 +271,23 @@ impl LiftCtx {
         insn: &Instruction,
         shape: NeonShape,
         shift: u16,
+        rounding: bool,
     ) -> Option<Expr> {
         let source_bits = shape.lane_bits.checked_mul(2)?;
         let source_view = source_bits.checked_mul(shape.lanes)?;
         let source = self.simd_operand_value(&insn.operands.get(1)?.clone(), source_view)?;
         let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
         for index in 0..shape.lanes {
-            let mut element = Self::extract_lane(source.clone(), source_bits, index)?;
-            if shift > 0 {
-                element = Expr::lshr(element, Expr::konst(u128::from(shift), source_bits));
-            }
-            lanes.push(Expr::extract(element, shape.lane_bits.checked_sub(1)?, 0));
+            let element = Self::extract_lane(source.clone(), source_bits, index)?;
+            let shifted = if rounding {
+                narrow_shifted_element(element, source_bits, shift, true, false)?
+            } else {
+                match shift {
+                    0 => element,
+                    _ => Expr::lshr(element, Expr::konst(u128::from(shift), source_bits)),
+                }
+            };
+            lanes.push(Expr::extract(shifted, shape.lane_bits.checked_sub(1)?, 0));
         }
         Self::concat_lanes(lanes)
     }
@@ -290,15 +307,22 @@ impl LiftCtx {
         shape: NeonShape,
         source_signed: bool,
         to_unsigned: bool,
+        shift: u16,
+        rounding: bool,
     ) -> Option<Expr> {
         let source_bits = shape.lane_bits.checked_mul(2)?;
         let source_view = source_bits.checked_mul(shape.lanes)?;
         let source = self.simd_operand_value(&insn.operands.get(1)?.clone(), source_view)?;
-        // The destination range is signed only for `vqmovn.s`: `vqmovn.u`
-        // and `vqmovun` both clamp into the unsigned range.
+        // The destination range is signed only for the `.s` narrows:
+        // `vqmovn.u` and the `*un` forms clamp into the unsigned range.
         let dest_signed = source_signed && !to_unsigned;
+        // The clamp happens one bit above the source, because that is
+        // where the rounded value lives. `vqmovn` has no shift and so
+        // no rounding term, but comparing at the wider width is exact
+        // for it too.
+        let compare_bits = source_bits.checked_add(1)?;
         let (min, max) =
-            crate::lift::simd::element_bounds(dest_signed, shape.lane_bits, source_bits)?;
+            crate::lift::simd::element_bounds(dest_signed, shape.lane_bits, compare_bits)?;
         let le = |left: Expr, right: Expr| {
             if source_signed {
                 Expr::sle(left, right)
@@ -308,7 +332,8 @@ impl LiftCtx {
         };
         let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
         for index in 0..shape.lanes {
-            let element = Self::extract_lane(source.clone(), source_bits, index)?;
+            let raw = Self::extract_lane(source.clone(), source_bits, index)?;
+            let element = narrow_shifted_element(raw, source_bits, shift, rounding, source_signed)?;
             let below_max = Expr::Ite {
                 cond: Box::new(le(element.clone(), max.clone())),
                 then_expr: Box::new(element),
@@ -464,4 +489,45 @@ impl LiftCtx {
             ),
         });
     }
+}
+
+/// One source element, optionally rounded and shifted right, carried
+/// **one bit wider than the source**.
+///
+/// The extra bit is load-bearing rather than defensive. ARM defines the
+/// rounding on the unbounded integer, so adding half an ulp at the
+/// source's own width can carry into the sign bit: `0x7fff + 8` in
+/// sixteen bits is negative, which turns a saturation at the top of the
+/// range into one at the bottom. This is the same trap the `AArch64`
+/// side hit and documented, and it is why the caller's clamp compares
+/// at this width too.
+///
+/// `signed` selects both the extension and the shift, so an unsigned
+/// narrow never drags a sign bit down into the retained half.
+fn narrow_shifted_element(
+    element: Expr,
+    source_bits: u16,
+    shift: u16,
+    rounding: bool,
+    signed: bool,
+) -> Option<Expr> {
+    let wide = source_bits.checked_add(1)?;
+    let mut value = if signed {
+        Expr::sign_ext(element, wide)
+    } else {
+        Expr::zero_ext(element, wide)
+    };
+    if shift == 0 {
+        return Some(value);
+    }
+    if rounding {
+        let half = 1u128 << (shift - 1);
+        value = Expr::add(value, Expr::konst(half, wide));
+    }
+    let amount = Expr::konst(u128::from(shift), wide);
+    Some(if signed {
+        Expr::ashr(value, amount)
+    } else {
+        Expr::lshr(value, amount)
+    })
 }

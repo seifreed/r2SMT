@@ -42,17 +42,23 @@ pub(in crate::lift::aarch32) enum WidenKind {
     LongArith { op: BinOp, wide_first: bool },
     /// `vmovn` — truncate each source element to half its width.
     Narrow,
-    /// `vshrn` — shift right, then truncate.
-    ShiftNarrow { shift: u16 },
+    /// `vshrn` / `vrshrn` — shift right, then truncate. `rounding` adds
+    /// half an ulp before the shift.
+    ShiftNarrow { shift: u16, rounding: bool },
     /// `vqmovn` / `vqmovun` — clamp each double-width source element into
     /// the narrow range instead of truncating it. `source_signed` says
     /// how the source is read and which comparisons the clamp uses;
     /// `to_unsigned` selects the destination range — `vqmovun` reads a
     /// signed source but saturates into `[0, 2^n - 1]`, so a negative
     /// source becomes zero.
+    /// A `shift` of zero is the plain `vqmovn`; the `vqshrn` /
+    /// `vqrshrn` family shifts first, with `rounding` adding half an
+    /// ulp before the shift.
     SaturatingNarrow {
         source_signed: bool,
         to_unsigned: bool,
+        shift: u16,
+        rounding: bool,
     },
 }
 
@@ -125,9 +131,10 @@ const fn long_arith(op: BinOp, wide_first: bool) -> WidenKind {
 /// source.
 pub(super) fn narrow_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     let (base, ty) = mnemonic.split_once('.')?;
-    let shifts = match base {
-        "vmovn" => false,
-        "vshrn" => true,
+    let (shifts, rounding) = match base {
+        "vmovn" => (false, false),
+        "vshrn" => (true, false),
+        "vrshrn" => (true, true),
         _ => return None,
     };
     // Truncation keeps the low half whatever the sign, which is why the
@@ -156,6 +163,7 @@ pub(super) fn narrow_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonSha
     let kind = if shifts {
         WidenKind::ShiftNarrow {
             shift: narrow_shift_amount(insn, lane_bits)?,
+            rounding,
         }
     } else {
         WidenKind::Narrow
@@ -178,9 +186,15 @@ pub(super) fn narrow_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonSha
 /// unsigned destination range, so it has no unsigned-source spelling.
 pub(super) fn saturating_narrow_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     let (base, ty) = mnemonic.split_once('.')?;
-    let to_unsigned = match base {
-        "vqmovn" => false,
-        "vqmovun" => true,
+    // `shifts` separates the `vqmovn` pair (2 operands, no shift) from
+    // the `vqshrn` family (3 operands, an immediate shift).
+    let (to_unsigned, shifts, rounding) = match base {
+        "vqmovn" => (false, false, false),
+        "vqmovun" => (true, false, false),
+        "vqshrn" => (false, true, false),
+        "vqrshrn" => (false, true, true),
+        "vqshrun" => (true, true, false),
+        "vqrshrun" => (true, true, true),
         _ => return None,
     };
     let (element, source_bits) = neon_element_type(ty)?;
@@ -191,7 +205,7 @@ pub(super) fn saturating_narrow_shape(insn: &Instruction, mnemonic: &str) -> Opt
         ElementKind::Unsigned if !to_unsigned => false,
         _ => return None,
     };
-    if insn.operands.len() != 2 {
+    if insn.operands.len() != usize::from(shifts) + 2 {
         return None;
     }
     let lane_bits = source_bits.checked_div(2)?;
@@ -209,11 +223,18 @@ pub(super) fn saturating_narrow_shape(insn: &Instruction, mnemonic: &str) -> Opt
     {
         return None;
     }
+    let shift = if shifts {
+        narrow_shift_amount(insn, lane_bits)?
+    } else {
+        0
+    };
     Some(NeonShape {
         op: NeonOp::Widen {
             kind: WidenKind::SaturatingNarrow {
                 source_signed,
                 to_unsigned,
+                shift,
+                rounding,
             },
             signed: source_signed,
         },
