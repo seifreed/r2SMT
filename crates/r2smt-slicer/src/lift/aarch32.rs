@@ -29,6 +29,22 @@ impl LiftCtx {
         // register operands, so the operand-shape collision is narrower
         // than on `AArch64` — but the indexed form (`vmov r0, d0[1]`)
         // reaches the integer arms by exactly the same route.
+        //
+        // `vpush` / `vpop` carry a VFP register list that reads as a
+        // vector arrangement, so they must be dispatched before the
+        // vector-shape gate that would otherwise decline them — they are
+        // plain stack transfers, not an unmodelled vector shape.
+        match insn.mnemonic.trim().to_ascii_lowercase().as_str() {
+            "vpush" => {
+                self.lift_aarch32_vpush(insn);
+                return;
+            }
+            "vpop" => {
+                self.lift_aarch32_vpop(insn);
+                return;
+            }
+            _ => {}
+        }
         if vector_shape(insn, Arch::Arm) == VectorShape::Declined {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
@@ -81,7 +97,15 @@ impl LiftCtx {
             self.lift_aarch32_predicated(insn, base, &cond_expr);
             return;
         }
-        match mnem.as_str() {
+        self.lift_aarch32_by_mnemonic(insn, &mnem);
+    }
+
+    /// The per-mnemonic `AArch32` dispatch, reached after the vector-shape
+    /// gate, the `.w` / `.n` and 2-operand normalisations, and the
+    /// cond-suffix peel. Split out only to keep the entry point under the
+    /// line limit; it is a pure dispatch table.
+    fn lift_aarch32_by_mnemonic(&mut self, insn: &Instruction, mnem: &str) {
+        match mnem {
             "mov" => self.lift_aarch64_mov(insn),
             "movs" => self.lift_aarch32_movs(insn),
             "vmrs" => self.lift_aarch32_vmrs(insn),
@@ -174,8 +198,8 @@ impl LiftCtx {
             // `vadd.f64`), not in the operand, and every mnemonic is
             // `v`-prefixed so none of them can collide with the
             // integer handlers above.
-            _ if vfp_scalar(&mnem).is_some() => {
-                if let Some((op, lane)) = vfp_scalar(&mnem) {
+            _ if vfp_scalar(mnem).is_some() => {
+                if let Some((op, lane)) = vfp_scalar(mnem) {
                     self.lift_aarch32_vfp(insn, op, lane);
                 }
             }
@@ -603,6 +627,66 @@ impl LiftCtx {
         self.emit_writeback(Some(Writeback::by_constant("sp", 4 * n, self.bits)));
     }
 
+    /// `vpush {regs}` — store each VFP register to a descending stack
+    /// slot (lowest register at the lowest address) and decrement `sp`
+    /// by the total byte count. `s` registers are 4 bytes, `d` are 8.
+    fn lift_aarch32_vpush(&mut self, insn: &Instruction) {
+        let Some((regs, width)) = insn
+            .operands
+            .first()
+            .and_then(|o| parse_vfp_reglist(&o.raw))
+        else {
+            self.unsupported_aarch32(insn, "vpush expects a VFP register list");
+            return;
+        };
+        let stride = i64::from(width / 8);
+        let total = stride * i64::try_from(regs.len()).unwrap_or(0);
+        for (i, reg) in regs.iter().enumerate() {
+            let off = -total + stride * i64::try_from(i).unwrap_or(0);
+            let address = aarch32_addr_from("sp", off, self.bits);
+            let Some(value) = self.read_simd_lane_bits(reg, width, 0) else {
+                self.unsupported_aarch32(insn, "vpush source not modelled");
+                return;
+            };
+            self.stmts.push(IrStmt::StoreMem {
+                address,
+                value,
+                bits: width,
+            });
+        }
+        self.emit_writeback(Some(Writeback::by_constant("sp", -total, self.bits)));
+    }
+
+    /// `vpop {regs}` — load each VFP register from an ascending stack
+    /// slot and increment `sp` by the total byte count.
+    fn lift_aarch32_vpop(&mut self, insn: &Instruction) {
+        let Some((regs, width)) = insn
+            .operands
+            .first()
+            .and_then(|o| parse_vfp_reglist(&o.raw))
+        else {
+            self.unsupported_aarch32(insn, "vpop expects a VFP register list");
+            return;
+        };
+        let stride = i64::from(width / 8);
+        let total = stride * i64::try_from(regs.len()).unwrap_or(0);
+        for (i, reg) in regs.iter().enumerate() {
+            let off = stride * i64::try_from(i).unwrap_or(0);
+            let address = aarch32_addr_from("sp", off, self.bits);
+            let tmp = self.new_temp(insn.address, width);
+            self.stmts.push(IrStmt::LoadMem {
+                dst: tmp.clone(),
+                address,
+                bits: width,
+            });
+            if !self.write_simd_lane(reg, Expr::Var(tmp), width, 0) {
+                self.unsupported_aarch32(insn, "vpop destination not modelled");
+                return;
+            }
+        }
+        self.emit_writeback(Some(Writeback::by_constant("sp", total, self.bits)));
+    }
+
     /// `ldm{ia} Rn{!}, {regs}` — increment-after load multiple from the
     /// explicit base register, with optional writeback.
     fn lift_aarch32_ldm(&mut self, insn: &Instruction) {
@@ -723,6 +807,64 @@ fn parse_reglist(raw: &str) -> Option<Vec<String>> {
     }
     regs.sort_by_key(|r| aarch32_reg_number(r).unwrap_or(u8::MAX));
     Some(regs)
+}
+
+/// Parse a VFP register list `{s0, s1}` / `{d8-d15}` into its member
+/// operands (in list order) and the element width (32 for `s`, 64 for
+/// `d`). Handles the dash range form and requires a single register
+/// class. Brace lists render as `OperandKind::Unknown` under real
+/// radare2, so the caller must not gate on operand kind.
+pub(crate) fn parse_vfp_reglist(raw: &str) -> Option<(Vec<Operand>, u16)> {
+    let body = raw.trim().strip_prefix('{')?.strip_suffix('}')?;
+    let mut members: Vec<(char, u16)> = Vec::new();
+    for part in body.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.split_once('-') {
+            Some((lo, hi)) => {
+                let (class, first) = parse_vfp_reg(lo.trim())?;
+                let (class_hi, last) = parse_vfp_reg(hi.trim())?;
+                if class != class_hi || last < first {
+                    return None;
+                }
+                for n in first..=last {
+                    members.push((class, n));
+                }
+            }
+            None => members.push(parse_vfp_reg(part)?),
+        }
+    }
+    let class = members.first()?.0;
+    if members.iter().any(|(c, _)| *c != class) {
+        return None;
+    }
+    let width = if class == 's' { 32 } else { 64 };
+    let operands = members
+        .into_iter()
+        .map(|(c, n)| Operand {
+            raw: format!("{c}{n}"),
+            kind: OperandKind::Register,
+        })
+        .collect();
+    Some((operands, width))
+}
+
+/// Parse a single VFP register name into `(class, number)` — `s0..s31`
+/// or `d0..d31`. `None` for anything else.
+fn parse_vfp_reg(name: &str) -> Option<(char, u16)> {
+    let name = name.trim().to_ascii_lowercase();
+    let mut chars = name.chars();
+    let class = chars.next()?;
+    if class != 's' && class != 'd' {
+        return None;
+    }
+    let number: u16 = chars.as_str().parse().ok()?;
+    if number > 31 {
+        return None;
+    }
+    Some((class, number))
 }
 
 /// Architectural register number for an `AArch32` GPR name (`r0..r15`

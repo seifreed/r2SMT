@@ -44,6 +44,14 @@ fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> Instruct
     // answered above the dispatch. `AArch32` NEON is `v`-prefixed with
     // a type suffix and so collides less, but the indexed form
     // (`d0[1]`) reaches the integer arms exactly the same way.
+    // `vpush` / `vpop` carry a VFP register list that reads as a vector
+    // arrangement, so they are answered before the vector-shape prelude
+    // that would otherwise decline them to `Other`.
+    match dispatch_mnemonic {
+        "vpush" => return aarch32_vfp_push_pop_effect(insn, false),
+        "vpop" => return aarch32_vfp_push_pop_effect(insn, true),
+        _ => {}
+    }
     if let Some(effect) = aarch32_vector_shape_effect(insn) {
         return effect;
     }
@@ -329,6 +337,49 @@ fn aarch32_str_effect(insn: &Instruction) -> InstructionEffect {
     InstructionEffect {
         kind: InstructionKind::Mov,
         defs: Vec::new(),
+        uses,
+        defines_flags: false,
+        has_memory_access: true,
+        is_call: false,
+        reads_flags: false,
+    }
+}
+
+fn aarch32_vfp_push_pop_effect(insn: &Instruction, is_pop: bool) -> InstructionEffect {
+    let parents = insn
+        .operands
+        .first()
+        .and_then(|o| crate::lift::parse_vfp_reglist(&o.raw))
+        .map(|(regs, _)| {
+            let mut out: Vec<&'static str> = Vec::new();
+            for reg in &regs {
+                if let Some(canon) = canonical_register(&reg.raw, Arch::Arm)
+                    && !out.contains(&canon)
+                {
+                    out.push(canon);
+                }
+            }
+            out
+        })
+        .unwrap_or_default();
+    let mut defs = vec!["sp"];
+    let mut uses = vec!["sp"];
+    for r in parents {
+        if is_pop {
+            if !defs.contains(&r) {
+                defs.push(r);
+            }
+            // A VFP write merges, so the destination is also a use.
+            if !uses.contains(&r) {
+                uses.push(r);
+            }
+        } else if !uses.contains(&r) {
+            uses.push(r);
+        }
+    }
+    InstructionEffect {
+        kind: InstructionKind::Simd,
+        defs,
         uses,
         defines_flags: false,
         has_memory_access: true,

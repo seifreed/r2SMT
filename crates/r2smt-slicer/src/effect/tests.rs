@@ -826,6 +826,28 @@ fn aarch32_thumb_wide_suffix_keeps_the_base_effect() {
 }
 
 #[test]
+fn aarch32_vpop_range_records_every_member_parent() {
+    // `vpop {d0-d4}` defines sp and every vector parent the range
+    // touches (v0, v1, v2). A range parser that only saw the endpoints
+    // would miss v1, leaving whatever defined it bound to a stale value.
+    let i = insn("vpop", vec![op("{d0-d4}", OperandKind::Unknown)]);
+    let e = analyze(&i, Arch::Arm);
+    assert!(e.has_memory_access);
+    for reg in ["sp", "v0", "v1", "v2"] {
+        assert!(e.defs.contains(&reg), "def {reg} missing: {e:?}");
+    }
+}
+
+#[test]
+fn aarch32_vpush_reads_its_registers_and_writes_sp() {
+    let i = insn("vpush", vec![op("{d8, d9}", OperandKind::Unknown)]);
+    let e = analyze(&i, Arch::Arm);
+    assert!(e.has_memory_access);
+    assert_eq!(e.defs, vec!["sp"]);
+    assert!(e.uses.contains(&"sp") && e.uses.contains(&"v4"), "{e:?}");
+}
+
+#[test]
 fn aarch32_vldr_defines_its_register_and_touches_memory() {
     // `vldr s0, [r0, #4]` defines the vector parent, reads it (merge)
     // and the base, and flags memory access.

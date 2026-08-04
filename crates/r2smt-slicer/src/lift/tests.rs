@@ -815,6 +815,39 @@ fn aarch32_rsb_swaps_operands_and_subtracts() {
 }
 
 #[test]
+fn aarch32_vpush_stores_each_doubleword_register() {
+    // `vpush {d8, d9}` stores two 64-bit registers and decrements sp.
+    let stmts = lift_aarch32("vpush", vec![op("{d8, d9}", OperandKind::Unknown)]);
+    let stores = stmts
+        .iter()
+        .filter(|s| matches!(s, IrStmt::StoreMem { bits: 64, .. }))
+        .count();
+    assert_eq!(stores, 2, "{stmts:?}");
+    assert!(
+        !stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. }))
+    );
+}
+
+#[test]
+fn aarch32_vpop_range_expands_every_member() {
+    // `vpop {s0-s3}` names a range: all four single-precision registers
+    // must load, not just the two endpoints.
+    let stmts = lift_aarch32("vpop", vec![op("{s0-s3}", OperandKind::Unknown)]);
+    let loads = stmts
+        .iter()
+        .filter(|s| matches!(s, IrStmt::LoadMem { bits: 32, .. }))
+        .count();
+    assert_eq!(loads, 4, "{stmts:?}");
+    assert!(
+        !stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. }))
+    );
+}
+
+#[test]
 fn aarch32_vldr_loads_the_register_width_through_the_byte_model() {
     // `vldr s0, [r0, #4]` loads 32 bits (the `s` register width) into a
     // temp and merges it into the vector register.

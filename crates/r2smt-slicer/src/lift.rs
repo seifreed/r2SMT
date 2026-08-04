@@ -44,7 +44,7 @@ mod x87;
 pub(crate) use aarch32::{
     VfpOp, aarch32_neon_writes_operand_pair, aarch32_structured_effect,
     aarch32_vmrs_transfers_flags, is_aarch32_neon_instruction, is_aarch32_packed_instruction,
-    vfp_scalar,
+    parse_vfp_reglist, vfp_scalar,
 };
 pub(crate) use aarch64::neon::structured::StructuredEffect;
 use merge::lower_merge;
@@ -138,11 +138,11 @@ fn is_simd_instruction(insn: &Instruction, arch: Arch) -> bool {
                 // NEON, but its per-mnemonic identity must win over any
                 // ESIL lowering that would clobber the flags `vcmp` set.
                 || aarch32_vmrs_transfers_flags(insn)
-                // `vldr` / `vstr` likewise need the per-mnemonic handler,
-                // which lowers the operand to its vector parent through
-                // the byte-granular memory model rather than a
-                // pointer-width ESIL node.
-                || matches!(mnem.as_str(), "vldr" | "vstr")
+                // `vldr` / `vstr` / `vpush` / `vpop` likewise need the
+                // per-mnemonic handler, which lowers the operand to its
+                // vector parent through the byte-granular memory model
+                // rather than a pointer-width ESIL node.
+                || matches!(mnem.as_str(), "vldr" | "vstr" | "vpush" | "vpop")
         }
         _ => false,
     }
