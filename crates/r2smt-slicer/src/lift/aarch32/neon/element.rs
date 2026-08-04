@@ -24,6 +24,7 @@
 use r2smt_ir::program::{Instruction, Operand, OperandKind};
 
 use crate::lift::BinOp;
+use crate::lift::FpArithOp;
 use crate::lift::aarch32::ElementKind;
 use crate::lift::aarch32::neon_element_type;
 use crate::registers::{is_simd_parent, register_layout};
@@ -44,12 +45,26 @@ pub(in crate::lift::aarch32) enum ByElementKind {
         combine: Option<BinOp>,
         signed: bool,
     },
+    /// `vmul.f32` / `vmla.f32` / `vmls.f32` — a floating-point product
+    /// of the same width as its sources. `accumulate` is the fused-free
+    /// rounding step reading the destination lane (`vmla` adds, `vmls`
+    /// subtracts); there is no long float by-element form.
+    Float { accumulate: Option<FpArithOp> },
 }
 
 /// `vmul` / `vmla` / `vmls` / `vmull` / `vmlal` / `vmlsl` with an
 /// indexed second source.
 pub(super) fn by_element_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     let (base, ty) = mnemonic.split_once('.')?;
+    if insn.operands.len() != 3 {
+        return None;
+    }
+    let (element, source_bits) = neon_element_type(ty)?;
+    // The float by-element product is the same width as its sources and
+    // rounds where the integer forms widen, so it is a separate shape.
+    if element == ElementKind::Float {
+        return by_element_float_shape(insn, base, source_bits);
+    }
     let (long, combine) = match base {
         "vmul" => (false, None),
         "vmla" => (false, Some(BinOp::Add)),
@@ -59,14 +74,9 @@ pub(super) fn by_element_shape(insn: &Instruction, mnemonic: &str) -> Option<Neo
         "vmlsl" => (true, Some(BinOp::Sub)),
         _ => return None,
     };
-    if insn.operands.len() != 3 {
-        return None;
-    }
-    let (element, source_bits) = neon_element_type(ty)?;
     // No by-element encoding exists at byte size — the index would not
-    // fit the field — and the floating-point forms are a separate
-    // lowering this module does not model.
-    if !matches!(source_bits, 16 | 32) || element == ElementKind::Float {
+    // fit the field.
+    if !matches!(source_bits, 16 | 32) {
         return None;
     }
     let (indexed_view, index) = indexed_element(insn.operands.get(2)?)?;
@@ -103,6 +113,40 @@ pub(super) fn by_element_shape(insn: &Instruction, mnemonic: &str) -> Option<Neo
     }
     Some(NeonShape {
         op: NeonOp::ByElement { kind, index },
+        lane_bits,
+        lanes,
+    })
+}
+
+/// `vmul.f32` / `vmla.f32` / `vmls.f32` with an indexed second source.
+///
+/// Same-width only — the architecture has no long float by-element form,
+/// and only `f16` / `f32` lanes have a by-element encoding.
+fn by_element_float_shape(insn: &Instruction, base: &str, source_bits: u16) -> Option<NeonShape> {
+    let accumulate = match base {
+        "vmul" => None,
+        "vmla" => Some(FpArithOp::Add),
+        "vmls" => Some(FpArithOp::Sub),
+        _ => return None,
+    };
+    if !matches!(source_bits, 16 | 32) {
+        return None;
+    }
+    let lane_bits = source_bits;
+    let (indexed_view, index) = indexed_element(insn.operands.get(2)?)?;
+    if index >= indexed_view.checked_div(source_bits)? {
+        return None;
+    }
+    let destination_view = vector_view_bits(insn.operands.first()?)?;
+    let lanes = destination_view.checked_div(lane_bits)?;
+    if vector_view_bits(insn.operands.get(1)?)? != source_bits.checked_mul(lanes)? || lanes < 2 {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::ByElement {
+            kind: ByElementKind::Float { accumulate },
+            index,
+        },
         lane_bits,
         lanes,
     })

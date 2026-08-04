@@ -19,6 +19,7 @@ use super::permute::{PairKind, PairSource, paired_source};
 use super::width::WidenKind;
 use super::{BITS_PER_BYTE, NeonOp, NeonShape};
 use crate::lift::BinOp;
+use crate::lift::{FpArithOp, fp_lane_result};
 
 /// Widen `value` to `target` bits, replicating the sign bit or not.
 fn extend(value: Expr, target: u16, signed: bool) -> Expr {
@@ -105,6 +106,9 @@ impl LiftCtx {
             ByElementKind::Long { combine, signed } => {
                 (combine, signed, shape.lane_bits.checked_div(2)?)
             }
+            ByElementKind::Float { accumulate } => {
+                return self.aarch32_by_element_float_lanes(insn, shape, accumulate, index);
+            }
         };
         let widens = source_bits != shape.lane_bits;
         let lanewise_view = source_bits.checked_mul(shape.lanes)?;
@@ -137,6 +141,47 @@ impl LiftCtx {
                     Self::extract_lane(previous.clone(), shape.lane_bits, lane)?,
                     product,
                 ),
+                (Some(_), None) => return None,
+            });
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// The float by-element forms — one lane of the second source
+    /// multiplied into every destination lane, rounded once.
+    ///
+    /// `vmla` / `vmls` are not fused: the product rounds, then the
+    /// destination-lane accumulate rounds again, which is what the
+    /// architecture defines for the NEON (non-`vfma`) spelling. So there
+    /// is nothing to widen — every step is at the lane width.
+    fn aarch32_by_element_float_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        accumulate: Option<FpArithOp>,
+        index: u16,
+    ) -> Option<Expr> {
+        let lane_bits = shape.lane_bits;
+        let lanewise_view = lane_bits.checked_mul(shape.lanes)?;
+        let lanewise = self.simd_operand_value(&insn.operands.get(1)?.clone(), lanewise_view)?;
+        let indexed = insn.operands.get(2)?.clone();
+        let element = self.read_simd_lane_bits(&indexed, lane_bits, index)?;
+        let accumulator = match accumulate {
+            Some(_) => {
+                Some(self.simd_operand_value(&insn.operands.first()?.clone(), shape.view_bits()?)?)
+            }
+            None => None,
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for lane in 0..shape.lanes {
+            let a = Self::extract_lane(lanewise.clone(), lane_bits, lane)?;
+            let product = fp_lane_result(FpArithOp::Mul, a, element.clone(), lane_bits)?;
+            lanes.push(match (accumulate, accumulator.as_ref()) {
+                (None, _) => product,
+                (Some(op), Some(previous)) => {
+                    let acc = Self::extract_lane(previous.clone(), lane_bits, lane)?;
+                    fp_lane_result(op, acc, product, lane_bits)?
+                }
                 (Some(_), None) => return None,
             });
         }

@@ -1497,11 +1497,84 @@ fn the_long_by_element_forms_decline_the_sign_agnostic_spelling() {
     assert!(declines("vmlal.i16", &["q0", "d2", "d4[0]"]));
 }
 
+// --- the float by-element forms ---
+//
+// Same width as their sources, not long, and rounded per step: `vmla` /
+// `vmls` are the NEON (non-`vfma`) spelling, so the product rounds and
+// then the destination accumulate rounds again.
+
+// The registers are chosen so nothing aliases: `d0` is the low half of
+// `v0`, `d2` the low half of `v1`, `d4` the low half of `v2`. Using
+// `d1` would be the *upper* half of `v0` (q0 = d0:d1), which the
+// destination write would then also touch.
+
 #[test]
-fn the_float_by_element_forms_still_decline() {
-    // `vmul.f32 d0, d1, d2[0]` is a floating-point product, a separate
-    // lowering from the integer one above.
-    assert!(declines("vmul.f32", &["d0", "d2", "d4[0]"]));
+fn vmul_float_by_element_scales_every_lane_by_one_element() {
+    // `d4[0]` is `3.0`, so each lane of `d2` = [2.0, 5.0] becomes
+    // [6.0, 15.0].
+    assert_computes(
+        "vmul.f32",
+        &["d0", "d2", "d4[0]"],
+        &[
+            // `d0` writes only the low half of `v0`; bind the whole
+            // register so the preserved upper half is not a free input.
+            ("v0", 0),
+            ("v1", 0x0000_0000_0000_0000_40a0_0000_4000_0000),
+            ("v2", 0x0000_0000_0000_0000_0000_0000_4040_0000),
+        ],
+        0x0000_0000_0000_0000_4170_0000_40c0_0000,
+    );
+}
+
+#[test]
+fn vmla_float_by_element_adds_into_the_destination_lane() {
+    // `d0` = [1.0, 2.0] plus [2.0, 5.0] * 3.0 = [7.0, 17.0].
+    assert_computes(
+        "vmla.f32",
+        &["d0", "d2", "d4[0]"],
+        &[
+            ("v0", 0x0000_0000_0000_0000_4000_0000_3f80_0000),
+            ("v1", 0x0000_0000_0000_0000_40a0_0000_4000_0000),
+            ("v2", 0x0000_0000_0000_0000_0000_0000_4040_0000),
+        ],
+        0x0000_0000_0000_0000_4188_0000_40e0_0000,
+    );
+}
+
+#[test]
+fn vmls_float_by_element_subtracts_the_product_from_the_destination() {
+    // `d0` = [20.0, 40.0] minus [2.0, 5.0] * 3.0 = [14.0, 25.0].
+    assert_computes(
+        "vmls.f32",
+        &["d0", "d2", "d4[0]"],
+        &[
+            ("v0", 0x0000_0000_0000_0000_4220_0000_41a0_0000),
+            ("v1", 0x0000_0000_0000_0000_40a0_0000_4000_0000),
+            ("v2", 0x0000_0000_0000_0000_0000_0000_4040_0000),
+        ],
+        0x0000_0000_0000_0000_41c8_0000_4160_0000,
+    );
+}
+
+#[test]
+fn vmul_float_by_element_reads_the_indexed_lane_across_a_quad() {
+    // `d4[1]` is `4.0`; the quad destination has four f32 lanes
+    // [1,2,3,4] → [4,8,12,16].
+    assert_computes(
+        "vmul.f32",
+        &["q0", "q1", "d4[1]"],
+        &[
+            ("v1", 0x4080_0000_4040_0000_4000_0000_3f80_0000),
+            ("v2", 0x0000_0000_0000_0000_4080_0000_0000_0000),
+        ],
+        0x4180_0000_4140_0000_4100_0000_4080_0000,
+    );
+}
+
+#[test]
+fn the_long_float_by_element_form_declines() {
+    // There is no widening float by-element encoding.
+    assert!(declines("vmull.f32", &["q0", "d2", "d4[0]"]));
 }
 
 #[test]
