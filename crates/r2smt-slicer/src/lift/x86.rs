@@ -7,13 +7,14 @@ use r2smt_ir::expr::{Expr, RoundingMode};
 use r2smt_ir::program::{Instruction, Operand, OperandKind};
 use r2smt_ir::stmt::IrStmt;
 
+mod simd;
+
 use crate::registers::{is_simd_parent, register_layout};
 
-use super::simd::{CompareKind, compare_lane};
+use super::simd::CompareKind;
 use super::{BinOp, PackedIntOp};
 use super::{
-    BitwiseOp, ExtendKind, FpArithOp, LiftCtx, ShiftOp, fp_lane_result, fp_sort_bits_checked,
-    nonzero_width,
+    BitwiseOp, ExtendKind, FpArithOp, LiftCtx, ShiftOp, fp_sort_bits_checked, nonzero_width,
 };
 
 /// x86 SHL/SHR/SAR/SAL mask the shift count before shifting: 5 bits
@@ -507,825 +508,6 @@ impl LiftCtx {
         self.set_flag("PF", Expr::Unknown(String::new()));
     }
 
-    /// `movaps`/`movups`/`movdqa`/`movdqu dst, src` (and their VEX
-    /// `v*` forms) — a full-view copy of `src` into `dst`. The view
-    /// width (128 / 256 / 512) comes from the operands; a legacy move
-    /// preserves the parent bits above the view, a VEX move zeroes them.
-    fn lift_simd_move(&mut self, insn: &Instruction) {
-        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
-            return;
-        };
-        let zero_upper = is_vex(insn);
-        let Some(value) = self.read_simd_operand(src) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        if !self.write_simd_dst(dst, value, zero_upper) {
-            self.push_simd_unsupported(insn);
-        }
-    }
-
-    /// `movss`/`movsd` (and their VEX forms) — a *scalar* move, which
-    /// merges one lane instead of copying a whole view.
-    ///
-    /// Legacy `movss xmm0, xmm1` writes the low lane and preserves every
-    /// bit above it. The VEX 3-operand form `vmovss xmm0, xmm1, xmm2`
-    /// takes the low lane from `src2`, the rest of the view from `src1`,
-    /// and zeroes the register above the view.
-    ///
-    /// A load form (`movss xmm0, dword [rbp - 8]`) zeroes everything
-    /// above the lane instead of merging, per the SDM — there is no
-    /// prior register value to merge with. A store form writes just the
-    /// lane. Both go through the byte-granular memory model.
-    ///
-    /// The 2-operand VEX shape with a register source is declined: it
-    /// does not exist in the ISA, so there is nothing to model.
-    fn lift_sse_scalar_move(&mut self, insn: &Instruction, lane: u16) {
-        let ops = &insn.operands;
-        let Some(dst) = ops.first() else {
-            return;
-        };
-        match (ops.len(), is_vex(insn)) {
-            (2, vex) => {
-                let src = &ops[1];
-                if vex && !self.is_modellable_simd_memory(src) {
-                    self.push_simd_unsupported(insn);
-                    return;
-                }
-                let Some(value) = self.read_simd_lane_bits(src, lane, 0) else {
-                    self.push_simd_unsupported(insn);
-                    return;
-                };
-                // Loading from memory zeroes above the lane; a
-                // register-to-register move merges.
-                let ok = if self.is_modellable_simd_memory(src) && self.is_simd_register(dst) {
-                    self.write_simd_dst(dst, value, true)
-                } else {
-                    self.write_simd_lane(dst, value, lane, 0)
-                };
-                if !ok {
-                    self.push_simd_unsupported(insn);
-                }
-            }
-            (3, true) => {
-                let Some(merged) = self.vex_scalar_move_value(dst, &ops[1], &ops[2], lane) else {
-                    self.push_simd_unsupported(insn);
-                    return;
-                };
-                if !self.write_simd_dst(dst, merged, true) {
-                    self.push_simd_unsupported(insn);
-                }
-            }
-            _ => self.push_simd_unsupported(insn),
-        }
-    }
-
-    /// The full-view value written by a VEX 3-operand scalar move: the
-    /// low lane from `src2`, the lanes above it from `src1`.
-    fn vex_scalar_move_value(
-        &mut self,
-        dst: &Operand,
-        src1: &Operand,
-        src2: &Operand,
-        lane: u16,
-    ) -> Option<Expr> {
-        let view = self.simd_view_bits(dst)?;
-        if view <= lane || self.simd_view_bits(src1)? != view {
-            return None;
-        }
-        let low = self.read_simd_lane_bits(src2, lane, 0)?;
-        let upper = Expr::extract(self.read_simd_operand(src1)?, view - 1, lane);
-        Some(Expr::concat(upper, low))
-    }
-
-    /// `pxor`/`pand`/`por`/`pandn` (2-operand RMW) and their `v`-prefixed
-    /// 3-operand VEX forms, modelled as 128-bit bit-vector ops. A
-    /// `pxor`/`vpxor` of a register with itself is the zero idiom —
-    /// the result is the 128-bit constant 0, independent of inputs.
-    fn lift_simd_bitwise(&mut self, insn: &Instruction, op: SimdBitOp) {
-        let ops = &insn.operands;
-        let Some(dst) = ops.first() else {
-            return;
-        };
-        let zero_upper = is_vex(insn);
-        let operand_refs: Vec<&Operand> = ops.iter().collect();
-        let Some(width) = self.simd_instruction_view_bits(&operand_refs) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        // Operand roles: 2-operand `OP dst, src` is RMW (a = dst,
-        // b = src); 3-operand VEX `OP dst, src1, src2` writes dst from
-        // (a = src1, b = src2).
-        let (a_op, b_op) = match ops.len() {
-            2 => (dst, &ops[1]),
-            3 => (&ops[1], &ops[2]),
-            _ => {
-                self.push_simd_unsupported(insn);
-                return;
-            }
-        };
-        if matches!(op, SimdBitOp::Xor) && same_xmm_register(a_op, b_op) {
-            if !self.write_simd_dst(dst, Expr::konst(0, width), zero_upper) {
-                self.push_simd_unsupported(insn);
-            }
-            return;
-        }
-        let Some(a) = self.simd_operand_value(a_op, width) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        let Some(b) = self.simd_operand_value(b_op, width) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        let result = match op {
-            SimdBitOp::Xor => Expr::bv_xor(a, b),
-            SimdBitOp::And => Expr::bv_and(a, b),
-            SimdBitOp::Or => Expr::bv_or(a, b),
-            // `pandn`/`vpandn` compute `(~a) & b`. The IR has no bitwise
-            // NOT, so `~a` is `a XOR all-ones` at the vector width.
-            SimdBitOp::AndNot => Expr::bv_and(Expr::bv_xor(a, super::simd::all_ones(width)), b),
-        };
-        if !self.write_simd_dst(dst, result, zero_upper) {
-            self.push_simd_unsupported(insn);
-        }
-    }
-
-    /// The packed-integer half of the x86 dispatch: arithmetic, the
-    /// whole-view byte slides and the lane shifts.
-    ///
-    /// Returns whether it claimed the mnemonic. Split out of
-    /// [`Self::lift_instruction_x86`] only to keep each under the line
-    /// limit; both are pure dispatch tables.
-    fn lift_x86_packed_int_by_mnemonic(&mut self, insn: &Instruction, mnem: &str) -> bool {
-        match mnem {
-            // Packed integer arithmetic. The lane width is spelled by
-            // the mnemonic suffix, as with the FP families.
-            "paddb" | "vpaddb" => self.lift_simd_packed_int(insn, ADD, 8),
-            "paddw" | "vpaddw" => self.lift_simd_packed_int(insn, ADD, 16),
-            "paddd" | "vpaddd" => self.lift_simd_packed_int(insn, ADD, 32),
-            "paddq" | "vpaddq" => self.lift_simd_packed_int(insn, ADD, 64),
-            "psubb" | "vpsubb" => self.lift_simd_packed_int(insn, SUB, 8),
-            "psubw" | "vpsubw" => self.lift_simd_packed_int(insn, SUB, 16),
-            "psubd" | "vpsubd" => self.lift_simd_packed_int(insn, SUB, 32),
-            "psubq" | "vpsubq" => self.lift_simd_packed_int(insn, SUB, 64),
-            "pmullw" | "vpmullw" => self.lift_simd_packed_int(insn, MUL, 16),
-            "pmulld" | "vpmulld" => self.lift_simd_packed_int(insn, MUL, 32),
-            // Whole-view byte slides, not lane shifts.
-            "pslldq" | "vpslldq" => self.lift_simd_byte_shift(insn, true),
-            "psrldq" | "vpsrldq" => self.lift_simd_byte_shift(insn, false),
-            // Lane shifts, immediate count only.
-            "psllw" | "vpsllw" => self.lift_simd_lane_shift(insn, ShiftOp::Shl, 16),
-            "pslld" | "vpslld" => self.lift_simd_lane_shift(insn, ShiftOp::Shl, 32),
-            "psllq" | "vpsllq" => self.lift_simd_lane_shift(insn, ShiftOp::Shl, 64),
-            "psrlw" | "vpsrlw" => self.lift_simd_lane_shift(insn, ShiftOp::Shr, 16),
-            "psrld" | "vpsrld" => self.lift_simd_lane_shift(insn, ShiftOp::Shr, 32),
-            "psrlq" | "vpsrlq" => self.lift_simd_lane_shift(insn, ShiftOp::Shr, 64),
-            "psraw" | "vpsraw" => self.lift_simd_lane_shift(insn, ShiftOp::Sar, 16),
-            "psrad" | "vpsrad" => self.lift_simd_lane_shift(insn, ShiftOp::Sar, 32),
-            _ => return false,
-        }
-        true
-    }
-
-    /// Packed integer arithmetic: the same lane operation over every
-    /// `lane_bits` lane of the destination's view.
-    ///
-    /// Shares its operand roles and upper-bits rule with the packed FP
-    /// twin — 2-operand is read-modify-write, 3-operand VEX reads its
-    /// two explicit sources, and a VEX write zeroes above the view.
-    fn lift_simd_packed_int(&mut self, insn: &Instruction, op: PackedIntOp, lane_bits: u16) {
-        let ops = &insn.operands;
-        let Some(dst) = ops.first() else {
-            return;
-        };
-        let (a_op, b_op) = match ops.len() {
-            2 => (dst, &ops[1]),
-            3 => (&ops[1], &ops[2]),
-            _ => {
-                self.push_simd_unsupported(insn);
-                return;
-            }
-        };
-        let (dst_c, a_c, b_c) = (dst.clone(), a_op.clone(), b_op.clone());
-        let Some(result) = self.packed_int_result(&dst_c, &a_c, Some(&b_c), op, lane_bits) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        if !self.write_simd_dst(&dst_c, result, is_vex(insn)) {
-            self.push_simd_unsupported(insn);
-        }
-    }
-
-    /// `pslldq` / `psrldq` — shift the *whole view* by a byte count.
-    ///
-    /// Despite sitting among the lane shifts these are not lane
-    /// operations at all: they slide the entire 128-bit (or 256-bit)
-    /// value, so treating them as a per-lane shift would be silently
-    /// wrong. A count of 16 or more clears the register.
-    fn lift_simd_byte_shift(&mut self, insn: &Instruction, left: bool) {
-        let ops = &insn.operands;
-        let (Some(dst), Some(count)) = (ops.first(), ops.last()) else {
-            return;
-        };
-        let (dst, count) = (dst.clone(), count.clone());
-        let source = if ops.len() == 3 {
-            ops[1].clone()
-        } else {
-            dst.clone()
-        };
-        let (Some(view), Some(bytes)) = (self.simd_view_bits(&dst), parse_immediate(&count.raw))
-        else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        let Some(value) = self.simd_operand_value(&source, view) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        let shift = bytes.saturating_mul(u64::from(BITS_PER_BYTE));
-        let result = if shift >= u64::from(view) {
-            Expr::konst(0, view)
-        } else {
-            let amount = Expr::konst(u128::from(shift), view);
-            if left {
-                Expr::shl(value, amount)
-            } else {
-                Expr::lshr(value, amount)
-            }
-        };
-        if !self.write_simd_dst(&dst, result, is_vex(insn)) {
-            self.push_simd_unsupported(insn);
-        }
-    }
-
-    /// `psll` / `psrl` / `psra` with an immediate count, applied to
-    /// every lane.
-    ///
-    /// The register-count form is deliberately absent: it takes the
-    /// amount from the low 64 bits of a vector register, which is a
-    /// different shape, and declining it is sound.
-    fn lift_simd_lane_shift(&mut self, insn: &Instruction, op: ShiftOp, lane_bits: u16) {
-        let ops = &insn.operands;
-        let (Some(dst), Some(count)) = (ops.first(), ops.last()) else {
-            return;
-        };
-        let (dst, count) = (dst.clone(), count.clone());
-        let source = if ops.len() == 3 {
-            ops[1].clone()
-        } else {
-            dst.clone()
-        };
-        if count.kind != OperandKind::Immediate {
-            self.push_simd_unsupported(insn);
-            return;
-        }
-        let (Some(view), Some(amount)) = (self.simd_view_bits(&dst), parse_immediate(&count.raw))
-        else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        let (Some(value), Some(lanes)) = (
-            self.simd_operand_value(&source, view),
-            Self::packed_lane_count(view, lane_bits),
-        ) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        let mut result = Vec::with_capacity(usize::from(lanes));
-        for index in 0..lanes {
-            let Some(lane) = Self::extract_lane(value.clone(), lane_bits, index) else {
-                self.push_simd_unsupported(insn);
-                return;
-            };
-            // x86 saturates the shift rather than masking it: a count
-            // at or beyond the lane width zeroes the lane (or fills it
-            // with the sign for an arithmetic shift), where a bare
-            // `Shl` at that width is undefined in the IR.
-            result.push(if amount >= u64::from(lane_bits) {
-                match op {
-                    ShiftOp::Sar => {
-                        Expr::ashr(lane, Expr::konst(u128::from(lane_bits - 1), lane_bits))
-                    }
-                    _ => Expr::konst(0, lane_bits),
-                }
-            } else {
-                let by = Expr::konst(u128::from(amount), lane_bits);
-                match op {
-                    ShiftOp::Shl => Expr::shl(lane, by),
-                    ShiftOp::Shr => Expr::lshr(lane, by),
-                    ShiftOp::Sar => Expr::ashr(lane, by),
-                }
-            });
-        }
-        let Some(packed) = Self::concat_lanes(result) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        if !self.write_simd_dst(&dst, packed, is_vex(insn)) {
-            self.push_simd_unsupported(insn);
-        }
-    }
-
-    /// `pmovmskb r32, xmm` — the sign bit of each source byte,
-    /// concatenated into the low bits of a general register with the
-    /// rest zeroed (16 bits from an `xmm` source, 32 from a `ymm`).
-    ///
-    /// This is the instruction that carries a vector compare's result
-    /// into the integer world, so it is the hinge of the SSE
-    /// strlen/memcmp idiom: without it the mask never reaches a flag
-    /// and the branch stays unresolved.
-    fn lift_simd_move_mask(&mut self, insn: &Instruction) {
-        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
-            return;
-        };
-        let (dst, src) = (dst.clone(), src.clone());
-        let (Some(view), Some(width)) = (
-            self.simd_view_bits(&src),
-            nonzero_width(self.operand_width(&dst)),
-        ) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        let Some(value) = self.simd_operand_value(&src, view) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        let Some(lanes) = Self::packed_lane_count(view, BITS_PER_BYTE) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        // Most significant byte first: `concat_lanes` takes its input
-        // least-significant first, and byte `i`'s sign bit lands at bit
-        // `i` of the result.
-        let mut bits = Vec::with_capacity(usize::from(lanes));
-        for index in 0..lanes {
-            let Some(byte) = Self::extract_lane(value.clone(), BITS_PER_BYTE, index) else {
-                self.push_simd_unsupported(insn);
-                return;
-            };
-            bits.push(Expr::extract(byte, BITS_PER_BYTE - 1, BITS_PER_BYTE - 1));
-        }
-        let Some(mask) = Self::concat_lanes(bits) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        if !self.write_register_to(&dst, Expr::zero_ext(mask, width)) {
-            self.push_simd_unsupported(insn);
-        }
-    }
-
-    /// `movd` / `movq` between a vector register and a general register
-    /// or memory, at `width` bits.
-    ///
-    /// Both directions **zero** everything above the transferred value
-    /// rather than merging: `movd xmm0, eax` clears bits 127:32 of the
-    /// destination, and the general-register direction zero-extends
-    /// into the full register. Merging instead would leave whatever the
-    /// vector held before, which is a wrong value rather than a
-    /// decline.
-    fn lift_simd_gpr_transfer(&mut self, insn: &Instruction, width: u16) {
-        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
-            return;
-        };
-        let (dst, src) = (dst.clone(), src.clone());
-        let to_vector = self.simd_layout(&dst).is_some();
-        let value = if self.simd_layout(&src).is_some() {
-            let Some(view) = self.simd_view_bits(&src) else {
-                self.push_simd_unsupported(insn);
-                return;
-            };
-            let Some(whole) = self.simd_operand_value(&src, view) else {
-                self.push_simd_unsupported(insn);
-                return;
-            };
-            if view <= width {
-                whole
-            } else {
-                Expr::extract(whole, width - 1, 0)
-            }
-        } else {
-            self.read_operand_at(&src, width)
-        };
-        if to_vector {
-            // `zero_upper = true` regardless of VEX: the legacy forms
-            // zero the vector register too.
-            if !self.write_simd_dst(&dst, value, true) {
-                self.push_simd_unsupported(insn);
-            }
-            return;
-        }
-        let Some(dst_width) = nonzero_width(self.operand_width(&dst)) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        let widened = if dst_width > width {
-            Expr::zero_ext(value, dst_width)
-        } else {
-            value
-        };
-        if !self.write_register_to(&dst, widened) {
-            self.push_simd_unsupported(insn);
-        }
-    }
-
-    /// The packed integer compares: `pcmpeq{b,w,d,q}` and
-    /// `pcmpgt{b,w,d,q}`.
-    ///
-    /// Each writes an all-ones mask into a lane where the predicate
-    /// holds and zeros where it does not — a *value*, not a flag, which
-    /// is why it cannot reuse the scalar compare path that writes
-    /// EFLAGS. `pcmpgt*` is signed on x86; there is no unsigned form.
-    ///
-    /// The mask is what feeds `pmovmskb` in the SSE string idiom, so
-    /// this family is the one the corpus measurement puts in a
-    /// conditional-branch block essentially every time it appears.
-    fn lift_simd_packed_compare(&mut self, insn: &Instruction, kind: CompareKind, lane_bits: u16) {
-        let ops = &insn.operands;
-        let Some(dst) = ops.first() else {
-            return;
-        };
-        let (a_op, b_op) = match ops.len() {
-            2 => (dst, &ops[1]),
-            3 => (&ops[1], &ops[2]),
-            _ => {
-                self.push_simd_unsupported(insn);
-                return;
-            }
-        };
-        let (a_op, b_op) = (a_op.clone(), b_op.clone());
-        let Some(result) = self.packed_compare_result(dst, &a_op, &b_op, kind, lane_bits) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        if !self.write_simd_dst(dst, result, is_vex(insn)) {
-            self.push_simd_unsupported(insn);
-        }
-    }
-
-    /// Lane-wise compare of two SIMD operands, materialising each once.
-    fn packed_compare_result(
-        &mut self,
-        dst: &Operand,
-        a_op: &Operand,
-        b_op: &Operand,
-        kind: CompareKind,
-        lane_bits: u16,
-    ) -> Option<Expr> {
-        let view = self.simd_instruction_view_bits(&[dst, a_op, b_op])?;
-        let a_val = self.simd_operand_value(a_op, view)?;
-        let b_val = self.simd_operand_value(b_op, view)?;
-        let count = Self::packed_lane_count(view, lane_bits)?;
-        let mut lanes = Vec::with_capacity(usize::from(count));
-        for index in 0..count {
-            let a = Self::extract_lane(a_val.clone(), lane_bits, index)?;
-            let b = Self::extract_lane(b_val.clone(), lane_bits, index)?;
-            lanes.push(compare_lane(kind, a, b, lane_bits)?);
-        }
-        Self::concat_lanes(lanes)
-    }
-
-    /// Packed floating-point arithmetic: the same lane operation applied
-    /// independently to every `lane_bits`-wide lane of the destination's
-    /// vector view (`addps` → 4 single lanes over 128 bits, `vaddps ymm`
-    /// → 8 over 256).
-    ///
-    /// Operand roles and the upper-bits rule are shared with
-    /// [`Self::lift_simd_bitwise`]: 2-operand is RMW, 3-operand VEX reads
-    /// its two explicit sources, and a VEX write zeroes above the view.
-    fn lift_simd_packed_fp(&mut self, insn: &Instruction, op: FpArithOp, lane_bits: u16) {
-        let ops = &insn.operands;
-        let Some(dst) = ops.first() else {
-            return;
-        };
-        let zero_upper = is_vex(insn);
-        let (a_op, b_op) = match ops.len() {
-            2 => (dst, &ops[1]),
-            3 => (&ops[1], &ops[2]),
-            _ => {
-                self.push_simd_unsupported(insn);
-                return;
-            }
-        };
-        let Some(result) = self.packed_fp_result(dst, a_op, b_op, op, lane_bits) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        if !self.write_simd_dst(dst, result, zero_upper) {
-            self.push_simd_unsupported(insn);
-        }
-    }
-
-    /// `vcvtph2ps` — widen packed half-precision lanes to single.
-    ///
-    /// The lane count comes from the *destination* view: each 32-bit
-    /// result lane consumes one 16-bit source lane, so a 128-bit
-    /// destination reads the low 64 bits of the source.
-    fn lift_f16c_widen(&mut self, insn: &Instruction) {
-        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
-            return;
-        };
-        let Some(result) = self.f16c_lanes(dst, src, F16C_HALF_BITS, F16C_SINGLE_BITS) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        if !self.write_simd_dst(dst, result, true) {
-            self.push_simd_unsupported(insn);
-        }
-    }
-
-    /// `vcvtps2ph` — narrow packed single lanes to half-precision.
-    ///
-    /// The lane count comes from the *source* view. The result is half
-    /// as wide as that view, and the VEX write zeroes everything above
-    /// it, so the narrower value is handed to the write as-is.
-    ///
-    /// The immediate selects the rounding mode, and bit 2 means "use
-    /// MXCSR" — which this lifter cannot pin, so that encoding declines
-    /// rather than assuming a mode.
-    fn lift_f16c_narrow(&mut self, insn: &Instruction) {
-        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
-            return;
-        };
-        let uses_mxcsr = insn
-            .operands
-            .get(2)
-            .and_then(|o| parse_immediate(&o.raw))
-            .is_none_or(|imm| imm & F16C_IMM_USE_MXCSR != 0);
-        if uses_mxcsr {
-            self.push_simd_unsupported(insn);
-            return;
-        }
-        let Some(result) = self.f16c_lanes(src, src, F16C_SINGLE_BITS, F16C_HALF_BITS) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        if !self.write_simd_dst(dst, result, true) {
-            self.push_simd_unsupported(insn);
-        }
-    }
-
-    /// Convert every lane of `src` from `from_bits` to `to_bits`, with
-    /// the lane count taken from `count_from`'s view divided by the
-    /// wider of the two lane widths.
-    fn f16c_lanes(
-        &mut self,
-        count_from: &Operand,
-        src: &Operand,
-        from_bits: u16,
-        to_bits: u16,
-    ) -> Option<Expr> {
-        let view = self.simd_instruction_view_bits(&[count_from, src])?;
-        let count = Self::packed_lane_count(view, from_bits.max(to_bits))?;
-        let (from_e, from_s) = fp_sort_bits_checked(from_bits)?;
-        let (to_e, to_s) = fp_sort_bits_checked(to_bits)?;
-        let src_val = self.simd_operand_value(src, view)?;
-        let mut lanes = Vec::with_capacity(usize::from(count));
-        for index in 0..count {
-            let raw = Self::extract_lane(src_val.clone(), from_bits, index)?;
-            lanes.push(Expr::fp_to_ieee_bv(Expr::fp_to_fp(
-                Expr::bv_to_fp(raw, from_e, from_s),
-                RoundingMode::NearestTiesEven,
-                to_e,
-                to_s,
-            )));
-        }
-        Self::concat_lanes(lanes)
-    }
-
-    /// The SSE/AVX compares, which write a per-lane mask of all-ones
-    /// (predicate true) or all-zeros rather than a float.
-    fn lift_simd_fp_mask_compare(&mut self, insn: &Instruction, cmp: &FpCompare) {
-        let ops = &insn.operands;
-        let Some(dst) = ops.first() else {
-            return;
-        };
-        let (a_op, b_op) = match ops.len() {
-            2 => (dst, &ops[1]),
-            3 => (&ops[1], &ops[2]),
-            _ => {
-                self.push_simd_unsupported(insn);
-                return;
-            }
-        };
-        let Some(result) = self.fp_mask_result(dst, a_op, b_op, cmp) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        let written = if cmp.packed {
-            self.write_simd_dst(dst, result, is_vex(insn))
-        } else {
-            self.write_simd_lane(dst, result, cmp.lane_bits, 0)
-        };
-        if !written {
-            self.push_simd_unsupported(insn);
-        }
-    }
-
-    fn fp_mask_result(
-        &mut self,
-        dst: &Operand,
-        a_op: &Operand,
-        b_op: &Operand,
-        cmp: &FpCompare,
-    ) -> Option<Expr> {
-        if !cmp.packed {
-            let a = self.read_simd_lane_bits(a_op, cmp.lane_bits, 0)?;
-            let b = self.read_simd_lane_bits(b_op, cmp.lane_bits, 0)?;
-            return fp_mask_lane(cmp, a, b);
-        }
-        let view = self.simd_instruction_view_bits(&[dst, a_op, b_op])?;
-        let count = Self::packed_lane_count(view, cmp.lane_bits)?;
-        let a_val = self.simd_operand_value(a_op, view)?;
-        let b_val = self.simd_operand_value(b_op, view)?;
-        let mut lanes = Vec::with_capacity(usize::from(count));
-        for index in 0..count {
-            let a = Self::extract_lane(a_val.clone(), cmp.lane_bits, index)?;
-            let b = Self::extract_lane(b_val.clone(), cmp.lane_bits, index)?;
-            lanes.push(fp_mask_lane(cmp, a, b)?);
-        }
-        Self::concat_lanes(lanes)
-    }
-
-    /// `sqrtps`/`sqrtpd` (every lane) and `sqrtss`/`sqrtsd` (low lane
-    /// only, upper bits of the destination preserved).
-    ///
-    /// Unary, so the source is the *second* operand in both the SSE and
-    /// the VEX form — unlike the binary handlers there is no RMW read of
-    /// the destination.
-    fn lift_simd_sqrt(&mut self, insn: &Instruction, lane_bits: u16, packed: bool) {
-        let ops = &insn.operands;
-        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
-            return;
-        };
-        let Some(result) = self.sqrt_result(dst, src, lane_bits, packed) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        let written = if packed {
-            self.write_simd_dst(dst, result, is_vex(insn))
-        } else {
-            self.write_simd_lane(dst, result, lane_bits, 0)
-        };
-        if !written {
-            self.push_simd_unsupported(insn);
-        }
-    }
-
-    fn sqrt_result(
-        &mut self,
-        dst: &Operand,
-        src: &Operand,
-        lane_bits: u16,
-        packed: bool,
-    ) -> Option<Expr> {
-        let (ebits, sbits) = fp_sort_bits_checked(lane_bits)?;
-        let root = |bits: Expr| {
-            Expr::fp_to_ieee_bv(Expr::fsqrt(
-                Expr::bv_to_fp(bits, ebits, sbits),
-                RoundingMode::NearestTiesEven,
-            ))
-        };
-        if !packed {
-            let low = self.read_simd_lane_bits(src, lane_bits, 0)?;
-            return Some(root(low));
-        }
-        let view = self.simd_instruction_view_bits(&[dst, src])?;
-        let count = Self::packed_lane_count(view, lane_bits)?;
-        let src_val = self.simd_operand_value(src, view)?;
-        let mut lanes = Vec::with_capacity(usize::from(count));
-        for index in 0..count {
-            lanes.push(root(Self::extract_lane(src_val.clone(), lane_bits, index)?));
-        }
-        Self::concat_lanes(lanes)
-    }
-
-    /// `addss`/`subss`/`mulss`/`divss` (32-bit lane) and their `sd`
-    /// double-precision (64-bit lane) forms — a scalar FP op on the low
-    /// lane of `dst`, with the upper parent bits preserved (legacy SSE
-    /// scalar semantics). `dst := fp_op(lane(dst), lane(src))`.
-    fn lift_simd_scalar_fp(&mut self, insn: &Instruction, op: FpArithOp, lane: u16) {
-        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
-            return;
-        };
-        let (Some(a), Some(b)) = (
-            self.read_simd_lane_bits(dst, lane, 0),
-            self.read_simd_lane_bits(src, lane, 0),
-        ) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        let Some(result) = fp_lane_result(op, a, b, lane) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        if !self.write_simd_lane(dst, result, lane, 0) {
-            self.push_simd_unsupported(insn);
-        }
-    }
-
-    /// `comiss`/`ucomiss` (32-bit lane) and `comisd`/`ucomisd` (64-bit)
-    /// — compare the low lanes and write the result into EFLAGS.
-    ///
-    /// Per the SDM: unordered sets ZF, PF and CF; greater-than clears
-    /// all three; less-than sets CF alone; equal sets ZF alone. OF, SF
-    /// and AF are always cleared. The ordered and unordered forms differ
-    /// only in which NaN raises the invalid-operation exception, which
-    /// the value model does not track, so both lift identically.
-    ///
-    /// PF is exact here, unlike the integer path where it degrades to
-    /// `Unknown`: it *is* the unordered predicate, which makes the
-    /// `ucomiss` + `jp`/`jnp` NaN check compilers emit resolve
-    /// precisely.
-    fn lift_simd_fp_compare(&mut self, insn: &Instruction, lane: u16) {
-        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
-            return;
-        };
-        let (Some(a), Some(b)) = (
-            self.read_simd_lane_fp(dst, lane, 0),
-            self.read_simd_lane_fp(src, lane, 0),
-        ) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        let unordered = Expr::bool_or(Expr::fisnan(a.clone()), Expr::fisnan(b.clone()));
-        self.set_flag("PF", unordered.clone());
-        self.set_flag(
-            "ZF",
-            Expr::bool_or(unordered.clone(), Expr::feq(a.clone(), b.clone())),
-        );
-        self.set_flag("CF", Expr::bool_or(unordered, Expr::flt(a, b)));
-        self.set_flag("OF", Expr::konst(0, 1));
-        self.set_flag("SF", Expr::konst(0, 1));
-    }
-
-    /// `cvtsi2ss`/`cvtsi2sd` — convert a signed integer register to a
-    /// float and write it to the low lane of `dst`.
-    ///
-    /// The rounding mode is the architectural MXCSR default, pinned the
-    /// same way the SSE arithmetic handlers pin it; a program that
-    /// reprograms MXCSR is outside the value model either way.
-    fn lift_int_to_fp(&mut self, insn: &Instruction, lane: u16) {
-        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
-            return;
-        };
-        let Some(int) = self.read_register(src) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        let Some((ebits, sbits)) = fp_sort_bits_checked(lane) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        let converted = Expr::sbv_to_fp(int, RoundingMode::NearestTiesEven, ebits, sbits);
-        if !self.write_simd_lane(dst, Expr::fp_to_ieee_bv(converted), lane, 0) {
-            self.push_simd_unsupported(insn);
-        }
-    }
-
-    /// `cvtss2si`/`cvtsd2si` and their truncating `cvtt…` forms —
-    /// convert the low lane of `src` to a signed integer register.
-    ///
-    /// The truncating forms carry the rounding mode in the opcode; the
-    /// others take the MXCSR default, pinned as in [`Self::lift_int_to_fp`].
-    fn lift_fp_to_int(&mut self, insn: &Instruction, lane: u16, rm: RoundingMode) {
-        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
-            return;
-        };
-        let Some(f) = self.read_simd_lane_fp(src, lane, 0) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        let width = self.operand_width(dst);
-        if !self.write_register_to(dst, Expr::fp_to_sbv(f, rm, width)) {
-            self.push_simd_unsupported(insn);
-        }
-    }
-
-    /// `cvtss2sd`/`cvtsd2ss` — convert the low lane of `src` to the
-    /// other float sort and write it to the low lane of `dst`.
-    ///
-    /// `src_lane` is the source sort's width, `dst_lane` the target's.
-    /// Widening is exact; narrowing rounds under the MXCSR default,
-    /// pinned as in [`Self::lift_int_to_fp`].
-    fn lift_fp_to_fp(&mut self, insn: &Instruction, src_lane: u16, dst_lane: u16) {
-        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
-            return;
-        };
-        let Some(f) = self.read_simd_lane_fp(src, src_lane, 0) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        let Some((ebits, sbits)) = fp_sort_bits_checked(dst_lane) else {
-            self.push_simd_unsupported(insn);
-            return;
-        };
-        let converted = Expr::fp_to_fp(f, RoundingMode::NearestTiesEven, ebits, sbits);
-        if !self.write_simd_lane(dst, Expr::fp_to_ieee_bv(converted), dst_lane, 0) {
-            self.push_simd_unsupported(insn);
-        }
-    }
-
     /// `sahf` — load SF, ZF, AF and PF and CF from the bits of AH.
     ///
     /// The bit positions are the point rather than an implementation
@@ -1350,13 +532,6 @@ impl LiftCtx {
         for (flag, bit) in SAHF_FLAG_BITS {
             self.set_flag(flag, Expr::extract(ah.clone(), bit, bit));
         }
-    }
-
-    fn push_simd_unsupported(&mut self, insn: &Instruction) {
-        self.stmts.push(IrStmt::Unsupported {
-            mnemonic: insn.mnemonic.clone(),
-            comment: format!("unmodellable SIMD operand at {addr}", addr = insn.address),
-        });
     }
 }
 
@@ -1394,6 +569,63 @@ const BITS_PER_BYTE: u16 = 8;
 const ADD: PackedIntOp = PackedIntOp::Bin(BinOp::Add);
 const SUB: PackedIntOp = PackedIntOp::Bin(BinOp::Sub);
 const MUL: PackedIntOp = PackedIntOp::Bin(BinOp::Mul);
+
+/// `padds*` / `paddus*` / `psubs*` / `psubus*` — the saturating forms.
+/// The `signed` flag picks both the extension of the operands and the
+/// bounds they clamp to, so `paddusb` stops at `0xff` where `paddsb`
+/// stops at `0x7f`.
+const SAT_ADD_SIGNED: PackedIntOp = PackedIntOp::Saturating {
+    subtract: false,
+    signed: true,
+};
+const SAT_ADD_UNSIGNED: PackedIntOp = PackedIntOp::Saturating {
+    subtract: false,
+    signed: false,
+};
+const SAT_SUB_SIGNED: PackedIntOp = PackedIntOp::Saturating {
+    subtract: true,
+    signed: true,
+};
+const SAT_SUB_UNSIGNED: PackedIntOp = PackedIntOp::Saturating {
+    subtract: true,
+    signed: false,
+};
+
+/// `pavgb` / `pavgw` — the unsigned rounded average `(a + b + 1) >> 1`.
+/// `rounding` is the half added before the shift, and dropping it would
+/// be a wrong value rather than a decline: `pavgb` of `3` and `4` is
+/// `4`, not `3`.
+const AVERAGE: PackedIntOp = PackedIntOp::Halving {
+    subtract: false,
+    signed: false,
+    rounding: true,
+};
+
+/// `pmax*` / `pmin*`. The comparison *is* the operation, so signedness
+/// is carried rather than inferred — `pmaxub` of `0xff` and `0x01` is
+/// `0xff`, `pmaxsb` of the same lanes is `0x01`.
+const MAX_SIGNED: PackedIntOp = PackedIntOp::MinMax {
+    max: true,
+    signed: true,
+};
+const MAX_UNSIGNED: PackedIntOp = PackedIntOp::MinMax {
+    max: true,
+    signed: false,
+};
+const MIN_SIGNED: PackedIntOp = PackedIntOp::MinMax {
+    max: false,
+    signed: true,
+};
+const MIN_UNSIGNED: PackedIntOp = PackedIntOp::MinMax {
+    max: false,
+    signed: false,
+};
+
+/// `pabs{b,w,d}` — the lane-wise absolute value, and the one x86 packed
+/// integer arithmetic form with a single source. Non-saturating, so
+/// `pabsb` of `0x80` is `0x80`; the two's-complement negation at a fixed
+/// width already gives that with no special case.
+const ABSOLUTE: PackedIntOp = PackedIntOp::Abs;
 
 /// `pcmpeq*` — lane equality.
 const EQUAL: CompareKind = CompareKind::Equal { float: false };
@@ -1447,7 +679,11 @@ pub(crate) fn x86_simd_shape(mnemonic: &str) -> Option<X86SimdShape> {
         // way. All three overwrite the whole destination — the vector
         // direction zeroes above the transferred value rather than
         // merging.
-        | "pmovmskb" | "vpmovmskb" | "movd" | "vmovd" | "movq" | "vmovq" => X86SimdShape::Move,
+        | "pmovmskb" | "vpmovmskb" | "movd" | "vmovd" | "movq" | "vmovq"
+        // `pabs*` is the one packed integer arithmetic form whose
+        // 2-operand shape is not read-modify-write: it writes the
+        // destination from its single source.
+        | "pabsb" | "pabsw" | "pabsd" | "vpabsb" | "vpabsw" | "vpabsd" => X86SimdShape::Move,
         // 2-operand read-modify-write (or its 3-operand VEX form).
         "pxor" | "vpxor" | "pand" | "vpand" | "por" | "vpor" | "pandn" | "vpandn" | "addss"
         | "subss" | "mulss" | "divss" | "addsd" | "subsd" | "mulsd" | "divsd" | "addps"
@@ -1468,7 +704,17 @@ pub(crate) fn x86_simd_shape(mnemonic: &str) -> Option<X86SimdShape> {
         | "psrld" | "psrlq" | "psraw" | "psrad" | "vpaddb" | "vpaddw" | "vpaddd" | "vpaddq"
         | "vpsubb" | "vpsubw" | "vpsubd" | "vpsubq" | "vpmullw" | "vpmulld" | "vpslldq"
         | "vpsrldq" | "vpsllw" | "vpslld" | "vpsllq" | "vpsrlw" | "vpsrld" | "vpsrlq"
-        | "vpsraw" | "vpsrad" => X86SimdShape::ReadModifyWrite,
+        | "vpsraw" | "vpsrad"
+        // The saturating, averaging and min/max families. Same
+        // read-modify-write shape as the wrapping arithmetic above —
+        // only the lane operation differs.
+        | "paddsb" | "paddsw" | "paddusb" | "paddusw" | "psubsb" | "psubsw" | "psubusb"
+        | "psubusw" | "pavgb" | "pavgw" | "pmaxsb" | "pmaxsw" | "pmaxsd" | "pmaxub" | "pmaxuw"
+        | "pmaxud" | "pminsb" | "pminsw" | "pminsd" | "pminub" | "pminuw" | "pminud"
+        | "vpaddsb" | "vpaddsw" | "vpaddusb" | "vpaddusw" | "vpsubsb" | "vpsubsw" | "vpsubusb"
+        | "vpsubusw" | "vpavgb" | "vpavgw" | "vpmaxsb" | "vpmaxsw" | "vpmaxsd" | "vpmaxub"
+        | "vpmaxuw" | "vpmaxud" | "vpminsb" | "vpminsw" | "vpminsd" | "vpminub" | "vpminuw"
+        | "vpminud" => X86SimdShape::ReadModifyWrite,
         _ => return None,
     };
     Some(shape)

@@ -413,3 +413,108 @@ fn psllw_past_the_lane_width_clears_the_lane() {
         0,
     );
 }
+
+#[test]
+fn pavgb_rounds_up_rather_than_truncating() {
+    // PAVGB is (a + b + 1) >> 1, so 3 and 4 average to 4. A plain
+    // halving gives 3 — a wrong value, not a decline.
+    assert_computes(
+        "pavgb",
+        &["xmm0", "xmm1"],
+        &[
+            ("zmm0", packed(8, &[0x03, 0xff])),
+            ("zmm1", packed(8, &[0x04, 0xff])),
+        ],
+        packed(8, &[0x04, 0xff]),
+    );
+}
+
+#[test]
+fn paddusb_saturates_at_the_unsigned_maximum() {
+    // 0xf0 + 0x20 is 0x110, which clamps to 0xff. Wrapping would give
+    // 0x10 and reading the lanes signed would clamp to 0x7f.
+    assert_computes(
+        "paddusb",
+        &["xmm0", "xmm1"],
+        &[("zmm0", packed(8, &[0xf0])), ("zmm1", packed(8, &[0x20]))],
+        packed(8, &[0xff]),
+    );
+}
+
+#[test]
+fn paddsb_saturates_at_the_signed_maximum() {
+    // The same lanes read signed: 0x70 + 0x20 is 0x90 unsigned, but as
+    // a signed byte it overflows and clamps to 0x7f.
+    assert_computes(
+        "paddsb",
+        &["xmm0", "xmm1"],
+        &[("zmm0", packed(8, &[0x70])), ("zmm1", packed(8, &[0x20]))],
+        packed(8, &[0x7f]),
+    );
+}
+
+#[test]
+fn psubusb_saturates_at_zero_rather_than_wrapping() {
+    // 0x10 - 0x20 underflows; unsigned saturation floors it at zero
+    // where wrapping would give 0xf0.
+    assert_computes(
+        "psubusb",
+        &["xmm0", "xmm1"],
+        &[("zmm0", packed(8, &[0x10])), ("zmm1", packed(8, &[0x20]))],
+        packed(8, &[0x00]),
+    );
+}
+
+#[test]
+fn pmaxub_and_pmaxsb_disagree_on_a_negative_byte() {
+    // 0xff is 255 unsigned and -1 signed, so the unsigned max is 0xff
+    // and the signed max is 0x01. Reading the wrong signedness here is
+    // a plausible-looking number rather than a decline.
+    let sources = [("zmm0", packed(8, &[0xff])), ("zmm1", packed(8, &[0x01]))];
+    assert_computes("pmaxub", &["xmm0", "xmm1"], &sources, packed(8, &[0xff]));
+    assert_computes("pmaxsb", &["xmm0", "xmm1"], &sources, packed(8, &[0x01]));
+}
+
+#[test]
+fn pminsw_selects_the_signed_minimum() {
+    // 0x8000 is the most negative word, so it wins a signed minimum
+    // against 0x0001 — unsigned it would lose.
+    assert_computes(
+        "pminsw",
+        &["xmm0", "xmm1"],
+        &[
+            ("zmm0", packed(16, &[0x8000])),
+            ("zmm1", packed(16, &[0x0001])),
+        ],
+        packed(16, &[0x8000]),
+    );
+}
+
+#[test]
+fn pabsb_maps_the_most_negative_byte_to_itself() {
+    // PABSB is non-saturating: |-128| is not representable in a signed
+    // byte, and the architecture leaves the wrapped 0x80 rather than
+    // clamping to 0x7f.
+    assert_computes(
+        "pabsb",
+        &["xmm0", "xmm1"],
+        &[("zmm1", packed(8, &[0x80, 0xfe]))],
+        packed(8, &[0x80, 0x02]),
+    );
+}
+
+#[test]
+fn pabsw_writes_its_destination_from_the_source_alone() {
+    // The 2-operand form is not read-modify-write: whatever xmm0 held
+    // is discarded. Binding it to a value that would change the answer
+    // is what gives this contract teeth.
+    assert_computes(
+        "pabsw",
+        &["xmm0", "xmm1"],
+        &[
+            ("zmm0", packed(16, &[0x7777, 0x7777])),
+            ("zmm1", packed(16, &[0xfffb, 0x0003])),
+        ],
+        packed(16, &[0x0005, 0x0003]),
+    );
+}

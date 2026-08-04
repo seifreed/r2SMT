@@ -3119,7 +3119,10 @@ fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
         "sqrtss", "sqrtsd", "movss", "movsd", "pcmpeqb", "pcmpeqw", "pcmpeqd", "pcmpeqq",
         "pcmpgtb", "pcmpgtw", "pcmpgtd", "pcmpgtq", "vpcmpeqb", "vpcmpeqd", "vpcmpgtb", "vpcmpgtd",
         "paddb", "paddw", "paddd", "paddq", "psubb", "psubw", "psubd", "psubq", "pmullw", "pmulld",
-        "vpaddd", "vpsubb",
+        "vpaddd", "vpsubb", "paddsb", "paddsw", "paddusb", "paddusw", "psubsb", "psubsw",
+        "psubusb", "psubusw", "pavgb", "pavgw", "pmaxsb", "pmaxsw", "pmaxsd", "pmaxub", "pmaxuw",
+        "pmaxud", "pminsb", "pminsw", "pminsd", "pminub", "pminuw", "pminud", "pabsb", "pabsw",
+        "pabsd", "vpaddsw", "vpavgb", "vpmaxub", "vpminsd", "vpabsd",
     ];
     // The vector-to-general transfers need realistic operands: their
     // destination is a GPR, not a vector register.
