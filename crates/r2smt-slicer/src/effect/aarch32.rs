@@ -133,6 +133,10 @@ fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> Instruct
             is_call: false,
             reads_flags: false,
         },
+        // Thumb compare-and-branch: does not touch NZCV, but reads the
+        // operand register, which the slicer keeps a definition of
+        // alive. Thumb has no `tbz` / `tbnz`.
+        "cbz" | "cbnz" => aarch32_compare_branch_effect(insn),
         m if m.starts_with('b')
             && crate::lift::strip_aarch32_cond_suffix(m).is_some_and(|(base, _)| base == "b") =>
         {
@@ -304,6 +308,24 @@ fn aarch32_str_effect(insn: &Instruction) -> InstructionEffect {
         uses,
         defines_flags: false,
         has_memory_access: true,
+        is_call: false,
+        reads_flags: false,
+    }
+}
+
+fn aarch32_compare_branch_effect(insn: &Instruction) -> InstructionEffect {
+    let mut uses = Vec::new();
+    if let Some(op) = insn.operands.first()
+        && let Some(reg) = canonical_register(&op.raw, Arch::Arm)
+    {
+        uses.push(reg);
+    }
+    InstructionEffect {
+        kind: InstructionKind::Jcc,
+        defs: Vec::new(),
+        uses,
+        defines_flags: false,
+        has_memory_access: false,
         is_call: false,
         reads_flags: false,
     }

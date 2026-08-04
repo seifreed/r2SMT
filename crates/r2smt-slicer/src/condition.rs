@@ -69,11 +69,12 @@ pub enum BranchCondition {
     /// `(R)CX == 0` — not a flag predicate; used by `jcxz` / `jecxz` /
     /// `jrcxz` (no `setcc` / `cmovcc` counterpart).
     CxZero,
-    /// `AArch64` `cbz Rn, label` — branch when `Rn == 0`. The register
-    /// name lives on [`crate::collector::BranchCandidate::compare_register`]
-    /// so the enum stays `Copy`.
+    /// `cbz Rn, label` (`AArch64` and Thumb) — branch when `Rn == 0`.
+    /// The register name lives on
+    /// [`crate::collector::BranchCandidate::compare_register`] so the
+    /// enum stays `Copy`.
     RegisterZero,
-    /// `AArch64` `cbnz Rn, label` — branch when `Rn != 0`.
+    /// `cbnz Rn, label` (`AArch64` and Thumb) — branch when `Rn != 0`.
     RegisterNotZero,
     /// `AArch64` `tbz Rn, #bit, label` — branch when bit `#bit` of
     /// `Rn` is zero. Register and bit live on
@@ -207,6 +208,11 @@ fn classify_aarch32(normalized: &str) -> Option<(BranchKind, BranchCondition)> {
     // (a wide conditional branch) would not be recognised as a branch.
     let normalized = crate::lift::strip_thumb_width_suffix(normalized);
     match normalized {
+        // Thumb compare-and-branch. Unlike AArch64 there is no `tbz` /
+        // `tbnz` — Thumb `tbb` / `tbh` are table branches, a different
+        // instruction — so only the register-zero forms are recognised.
+        "cbz" => return Some((BranchKind::Jcc, BranchCondition::RegisterZero)),
+        "cbnz" => return Some((BranchKind::Jcc, BranchCondition::RegisterNotZero)),
         "b" | "bl" | "blx" | "bx" => return None,
         _ => {}
     }
@@ -517,6 +523,22 @@ mod tests {
         assert!(classify("b", Arch::Arm).is_none());
         assert!(classify("bl", Arch::Arm).is_none());
         assert!(classify("bx", Arch::Arm).is_none());
+    }
+
+    #[test]
+    fn aarch32_thumb_compare_and_branch_classifies() {
+        assert_eq!(
+            classify("cbz", Arch::Arm),
+            Some((BranchKind::Jcc, BranchCondition::RegisterZero))
+        );
+        assert_eq!(
+            classify("cbnz", Arch::Arm),
+            Some((BranchKind::Jcc, BranchCondition::RegisterNotZero))
+        );
+        // Thumb has no `tbz` / `tbnz` (those spellings are AArch64-only;
+        // Thumb `tbb` / `tbh` are unrelated table branches).
+        assert!(classify("tbz", Arch::Arm).is_none());
+        assert!(classify("tbnz", Arch::Arm).is_none());
     }
 
     #[test]

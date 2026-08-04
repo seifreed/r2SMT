@@ -826,6 +826,24 @@ fn aarch32_thumb_wide_suffix_keeps_the_base_effect() {
 }
 
 #[test]
+fn aarch32_cbz_reads_the_compared_register() {
+    // `cbz r0, 0x1000` is a Jcc that reads r0 (so the slicer keeps its
+    // definition) and touches no flags or register defs.
+    let cbz = insn(
+        "cbz",
+        vec![
+            op("r0", OperandKind::Register),
+            op("0x1000", OperandKind::Immediate),
+        ],
+    );
+    let effect = analyze(&cbz, Arch::Arm);
+    assert_eq!(effect.kind, InstructionKind::Jcc);
+    assert_eq!(effect.uses, vec!["r0"]);
+    assert!(effect.defs.is_empty());
+    assert!(!effect.defines_flags);
+}
+
+#[test]
 fn aarch32_bfi_is_not_a_conditional_branch() {
     // `bfi` / `bfc` are 3-char `b`-words that *define* `Rd`. A length
     // gate on the `b<cond>` arm swallowed them as flag-free `Jcc`, so
