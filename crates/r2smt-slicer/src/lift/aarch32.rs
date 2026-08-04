@@ -85,6 +85,8 @@ impl LiftCtx {
             "mov" => self.lift_aarch64_mov(insn),
             "movs" => self.lift_aarch32_movs(insn),
             "vmrs" => self.lift_aarch32_vmrs(insn),
+            "vldr" => self.lift_aarch32_vfp_mem(insn, true),
+            "vstr" => self.lift_aarch32_vfp_mem(insn, false),
             "mvn" => self.lift_aarch32_mvn(insn),
             "add" => self.lift_aarch64_arith3(insn, BinOp::Add, false),
             "adds" => self.lift_aarch64_arith3(insn, BinOp::Add, true),
@@ -418,6 +420,76 @@ impl LiftCtx {
         }
     }
 
+    /// `vldr` / `vstr` — scalar VFP load / store of a single `s` (32) or
+    /// `d` (64) register through the byte-granular memory model, reusing
+    /// the integer address resolver. The write merges (VFP preserves the
+    /// rest of the register file), like every other `AArch32` vector
+    /// write. A PC-relative literal pool declines: this model carries no
+    /// live PC value.
+    fn lift_aarch32_vfp_mem(&mut self, insn: &Instruction, is_load: bool) {
+        let (Some(reg), Some(mem)) = (insn.operands.first(), insn.operands.get(1)) else {
+            return;
+        };
+        if reg.kind != OperandKind::Register || mem.kind != OperandKind::Memory {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "vldr/vstr operand shape".into(),
+            });
+            return;
+        }
+        if aarch32_mem_base_is_pc(mem) {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "vldr/vstr pc-relative literal pool not modelled".into(),
+            });
+            return;
+        }
+        let Some(bits) = nonzero_width(self.operand_width(reg)) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "vldr/vstr zero-width register".into(),
+            });
+            return;
+        };
+        let Some(access) = aarch32_mem_access(mem, insn.operands.get(2), self.bits) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: format!("vldr/vstr addressing mode not modelled: {}", mem.raw),
+            });
+            return;
+        };
+        let MemAccess { address, writeback } = access;
+        if is_load {
+            let tmp = self.new_temp(insn.address, bits);
+            self.stmts.push(IrStmt::LoadMem {
+                dst: tmp.clone(),
+                address,
+                bits,
+            });
+            if !self.write_simd_lane(reg, Expr::Var(tmp), bits, 0) {
+                self.stmts.push(IrStmt::Unsupported {
+                    mnemonic: insn.mnemonic.clone(),
+                    comment: "vldr destination not modelled".into(),
+                });
+                return;
+            }
+        } else {
+            let Some(value) = self.read_simd_lane_bits(reg, bits, 0) else {
+                self.stmts.push(IrStmt::Unsupported {
+                    mnemonic: insn.mnemonic.clone(),
+                    comment: "vstr source not modelled".into(),
+                });
+                return;
+            };
+            self.stmts.push(IrStmt::StoreMem {
+                address,
+                value,
+                bits,
+            });
+        }
+        self.emit_writeback(writeback);
+    }
+
     /// Lift an `AArch32` load. `width_override` is `Some(8)` for `ldrb`
     /// and `Some(16)` for `ldrh` (zero-extended into the 32-bit
     /// register); `None` for the word-sized `ldr`.
@@ -716,6 +788,14 @@ fn aarch32_mem_access(mem: &Operand, post: Option<&Operand>, ptr_bits: u16) -> O
         address: aarch32_addr_from(parent, offset, ptr_bits),
         writeback: None,
     })
+}
+
+/// Whether a memory operand's base register is the program counter — a
+/// PC-relative literal pool this model cannot resolve (no live PC value).
+fn aarch32_mem_base_is_pc(mem: &Operand) -> bool {
+    let raw = mem.raw.trim();
+    let body = raw.strip_suffix('!').unwrap_or(raw);
+    parse_aarch32_memory(body).is_some_and(|(base, _)| matches!(base.as_str(), "pc" | "r15"))
 }
 
 /// Build `base ± offset` at the pointer width (base alone if zero).

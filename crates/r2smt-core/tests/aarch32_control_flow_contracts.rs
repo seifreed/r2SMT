@@ -160,6 +160,96 @@ fn aarch32_vcmp_vmrs_branch_resolves_instead_of_truncating() {
     );
 }
 
+/// `mov r1,#5; str r1,[r0]; vldr s0,[r0]; vstr s0,[r0]; ldr r2,[r0];
+/// cmp r2,#5; beq tgt` — the 32 stored bits roundtrip through a VFP
+/// load and store unchanged, so r2 == 5 and the branch is always taken.
+fn vldr_vstr_roundtrip_program() -> Program {
+    let block = BasicBlock {
+        address: Address(0x1000),
+        instructions: vec![
+            insn(
+                0x1000,
+                "mov",
+                vec![
+                    op("r1", OperandKind::Register),
+                    op("5", OperandKind::Immediate),
+                ],
+            ),
+            insn(
+                0x1004,
+                "str",
+                vec![
+                    op("r1", OperandKind::Register),
+                    op("[r0]", OperandKind::Memory),
+                ],
+            ),
+            insn(
+                0x1008,
+                "vldr",
+                vec![
+                    op("s0", OperandKind::Register),
+                    op("[r0]", OperandKind::Memory),
+                ],
+            ),
+            insn(
+                0x100c,
+                "vstr",
+                vec![
+                    op("s0", OperandKind::Register),
+                    op("[r0]", OperandKind::Memory),
+                ],
+            ),
+            insn(
+                0x1010,
+                "ldr",
+                vec![
+                    op("r2", OperandKind::Register),
+                    op("[r0]", OperandKind::Memory),
+                ],
+            ),
+            insn(
+                0x1014,
+                "cmp",
+                vec![
+                    op("r2", OperandKind::Register),
+                    op("5", OperandKind::Immediate),
+                ],
+            ),
+            insn(0x1018, "beq", vec![op("0x1080", OperandKind::Immediate)]),
+        ],
+        successors: vec![],
+    };
+    Program {
+        arch: Arch::Arm,
+        bits: 32,
+        entry: Some(Address(0x1000)),
+        functions: vec![Function {
+            address: Address(0x1000),
+            name: Some("sym.main".into()),
+            blocks: vec![block],
+            is_thumb: true,
+        }],
+    }
+}
+
+#[test]
+fn aarch32_vldr_vstr_roundtrip_preserves_the_stored_bytes() {
+    let program = vldr_vstr_roundtrip_program();
+    let candidates = collect_branches(&program);
+    let candidate = candidates.first().expect("beq candidate");
+    let limits = SliceLimits {
+        allow_memory: true,
+        ..SliceLimits::default()
+    };
+    let slice = slice_branch(candidate, &program.functions[0], &limits, Arch::Arm);
+    let lifted = lift_slice(&slice, Arch::Arm);
+    assert_eq!(
+        solve_branch(&ssa_convert(&lifted), solve_opts()),
+        SmtResult::AlwaysTrue,
+        "the 32 stored bits must roundtrip through vldr/vstr unchanged",
+    );
+}
+
 #[test]
 fn aarch32_cbz_on_a_zeroed_register_is_always_taken() {
     // `mov r0, #0; cbz r0, tgt` — cbz branches when r0 == 0, which is

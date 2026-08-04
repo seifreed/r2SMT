@@ -44,20 +44,31 @@ fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> Instruct
     // answered above the dispatch. `AArch32` NEON is `v`-prefixed with
     // a type suffix and so collides less, but the indexed form
     // (`d0[1]`) reaches the integer arms exactly the same way.
-    match crate::lift::vector_shape(insn, Arch::Arm) {
-        // A structured access moves bytes rather than computing them,
-        // so its entry is the memory-shaped one.
-        crate::lift::VectorShape::LiftedMemory(effect) => {
-            return aarch32_structured_effect(insn, effect);
-        }
-        crate::lift::VectorShape::Declined => return other_effect(insn),
-        // `None` means no operand carries vector shape and the mnemonic
-        // dispatch below applies — which is also where a `Lifted` form
-        // lands, at the guard arm that builds the vector entry. The two
-        // share this arm because on `AArch32` the packed families are
-        // recognised from the mnemonic either way.
-        crate::lift::VectorShape::None | crate::lift::VectorShape::Lifted { .. } => {}
+    if let Some(effect) = aarch32_vector_shape_effect(insn) {
+        return effect;
     }
+    aarch32_dispatch_mnemonic(insn, dispatch_mnemonic)
+}
+
+/// The vector-shape prelude shared by every `AArch32` mnemonic: a
+/// structured access is the memory-shaped entry, a declined shape is
+/// `Other`, and `None` / `Lifted` fall through to the mnemonic dispatch.
+fn aarch32_vector_shape_effect(insn: &Instruction) -> Option<InstructionEffect> {
+    match crate::lift::vector_shape(insn, Arch::Arm) {
+        crate::lift::VectorShape::LiftedMemory(effect) => {
+            Some(aarch32_structured_effect(insn, effect))
+        }
+        crate::lift::VectorShape::Declined => Some(other_effect(insn)),
+        // `None` means no operand carries vector shape and the mnemonic
+        // dispatch applies — which is also where a `Lifted` form lands,
+        // at the guard arm that builds the vector entry. The two share
+        // this arm because on `AArch32` the packed families are
+        // recognised from the mnemonic either way.
+        crate::lift::VectorShape::None | crate::lift::VectorShape::Lifted { .. } => None,
+    }
+}
+
+fn aarch32_dispatch_mnemonic(insn: &Instruction, dispatch_mnemonic: &str) -> InstructionEffect {
     match dispatch_mnemonic {
         // 2-operand `mov Rd, Rn/imm` and `mvn Rd, Op` (bitwise NOT).
         // `movs` is the Thumb flag-setting move (N/Z from the value).
@@ -186,6 +197,11 @@ fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> Instruct
         "vmrs" if crate::lift::aarch32_vmrs_transfers_flags(insn) => {
             aarch32_vmrs_flag_transfer_effect()
         }
+        // Scalar VFP load / store. `vldr` defines its vector register
+        // (and reads it — the write merges); `vstr` reads it. Both touch
+        // memory so the memory-aware slice walker keeps them.
+        "vldr" => aarch32_vfp_mem_effect(insn, true),
+        "vstr" => aarch32_vfp_mem_effect(insn, false),
         m if crate::lift::vfp_scalar(m).is_some()
             || crate::lift::is_aarch32_packed_instruction(insn)
             || crate::lift::is_aarch32_neon_instruction(insn) =>
@@ -313,6 +329,39 @@ fn aarch32_str_effect(insn: &Instruction) -> InstructionEffect {
     InstructionEffect {
         kind: InstructionKind::Mov,
         defs: Vec::new(),
+        uses,
+        defines_flags: false,
+        has_memory_access: true,
+        is_call: false,
+        reads_flags: false,
+    }
+}
+
+fn aarch32_vfp_mem_effect(insn: &Instruction, is_load: bool) -> InstructionEffect {
+    let mut defs = Vec::new();
+    let mut uses = Vec::new();
+    if let Some(reg) = insn.operands.first()
+        && let Some(canonical) = canonical_register(&reg.raw, Arch::Arm)
+    {
+        if is_load {
+            defs.push(canonical);
+            // The load covers only the addressed slice, so the rest of
+            // the vector register survives and the prior value stays live.
+            uses.push(canonical);
+        } else {
+            uses.push(canonical);
+        }
+    }
+    if let Some(mem) = insn.operands.get(1) {
+        for r in registers_in_operand(mem, Arch::Arm) {
+            if !uses.contains(&r) {
+                uses.push(r);
+            }
+        }
+    }
+    InstructionEffect {
+        kind: InstructionKind::Simd,
+        defs,
         uses,
         defines_flags: false,
         has_memory_access: true,

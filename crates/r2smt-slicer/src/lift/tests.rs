@@ -815,6 +815,52 @@ fn aarch32_rsb_swaps_operands_and_subtracts() {
 }
 
 #[test]
+fn aarch32_vldr_loads_the_register_width_through_the_byte_model() {
+    // `vldr s0, [r0, #4]` loads 32 bits (the `s` register width) into a
+    // temp and merges it into the vector register.
+    let stmts = lift_aarch32("vldr", vec![reg("s0"), op("[r0, #4]", OperandKind::Memory)]);
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::LoadMem { bits: 32, .. })),
+        "{stmts:?}"
+    );
+    assert!(
+        !stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. }))
+    );
+}
+
+#[test]
+fn aarch32_vstr_stores_the_register_width() {
+    // `vstr d0, [r1]` stores 64 bits (the `d` register width).
+    let stmts = lift_aarch32("vstr", vec![reg("d0"), op("[r1]", OperandKind::Memory)]);
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::StoreMem { bits: 64, .. })),
+        "{stmts:?}"
+    );
+    assert!(
+        !stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. }))
+    );
+}
+
+#[test]
+fn aarch32_vldr_pc_relative_literal_pool_declines() {
+    // A PC-relative literal load has no live PC value in this model.
+    let stmts = lift_aarch32("vldr", vec![reg("s0"), op("[pc, #8]", OperandKind::Memory)]);
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. }))
+    );
+}
+
+#[test]
 fn aarch32_vmrs_flag_transfer_is_a_modelled_nop() {
     // `vmrs APSR_nzcv, FPSCR` is an identity in this model (vcmp wrote
     // NZCV directly), lifted as a Nop so the slice keeps walking past it

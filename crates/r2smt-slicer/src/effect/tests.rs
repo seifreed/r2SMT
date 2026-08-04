@@ -826,6 +826,38 @@ fn aarch32_thumb_wide_suffix_keeps_the_base_effect() {
 }
 
 #[test]
+fn aarch32_vldr_defines_its_register_and_touches_memory() {
+    // `vldr s0, [r0, #4]` defines the vector parent, reads it (merge)
+    // and the base, and flags memory access.
+    let i = insn(
+        "vldr",
+        vec![
+            op("s0", OperandKind::Register),
+            op("[r0, #4]", OperandKind::Memory),
+        ],
+    );
+    let e = analyze(&i, Arch::Arm);
+    assert!(e.has_memory_access);
+    assert_eq!(e.defs, vec!["v0"]);
+    assert!(e.uses.contains(&"v0") && e.uses.contains(&"r0"), "{e:?}");
+}
+
+#[test]
+fn aarch32_vstr_reads_its_register_and_defines_none() {
+    let i = insn(
+        "vstr",
+        vec![
+            op("d0", OperandKind::Register),
+            op("[r1]", OperandKind::Memory),
+        ],
+    );
+    let e = analyze(&i, Arch::Arm);
+    assert!(e.has_memory_access);
+    assert!(e.defs.is_empty());
+    assert!(e.uses.contains(&"v0") && e.uses.contains(&"r1"), "{e:?}");
+}
+
+#[test]
 fn aarch32_vmrs_flag_transfer_is_kept_not_truncated() {
     // `vmrs APSR_nzcv, FPSCR` must define and read the flags so the
     // slice walks past it to the `vcmp`, rather than falling to `Other`

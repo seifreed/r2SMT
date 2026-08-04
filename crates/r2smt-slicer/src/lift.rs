@@ -138,6 +138,11 @@ fn is_simd_instruction(insn: &Instruction, arch: Arch) -> bool {
                 // NEON, but its per-mnemonic identity must win over any
                 // ESIL lowering that would clobber the flags `vcmp` set.
                 || aarch32_vmrs_transfers_flags(insn)
+                // `vldr` / `vstr` likewise need the per-mnemonic handler,
+                // which lowers the operand to its vector parent through
+                // the byte-granular memory model rather than a
+                // pointer-width ESIL node.
+                || matches!(mnem.as_str(), "vldr" | "vstr")
         }
         _ => false,
     }
