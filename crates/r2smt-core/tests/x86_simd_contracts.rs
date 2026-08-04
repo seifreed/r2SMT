@@ -27,7 +27,11 @@ const VECTOR_BITS: u16 = 512;
 fn operand(raw: &str) -> Operand {
     Operand {
         raw: raw.into(),
-        kind: OperandKind::Register,
+        kind: if raw.starts_with(|c: char| c.is_ascii_digit()) {
+            OperandKind::Immediate
+        } else {
+            OperandKind::Register
+        },
     }
 }
 
@@ -331,5 +335,81 @@ fn movq_into_a_vector_keeps_the_low_quadword_and_zeroes_above_it() {
         &["xmm0", "xmm1"],
         &[("zmm0", u128::MAX), ("zmm1", 0x1234_5678_9abc_def0)],
         0x1234_5678_9abc_def0,
+    );
+}
+
+#[test]
+fn paddb_wraps_within_each_byte_lane() {
+    // 0xff + 0x02 is 0x01 in a byte and 0x101 in anything wider. If the
+    // lanes were not isolated the carry would bleed into the next one.
+    assert_computes(
+        "paddb",
+        &["xmm0", "xmm1"],
+        &[
+            ("zmm0", packed(8, &[0xff, 0x00])),
+            ("zmm1", packed(8, &[0x02, 0x00])),
+        ],
+        packed(8, &[0x01, 0x00]),
+    );
+}
+
+#[test]
+fn paddq_carries_across_the_whole_quadword() {
+    // The companion direction: at 64-bit lanes the same addition must
+    // carry, so a lowering stuck at byte width would be visibly wrong.
+    assert_computes(
+        "paddq",
+        &["xmm0", "xmm1"],
+        &[("zmm0", 0xff), ("zmm1", 0x02)],
+        0x101,
+    );
+}
+
+#[test]
+fn psrldq_slides_the_whole_register_by_bytes() {
+    // `psrldq` is not a lane shift: it moves the entire 128-bit value
+    // down by whole bytes, so byte 4 becomes byte 0.
+    assert_computes(
+        "psrldq",
+        &["xmm0", "4"],
+        &[("zmm0", packed(8, &[0, 0, 0, 0, 0xaa, 0xbb]))],
+        packed(8, &[0xaa, 0xbb]),
+    );
+}
+
+#[test]
+fn psrld_shifts_each_doubleword_independently() {
+    // The lane form, for contrast with psrldq: each dword shifts on its
+    // own and nothing crosses the boundary.
+    assert_computes(
+        "psrld",
+        &["xmm0", "4"],
+        &[("zmm0", packed(32, &[0xf0, 0xff00]))],
+        packed(32, &[0x0f, 0x0ff0]),
+    );
+}
+
+#[test]
+fn psraw_replicates_the_sign_bit() {
+    // Arithmetic right shift of 0x8000 by 4 is 0xf800, not 0x0800 —
+    // using a logical shift here is a wrong value, not a decline.
+    assert_computes(
+        "psraw",
+        &["xmm0", "4"],
+        &[("zmm0", packed(16, &[0x8000]))],
+        packed(16, &[0xf800]),
+    );
+}
+
+#[test]
+fn psllw_past_the_lane_width_clears_the_lane() {
+    // x86 saturates rather than masking the count: a shift of 16 on a
+    // word lane yields zero, where masking to 0 would leave the lane
+    // untouched.
+    assert_computes(
+        "psllw",
+        &["xmm0", "16"],
+        &[("zmm0", packed(16, &[0x1234]))],
+        0,
     );
 }

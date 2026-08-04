@@ -10,6 +10,7 @@ use r2smt_ir::stmt::IrStmt;
 use crate::registers::{is_simd_parent, register_layout};
 
 use super::simd::{CompareKind, compare_lane};
+use super::{BinOp, PackedIntOp};
 use super::{
     BitwiseOp, ExtendKind, FpArithOp, LiftCtx, ShiftOp, fp_lane_result, fp_sort_bits_checked,
     nonzero_width,
@@ -37,6 +38,9 @@ const X87_EXTENDED_MEMORY_BITS: u16 = 80;
 impl LiftCtx {
     pub(super) fn lift_instruction_x86(&mut self, insn: &Instruction) {
         let mnem = insn.mnemonic.trim().to_ascii_lowercase();
+        if self.lift_x86_packed_int_by_mnemonic(insn, mnem.as_str()) {
+            return;
+        }
         match mnem.as_str() {
             "mov" => self.lift_mov(insn),
             "movzx" => self.lift_mov_extending(insn, ExtendKind::Zero),
@@ -647,6 +651,182 @@ impl LiftCtx {
         }
     }
 
+    /// The packed-integer half of the x86 dispatch: arithmetic, the
+    /// whole-view byte slides and the lane shifts.
+    ///
+    /// Returns whether it claimed the mnemonic. Split out of
+    /// [`Self::lift_instruction_x86`] only to keep each under the line
+    /// limit; both are pure dispatch tables.
+    fn lift_x86_packed_int_by_mnemonic(&mut self, insn: &Instruction, mnem: &str) -> bool {
+        match mnem {
+            // Packed integer arithmetic. The lane width is spelled by
+            // the mnemonic suffix, as with the FP families.
+            "paddb" | "vpaddb" => self.lift_simd_packed_int(insn, ADD, 8),
+            "paddw" | "vpaddw" => self.lift_simd_packed_int(insn, ADD, 16),
+            "paddd" | "vpaddd" => self.lift_simd_packed_int(insn, ADD, 32),
+            "paddq" | "vpaddq" => self.lift_simd_packed_int(insn, ADD, 64),
+            "psubb" | "vpsubb" => self.lift_simd_packed_int(insn, SUB, 8),
+            "psubw" | "vpsubw" => self.lift_simd_packed_int(insn, SUB, 16),
+            "psubd" | "vpsubd" => self.lift_simd_packed_int(insn, SUB, 32),
+            "psubq" | "vpsubq" => self.lift_simd_packed_int(insn, SUB, 64),
+            "pmullw" | "vpmullw" => self.lift_simd_packed_int(insn, MUL, 16),
+            "pmulld" | "vpmulld" => self.lift_simd_packed_int(insn, MUL, 32),
+            // Whole-view byte slides, not lane shifts.
+            "pslldq" | "vpslldq" => self.lift_simd_byte_shift(insn, true),
+            "psrldq" | "vpsrldq" => self.lift_simd_byte_shift(insn, false),
+            // Lane shifts, immediate count only.
+            "psllw" | "vpsllw" => self.lift_simd_lane_shift(insn, ShiftOp::Shl, 16),
+            "pslld" | "vpslld" => self.lift_simd_lane_shift(insn, ShiftOp::Shl, 32),
+            "psllq" | "vpsllq" => self.lift_simd_lane_shift(insn, ShiftOp::Shl, 64),
+            "psrlw" | "vpsrlw" => self.lift_simd_lane_shift(insn, ShiftOp::Shr, 16),
+            "psrld" | "vpsrld" => self.lift_simd_lane_shift(insn, ShiftOp::Shr, 32),
+            "psrlq" | "vpsrlq" => self.lift_simd_lane_shift(insn, ShiftOp::Shr, 64),
+            "psraw" | "vpsraw" => self.lift_simd_lane_shift(insn, ShiftOp::Sar, 16),
+            "psrad" | "vpsrad" => self.lift_simd_lane_shift(insn, ShiftOp::Sar, 32),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Packed integer arithmetic: the same lane operation over every
+    /// `lane_bits` lane of the destination's view.
+    ///
+    /// Shares its operand roles and upper-bits rule with the packed FP
+    /// twin — 2-operand is read-modify-write, 3-operand VEX reads its
+    /// two explicit sources, and a VEX write zeroes above the view.
+    fn lift_simd_packed_int(&mut self, insn: &Instruction, op: PackedIntOp, lane_bits: u16) {
+        let ops = &insn.operands;
+        let Some(dst) = ops.first() else {
+            return;
+        };
+        let (a_op, b_op) = match ops.len() {
+            2 => (dst, &ops[1]),
+            3 => (&ops[1], &ops[2]),
+            _ => {
+                self.push_simd_unsupported(insn);
+                return;
+            }
+        };
+        let (dst_c, a_c, b_c) = (dst.clone(), a_op.clone(), b_op.clone());
+        let Some(result) = self.packed_int_result(&dst_c, &a_c, Some(&b_c), op, lane_bits) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        if !self.write_simd_dst(&dst_c, result, is_vex(insn)) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
+    /// `pslldq` / `psrldq` — shift the *whole view* by a byte count.
+    ///
+    /// Despite sitting among the lane shifts these are not lane
+    /// operations at all: they slide the entire 128-bit (or 256-bit)
+    /// value, so treating them as a per-lane shift would be silently
+    /// wrong. A count of 16 or more clears the register.
+    fn lift_simd_byte_shift(&mut self, insn: &Instruction, left: bool) {
+        let ops = &insn.operands;
+        let (Some(dst), Some(count)) = (ops.first(), ops.last()) else {
+            return;
+        };
+        let (dst, count) = (dst.clone(), count.clone());
+        let source = if ops.len() == 3 {
+            ops[1].clone()
+        } else {
+            dst.clone()
+        };
+        let (Some(view), Some(bytes)) = (self.simd_view_bits(&dst), parse_immediate(&count.raw))
+        else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let Some(value) = self.simd_operand_value(&source, view) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let shift = bytes.saturating_mul(u64::from(BITS_PER_BYTE));
+        let result = if shift >= u64::from(view) {
+            Expr::konst(0, view)
+        } else {
+            let amount = Expr::konst(u128::from(shift), view);
+            if left {
+                Expr::shl(value, amount)
+            } else {
+                Expr::lshr(value, amount)
+            }
+        };
+        if !self.write_simd_dst(&dst, result, is_vex(insn)) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
+    /// `psll` / `psrl` / `psra` with an immediate count, applied to
+    /// every lane.
+    ///
+    /// The register-count form is deliberately absent: it takes the
+    /// amount from the low 64 bits of a vector register, which is a
+    /// different shape, and declining it is sound.
+    fn lift_simd_lane_shift(&mut self, insn: &Instruction, op: ShiftOp, lane_bits: u16) {
+        let ops = &insn.operands;
+        let (Some(dst), Some(count)) = (ops.first(), ops.last()) else {
+            return;
+        };
+        let (dst, count) = (dst.clone(), count.clone());
+        let source = if ops.len() == 3 {
+            ops[1].clone()
+        } else {
+            dst.clone()
+        };
+        if count.kind != OperandKind::Immediate {
+            self.push_simd_unsupported(insn);
+            return;
+        }
+        let (Some(view), Some(amount)) = (self.simd_view_bits(&dst), parse_immediate(&count.raw))
+        else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let (Some(value), Some(lanes)) = (
+            self.simd_operand_value(&source, view),
+            Self::packed_lane_count(view, lane_bits),
+        ) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let mut result = Vec::with_capacity(usize::from(lanes));
+        for index in 0..lanes {
+            let Some(lane) = Self::extract_lane(value.clone(), lane_bits, index) else {
+                self.push_simd_unsupported(insn);
+                return;
+            };
+            // x86 saturates the shift rather than masking it: a count
+            // at or beyond the lane width zeroes the lane (or fills it
+            // with the sign for an arithmetic shift), where a bare
+            // `Shl` at that width is undefined in the IR.
+            result.push(if amount >= u64::from(lane_bits) {
+                match op {
+                    ShiftOp::Sar => {
+                        Expr::ashr(lane, Expr::konst(u128::from(lane_bits - 1), lane_bits))
+                    }
+                    _ => Expr::konst(0, lane_bits),
+                }
+            } else {
+                let by = Expr::konst(u128::from(amount), lane_bits);
+                match op {
+                    ShiftOp::Shl => Expr::shl(lane, by),
+                    ShiftOp::Shr => Expr::lshr(lane, by),
+                    ShiftOp::Sar => Expr::ashr(lane, by),
+                }
+            });
+        }
+        let Some(packed) = Self::concat_lanes(result) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        if !self.write_simd_dst(&dst, packed, is_vex(insn)) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
     /// `pmovmskb r32, xmm` — the sign bit of each source byte,
     /// concatenated into the low bits of a general register with the
     /// rest zeroed (16 bits from an `xmm` source, 32 from a `ymm`).
@@ -1210,6 +1390,11 @@ fn same_xmm_register(a: &Operand, b: &Operand) -> bool {
 /// Bits in a byte — the lane width `pmovmskb` samples.
 const BITS_PER_BYTE: u16 = 8;
 
+/// The lane-wise arithmetic `PackedIntOp`s x86 spells.
+const ADD: PackedIntOp = PackedIntOp::Bin(BinOp::Add);
+const SUB: PackedIntOp = PackedIntOp::Bin(BinOp::Sub);
+const MUL: PackedIntOp = PackedIntOp::Bin(BinOp::Mul);
+
 /// `pcmpeq*` — lane equality.
 const EQUAL: CompareKind = CompareKind::Equal { float: false };
 
@@ -1276,7 +1461,14 @@ pub(crate) fn x86_simd_shape(mnemonic: &str) -> Option<X86SimdShape> {
         // source, so they share the arithmetic's shape.
         | "pcmpeqb" | "pcmpeqw" | "pcmpeqd" | "pcmpeqq" | "pcmpgtb" | "pcmpgtw" | "pcmpgtd"
         | "pcmpgtq" | "vpcmpeqb" | "vpcmpeqw" | "vpcmpeqd" | "vpcmpeqq" | "vpcmpgtb"
-        | "vpcmpgtw" | "vpcmpgtd" | "vpcmpgtq" => X86SimdShape::ReadModifyWrite,
+        | "vpcmpgtw" | "vpcmpgtd" | "vpcmpgtq"
+        // Packed integer arithmetic and the shifts, same shape again.
+        | "paddb" | "paddw" | "paddd" | "paddq" | "psubb" | "psubw" | "psubd" | "psubq"
+        | "pmullw" | "pmulld" | "pslldq" | "psrldq" | "psllw" | "pslld" | "psllq" | "psrlw"
+        | "psrld" | "psrlq" | "psraw" | "psrad" | "vpaddb" | "vpaddw" | "vpaddd" | "vpaddq"
+        | "vpsubb" | "vpsubw" | "vpsubd" | "vpsubq" | "vpmullw" | "vpmulld" | "vpslldq"
+        | "vpsrldq" | "vpsllw" | "vpslld" | "vpsllq" | "vpsrlw" | "vpsrld" | "vpsrlq"
+        | "vpsraw" | "vpsrad" => X86SimdShape::ReadModifyWrite,
         _ => return None,
     };
     Some(shape)

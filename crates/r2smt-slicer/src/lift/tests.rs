@@ -3118,6 +3118,8 @@ fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
         "minps", "maxpd", "minpd", "maxss", "minss", "maxsd", "minsd", "sqrtps", "sqrtpd",
         "sqrtss", "sqrtsd", "movss", "movsd", "pcmpeqb", "pcmpeqw", "pcmpeqd", "pcmpeqq",
         "pcmpgtb", "pcmpgtw", "pcmpgtd", "pcmpgtq", "vpcmpeqb", "vpcmpeqd", "vpcmpgtb", "vpcmpgtd",
+        "paddb", "paddw", "paddd", "paddq", "psubb", "psubw", "psubd", "psubq", "pmullw", "pmulld",
+        "vpaddd", "vpsubb",
     ];
     // The vector-to-general transfers need realistic operands: their
     // destination is a GPR, not a vector register.
@@ -3125,6 +3127,11 @@ fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
         ("pmovmskb", "eax", "xmm1"),
         ("movd", "eax", "xmm1"),
         ("movq", "xmm0", "xmm1"),
+        ("pslldq", "xmm0", "4"),
+        ("psrldq", "xmm0", "4"),
+        ("psllw", "xmm0", "3"),
+        ("psrld", "xmm0", "3"),
+        ("psraw", "xmm0", "3"),
     ];
     let cases = mnemonics
         .iter()
@@ -3137,7 +3144,14 @@ fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
             m,
             vec![
                 op(dst, OperandKind::Register),
-                op(src, OperandKind::Register),
+                op(
+                    src,
+                    if src.starts_with(|c: char| c.is_ascii_digit()) {
+                        OperandKind::Immediate
+                    } else {
+                        OperandKind::Register
+                    },
+                ),
             ],
         );
         assert!(
