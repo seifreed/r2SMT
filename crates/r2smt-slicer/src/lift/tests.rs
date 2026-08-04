@@ -908,6 +908,70 @@ fn aarch32_register_post_index_updates_its_base_by_the_delta_register() {
 }
 
 #[test]
+fn aarch32_predicated_load_wraps_its_destination_in_an_ite() {
+    let stmts = lift_aarch32("ldreq", vec![reg("r0"), op("[r1]", OperandKind::Memory)]);
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    assert!(
+        stmts.iter().any(|s| matches!(
+            s,
+            IrStmt::Assign { dst, src } if dst.name == "r0" && format!("{src:?}").contains("Ite")
+        )),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_predicated_store_becomes_a_read_modify_write() {
+    // The IR has no conditional store. Wrapping only `Assign` would let
+    // `streq` write unconditionally — the memory would take the new
+    // value on a path the machine never stores on. Instead the store
+    // writes back the bytes already there when the predicate is false.
+    let stmts = lift_aarch32("streq", vec![reg("r0"), op("[r1]", OperandKind::Memory)]);
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    let store = stmts
+        .iter()
+        .find_map(|s| match s {
+            IrStmt::StoreMem { value, .. } => Some(format!("{value:?}")),
+            _ => None,
+        })
+        .expect("streq must still store");
+    assert!(store.contains("Ite"), "{store}");
+}
+
+#[test]
+fn aarch32_predicated_store_loads_the_old_bytes_before_storing() {
+    // The read-modify-write only works if the load is emitted ahead of
+    // the store that consumes it.
+    let stmts = lift_aarch32("streq", vec![reg("r0"), op("[r1]", OperandKind::Memory)]);
+    let load_at = stmts
+        .iter()
+        .position(|s| matches!(s, IrStmt::LoadMem { .. }));
+    let store_at = stmts
+        .iter()
+        .position(|s| matches!(s, IrStmt::StoreMem { .. }));
+    assert!(load_at < store_at, "{stmts:?}");
+    assert!(load_at.is_some(), "{stmts:?}");
+}
+
+#[test]
+fn aarch32_unpredicated_store_stays_a_plain_store() {
+    // Companion direction: an unconditional `str` must not pay for the
+    // read-modify-write.
+    let stmts = lift_aarch32("str", vec![reg("r0"), op("[r1]", OperandKind::Memory)]);
+    assert!(
+        !stmts.iter().any(|s| matches!(s, IrStmt::LoadMem { .. })),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_predicated_pop_lifts_rather_than_declining() {
+    // `popne` appears in every conditional ARM epilogue.
+    let stmts = lift_aarch32("popne", vec![op("{r4, pc}", OperandKind::Unknown)]);
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+}
+
+#[test]
 fn aarch32_sxtb_sign_extends_the_low_byte() {
     let stmts = lift_aarch32("sxtb", vec![reg("r0"), reg("r1")]);
     assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");

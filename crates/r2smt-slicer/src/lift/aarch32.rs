@@ -356,6 +356,65 @@ impl LiftCtx {
         self.set_flag("PF", Expr::Unknown(String::new()));
     }
 
+    /// Rewrite a `StoreMem` the predicated body emitted so it only
+    /// takes effect when `cond_expr` holds.
+    ///
+    /// The IR has no conditional store, so the store becomes a
+    /// read-modify-write: on the false path it writes back the bytes
+    /// already at that address. Exact for any address the byte model
+    /// can resolve, and it needs no new `Expr` variant.
+    ///
+    /// The load has to be emitted *before* the store it feeds, which is
+    /// why this returns the statement rather than editing in place.
+    fn predicated_store(
+        &mut self,
+        address: &Expr,
+        value: &Expr,
+        bits: u16,
+        cond_expr: &Expr,
+        at: r2smt_common::Address,
+    ) -> (IrStmt, IrStmt) {
+        let previous = self.new_temp(at, bits);
+        let load = IrStmt::LoadMem {
+            dst: previous.clone(),
+            address: address.clone(),
+            bits,
+        };
+        let store = IrStmt::StoreMem {
+            address: address.clone(),
+            value: Expr::Ite {
+                cond: Box::new(cond_expr.clone()),
+                then_expr: Box::new(value.clone()),
+                else_expr: Box::new(Expr::Var(previous)),
+            },
+            bits,
+        };
+        (load, store)
+    }
+
+    /// Replace every `StoreMem` emitted from `start_idx` onwards with
+    /// the conditional read-modify-write pair.
+    ///
+    /// Walks in reverse so each splice leaves the earlier indices valid.
+    fn predicate_stores(&mut self, start_idx: usize, cond_expr: &Expr, at: r2smt_common::Address) {
+        let stores: Vec<usize> = (start_idx..self.stmts.len())
+            .filter(|&i| matches!(self.stmts[i], IrStmt::StoreMem { .. }))
+            .collect();
+        for index in stores.into_iter().rev() {
+            let IrStmt::StoreMem {
+                address,
+                value,
+                bits,
+            } = self.stmts[index].clone()
+            else {
+                continue;
+            };
+            let (load, store) = self.predicated_store(&address, &value, bits, cond_expr, at);
+            self.stmts[index] = store;
+            self.stmts.insert(index, load);
+        }
+    }
+
     fn lift_aarch32_predicated(&mut self, insn: &Instruction, base: &str, cond_expr: &Expr) {
         // Re-enter the AArch32 dispatcher with the cond suffix peeled
         // off, then wrap every `Assign` it emitted in
@@ -371,6 +430,7 @@ impl LiftCtx {
         // a cond suffix, so `strip_aarch32_cond_suffix` returns `None`
         // and the `match` body executes normally.
         self.lift_instruction_aarch32(&base_insn);
+        self.predicate_stores(start_idx, cond_expr, insn.address);
         for stmt in self.stmts.iter_mut().skip(start_idx) {
             if let IrStmt::Assign { dst, src } = stmt {
                 let old_value = Expr::Var(dst.clone());

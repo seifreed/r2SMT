@@ -1157,7 +1157,10 @@ const AARCH32_BASE_MNEMONICS: &[&str] = &[
     "mov", "movs", "mvn", "add", "adds", "sub", "subs", "rsb", "rsbs", "and", "ands", "bic",
     "bics", "orr", "orrs", "eor", "eors", "mul", "muls", "udiv", "sdiv", "lsl", "lsls", "lsr",
     "lsrs", "asr", "asrs", "cmp", "cmn", "tst", "teq", "adc", "adcs", "sbc", "sbcs", "movw",
-    "movt", "sxtb", "sxth", "uxtb", "uxth", "rev", "mla", "mls", "umull", "smull",
+    "movt", "sxtb", "sxth", "uxtb", "uxth", "rev", "mla", "mls", "umull", "smull", "ldr", "ldrb",
+    "ldrh", "ldrsb", "ldrsh", "ldrd", "str", "strb", "strh", "strd", "push", "pop", "ldm", "ldmia",
+    "ldmib", "ldmda", "ldmdb", "ldmfd", "ldmea", "ldmfa", "ldmed", "stm", "stmia", "stmib",
+    "stmda", "stmdb", "stmfd", "stmea", "stmfa", "stmed",
 ];
 
 pub(crate) fn is_aarch32_base_supported(base: &str) -> bool {
