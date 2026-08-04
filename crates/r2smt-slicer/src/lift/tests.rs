@@ -908,6 +908,87 @@ fn aarch32_register_post_index_updates_its_base_by_the_delta_register() {
 }
 
 #[test]
+fn aarch32_sxtb_sign_extends_the_low_byte() {
+    let stmts = lift_aarch32("sxtb", vec![reg("r0"), reg("r1")]);
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    assert!(format!("{stmts:?}").contains("SignExtend"), "{stmts:?}");
+}
+
+#[test]
+fn aarch32_uxth_zero_extends_the_low_halfword() {
+    let stmts = lift_aarch32("uxth", vec![reg("r0"), reg("r1")]);
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    assert!(format!("{stmts:?}").contains("ZeroExtend"), "{stmts:?}");
+}
+
+#[test]
+fn aarch32_mla_accumulates_the_fourth_operand() {
+    // `mla Rd, Rn, Rm, Ra` = Ra + Rn*Rm. The accumulator is operand 3,
+    // not operand 1 — reading it positionally like every other
+    // 3-operand form would multiply the wrong pair.
+    let stmts = lift_aarch32("mla", vec![reg("r0"), reg("r1"), reg("r2"), reg("r3")]);
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    let body = format!("{stmts:?}");
+    assert!(body.contains("Add(Var(Var { name: \"r3\""), "{stmts:?}");
+    assert!(body.contains("Mul"), "{stmts:?}");
+}
+
+#[test]
+fn aarch32_mls_subtracts_the_product_from_the_accumulator() {
+    let stmts = lift_aarch32("mls", vec![reg("r0"), reg("r1"), reg("r2"), reg("r3")]);
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    assert!(
+        format!("{stmts:?}").contains("Sub(Var(Var { name: \"r3\""),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_umull_widens_before_multiplying() {
+    // The whole point of the long multiply is the high half. Computing
+    // the product at the source width would discard exactly the bits
+    // `RdHi` receives.
+    let stmts = lift_aarch32("umull", vec![reg("r0"), reg("r1"), reg("r2"), reg("r3")]);
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.bits == 64)),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_smull_writes_both_halves_to_different_registers() {
+    let stmts = lift_aarch32("smull", vec![reg("r0"), reg("r1"), reg("r2"), reg("r3")]);
+    let written: Vec<&str> = stmts
+        .iter()
+        .filter_map(|s| match s {
+            IrStmt::Assign { dst, .. } if dst.name == "r0" || dst.name == "r1" => {
+                Some(dst.name.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        written.contains(&"r0") && written.contains(&"r1"),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_rev_reverses_every_byte() {
+    let stmts = lift_aarch32("rev", vec![reg("r0"), reg("r1")]);
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    // Four bytes reversed is three nested Concats.
+    assert_eq!(
+        format!("{stmts:?}").matches("Concat").count(),
+        3,
+        "{stmts:?}"
+    );
+}
+
+#[test]
 fn aarch32_adc_adds_the_carry_flag() {
     let stmts = lift_aarch32("adc", vec![reg("r0"), reg("r1"), reg("r2")]);
     assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");

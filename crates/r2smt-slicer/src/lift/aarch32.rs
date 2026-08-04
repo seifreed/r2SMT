@@ -117,6 +117,15 @@ impl LiftCtx {
             "adcs" => self.lift_aarch32_carry_arith(insn, BinOp::Add, true),
             "sbc" => self.lift_aarch32_carry_arith(insn, BinOp::Sub, false),
             "sbcs" => self.lift_aarch32_carry_arith(insn, BinOp::Sub, true),
+            "sxtb" => self.lift_aarch32_extend(insn, 8, true),
+            "sxth" => self.lift_aarch32_extend(insn, 16, true),
+            "uxtb" => self.lift_aarch32_extend(insn, 8, false),
+            "uxth" => self.lift_aarch32_extend(insn, 16, false),
+            "mla" => self.lift_aarch32_multiply_accumulate(insn, true),
+            "mls" => self.lift_aarch32_multiply_accumulate(insn, false),
+            "umull" => self.lift_aarch32_long_multiply(insn, false),
+            "smull" => self.lift_aarch32_long_multiply(insn, true),
+            "rev" => self.lift_aarch32_reverse_bytes(insn),
             "movw" => self.lift_aarch32_mov_half(insn, false),
             "movt" => self.lift_aarch32_mov_half(insn, true),
             "add" => self.lift_aarch64_arith3(insn, BinOp::Add, false),
@@ -579,6 +588,148 @@ impl LiftCtx {
         }
         if !self.write_register_to(dst, result) {
             self.unsupported_aarch32(insn, "adc/sbc destination not a supported register");
+        }
+    }
+
+    /// `sxtb`/`sxth`/`uxtb`/`uxth Rd, Rm` — take the low `bits` of the
+    /// source and extend them across the destination.
+    fn lift_aarch32_extend(&mut self, insn: &Instruction, bits: u16, signed: bool) {
+        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
+            self.unsupported_aarch32(insn, "extend expects Rd, Rm");
+            return;
+        };
+        if dst.kind != OperandKind::Register {
+            self.unsupported_aarch32(insn, "extend non-register destination");
+            return;
+        }
+        let Some(width) = nonzero_width(self.operand_width(dst)) else {
+            self.unsupported_aarch32(insn, "extend zero-width destination");
+            return;
+        };
+        let low = Expr::extract(self.read_operand_at(src, width), bits - 1, 0);
+        let result = if signed {
+            Expr::sign_ext(low, width)
+        } else {
+            Expr::zero_ext(low, width)
+        };
+        if !self.write_register_to(dst, result) {
+            self.unsupported_aarch32(insn, "extend destination not a supported register");
+        }
+    }
+
+    /// `mla Rd, Rn, Rm, Ra` = `Ra + Rn * Rm`; `mls` subtracts instead.
+    /// The accumulator is the *fourth* operand, unlike every other
+    /// 3-operand form where operand 1 is the first source.
+    fn lift_aarch32_multiply_accumulate(&mut self, insn: &Instruction, add: bool) {
+        let (Some(dst), Some(n), Some(m), Some(a)) = (
+            insn.operands.first(),
+            insn.operands.get(1),
+            insn.operands.get(2),
+            insn.operands.get(3),
+        ) else {
+            self.unsupported_aarch32(insn, "mla/mls expect Rd, Rn, Rm, Ra");
+            return;
+        };
+        if dst.kind != OperandKind::Register {
+            self.unsupported_aarch32(insn, "mla/mls non-register destination");
+            return;
+        }
+        let Some(width) = nonzero_width(self.operand_width(dst)) else {
+            self.unsupported_aarch32(insn, "mla/mls zero-width destination");
+            return;
+        };
+        let product = Expr::mul(
+            self.read_operand_at(n, width),
+            self.read_operand_at(m, width),
+        );
+        let accumulator = self.read_operand_at(a, width);
+        let result = if add {
+            Expr::add(accumulator, product)
+        } else {
+            Expr::sub(accumulator, product)
+        };
+        if !self.write_register_to(dst, result) {
+            self.unsupported_aarch32(insn, "mla/mls destination not a supported register");
+        }
+    }
+
+    /// `umull RdLo, RdHi, Rn, Rm` — the full 2N-bit product, split
+    /// across two registers. Computing it at the source width would
+    /// discard exactly the half `RdHi` receives, so both operands widen
+    /// first.
+    fn lift_aarch32_long_multiply(&mut self, insn: &Instruction, signed: bool) {
+        let (Some(lo), Some(hi), Some(n), Some(m)) = (
+            insn.operands.first(),
+            insn.operands.get(1),
+            insn.operands.get(2),
+            insn.operands.get(3),
+        ) else {
+            self.unsupported_aarch32(insn, "umull/smull expect RdLo, RdHi, Rn, Rm");
+            return;
+        };
+        if lo.kind != OperandKind::Register || hi.kind != OperandKind::Register {
+            self.unsupported_aarch32(insn, "umull/smull non-register destination");
+            return;
+        }
+        let width = self.bits;
+        let wide = width * 2;
+        let extend = |value: Expr| {
+            if signed {
+                Expr::sign_ext(value, wide)
+            } else {
+                Expr::zero_ext(value, wide)
+            }
+        };
+        let product = Expr::mul(
+            extend(self.read_operand_at(n, width)),
+            extend(self.read_operand_at(m, width)),
+        );
+        let tmp = self.new_temp(insn.address, wide);
+        self.assign(tmp.clone(), product);
+        let halves = [
+            (lo, Expr::extract(Expr::Var(tmp.clone()), width - 1, 0)),
+            (hi, Expr::extract(Expr::Var(tmp), wide - 1, width)),
+        ];
+        for (dst, value) in halves {
+            if !self.write_register_to(dst, value) {
+                self.unsupported_aarch32(insn, "umull/smull destination not a supported register");
+                return;
+            }
+        }
+    }
+
+    /// `rev Rd, Rm` — reverse the byte order of the whole register.
+    fn lift_aarch32_reverse_bytes(&mut self, insn: &Instruction) {
+        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
+            self.unsupported_aarch32(insn, "rev expects Rd, Rm");
+            return;
+        };
+        if dst.kind != OperandKind::Register {
+            self.unsupported_aarch32(insn, "rev non-register destination");
+            return;
+        }
+        let Some(width) = nonzero_width(self.operand_width(dst)) else {
+            self.unsupported_aarch32(insn, "rev zero-width destination");
+            return;
+        };
+        let value = self.read_operand_at(src, width);
+        // Concat is (high, low), so walking the source bytes from lowest
+        // to highest and folding each onto the low end reverses them.
+        let mut result: Option<Expr> = None;
+        for byte in 0..width / 8 {
+            let lo = byte * 8;
+            let slice = Expr::extract(value.clone(), lo + 7, lo);
+            result = Some(match result {
+                None => slice,
+                Some(acc) => Expr::concat(acc, slice),
+            });
+        }
+        let Some(result) = result else {
+            self.unsupported_aarch32(insn, "rev on a sub-byte destination");
+            return;
+        };
+        if !self.write_register_to(dst, result) {
+            self.unsupported_aarch32(insn, "rev destination not a supported register");
         }
     }
 

@@ -88,15 +88,31 @@ fn aarch32_vector_shape_effect(insn: &Instruction) -> Option<InstructionEffect> 
     }
 }
 
-fn aarch32_dispatch_mnemonic(insn: &Instruction, dispatch_mnemonic: &str) -> InstructionEffect {
-    match dispatch_mnemonic {
+/// The data-processing half of the `AArch32` dispatch: everything whose
+/// effect is "define `Rd` from the source operands", with or without
+/// the flag side effect. Split out from [`aarch32_dispatch_mnemonic`]
+/// only to keep each under the line limit; both are pure dispatch.
+fn aarch32_data_processing_effect(
+    insn: &Instruction,
+    dispatch_mnemonic: &str,
+) -> Option<InstructionEffect> {
+    Some(match dispatch_mnemonic {
         // 2-operand `mov Rd, Rn/imm` and `mvn Rd, Op` (bitwise NOT).
         // `movs` is the Thumb flag-setting move (N/Z from the value).
         // `movw` overwrites the whole register, like `mov`; `movt`
         // replaces only the top half, so it reads `Rd` too.
-        "mov" | "mvn" | "movw" => aarch32_mov_effect(insn, false),
+        // The 2-operand whole-register writes: `Rd` is defined from the
+        // source and never read. Deliberately not `aarch32_arith_effect`,
+        // whose 2-operand arm reads `Rd` back for the Thumb narrow form
+        // (`add r0, r1` ≡ `add r0, r0, r1`) — `sxtb r0, r1` overwrites.
+        "mov" | "mvn" | "movw" | "sxtb" | "sxth" | "uxtb" | "uxth" | "rev" => {
+            aarch32_mov_effect(insn, false)
+        }
         "movs" => aarch32_mov_effect(insn, true),
         "movt" => aarch32_mov_half_top_effect(insn),
+        // `umull`/`smull` write *two* registers; reporting only the low
+        // one would let the walk drop a later read of the high half.
+        "umull" | "smull" => aarch32_long_multiply_effect(insn),
         "adc" | "sbc" | "adcs" | "sbcs" => aarch32_carry_arith_effect(insn, dispatch_mnemonic),
         // 3-operand arithmetic / logical. The `s` suffix sets flags.
         "add" => aarch32_arith_effect(insn, InstructionKind::Add, false),
@@ -118,7 +134,11 @@ fn aarch32_dispatch_mnemonic(insn: &Instruction, dispatch_mnemonic: &str) -> Ins
         "eors" => aarch32_arith_effect(insn, InstructionKind::Xor, true),
         // `mul`, `udiv`, `sdiv` share the 3-operand shape and never
         // set NZCV in their plain (no-`s`) form. `muls` toggles flags.
-        "mul" | "udiv" | "sdiv" => aarch32_arith_effect(insn, InstructionKind::Imul, false),
+        // `mla Rd, Rn, Rm, Ra` carries four operands, so the narrow-form
+        // arm of `aarch32_arith_effect` cannot misfire on it.
+        "mul" | "udiv" | "sdiv" | "mla" | "mls" => {
+            aarch32_arith_effect(insn, InstructionKind::Imul, false)
+        }
         "muls" => aarch32_arith_effect(insn, InstructionKind::Imul, true),
         "lsl" | "lsls" => aarch32_arith_effect(
             insn,
@@ -135,6 +155,15 @@ fn aarch32_dispatch_mnemonic(insn: &Instruction, dispatch_mnemonic: &str) -> Ins
             InstructionKind::Sar,
             dispatch_mnemonic.ends_with('s') && dispatch_mnemonic != "asr",
         ),
+        _ => return None,
+    })
+}
+
+fn aarch32_dispatch_mnemonic(insn: &Instruction, dispatch_mnemonic: &str) -> InstructionEffect {
+    if let Some(effect) = aarch32_data_processing_effect(insn, dispatch_mnemonic) {
+        return effect;
+    }
+    match dispatch_mnemonic {
         // `cmp` / `cmn` set flags from a subtract / add and have
         // identical register-flow shape; `tst` / `teq` are the
         // logical counterparts.
@@ -583,6 +612,35 @@ fn aarch32_mov_effect(insn: &Instruction, sets_flags: bool) -> InstructionEffect
         uses,
         defines_flags: sets_flags,
         has_memory_access: any_memory_operand(&insn.operands),
+        is_call: false,
+        reads_flags: false,
+    }
+}
+
+/// `umull RdLo, RdHi, Rn, Rm` defines both destination registers and
+/// reads only the two factors.
+fn aarch32_long_multiply_effect(insn: &Instruction) -> InstructionEffect {
+    const FACTOR_INDEX: usize = 2;
+    let defs: Vec<&'static str> = insn
+        .operands
+        .iter()
+        .take(FACTOR_INDEX)
+        .filter_map(|op| canonical_register(&op.raw, Arch::Arm))
+        .collect();
+    let mut uses: Vec<&'static str> = Vec::new();
+    for op in insn.operands.iter().skip(FACTOR_INDEX) {
+        for r in registers_in_operand(op, Arch::Arm) {
+            if !uses.contains(&r) {
+                uses.push(r);
+            }
+        }
+    }
+    InstructionEffect {
+        kind: InstructionKind::Mov,
+        defs,
+        uses,
+        defines_flags: false,
+        has_memory_access: false,
         is_call: false,
         reads_flags: false,
     }
