@@ -83,6 +83,7 @@ impl LiftCtx {
         }
         match mnem.as_str() {
             "mov" => self.lift_aarch64_mov(insn),
+            "movs" => self.lift_aarch32_movs(insn),
             "mvn" => self.lift_aarch32_mvn(insn),
             "add" => self.lift_aarch64_arith3(insn, BinOp::Add, false),
             "adds" => self.lift_aarch64_arith3(insn, BinOp::Add, true),
@@ -354,6 +355,45 @@ impl LiftCtx {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: "non-register destination (mvn)".into(),
+            });
+        }
+    }
+
+    /// `movs Rd, Op` — a move that also sets N/Z from the moved value.
+    /// C and V are unchanged for the register form and non-rotated
+    /// immediates (the modified-immediate carry is not modelled), so
+    /// they are left untouched rather than fabricated. The value is
+    /// stashed in a temp before the destination write so the flag terms
+    /// read the moved value, not the post-write register (the
+    /// flag-ordering invariant, load-bearing when `Rd` overlaps `Op`).
+    fn lift_aarch32_movs(&mut self, insn: &Instruction) {
+        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
+            return;
+        };
+        if dst.kind != OperandKind::Register {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "non-register destination (movs)".into(),
+            });
+            return;
+        }
+        let Some(dst_width) = nonzero_width(self.operand_width(dst)) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "zero-width destination (movs)".into(),
+            });
+            return;
+        };
+        let value = self.read_operand_at(src, dst_width);
+        let tmp = self.new_temp(insn.address, dst_width);
+        self.assign(tmp.clone(), value);
+        let tmp_expr = Expr::Var(tmp);
+        self.set_flag("ZF", Expr::eq(tmp_expr.clone(), Expr::konst(0, dst_width)));
+        self.set_flag("SF", Expr::slt(tmp_expr.clone(), Expr::konst(0, dst_width)));
+        if !self.write_register_to(dst, tmp_expr) {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "non-register destination (movs)".into(),
             });
         }
     }

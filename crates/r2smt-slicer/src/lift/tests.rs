@@ -815,6 +815,47 @@ fn aarch32_rsb_swaps_operands_and_subtracts() {
 }
 
 #[test]
+fn aarch32_movs_sets_zero_flag_from_the_moved_value() {
+    // `movs` is a flag-setting move: N/Z come from the value, C/V are
+    // untouched. `movs r0, #0` must set ZF, unlike plain `mov`.
+    let stmts = lift_aarch32("movs", vec![reg("r0"), op("0x0", OperandKind::Immediate)]);
+    let zf = stmts
+        .iter()
+        .find(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == "ZF"))
+        .expect("movs must set ZF");
+    assert!(matches!(
+        zf,
+        IrStmt::Assign {
+            src: Expr::Eq(..),
+            ..
+        }
+    ));
+    // Plain `mov` sets no flags.
+    let plain = lift_aarch32("mov", vec![reg("r0"), op("0x0", OperandKind::Immediate)]);
+    assert!(
+        !plain
+            .iter()
+            .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == "ZF")),
+        "plain mov must not set ZF"
+    );
+}
+
+#[test]
+fn aarch32_movs_leaves_carry_and_overflow_untouched() {
+    // MOVS updates N/Z only; C and V are unchanged, so the lifter must
+    // not fabricate CF / OF assignments.
+    let stmts = lift_aarch32("movs", vec![reg("r0"), reg("r1")]);
+    for flag in ["CF", "OF"] {
+        assert!(
+            !stmts
+                .iter()
+                .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == flag)),
+            "movs must not write {flag}"
+        );
+    }
+}
+
+#[test]
 fn aarch32_thumb_two_operand_arith_expands_the_destination() {
     // `add r0, r1` is the Thumb narrow form of `add r0, r0, r1`. Both
     // must lift identically.

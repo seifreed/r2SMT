@@ -1144,9 +1144,9 @@ const AARCH_COND_SUFFIXES: &[&str] = &[
 /// Used by the predicated-execution wrapper to decide whether to
 /// peel the cond suffix or fall through to `Unsupported`.
 const AARCH32_BASE_MNEMONICS: &[&str] = &[
-    "mov", "mvn", "add", "adds", "sub", "subs", "rsb", "rsbs", "and", "ands", "bic", "bics", "orr",
-    "orrs", "eor", "eors", "mul", "muls", "udiv", "sdiv", "lsl", "lsls", "lsr", "lsrs", "asr",
-    "asrs", "cmp", "cmn", "tst", "teq",
+    "mov", "movs", "mvn", "add", "adds", "sub", "subs", "rsb", "rsbs", "and", "ands", "bic",
+    "bics", "orr", "orrs", "eor", "eors", "mul", "muls", "udiv", "sdiv", "lsl", "lsls", "lsr",
+    "lsrs", "asr", "asrs", "cmp", "cmn", "tst", "teq",
 ];
 
 pub(crate) fn is_aarch32_base_supported(base: &str) -> bool {

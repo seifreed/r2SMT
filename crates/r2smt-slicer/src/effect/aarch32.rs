@@ -60,7 +60,9 @@ fn analyze_aarch32_base(insn: &Instruction, dispatch_mnemonic: &str) -> Instruct
     }
     match dispatch_mnemonic {
         // 2-operand `mov Rd, Rn/imm` and `mvn Rd, Op` (bitwise NOT).
-        "mov" | "mvn" => aarch32_mov_effect(insn),
+        // `movs` is the Thumb flag-setting move (N/Z from the value).
+        "mov" | "mvn" => aarch32_mov_effect(insn, false),
+        "movs" => aarch32_mov_effect(insn, true),
         // 3-operand arithmetic / logical. The `s` suffix sets flags.
         "add" => aarch32_arith_effect(insn, InstructionKind::Add, false),
         "adds" => aarch32_arith_effect(insn, InstructionKind::Add, true),
@@ -307,7 +309,7 @@ fn aarch32_str_effect(insn: &Instruction) -> InstructionEffect {
     }
 }
 
-fn aarch32_mov_effect(insn: &Instruction) -> InstructionEffect {
+fn aarch32_mov_effect(insn: &Instruction, sets_flags: bool) -> InstructionEffect {
     let mut defs = Vec::new();
     let mut uses = Vec::new();
     if let Some(dst) = insn.operands.first()
@@ -322,7 +324,7 @@ fn aarch32_mov_effect(insn: &Instruction) -> InstructionEffect {
         kind: InstructionKind::Mov,
         defs,
         uses,
-        defines_flags: false,
+        defines_flags: sets_flags,
         has_memory_access: any_memory_operand(&insn.operands),
         is_call: false,
         reads_flags: false,
