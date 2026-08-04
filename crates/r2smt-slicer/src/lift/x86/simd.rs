@@ -231,6 +231,21 @@ impl LiftCtx {
             "pabsb" | "vpabsb" => self.lift_simd_packed_int_unary(insn, ABSOLUTE, 8),
             "pabsw" | "vpabsw" => self.lift_simd_packed_int_unary(insn, ABSOLUTE, 16),
             "pabsd" | "vpabsd" => self.lift_simd_packed_int_unary(insn, ABSOLUTE, 32),
+            // Constant permutations selected by an immediate.
+            "pshufd" | "vpshufd" => self.lift_simd_shuffle(insn, ShuffleForm::Doubleword),
+            "pshuflw" | "vpshuflw" => self.lift_simd_shuffle(insn, ShuffleForm::LowWords),
+            "pshufhw" | "vpshufhw" => self.lift_simd_shuffle(insn, ShuffleForm::HighWords),
+            // Interleaves. The suffix names the *source* element and the
+            // destination element is twice it, which is why `punpcklbw`
+            // reads bytes and writes words.
+            "punpcklbw" | "vpunpcklbw" => self.lift_simd_unpack(insn, false, 8),
+            "punpcklwd" | "vpunpcklwd" => self.lift_simd_unpack(insn, false, 16),
+            "punpckldq" | "vpunpckldq" => self.lift_simd_unpack(insn, false, 32),
+            "punpcklqdq" | "vpunpcklqdq" => self.lift_simd_unpack(insn, false, 64),
+            "punpckhbw" | "vpunpckhbw" => self.lift_simd_unpack(insn, true, 8),
+            "punpckhwd" | "vpunpckhwd" => self.lift_simd_unpack(insn, true, 16),
+            "punpckhdq" | "vpunpckhdq" => self.lift_simd_unpack(insn, true, 32),
+            "punpckhqdq" | "vpunpckhqdq" => self.lift_simd_unpack(insn, true, 64),
             // Whole-view byte slides, not lane shifts.
             "pslldq" | "vpslldq" => self.lift_simd_byte_shift(insn, true),
             "psrldq" | "vpsrldq" => self.lift_simd_byte_shift(insn, false),
@@ -246,6 +261,108 @@ impl LiftCtx {
             _ => return false,
         }
         true
+    }
+
+    /// `pshufd` / `pshuflw` / `pshufhw` — a constant permutation of one
+    /// source, selected by an immediate.
+    ///
+    /// Never read-modify-write despite having three operands: the
+    /// immediate occupies the third slot, and every destination lane
+    /// comes from the source.
+    fn lift_simd_shuffle(&mut self, insn: &Instruction, form: ShuffleForm) {
+        let ops = &insn.operands;
+        let (Some(dst), Some(src), Some(imm)) = (ops.first(), ops.get(1), ops.get(2)) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let (dst, src, imm) = (dst.clone(), src.clone(), imm.clone());
+        if imm.kind != OperandKind::Immediate {
+            self.push_simd_unsupported(insn);
+            return;
+        }
+        let (Some(view), Some(selector)) = (
+            self.simd_instruction_view_bits(&[&dst, &src]),
+            parse_immediate(&imm.raw),
+        ) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let Some(picks) = shuffle_picks(form, selector, view) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let Some(result) = self.permuted_value(&src, None, view, form.lane_bits(), &picks) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        if !self.write_simd_dst(&dst, result, is_vex(insn)) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
+    /// `punpck{l,h}{bw,wd,dq,qdq}` — interleave the matching half of two
+    /// sources, lane by lane.
+    ///
+    /// Operand roles follow the arithmetic family: 2-operand is
+    /// read-modify-write, 3-operand VEX reads its two explicit sources.
+    fn lift_simd_unpack(&mut self, insn: &Instruction, high: bool, lane_bits: u16) {
+        let ops = &insn.operands;
+        let Some(dst) = ops.first() else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let (a_op, b_op) = match ops.len() {
+            2 => (dst, &ops[1]),
+            3 => (&ops[1], &ops[2]),
+            _ => {
+                self.push_simd_unsupported(insn);
+                return;
+            }
+        };
+        let (dst, a_op, b_op) = (dst.clone(), a_op.clone(), b_op.clone());
+        let Some(view) = self.simd_instruction_view_bits(&[&dst, &a_op, &b_op]) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let Some(picks) = unpack_picks(high, lane_bits, view) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let Some(result) = self.permuted_value(&a_op, Some(&b_op), view, lane_bits, &picks) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        if !self.write_simd_dst(&dst, result, is_vex(insn)) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
+    /// Build a whole view from a constant table of lane sources.
+    ///
+    /// Each operand is materialised **once** and the lanes are extracted
+    /// from that value, so a memory source costs one load rather than
+    /// one per lane. The picks carry absolute lane indices, which is what
+    /// lets the per-128-bit-block tables above be written once and
+    /// repeated across a 256-bit view.
+    fn permuted_value(
+        &mut self,
+        a_op: &Operand,
+        b_op: Option<&Operand>,
+        view: u16,
+        lane_bits: u16,
+        picks: &[LanePick],
+    ) -> Option<Expr> {
+        let a = self.simd_operand_value(a_op, view)?;
+        let b = match b_op {
+            Some(op) => Some(self.simd_operand_value(op, view)?),
+            None => None,
+        };
+        let mut lanes = Vec::with_capacity(picks.len());
+        for &(from_second, index) in picks {
+            let source = if from_second { b.clone()? } else { a.clone() };
+            lanes.push(Self::extract_lane(source, lane_bits, index)?);
+        }
+        Self::concat_lanes(lanes)
     }
 
     /// Packed integer arithmetic: the same lane operation over every
@@ -925,4 +1042,115 @@ impl LiftCtx {
             comment: format!("unmodellable SIMD operand at {addr}", addr = insn.address),
         });
     }
+}
+
+/// Where one destination lane comes from: `true` selects the second
+/// source operand, and the index is absolute within the whole view.
+type LanePick = (bool, u16);
+
+/// Bits in the 128-bit block every x86 lane permutation is confined to.
+///
+/// This is the load-bearing constant of the whole family. AVX widened
+/// `pshufd` and `punpck*` to 256 bits by running the *same* 128-bit
+/// permutation in each half rather than by widening the permutation, so
+/// an index never crosses the halfway line. Treating a `ymm` operand as
+/// one flat vector of lanes would move bytes between halves — a wrong
+/// value, not a decline.
+const PERMUTE_BLOCK_BITS: u16 = 128;
+
+/// Which constant shuffle a `pshuf*` mnemonic names.
+#[derive(Clone, Copy)]
+enum ShuffleForm {
+    /// `pshufd` — the immediate selects all four doublewords.
+    Doubleword,
+    /// `pshuflw` — the immediate selects the low four words; the high
+    /// four are copied.
+    LowWords,
+    /// `pshufhw` — the mirror image: the high four are selected, the low
+    /// four copied.
+    HighWords,
+}
+
+impl ShuffleForm {
+    /// The element width the form permutes.
+    const fn lane_bits(self) -> u16 {
+        match self {
+            Self::Doubleword => 32,
+            Self::LowWords | Self::HighWords => 16,
+        }
+    }
+
+    /// The lane the immediate's four selectors start at within a block.
+    const fn first_selected_lane(self) -> u16 {
+        match self {
+            Self::Doubleword | Self::LowWords => 0,
+            Self::HighWords => SHUFFLE_SELECTORS,
+        }
+    }
+}
+
+/// Selectors an `imm8` carries: four 2-bit fields.
+const SHUFFLE_SELECTORS: u16 = 4;
+/// Width of one of those fields.
+const SHUFFLE_SELECTOR_BITS: u16 = 2;
+/// Mask of one field.
+const SHUFFLE_SELECTOR_MASK: u64 = 0b11;
+
+/// How many whole 128-bit blocks a view divides into, or `None` if it is
+/// not a multiple of one.
+fn permute_blocks(view: u16) -> Option<u16> {
+    (view % PERMUTE_BLOCK_BITS == 0).then_some(view / PERMUTE_BLOCK_BITS)
+}
+
+/// The destination lane table of a `pshuf*`.
+///
+/// Within each block the four selected lanes come from the immediate and
+/// every other lane is copied straight through, which is what makes
+/// `pshuflw` leave the high quadword standing.
+fn shuffle_picks(form: ShuffleForm, selector: u64, view: u16) -> Option<Vec<LanePick>> {
+    let lane_bits = form.lane_bits();
+    let blocks = permute_blocks(view)?;
+    let per_block = PERMUTE_BLOCK_BITS / lane_bits;
+    let first = form.first_selected_lane();
+    let mut picks = Vec::with_capacity(usize::from(blocks) * usize::from(per_block));
+    for block in 0..blocks {
+        let base = block.checked_mul(per_block)?;
+        for lane in 0..per_block {
+            let within = match lane.checked_sub(first) {
+                Some(field) if field < SHUFFLE_SELECTORS => {
+                    let shift = u32::from(field.checked_mul(SHUFFLE_SELECTOR_BITS)?);
+                    let chosen = (selector >> shift) & SHUFFLE_SELECTOR_MASK;
+                    first.checked_add(u16::try_from(chosen).ok()?)?
+                }
+                // Outside the immediate's reach, so copied verbatim.
+                _ => lane,
+            };
+            picks.push((false, base.checked_add(within)?));
+        }
+    }
+    Some(picks)
+}
+
+/// The destination lane table of a `punpck{l,h}*`.
+///
+/// Alternating lanes come from the two sources, both read from the same
+/// half of their block: the low form takes the bottom half of each,
+/// the high form the top.
+fn unpack_picks(high: bool, lane_bits: u16, view: u16) -> Option<Vec<LanePick>> {
+    let blocks = permute_blocks(view)?;
+    let per_block = PERMUTE_BLOCK_BITS
+        .checked_div(lane_bits)
+        .filter(|n| *n > 1)?;
+    let half = per_block / 2;
+    let source_base = if high { half } else { 0 };
+    let mut picks = Vec::with_capacity(usize::from(blocks) * usize::from(per_block));
+    for block in 0..blocks {
+        let base = block.checked_mul(per_block)?;
+        for pair in 0..half {
+            let index = base.checked_add(source_base)?.checked_add(pair)?;
+            picks.push((false, index));
+            picks.push((true, index));
+        }
+    }
+    Some(picks)
 }

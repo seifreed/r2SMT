@@ -3103,6 +3103,125 @@ fn aarch32_families_are_covered_by_both_effect_and_lifter() {
     }
 }
 
+/// Every x86 SIMD mnemonic whose register-register 2-operand
+/// form the parity guard below exercises.
+const SIMD_PARITY_MNEMONICS: &[&str] = &[
+    "movaps",
+    "movups",
+    "movapd",
+    "movupd",
+    "movdqa",
+    "movdqu",
+    "vmovaps",
+    "vmovups",
+    "vmovapd",
+    "vmovupd",
+    "vmovdqa",
+    "vmovdqu",
+    "pxor",
+    "vpxor",
+    "pand",
+    "vpand",
+    "por",
+    "vpor",
+    "pandn",
+    "vpandn",
+    "addss",
+    "subss",
+    "mulss",
+    "divss",
+    "addsd",
+    "subsd",
+    "mulsd",
+    "divsd",
+    "addps",
+    "subps",
+    "mulps",
+    "divps",
+    "addpd",
+    "subpd",
+    "mulpd",
+    "divpd",
+    "maxps",
+    "minps",
+    "maxpd",
+    "minpd",
+    "maxss",
+    "minss",
+    "maxsd",
+    "minsd",
+    "sqrtps",
+    "sqrtpd",
+    "sqrtss",
+    "sqrtsd",
+    "movss",
+    "movsd",
+    "pcmpeqb",
+    "pcmpeqw",
+    "pcmpeqd",
+    "pcmpeqq",
+    "pcmpgtb",
+    "pcmpgtw",
+    "pcmpgtd",
+    "pcmpgtq",
+    "vpcmpeqb",
+    "vpcmpeqd",
+    "vpcmpgtb",
+    "vpcmpgtd",
+    "paddb",
+    "paddw",
+    "paddd",
+    "paddq",
+    "psubb",
+    "psubw",
+    "psubd",
+    "psubq",
+    "pmullw",
+    "pmulld",
+    "vpaddd",
+    "vpsubb",
+    "paddsb",
+    "paddsw",
+    "paddusb",
+    "paddusw",
+    "psubsb",
+    "psubsw",
+    "psubusb",
+    "psubusw",
+    "pavgb",
+    "pavgw",
+    "pmaxsb",
+    "pmaxsw",
+    "pmaxsd",
+    "pmaxub",
+    "pmaxuw",
+    "pmaxud",
+    "pminsb",
+    "pminsw",
+    "pminsd",
+    "pminub",
+    "pminuw",
+    "pminud",
+    "pabsb",
+    "pabsw",
+    "pabsd",
+    "vpaddsw",
+    "vpavgb",
+    "vpmaxub",
+    "vpminsd",
+    "vpabsd",
+    "punpcklbw",
+    "punpcklwd",
+    "punpckldq",
+    "punpcklqdq",
+    "punpckhbw",
+    "punpckhwd",
+    "punpckhdq",
+    "punpckhqdq",
+    "vpunpcklbw",
+    "vpunpckhqdq",
+];
+
 #[test]
 fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
     // Parity guard: the effect table keeps an instruction iff the lifter
@@ -3110,20 +3229,7 @@ fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
     // from the lifter (the historical `pandn` bug) leaves the vector
     // parent undefined — a stale-def fabrication. Assert both directions
     // stay in lockstep for every SIMD mnemonic.
-    let mnemonics = [
-        "movaps", "movups", "movapd", "movupd", "movdqa", "movdqu", "vmovaps", "vmovups",
-        "vmovapd", "vmovupd", "vmovdqa", "vmovdqu", "pxor", "vpxor", "pand", "vpand", "por",
-        "vpor", "pandn", "vpandn", "addss", "subss", "mulss", "divss", "addsd", "subsd", "mulsd",
-        "divsd", "addps", "subps", "mulps", "divps", "addpd", "subpd", "mulpd", "divpd", "maxps",
-        "minps", "maxpd", "minpd", "maxss", "minss", "maxsd", "minsd", "sqrtps", "sqrtpd",
-        "sqrtss", "sqrtsd", "movss", "movsd", "pcmpeqb", "pcmpeqw", "pcmpeqd", "pcmpeqq",
-        "pcmpgtb", "pcmpgtw", "pcmpgtd", "pcmpgtq", "vpcmpeqb", "vpcmpeqd", "vpcmpgtb", "vpcmpgtd",
-        "paddb", "paddw", "paddd", "paddq", "psubb", "psubw", "psubd", "psubq", "pmullw", "pmulld",
-        "vpaddd", "vpsubb", "paddsb", "paddsw", "paddusb", "paddusw", "psubsb", "psubsw",
-        "psubusb", "psubusw", "pavgb", "pavgw", "pmaxsb", "pmaxsw", "pmaxsd", "pmaxub", "pmaxuw",
-        "pmaxud", "pminsb", "pminsw", "pminsd", "pminub", "pminuw", "pminud", "pabsb", "pabsw",
-        "pabsd", "vpaddsw", "vpavgb", "vpmaxub", "vpminsd", "vpabsd",
-    ];
+    let mnemonics = SIMD_PARITY_MNEMONICS;
     // The vector-to-general transfers need realistic operands: their
     // destination is a GPR, not a vector register.
     let transfers = [
@@ -3136,58 +3242,66 @@ fn every_simd_mnemonic_is_covered_by_both_effect_and_lifter() {
         ("psrld", "xmm0", "3"),
         ("psraw", "xmm0", "3"),
     ];
+    // The `pshuf*` family carries a genuine third operand — the
+    // immediate selector — so it cannot be built from the 2-operand
+    // shape above.
+    let selected = ["pshufd", "pshuflw", "pshufhw", "vpshufd", "vpshufhw"];
     let cases = mnemonics
         .iter()
-        .map(|m| (*m, "xmm0", "xmm1"))
-        .chain(transfers);
-    for (m, dst, src) in cases {
-        let i = insn(
-            0x1000,
-            4,
-            m,
-            vec![
-                op(dst, OperandKind::Register),
-                op(
-                    src,
-                    if src.starts_with(|c: char| c.is_ascii_digit()) {
-                        OperandKind::Immediate
-                    } else {
-                        OperandKind::Register
-                    },
-                ),
-            ],
-        );
+        .map(|m| (*m, "xmm0", "xmm1", None))
+        .chain(transfers.map(|(m, dst, src)| (m, dst, src, None)))
+        .chain(selected.map(|m| (m, "xmm0", "xmm1", Some("0x1b"))));
+    for (m, dst, src, selector) in cases {
+        assert_simd_parity(m, dst, src, selector);
+    }
+}
+
+/// One case of the SIMD parity guard: the effect table and the lifter
+/// must agree about `mnemonic dst, src[, selector]`.
+fn assert_simd_parity(m: &str, dst: &str, src: &str, selector: Option<&str>) {
+    let mut operands = vec![
+        op(dst, OperandKind::Register),
+        op(
+            src,
+            if src.starts_with(|c: char| c.is_ascii_digit()) {
+                OperandKind::Immediate
+            } else {
+                OperandKind::Register
+            },
+        ),
+    ];
+    operands.extend(selector.map(|s| op(s, OperandKind::Immediate)));
+    let i = insn(0x1000, 4, m, operands);
+    assert!(
+        is_x86_simd_instruction(&i),
+        "{m}: not recognised by is_x86_simd_instruction"
+    );
+    assert_eq!(
+        crate::effect::analyze(&i, Arch::X86_64).kind,
+        crate::effect::InstructionKind::Simd,
+        "{m}: effect table does not classify it as Simd"
+    );
+    // The invariant that matters: whatever the effect table claims the
+    // instruction defines, the lifter must actually define. A mnemonic
+    // the slicer retains but no handler writes leaves its destination
+    // undefined, and a later read binds to a stale value — the `pandn`
+    // bug, and the shape of the ARM def/use gaps that fabricated
+    // verdicts.
+    let stmts = lift_per_mnemonic(&i, Arch::X86_64);
+    for def in crate::effect::analyze(&i, Arch::X86_64).defs {
         assert!(
-            is_x86_simd_instruction(&i),
-            "{m}: not recognised by is_x86_simd_instruction"
-        );
-        assert_eq!(
-            crate::effect::analyze(&i, Arch::X86_64).kind,
-            crate::effect::InstructionKind::Simd,
-            "{m}: effect table does not classify it as Simd"
-        );
-        // The invariant that matters: whatever the effect table claims
-        // the instruction defines, the lifter must actually define.
-        // A mnemonic the slicer retains but no handler writes leaves
-        // its destination undefined, and a later read binds to a stale
-        // value — the `pandn` bug, and the shape of the ARM def/use
-        // gaps that fabricated verdicts.
-        let stmts = lift_per_mnemonic(&i, Arch::X86_64);
-        for def in crate::effect::analyze(&i, Arch::X86_64).defs {
-            assert!(
-                stmts
-                    .iter()
-                    .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == def)),
-                "{m}: effect table claims it defines {def}, lifter does not"
-            );
-        }
-        assert!(
-            !stmts
+            stmts
                 .iter()
-                .any(|s| matches!(s, IrStmt::Unsupported { .. })),
-            "{m}: lifter emitted Unsupported"
+                .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == def)),
+            "{m}: effect table claims it defines {def}, lifter does not"
         );
     }
+    assert!(
+        !stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+        "{m}: lifter emitted Unsupported"
+    );
 }
 
 #[test]

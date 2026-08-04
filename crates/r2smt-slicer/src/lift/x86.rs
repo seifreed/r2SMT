@@ -683,7 +683,12 @@ pub(crate) fn x86_simd_shape(mnemonic: &str) -> Option<X86SimdShape> {
         // `pabs*` is the one packed integer arithmetic form whose
         // 2-operand shape is not read-modify-write: it writes the
         // destination from its single source.
-        | "pabsb" | "pabsw" | "pabsd" | "vpabsb" | "vpabsw" | "vpabsd" => X86SimdShape::Move,
+        | "pabsb" | "pabsw" | "pabsd" | "vpabsb" | "vpabsw" | "vpabsd"
+        // The `pshuf*` family has three operands, but the third is the
+        // immediate selector rather than a second source, and every
+        // destination lane comes from the one source.
+        | "pshufd" | "pshuflw" | "pshufhw" | "vpshufd" | "vpshuflw"
+        | "vpshufhw" => X86SimdShape::Move,
         // 2-operand read-modify-write (or its 3-operand VEX form).
         "pxor" | "vpxor" | "pand" | "vpand" | "por" | "vpor" | "pandn" | "vpandn" | "addss"
         | "subss" | "mulss" | "divss" | "addsd" | "subsd" | "mulsd" | "divsd" | "addps"
@@ -714,7 +719,13 @@ pub(crate) fn x86_simd_shape(mnemonic: &str) -> Option<X86SimdShape> {
         | "vpaddsb" | "vpaddsw" | "vpaddusb" | "vpaddusw" | "vpsubsb" | "vpsubsw" | "vpsubusb"
         | "vpsubusw" | "vpavgb" | "vpavgw" | "vpmaxsb" | "vpmaxsw" | "vpmaxsd" | "vpmaxub"
         | "vpmaxuw" | "vpmaxud" | "vpminsb" | "vpminsw" | "vpminsd" | "vpminub" | "vpminuw"
-        | "vpminud" => X86SimdShape::ReadModifyWrite,
+        | "vpminud"
+        // The interleaves read the destination as their first source in
+        // the 2-operand form, like the arithmetic.
+        | "punpcklbw" | "punpcklwd" | "punpckldq" | "punpcklqdq" | "punpckhbw" | "punpckhwd"
+        | "punpckhdq" | "punpckhqdq" | "vpunpcklbw" | "vpunpcklwd" | "vpunpckldq"
+        | "vpunpcklqdq" | "vpunpckhbw" | "vpunpckhwd" | "vpunpckhdq"
+        | "vpunpckhqdq" => X86SimdShape::ReadModifyWrite,
         _ => return None,
     };
     Some(shape)

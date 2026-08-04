@@ -68,6 +68,46 @@ fn solve_lowering(
     sources: &[(&str, u128)],
     expected: u128,
 ) -> SmtResult {
+    solve_lowering_at(mnemonic, operands, sources, expected, 0)
+}
+
+/// As [`solve_lowering`], but comparing the 128-bit block starting at
+/// `lo` rather than the low one — the only way to state a contract about
+/// the upper half of a 256-bit view.
+fn solve_lowering_at(
+    mnemonic: &str,
+    operands: &[&str],
+    sources: &[(&str, u128)],
+    expected: u128,
+    lo: u16,
+) -> SmtResult {
+    let bindings: Vec<(&str, Expr)> = sources
+        .iter()
+        .map(|(name, value)| (*name, Expr::konst(*value, VECTOR_BITS)))
+        .collect();
+    solve_with_bindings(mnemonic, operands, &bindings, expected, lo)
+}
+
+/// A `VECTOR_BITS`-wide constant whose two low 128-bit blocks are `low`
+/// and `high`.
+///
+/// Needed because a 256-bit source does not fit the `u128` the other
+/// helpers bind, and the block-confinement contracts are exactly the
+/// ones that need data in the upper block.
+fn two_blocks(low: u128, high: u128) -> Expr {
+    Expr::concat(
+        Expr::konst(0, VECTOR_BITS - 256),
+        Expr::concat(Expr::konst(high, 128), Expr::konst(low, 128)),
+    )
+}
+
+fn solve_with_bindings(
+    mnemonic: &str,
+    operands: &[&str],
+    sources: &[(&str, Expr)],
+    expected: u128,
+    lo: u16,
+) -> SmtResult {
     let insn = Instruction {
         address: Address::new(0x1000),
         size: 4,
@@ -90,7 +130,7 @@ fn solve_lowering(
         .iter()
         .map(|(name, value)| IrStmt::Assign {
             dst: Var::new(*name, VECTOR_BITS),
-            src: Expr::konst(*value, VECTOR_BITS),
+            src: value.clone(),
         })
         .collect();
     statements.extend(lifted);
@@ -99,7 +139,7 @@ fn solve_lowering(
         branch: branch(),
         statements,
         condition: Expr::eq(
-            Expr::extract(Expr::Var(Var::new("zmm0", VECTOR_BITS)), 127, 0),
+            Expr::extract(Expr::Var(Var::new("zmm0", VECTOR_BITS)), lo + 127, lo),
             Expr::konst(expected, 128),
         ),
         status: SliceStatus::Complete,
@@ -516,5 +556,173 @@ fn pabsw_writes_its_destination_from_the_source_alone() {
             ("zmm1", packed(16, &[0xfffb, 0x0003])),
         ],
         packed(16, &[0x0005, 0x0003]),
+    );
+}
+
+#[test]
+fn punpcklbw_interleaves_the_low_bytes_of_both_sources() {
+    // Destination byte 2i comes from the first source and 2i+1 from the
+    // second, both from the *low* half. Concatenating the halves
+    // instead would put all of xmm0's bytes below all of xmm1's.
+    assert_computes(
+        "punpcklbw",
+        &["xmm0", "xmm1"],
+        &[
+            ("zmm0", packed(8, &[0x11, 0x22, 0x33, 0x44])),
+            ("zmm1", packed(8, &[0xaa, 0xbb, 0xcc, 0xdd])),
+        ],
+        packed(8, &[0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc, 0x44, 0xdd]),
+    );
+}
+
+#[test]
+fn punpckhqdq_takes_the_upper_quadword_of_each_source() {
+    // The high form reads the top half of each source, so the result is
+    // xmm0's upper quadword under xmm1's.
+    assert_computes(
+        "punpckhqdq",
+        &["xmm0", "xmm1"],
+        &[
+            (
+                "zmm0",
+                packed(64, &[0x1111_1111_1111_1111, 0x2222_2222_2222_2222]),
+            ),
+            (
+                "zmm1",
+                packed(64, &[0x3333_3333_3333_3333, 0x4444_4444_4444_4444]),
+            ),
+        ],
+        packed(64, &[0x2222_2222_2222_2222, 0x4444_4444_4444_4444]),
+    );
+}
+
+#[test]
+fn pshufd_selects_each_doubleword_by_its_immediate_field() {
+    // 0x1b is 00_01_10_11, so the destination doublewords come from
+    // source doublewords 3, 2, 1, 0 — a reversal.
+    assert_computes(
+        "pshufd",
+        &["xmm0", "xmm1", "0x1b"],
+        &[(
+            "zmm1",
+            packed(32, &[0x0000_000a, 0x0000_000b, 0x0000_000c, 0x0000_000d]),
+        )],
+        packed(32, &[0x0000_000d, 0x0000_000c, 0x0000_000b, 0x0000_000a]),
+    );
+}
+
+#[test]
+fn pshufd_writes_its_destination_from_the_source_alone() {
+    // Three operands, but the third is the selector — this is not a
+    // read-modify-write, so whatever xmm0 held is discarded.
+    assert_computes(
+        "pshufd",
+        &["xmm0", "xmm1", "0x00"],
+        &[
+            (
+                "zmm0",
+                packed(32, &[0x7777_7777, 0x7777_7777, 0x7777_7777, 0x7777_7777]),
+            ),
+            ("zmm1", packed(32, &[0x0000_0005, 0, 0, 0])),
+        ],
+        packed(32, &[5, 5, 5, 5]),
+    );
+}
+
+#[test]
+fn pshuflw_leaves_the_high_quadword_standing() {
+    // Only the low four words are permuted; the top four are copied
+    // verbatim. Permuting all eight would be a wrong value.
+    assert_computes(
+        "pshuflw",
+        &["xmm0", "xmm1", "0x1b"],
+        &[("zmm1", packed(16, &[1, 2, 3, 4, 5, 6, 7, 8]))],
+        packed(16, &[4, 3, 2, 1, 5, 6, 7, 8]),
+    );
+}
+
+#[test]
+fn pshufhw_permutes_only_the_high_quadword() {
+    // The mirror image: the low four words are copied and the immediate
+    // selects among the high four, whose indices start at 4.
+    assert_computes(
+        "pshufhw",
+        &["xmm0", "xmm1", "0x1b"],
+        &[("zmm1", packed(16, &[1, 2, 3, 4, 5, 6, 7, 8]))],
+        packed(16, &[1, 2, 3, 4, 8, 7, 6, 5]),
+    );
+}
+
+#[test]
+fn vpshufd_permutes_each_128_bit_block_independently() {
+    // The load-bearing property of the 256-bit forms: AVX widened these
+    // by running the same 128-bit permutation in each half, so a
+    // selector never reaches across the halfway line. Reading a ymm as
+    // one flat vector of eight doublewords would move data between
+    // halves — a wrong value rather than a decline.
+    //
+    // Source doublewords are 0..8 and the selector 0x1b reverses each
+    // group of four, so the low block reverses 0,1,2,3 and the upper
+    // block reverses 4,5,6,7 *within itself*.
+    let source = [(
+        "zmm1",
+        two_blocks(packed(32, &[0, 1, 2, 3]), packed(32, &[4, 5, 6, 7])),
+    )];
+    let operands = ["ymm0", "ymm1", "0x1b"];
+    assert_eq!(
+        solve_with_bindings("vpshufd", &operands, &source, packed(32, &[3, 2, 1, 0]), 0),
+        SmtResult::AlwaysTrue,
+        "vpshufd should reverse the low block within itself"
+    );
+    assert_eq!(
+        solve_with_bindings(
+            "vpshufd",
+            &operands,
+            &source,
+            packed(32, &[7, 6, 5, 4]),
+            128
+        ),
+        SmtResult::AlwaysTrue,
+        "vpshufd should reverse the upper block within itself"
+    );
+}
+
+#[test]
+fn vpunpcklqdq_interleaves_within_each_128_bit_block() {
+    // Same block confinement for the interleaves: the upper block pairs
+    // the two sources' upper-block low quadwords, not their overall
+    // ones.
+    let sources = [
+        (
+            "zmm1",
+            two_blocks(packed(64, &[0x0a, 0x0b]), packed(64, &[0x0c, 0x0d])),
+        ),
+        (
+            "zmm2",
+            two_blocks(packed(64, &[0x1a, 0x1b]), packed(64, &[0x1c, 0x1d])),
+        ),
+    ];
+    let operands = ["ymm0", "ymm1", "ymm2"];
+    assert_eq!(
+        solve_with_bindings(
+            "vpunpcklqdq",
+            &operands,
+            &sources,
+            packed(64, &[0x0a, 0x1a]),
+            0
+        ),
+        SmtResult::AlwaysTrue,
+        "vpunpcklqdq should pair the low quadwords of each source's low block"
+    );
+    assert_eq!(
+        solve_with_bindings(
+            "vpunpcklqdq",
+            &operands,
+            &sources,
+            packed(64, &[0x0c, 0x1c]),
+            128
+        ),
+        SmtResult::AlwaysTrue,
+        "vpunpcklqdq should pair the low quadwords of each source's upper block"
     );
 }
