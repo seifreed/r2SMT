@@ -1,0 +1,218 @@
+//! `AArch32` NEON families that compute one destination lane from the
+//! matching source lanes: the lane compares, the pairwise reductions,
+//! and the per-element bit counts.
+//!
+//! They share this module because they share a shape — a typed or
+//! bare-width element on the mnemonic and bare vector operands — and
+//! none of them widens or narrows.
+
+use r2smt_ir::expr::Expr;
+use r2smt_ir::program::{Instruction, Operand, OperandKind};
+
+use crate::lift::LiftCtx;
+use crate::lift::aarch32::ElementKind;
+use crate::lift::aarch32::neon_element_type;
+use crate::lift::fp_sort_bits_checked;
+use crate::lift::simd::all_ones;
+
+use super::{NeonOp, NeonShape, bare_element_bits, uniform_vector_view, vector_view_bits};
+
+/// Which lane-wise predicate a compare mnemonic names.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::lift::aarch32) enum CompareKind {
+    /// `vceq` — equality. `float` reads the lane as an IEEE value.
+    Equal { float: bool },
+    /// `vcgt` / `vcge` — ordered comparison. `or_equal` picks `ge` over
+    /// `gt`; `signed` chooses the integer comparison and is unused for a
+    /// float lane.
+    Ordered {
+        float: bool,
+        signed: bool,
+        or_equal: bool,
+    },
+    /// `vtst` — true where the bitwise AND of the two lanes is non-zero.
+    TestBits,
+}
+
+/// `vceq` / `vcgt` / `vcge` / `vtst` — the lane-wise compares, whose
+/// result is an all-ones / all-zeros mask per lane rather than a flag,
+/// because it feeds another vector operation.
+///
+/// Each compare-against-register form has a compare-against-`#0`
+/// counterpart (`vcge.s8 d0, d1, #0`), which is what most
+/// opaque-predicate patterns use. `vtst` has no zero form.
+pub(super) fn compare_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (base, ty) = mnemonic.split_once('.')?;
+    if base == "vtst" {
+        // `vtst` is bitwise, so it spells a bare width and has no signed
+        // or float class and no zero form.
+        let lane_bits = bare_element_bits(ty).or_else(|| untyped_bits(ty))?;
+        return build_compare(insn, CompareKind::TestBits, lane_bits, false);
+    }
+    let (element, lane_bits) = neon_element_type(ty)?;
+    let kind = match base {
+        // Equality needs no signedness; `vceq` is spelled `i` or `f`.
+        "vceq" => CompareKind::Equal {
+            float: element == ElementKind::Float,
+        },
+        "vcgt" => ordered_kind(element, false)?,
+        "vcge" => ordered_kind(element, true)?,
+        _ => return None,
+    };
+    build_compare(insn, kind, lane_bits, true)
+}
+
+/// Width of an `i`-spelled bare element, for the `vtst.i8` spelling some
+/// disassemblers print instead of `vtst.8`.
+fn untyped_bits(ty: &str) -> Option<u16> {
+    match neon_element_type(ty)? {
+        (ElementKind::Untyped, bits) => Some(bits),
+        _ => None,
+    }
+}
+
+/// The ordered compare `vcgt` / `vcge` names, or `None` for the
+/// sign-agnostic `i` spelling the ordered forms have no encoding for.
+fn ordered_kind(element: ElementKind, or_equal: bool) -> Option<CompareKind> {
+    let (float, signed) = match element {
+        ElementKind::Signed => (false, true),
+        ElementKind::Unsigned => (false, false),
+        ElementKind::Float => (true, true),
+        ElementKind::Untyped => return None,
+    };
+    Some(CompareKind::Ordered {
+        float,
+        signed,
+        or_equal,
+    })
+}
+
+fn build_compare(
+    insn: &Instruction,
+    kind: CompareKind,
+    lane_bits: u16,
+    allow_zero: bool,
+) -> Option<NeonShape> {
+    if insn.operands.len() != 3 {
+        return None;
+    }
+    let view = uniform_vector_view(insn, 2)?;
+    let lanes = view.checked_div(lane_bits)?;
+    if lanes == 0 {
+        return None;
+    }
+    let third = insn.operands.get(2)?;
+    let zero = if third.kind == OperandKind::Immediate {
+        if !allow_zero || !is_zero_immediate(third) {
+            return None;
+        }
+        true
+    } else {
+        if vector_view_bits(third)? != view {
+            return None;
+        }
+        false
+    };
+    // A float compare needs an IEEE lane.
+    let float = matches!(
+        kind,
+        CompareKind::Equal { float: true } | CompareKind::Ordered { float: true, .. }
+    );
+    if float && fp_sort_bits_checked(lane_bits).is_none() {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::Compare { kind, zero },
+        lane_bits,
+        lanes,
+    })
+}
+
+/// Whether `op` is the immediate zero the compare-against-zero forms
+/// take.
+fn is_zero_immediate(op: &Operand) -> bool {
+    let raw = op.raw.trim().trim_start_matches('#');
+    matches!(raw, "0" | "0x0" | "0.0" | "0.00000" | "#0")
+}
+
+impl LiftCtx {
+    /// Lower a lane-wise compare into a per-lane all-ones / all-zeros
+    /// mask.
+    pub(in crate::lift::aarch32::neon) fn aarch32_compare_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        kind: CompareKind,
+        zero: bool,
+    ) -> Option<Expr> {
+        let view = shape.view_bits()?;
+        let first = self.simd_operand_value(&insn.operands.get(1)?.clone(), view)?;
+        let second = if zero {
+            None
+        } else {
+            Some(self.simd_operand_value(&insn.operands.get(2)?.clone(), view)?)
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let a = Self::extract_lane(first.clone(), shape.lane_bits, index)?;
+            let b = match second.as_ref() {
+                Some(value) => Self::extract_lane(value.clone(), shape.lane_bits, index)?,
+                None => Expr::konst(0, shape.lane_bits),
+            };
+            lanes.push(compare_lane(kind, a, b, shape.lane_bits)?);
+        }
+        Self::concat_lanes(lanes)
+    }
+}
+
+/// One destination lane of a compare: an all-ones mask where the
+/// predicate holds and all-zeros where it does not.
+///
+/// A `gt` lowers as `slt(b, a)`, not `sgt(a, b)`, mirroring the
+/// `AArch64` side and keeping one comparison direction throughout.
+fn compare_lane(kind: CompareKind, a: Expr, b: Expr, lane_bits: u16) -> Option<Expr> {
+    let predicate = match kind {
+        CompareKind::Equal { float: false } => Expr::eq(a, b),
+        CompareKind::Equal { float: true } => {
+            let (ebits, sbits) = fp_sort_bits_checked(lane_bits)?;
+            Expr::feq(
+                Expr::bv_to_fp(a, ebits, sbits),
+                Expr::bv_to_fp(b, ebits, sbits),
+            )
+        }
+        CompareKind::Ordered {
+            float: true,
+            or_equal,
+            ..
+        } => {
+            let (ebits, sbits) = fp_sort_bits_checked(lane_bits)?;
+            let (x, y) = (
+                Expr::bv_to_fp(a, ebits, sbits),
+                Expr::bv_to_fp(b, ebits, sbits),
+            );
+            // Ordered: unordered compares false, which `fp.lt` / `fp.leq`
+            // already give.
+            if or_equal {
+                Expr::fle(y, x)
+            } else {
+                Expr::flt(y, x)
+            }
+        }
+        CompareKind::Ordered {
+            float: false,
+            signed,
+            or_equal,
+        } => match (signed, or_equal) {
+            (true, false) => Expr::slt(b, a),
+            (true, true) => Expr::sle(b, a),
+            (false, false) => Expr::ult(b, a),
+            (false, true) => Expr::ule(b, a),
+        },
+        CompareKind::TestBits => Expr::ne(Expr::bv_and(a, b), Expr::konst(0, lane_bits)),
+    };
+    Some(Expr::Ite {
+        cond: Box::new(predicate),
+        then_expr: Box::new(all_ones(lane_bits)),
+        else_expr: Box::new(Expr::konst(0, lane_bits)),
+    })
+}

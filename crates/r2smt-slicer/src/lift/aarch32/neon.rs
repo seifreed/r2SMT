@@ -23,6 +23,7 @@ use r2smt_ir::program::{Instruction, Operand, OperandKind};
 use crate::registers::{has_vector_arrangement, is_simd_parent, register_layout};
 
 mod element;
+mod lanewise;
 pub(super) mod lower;
 mod permute;
 pub(super) mod structured;
@@ -75,6 +76,13 @@ pub(super) enum NeonOp {
     /// destination byte for an out-of-range index where `vtbl` writes
     /// zero.
     TableLookup { keep: bool, table_lanes: u16 },
+    /// `vceq` / `vcgt` / `vcge` / `vtst` — a lane-wise compare whose
+    /// result is an all-ones / all-zeros mask. `zero` is the
+    /// compare-against-`#0` form.
+    Compare {
+        kind: lanewise::CompareKind,
+        zero: bool,
+    },
 }
 
 /// A resolved `AArch32` NEON instruction: what to compute, and at what
@@ -131,6 +139,7 @@ pub(super) fn resolve(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| width::saturating_narrow_shape(insn, &mnemonic))
         .or_else(|| element::by_element_shape(insn, &mnemonic))
         .or_else(|| table::table_lookup_shape(insn, &mnemonic))
+        .or_else(|| lanewise::compare_shape(insn, &mnemonic))
 }
 
 /// Architectural width of the `AArch32` vector register parent, which

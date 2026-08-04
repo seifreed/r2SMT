@@ -1661,6 +1661,111 @@ fn vtbl_declines_a_table_of_five_registers() {
 }
 
 // ---------------------------------------------------------------
+// `vceq` / `vcgt` / `vcge` / `vtst` — lane compares
+//
+// The result is an all-ones mask where the predicate holds and
+// all-zeros where it does not — a value, not a flag, because it feeds
+// another vector operation. `d0` is the low half of `v0` (bind `v0` so
+// its upper half is not free), `d2` the low half of `v1`, `d4` the low
+// half of `v2`.
+// ---------------------------------------------------------------
+
+#[test]
+fn vcge_signed_sets_all_ones_where_the_first_lane_is_at_least_the_second() {
+    assert_computes_into(
+        "vcge.s8",
+        &["d0", "d2", "d4"],
+        &[
+            ("v0", 0),
+            ("v1", 0x0000_0000_0000_0000_0381_0aff_007f_8005),
+            ("v2", 0x0000_0000_0000_0000_0381_14fe_0180_7f05),
+        ],
+        "v0",
+        0x0000_0000_0000_0000_ffff_00ff_00ff_00ff,
+    );
+}
+
+#[test]
+fn vcgt_unsigned_compares_each_halfword_as_a_magnitude() {
+    assert_computes_into(
+        "vcgt.u16",
+        &["d0", "d2", "d4"],
+        &[
+            ("v0", 0),
+            ("v1", 0x0000_0000_0000_0000_0064_8000_ffff_0005),
+            ("v2", 0x0000_0000_0000_0000_00c8_7fff_0001_0005),
+        ],
+        "v0",
+        0x0000_0000_0000_0000_0000_ffff_ffff_0000,
+    );
+}
+
+#[test]
+fn vceq_integer_masks_the_equal_lanes() {
+    assert_computes_into(
+        "vceq.i32",
+        &["d0", "d2", "d4"],
+        &[
+            ("v0", 0),
+            ("v1", 0x0000_0000_0000_0000_dead_beef_1122_3344),
+            ("v2", 0x0000_0000_0000_0000_0000_0000_1122_3344),
+        ],
+        "v0",
+        0x0000_0000_0000_0000_0000_0000_ffff_ffff,
+    );
+}
+
+#[test]
+fn vcge_against_zero_masks_the_non_negative_lanes() {
+    // The compare-against-`#0` form is what most opaque predicates use.
+    assert_computes_into(
+        "vcge.s16",
+        &["d0", "d2", "0"],
+        &[("v0", 0), ("v1", 0x0000_0000_0000_0000_8000_ffff_0001_0000)],
+        "v0",
+        0x0000_0000_0000_0000_0000_0000_ffff_ffff,
+    );
+}
+
+#[test]
+fn vceq_float_masks_the_lanes_that_are_equal_as_ieee_values() {
+    assert_computes_into(
+        "vceq.f32",
+        &["d0", "d2", "d4"],
+        &[
+            ("v0", 0),
+            ("v1", 0x0000_0000_0000_0000_4000_0000_3fc0_0000),
+            ("v2", 0x0000_0000_0000_0000_4040_0000_3fc0_0000),
+        ],
+        "v0",
+        0x0000_0000_0000_0000_0000_0000_ffff_ffff,
+    );
+}
+
+#[test]
+fn vtst_masks_the_lanes_whose_bitwise_and_is_non_zero() {
+    assert_computes_into(
+        "vtst.8",
+        &["d0", "d2", "d4"],
+        &[
+            ("v0", 0),
+            ("v1", 0x0000_0000_0000_0000_55aa_8001_00ff_f00f),
+            ("v2", 0x0000_0000_0000_0000_5555_8002_ff00_0f01),
+        ],
+        "v0",
+        0x0000_0000_0000_0000_ff00_ff00_0000_00ff,
+    );
+}
+
+#[test]
+fn the_ordered_compares_decline_the_sign_agnostic_spelling() {
+    // `vcgt` / `vcge` need a signed or unsigned class; `i` has no
+    // ordered encoding.
+    assert!(declines("vcgt.i8", &["d0", "d2", "d4"]));
+    assert!(declines("vcge.i16", &["d0", "d2", "d4"]));
+}
+
+// ---------------------------------------------------------------
 // Structured loads and stores
 //
 // `vld1`–`vld4` / `vst1`–`vst4` move bytes rather than computing them,
