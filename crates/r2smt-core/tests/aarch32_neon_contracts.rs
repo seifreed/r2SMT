@@ -40,6 +40,11 @@ const VECTOR_BITS: u16 = 128;
 /// binary32 `+1.0` and `-1.0`, as bit patterns.
 const F32_ONE: u128 = 0x3f80_0000;
 const F32_MINUS_ONE: u128 = 0xbf80_0000;
+/// binary32 `+2.0` / `+3.0`, a quiet NaN, and negative zero.
+const F32_TWO: u128 = 0x4000_0000;
+const F32_THREE: u128 = 0x4040_0000;
+const F32_QUIET_NAN: u128 = 0x7fc0_0000;
+const F32_NEGATIVE_ZERO: u128 = 0x8000_0000;
 
 /// Classify a fixture operand the way the radare2 adapter's parser
 /// does: a brace register list is `Unknown`, a bracketed operand
@@ -352,6 +357,61 @@ fn vmax_float_selects_a_whole_lane_not_a_scalar() {
     let lhs = F32_ONE | (F32_ONE << 32);
     let rhs = F32_MINUS_ONE | (F32_MINUS_ONE << 32);
     assert_computes("vmax.f32", &QUADS, &[("v1", lhs), ("v2", rhs)], lhs);
+}
+
+// ---------------------------------------------------------------
+// `vpadd` / `vpmax` / `vpmin` `.f32` — the float pairwise forms.
+// Doubleword-only, so the destination write merges: pin `v0 = 0` and
+// use non-overlapping `d` registers (d0/d2/d4), then read the low 64
+// bits. Each destination lane combines an adjacent pair of one source.
+// ---------------------------------------------------------------
+
+#[test]
+fn vpadd_float_adds_each_adjacent_pair() {
+    // dst.lane0 = d2.lane0 + d2.lane1 = 1.0 + 2.0 = 3.0;
+    // dst.lane1 = d4.lane0 + d4.lane1 = 1.0 + 1.0 = 2.0.
+    assert_computes(
+        "vpadd.f32",
+        &["d0", "d2", "d4"],
+        &[
+            ("v0", 0),
+            ("v1", F32_ONE | (F32_TWO << 32)),
+            ("v2", F32_ONE | (F32_ONE << 32)),
+        ],
+        F32_THREE | (F32_TWO << 32),
+    );
+}
+
+#[test]
+fn vpmax_float_propagates_a_nan_instead_of_selecting_the_number() {
+    // ARM `FPMax` propagates the NaN; Intel's `MAXPS` would return the
+    // number (1.0), which is the value this contract rules out.
+    assert_computes(
+        "vpmax.f32",
+        &["d0", "d2", "d4"],
+        &[
+            ("v0", 0),
+            ("v1", F32_QUIET_NAN | (F32_ONE << 32)),
+            ("v2", F32_ONE | (F32_ONE << 32)),
+        ],
+        F32_QUIET_NAN | (F32_ONE << 32),
+    );
+}
+
+#[test]
+fn vpmin_float_combines_signed_zeros() {
+    // `FPMin(-0, +0)` combines the signs to `-0` (OR for min); `MINPS`
+    // would take its second operand and give `+0`.
+    assert_computes(
+        "vpmin.f32",
+        &["d0", "d2", "d4"],
+        &[
+            ("v0", 0),
+            ("v1", F32_NEGATIVE_ZERO),
+            ("v2", F32_ONE | (F32_ONE << 32)),
+        ],
+        F32_NEGATIVE_ZERO | (F32_ONE << 32),
+    );
 }
 
 // ---------------------------------------------------------------
@@ -1823,13 +1883,12 @@ fn vpmin_unsigned_selects_the_smaller_of_each_halfword_pair() {
 }
 
 #[test]
-fn the_pairwise_forms_decline_float_and_a_quad() {
-    // Float pairwise carries the `FPMax` NaN hazard and is out of scope;
-    // and there is no quadword pairwise encoding.
-    assert!(declines("vpadd.f32", &["d0", "d2", "d4"]));
-    assert!(declines("vpmax.f32", &["d0", "d2", "d4"]));
+fn the_pairwise_forms_decline_a_quad_and_an_unclassed_max() {
+    // There is no quadword pairwise encoding.
     assert!(declines("vpadd.i8", &["q0", "q1", "q2"]));
-    // `vpmax` / `vpmin` need a signedness class.
+    // `vpmax` / `vpmin` need a signedness class; the bare `i` spelling
+    // has no ordered encoding (the float forms carry their own ordering
+    // and do lift — see the `.f32` contracts above).
     assert!(declines("vpmax.i8", &["d0", "d2", "d4"]));
 }
 

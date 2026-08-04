@@ -12,8 +12,8 @@ use r2smt_ir::program::{Instruction, Operand, OperandKind};
 use crate::lift::LiftCtx;
 use crate::lift::aarch32::ElementKind;
 use crate::lift::aarch32::neon_element_type;
-use crate::lift::fp_sort_bits_checked;
 use crate::lift::simd::all_ones;
+use crate::lift::{FpArithOp, fp_lane_result, fp_propagating_max_min, fp_sort_bits_checked};
 
 use super::{NeonOp, NeonShape, bare_element_bits, uniform_vector_view, vector_view_bits};
 
@@ -88,8 +88,9 @@ pub(super) fn compare_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonSh
 /// The two sources fill the destination in order: the first source's
 /// pairwise results occupy the low half of the destination, the
 /// second's the high half. Doubleword-only, as the architecture has no
-/// quadword pairwise form, and integer-only here — the float forms
-/// carry the `FPMax` NaN hazard and decline.
+/// quadword pairwise form. The `.f32` forms lower through the IEEE
+/// lane helpers — `vpmax` / `vpmin` reuse the ARM `FPMax` value, never
+/// Intel's `MAXPS`.
 pub(super) fn pairwise_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     let (base, ty) = mnemonic.split_once('.')?;
     let op = match base {
@@ -99,21 +100,23 @@ pub(super) fn pairwise_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonS
         _ => return None,
     };
     let (element, lane_bits) = neon_element_type(ty)?;
-    // Float pairwise carries the `FPMax` NaN hazard and is out of scope.
-    if element == ElementKind::Float {
-        return None;
-    }
+    let float = element == ElementKind::Float;
     let signed = match op {
-        // Addition is sign-agnostic; `vpadd` is spelled `i`.
+        // Addition is sign-agnostic; `vpadd` is spelled `i` or `f`.
         PairwiseOp::Add => false,
-        // Max / min need a signedness class; the `i` spelling has no
-        // ordered encoding.
+        // Max / min need a signedness class for the integer forms; the
+        // `i` spelling has no ordered encoding. Float carries its own
+        // ordering, so signedness does not apply.
         PairwiseOp::Max | PairwiseOp::Min => match element {
             ElementKind::Signed => true,
-            ElementKind::Unsigned => false,
-            _ => return None,
+            ElementKind::Unsigned | ElementKind::Float => false,
+            ElementKind::Untyped => return None,
         },
     };
+    // The float forms exist only at single precision.
+    if float && lane_bits != 32 {
+        return None;
+    }
     if insn.operands.len() != 3 {
         return None;
     }
@@ -127,7 +130,7 @@ pub(super) fn pairwise_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonS
         return None;
     }
     Some(NeonShape {
-        op: NeonOp::Pairwise { op, signed },
+        op: NeonOp::Pairwise { op, signed, float },
         lane_bits,
         lanes,
     })
@@ -334,6 +337,7 @@ impl LiftCtx {
         shape: NeonShape,
         op: PairwiseOp,
         signed: bool,
+        float: bool,
     ) -> Option<Expr> {
         let view = shape.view_bits()?;
         let first = self.simd_operand_value(&insn.operands.get(1)?.clone(), view)?;
@@ -352,7 +356,7 @@ impl LiftCtx {
                 shape.lane_bits,
                 pair.checked_mul(2)?.checked_add(1)?,
             )?;
-            lanes.push(pairwise_combine(op, signed, a, b));
+            lanes.push(pairwise_combine(op, signed, float, shape.lane_bits, a, b)?);
         }
         Self::concat_lanes(lanes)
     }
@@ -417,9 +421,26 @@ fn count_leading_zeros_lane(element: &Expr, bits: u16) -> Expr {
     result
 }
 
-/// One destination lane of a pairwise reduction.
-fn pairwise_combine(op: PairwiseOp, signed: bool, a: Expr, b: Expr) -> Expr {
-    match op {
+/// One destination lane of a pairwise reduction. The float forms lower
+/// through the IEEE lane helpers: `vpadd.f32` is a lane add, and
+/// `vpmax` / `vpmin` use the ARM `FPMax` value (`number_wins = false`,
+/// so a NaN operand propagates), never Intel's `MAXPS`.
+fn pairwise_combine(
+    op: PairwiseOp,
+    signed: bool,
+    float: bool,
+    lane_bits: u16,
+    a: Expr,
+    b: Expr,
+) -> Option<Expr> {
+    if float {
+        return match op {
+            PairwiseOp::Add => fp_lane_result(FpArithOp::Add, a, b, lane_bits),
+            PairwiseOp::Max => fp_propagating_max_min(a, b, lane_bits, true, false),
+            PairwiseOp::Min => fp_propagating_max_min(a, b, lane_bits, false, false),
+        };
+    }
+    Some(match op {
         PairwiseOp::Add => Expr::add(a, b),
         PairwiseOp::Max | PairwiseOp::Min => {
             let less = if signed {
@@ -439,5 +460,5 @@ fn pairwise_combine(op: PairwiseOp, signed: bool, a: Expr, b: Expr) -> Expr {
                 else_expr: Box::new(else_expr),
             }
         }
-    }
+    })
 }

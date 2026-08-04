@@ -85,10 +85,12 @@ pub(super) enum NeonOp {
         zero: bool,
     },
     /// `vpadd` / `vpmax` / `vpmin` — a pairwise reduction of adjacent
-    /// source lanes.
+    /// source lanes. `float` selects the `.f32` forms, whose `vpmax` /
+    /// `vpmin` follow ARM `FPMax` NaN / signed-zero semantics.
     Pairwise {
         op: lanewise::PairwiseOp,
         signed: bool,
+        float: bool,
     },
     /// `vcnt` / `vclz` — a per-element bit count. `leading` is `vclz`
     /// (count leading zeros) against `vcnt` (population count).

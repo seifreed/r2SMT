@@ -85,7 +85,9 @@ impl LiftCtx {
                 self.aarch32_table_lookup_lanes(insn, shape, keep, table_lanes)
             }
             NeonOp::Compare { kind, zero } => self.aarch32_compare_lanes(insn, shape, kind, zero),
-            NeonOp::Pairwise { op, signed } => self.aarch32_pairwise_lanes(insn, shape, op, signed),
+            NeonOp::Pairwise { op, signed, float } => {
+                self.aarch32_pairwise_lanes(insn, shape, op, signed, float)
+            }
             NeonOp::CountBits { leading } => self.aarch32_count_lanes(insn, shape, leading),
             NeonOp::Estimate => self.aarch32_estimate_value(insn, shape),
             // Handled by the caller; it writes two destinations and so
