@@ -42,23 +42,27 @@ const F32_ONE: u128 = 0x3f80_0000;
 const F32_MINUS_ONE: u128 = 0xbf80_0000;
 
 /// Classify a fixture operand the way the radare2 adapter's parser
-/// does: a bracketed operand addresses memory, anything starting with a
-/// digit is an immediate, everything else names a register.
+/// does: a brace register list is `Unknown`, a bracketed operand
+/// addresses memory, anything starting with a digit is an immediate,
+/// everything else names a register.
 ///
 /// `AArch32` NEON shift counts matter here — radare2 prints them bare
 /// (`vshl.i32 q0, q1, 3`), and in hex once they reach `0x10`, rather
 /// than with the manual's `#`.
 ///
-/// The memory case is load-bearing for the structured accesses rather
-/// than cosmetic: their resolver refuses an operand that is not
-/// [`OperandKind::Memory`], so a fixture spelling `[r0]` as a register
-/// would make every one of their decline assertions pass without
-/// reaching the check it names.
+/// The brace-list case is load-bearing rather than cosmetic: radare2
+/// renders `{d0, d1}` as [`OperandKind::Unknown`], not `Register`, so a
+/// structured or table resolver that gated on the kind would decline
+/// every real access. A fixture that spelled the list as a register
+/// would hide exactly that bug — which is how it hid once.
 fn operand(raw: &str) -> Operand {
-    // The leading bracket is what separates an address from an indexed
-    // register: `[r0]` addresses memory, `d4[2]` names one lane of a
-    // register and must stay `Register` for the by-element resolver.
-    let kind = if raw.trim_start().starts_with('[') {
+    // The leading brace is a register list; the leading bracket separates
+    // an address from an indexed register: `[r0]` addresses memory,
+    // `d4[2]` names one lane of a register and must stay `Register` for
+    // the by-element resolver.
+    let kind = if raw.trim_start().starts_with('{') {
+        OperandKind::Unknown
+    } else if raw.trim_start().starts_with('[') {
         OperandKind::Memory
     } else if raw.starts_with(|c: char| c.is_ascii_digit()) {
         OperandKind::Immediate

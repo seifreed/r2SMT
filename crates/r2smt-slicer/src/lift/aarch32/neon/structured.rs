@@ -215,9 +215,10 @@ fn family(base: &str) -> Option<(u16, bool)> {
 /// Shared with the `vtbl` / `vtbx` table parser, whose register list is
 /// the same shape (consecutive whole `d` registers).
 pub(in crate::lift::aarch32::neon) fn parse_members(op: &Operand) -> Option<Vec<Operand>> {
-    if op.kind != OperandKind::Register && op.kind != OperandKind::Memory {
-        return None;
-    }
+    // radare2 renders a brace register list as `OperandKind::Unknown`
+    // (see the r2pipe operand classifier), so the kind is not a reliable
+    // gate — the brace strip below is. Matches the `AArch64` list parser,
+    // which checks no kind either.
     let raw = op.raw.trim().to_ascii_lowercase();
     let body = raw.strip_prefix('{')?.strip_suffix('}')?;
     let mut members = Vec::new();
@@ -258,9 +259,8 @@ pub(in crate::lift::aarch32::neon) fn parse_members(op: &Operand) -> Option<Vec<
 /// interleaved family allows. The members are never sorted — consecutive
 /// list positions take consecutive addresses.
 fn parse_list(op: &Operand) -> Option<(Vec<Operand>, ListShape, u16)> {
-    if op.kind != OperandKind::Register && op.kind != OperandKind::Memory {
-        return None;
-    }
+    // The brace strip validates the operand; `op.kind` is `Unknown` for a
+    // register list under real radare2 output, so it cannot gate here.
     let raw = op.raw.trim().to_ascii_lowercase();
     let body = raw.strip_prefix('{')?.strip_suffix('}')?;
     let mut members = Vec::new();
