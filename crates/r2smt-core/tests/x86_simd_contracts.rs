@@ -810,3 +810,139 @@ fn packssdw_fills_the_low_half_from_the_first_source_and_the_high_from_the_secon
         packed(16, &[1, 2, 0, 0, 3, 4, 0, 0]),
     );
 }
+
+/// Solve `ptest`'s flag output: bind the two vectors and ask whether the
+/// named flag is necessarily `expected`.
+fn assert_ptest_flag(
+    mnemonic: &str,
+    operands: &[&str],
+    sources: &[(&str, u128)],
+    flag: &str,
+    expected: u128,
+) {
+    let insn = Instruction {
+        address: Address::new(0x1000),
+        size: 4,
+        bytes: vec![],
+        mnemonic: mnemonic.into(),
+        operands: operands.iter().map(|o| operand(o)).collect(),
+        esil: None,
+        pcode: None,
+        is_thumb: false,
+    };
+    let lifted = lift_per_mnemonic(&insn, Arch::X86_64);
+    assert!(
+        lifted
+            .iter()
+            .all(|s| !matches!(s, IrStmt::Unsupported { .. })),
+        "{mnemonic} declined: {lifted:?}"
+    );
+    let mut statements: Vec<IrStmt> = sources
+        .iter()
+        .map(|(name, value)| IrStmt::Assign {
+            dst: Var::new(*name, VECTOR_BITS),
+            src: Expr::konst(*value, VECTOR_BITS),
+        })
+        .collect();
+    statements.extend(lifted);
+    let slice = LiftedSlice {
+        branch: branch(),
+        statements,
+        condition: Expr::eq(Expr::Var(Var::new(flag, 1)), Expr::konst(expected, 1)),
+        status: SliceStatus::Complete,
+        treat_truncation_as_inputs: false,
+        arch: Arch::X86_64,
+    };
+    assert_eq!(
+        solve_branch(
+            &ssa_convert(&slice),
+            SolveOptions {
+                timeout_ms: TEST_SOLVE_TIMEOUT_MS,
+                ..SolveOptions::default()
+            },
+        ),
+        SmtResult::AlwaysTrue,
+        "{mnemonic} {operands:?} with {sources:x?} should leave {flag} = {expected}"
+    );
+}
+
+#[test]
+fn ptest_sets_zf_when_the_operands_share_no_bits() {
+    // ZF is the AND being zero, which is the whole point of the
+    // `ptest xmm0, xmm0 ; jz` idiom this exists to resolve.
+    assert_ptest_flag(
+        "ptest",
+        &["xmm0", "xmm1"],
+        &[("zmm0", 0x00ff), ("zmm1", 0xff00)],
+        "ZF",
+        1,
+    );
+    assert_ptest_flag(
+        "ptest",
+        &["xmm0", "xmm1"],
+        &[("zmm0", 0x0ff0), ("zmm1", 0xff00)],
+        "ZF",
+        0,
+    );
+}
+
+#[test]
+fn ptest_of_a_register_against_itself_tests_that_register_for_zero() {
+    // The common idiom: `ptest xmm0, xmm0` sets ZF exactly when xmm0 is
+    // all zero, because `x AND x` is `x`.
+    assert_ptest_flag("ptest", &["xmm0", "xmm0"], &[("zmm0", 0)], "ZF", 1);
+    assert_ptest_flag("ptest", &["xmm0", "xmm0"], &[("zmm0", 0x8000)], "ZF", 0);
+}
+
+#[test]
+fn ptest_complements_its_first_operand_for_cf_not_its_second() {
+    // CF is `src AND NOT dst`. With dst = 0x00ff and src = 0xff00,
+    // NOT dst covers every bit of src, so CF is 0; swapping the roles
+    // gives NOT dst = ~0xff00, which shares no bit with 0x00ff... it
+    // does, so CF flips. Reversing the complemented operand is a wrong
+    // flag rather than a decline.
+    assert_ptest_flag(
+        "ptest",
+        &["xmm0", "xmm1"],
+        &[("zmm0", 0x00ff), ("zmm1", 0xff00)],
+        "CF",
+        0,
+    );
+    assert_ptest_flag(
+        "ptest",
+        &["xmm1", "xmm0"],
+        &[("zmm0", 0x00ff), ("zmm1", 0xff00)],
+        "CF",
+        0,
+    );
+    // A case where the two orders genuinely disagree: src is a subset
+    // of dst, so `src AND NOT dst` is empty one way round and not the
+    // other.
+    assert_ptest_flag(
+        "ptest",
+        &["xmm0", "xmm1"],
+        &[("zmm0", 0x00ff), ("zmm1", 0x000f)],
+        "CF",
+        1,
+    );
+    assert_ptest_flag(
+        "ptest",
+        &["xmm1", "xmm0"],
+        &[("zmm0", 0x00ff), ("zmm1", 0x000f)],
+        "CF",
+        0,
+    );
+}
+
+#[test]
+fn ptest_clears_the_flags_it_does_not_compute() {
+    for flag in ["OF", "SF", "PF"] {
+        assert_ptest_flag(
+            "ptest",
+            &["xmm0", "xmm1"],
+            &[("zmm0", 0x1234), ("zmm1", 0x5678)],
+            flag,
+            0,
+        );
+    }
+}

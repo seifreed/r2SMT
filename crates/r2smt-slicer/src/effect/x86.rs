@@ -357,6 +357,11 @@ pub(super) fn analyze_x86(insn: &Instruction) -> InstructionEffect {
         "comiss" | "ucomiss" | "comisd" | "ucomisd" => {
             cmp_or_test_effect(insn, InstructionKind::Cmp)
         }
+        // `ptest` shares `cmp`'s shape too: it reads both vector
+        // operands, defines no register and writes flags. Routing it
+        // through `simd_effect` instead would claim its first operand as
+        // a definition and drop whatever produced that vector.
+        m if crate::lift::is_x86_vector_test(m) => cmp_or_test_effect(insn, InstructionKind::Cmp),
         // The compare family writes a mask into its destination, so it
         // is a SIMD def like the arithmetic — not a flag-setting `cmp`.
         m if crate::lift::is_fp_compare_mnemonic(m) => {

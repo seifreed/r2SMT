@@ -52,7 +52,9 @@ pub(crate) use simd::{
     FpArithOp, FusedStep, PackedIntOp, PackedOp, fp_lane_result, fp_propagating_max_min,
     fp_sort_bits_checked, fused_multiply_lane,
 };
-pub(crate) use x86::{X86SimdShape, is_fp_compare_mnemonic, sse_scalar_move_lane, x86_simd_shape};
+pub(crate) use x86::{
+    X86SimdShape, is_fp_compare_mnemonic, is_x86_vector_test, sse_scalar_move_lane, x86_simd_shape,
+};
 use x87::X87Stack;
 pub(crate) use x87::{X87Effect, is_modelled_x87, x87_effect};
 
@@ -182,7 +184,12 @@ fn is_x86_simd_instruction(insn: &Instruction) -> bool {
     // The compare family is 64 mnemonics once the eight predicates are
     // crossed with ps/pd/ss/sd and the VEX prefix, so it is recognised
     // structurally rather than listed.
-    if x86::is_fp_compare_mnemonic(&insn.mnemonic) || x86::sse_scalar_move_lane(insn).is_some() {
+    if x86::is_fp_compare_mnemonic(&insn.mnemonic)
+        || x86::sse_scalar_move_lane(insn).is_some()
+        // `ptest` writes flags and defines no register, so it is absent
+        // from the membership table on purpose; see `is_x86_vector_test`.
+        || x86::is_x86_vector_test(&insn.mnemonic)
+    {
         return true;
     }
     x86::x86_simd_shape(insn.mnemonic.trim().to_ascii_lowercase().as_str()).is_some()

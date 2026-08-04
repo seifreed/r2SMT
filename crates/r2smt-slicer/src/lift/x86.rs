@@ -119,6 +119,7 @@ impl LiftCtx {
             }
             "vcvtph2ps" => self.lift_f16c_widen(insn),
             "vcvtps2ph" => self.lift_f16c_narrow(insn),
+            "ptest" | "vptest" => self.lift_simd_vector_test(insn),
             "comiss" | "ucomiss" => self.lift_simd_fp_compare(insn, 32),
             "comisd" | "ucomisd" => self.lift_simd_fp_compare(insn, 64),
             "cvtsi2ss" => self.lift_int_to_fp(insn, 32),
@@ -564,6 +565,26 @@ fn same_xmm_register(a: &Operand, b: &Operand) -> bool {
 
 /// Bits in a byte — the lane width `pmovmskb` samples.
 const BITS_PER_BYTE: u16 = 8;
+
+/// Flags `ptest` architecturally clears. `ZF` and `CF` carry the result
+/// and are written separately.
+const VECTOR_TEST_CLEARED_FLAGS: [&str; 3] = ["OF", "SF", "PF"];
+
+/// Whether `mnemonic` is a vector bitwise test — an instruction that
+/// reads two vector operands, writes flags, and defines no register.
+///
+/// Deliberately **not** in [`x86_simd_shape`]. That table's effect-side
+/// arm runs before the compare arms and would make operand 0 a
+/// definition, so the slicer would treat `ptest xmm0, xmm0` as
+/// redefining `xmm0` and drop whatever actually produced it — the
+/// def/use asymmetry that fabricates verdicts. It follows `comiss`'s
+/// path instead, which is the shape it genuinely shares.
+pub(crate) fn is_x86_vector_test(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic.trim().to_ascii_lowercase().as_str(),
+        "ptest" | "vptest"
+    )
+}
 
 /// The lane-wise arithmetic `PackedIntOp`s x86 spells.
 const ADD: PackedIntOp = PackedIntOp::Bin(BinOp::Add);

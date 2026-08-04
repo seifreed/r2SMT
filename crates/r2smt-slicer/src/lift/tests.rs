@@ -5099,3 +5099,59 @@ fn aarch64_reciprocal_step_lifts_for_single_lanes() {
     assert!(!neon_declines("frecps", &["v0.4s", "v1.4s", "v2.4s"]));
     assert!(!neon_declines("frsqrts", &["v0.4s", "v1.4s", "v2.4s"]));
 }
+
+#[test]
+fn ptest_defines_flags_and_no_vector_register() {
+    // `ptest` reads two vectors and writes only flags. If it went
+    // through the SIMD membership table instead, `simd_effect` would
+    // claim operand 0 as a definition, the backward walk would stop at
+    // it, and whatever actually produced that vector would be dropped
+    // from the slice — a fabricated verdict, not a lost one.
+    for mnemonic in ["ptest", "vptest"] {
+        let i = insn(
+            0x1000,
+            4,
+            mnemonic,
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        );
+        let effect = crate::effect::analyze(&i, Arch::X86_64);
+        assert!(
+            effect.defs.is_empty(),
+            "{mnemonic}: must define no register, got {:?}",
+            effect.defs
+        );
+        assert!(effect.defines_flags, "{mnemonic}: must define flags");
+        assert!(
+            effect.uses.contains(&"zmm0") && effect.uses.contains(&"zmm1"),
+            "{mnemonic}: must read both vectors, got {:?}",
+            effect.uses
+        );
+    }
+}
+
+#[test]
+fn ptest_is_claimed_by_the_x86_simd_gate_so_esil_does_not_win() {
+    // The per-mnemonic handler only runs if the gate claims the
+    // instruction; otherwise the ESIL ladder lowers it first and the
+    // flag model above never applies.
+    let i = insn(
+        0x1000,
+        4,
+        "ptest",
+        vec![
+            op("xmm0", OperandKind::Register),
+            op("xmm1", OperandKind::Register),
+        ],
+    );
+    assert!(is_x86_simd_instruction(&i));
+    let stmts = lift_per_mnemonic(&i, Arch::X86_64);
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == "ZF")),
+        "ptest should define ZF, got {stmts:?}"
+    );
+}

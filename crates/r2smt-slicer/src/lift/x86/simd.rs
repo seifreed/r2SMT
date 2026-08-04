@@ -25,8 +25,8 @@ use crate::lift::{
 use super::{
     ABSOLUTE, ADD, AVERAGE, BITS_PER_BYTE, F16C_HALF_BITS, F16C_IMM_USE_MXCSR, F16C_SINGLE_BITS,
     FpCompare, MAX_SIGNED, MAX_UNSIGNED, MIN_SIGNED, MIN_UNSIGNED, MUL, SAT_ADD_SIGNED,
-    SAT_ADD_UNSIGNED, SAT_SUB_SIGNED, SAT_SUB_UNSIGNED, SUB, SimdBitOp, fp_mask_lane, is_vex,
-    parse_immediate, same_xmm_register,
+    SAT_ADD_UNSIGNED, SAT_SUB_SIGNED, SAT_SUB_UNSIGNED, SUB, SimdBitOp, VECTOR_TEST_CLEARED_FLAGS,
+    fp_mask_lane, is_vex, parse_immediate, same_xmm_register,
 };
 
 impl LiftCtx {
@@ -865,6 +865,49 @@ impl LiftCtx {
             lanes.push(compare_lane(kind, a, b, lane_bits)?);
         }
         Self::concat_lanes(lanes)
+    }
+
+    /// `ptest` / `vptest` — a whole-view bitwise test that writes flags
+    /// and no register.
+    ///
+    /// `ZF` is set when `src AND dst` is zero and `CF` when
+    /// `src AND NOT dst` is; the SDM calls the second one the
+    /// "`ANDN`" form. The asymmetry is the trap: it is the *first*
+    /// operand that gets complemented, so reversing the roles produces a
+    /// wrong flag rather than a decline. `OF`, `AF`, `PF` and `SF` are
+    /// architecturally cleared.
+    ///
+    /// The AND needs no lane loop — no carry crosses a lane boundary, so
+    /// the whole view at once is the same bits and a far smaller term.
+    pub(super) fn lift_simd_vector_test(&mut self, insn: &Instruction) {
+        let ops = &insn.operands;
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let (dst, src) = (dst.clone(), src.clone());
+        let Some(view) = self.simd_instruction_view_bits(&[&dst, &src]) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let (Some(dst_val), Some(src_val)) = (
+            self.simd_operand_value(&dst, view),
+            self.simd_operand_value(&src, view),
+        ) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let zero = Expr::konst(0, view);
+        let both = Expr::bv_and(src_val.clone(), dst_val.clone());
+        let complemented = Expr::bv_and(
+            src_val,
+            Expr::bv_xor(dst_val, crate::lift::simd::all_ones(view)),
+        );
+        self.set_flag("ZF", Expr::eq(both, zero.clone()));
+        self.set_flag("CF", Expr::eq(complemented, zero));
+        for flag in VECTOR_TEST_CLEARED_FLAGS {
+            self.set_flag(flag, Expr::konst(0, 1));
+        }
     }
 
     /// Packed floating-point arithmetic: the same lane operation applied
