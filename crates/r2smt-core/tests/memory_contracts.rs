@@ -446,9 +446,11 @@ fn test_aarch32_str_emits_storemem_with_value_and_address() {
 }
 
 #[test]
-fn test_aarch32_ldr_register_offset_declines_soundly() {
-    // `ldr r0, [r1, r2]` (register offset) is not modelled — the
-    // lifter must decline to `Unsupported`, never emit a LoadMem.
+fn test_aarch32_ldr_register_offset_addresses_base_plus_index() {
+    // `ldr r0, [r1, r2]` addresses `r1 + r2`. This form used to
+    // decline; modelling it is a widening, so the contract now pins
+    // that *both* registers reach the address rather than that no
+    // LoadMem is emitted.
     let stmts = lift_per_mnemonic(
         &insn(
             0x1000,
@@ -460,9 +462,45 @@ fn test_aarch32_ldr_register_offset_declines_soundly() {
         ),
         Arch::Arm,
     );
+    let address = stmts
+        .iter()
+        .find_map(|s| match s {
+            IrStmt::LoadMem { address, .. } => Some(format!("{address:?}")),
+            _ => None,
+        })
+        .expect("register-offset ldr must produce a LoadMem");
     assert!(
-        !stmts.iter().any(|s| matches!(s, IrStmt::LoadMem { .. })),
-        "register-offset ldr must not fabricate a LoadMem: {stmts:?}"
+        address.contains("\"r1\"") && address.contains("\"r2\""),
+        "{address}"
+    );
+}
+
+#[test]
+fn test_aarch32_ldr_shifted_register_offset_scales_only_the_index() {
+    // `ldr r0, [r1, r2, lsl 2]` addresses `r1 + (r2 << 2)`. Scaling the
+    // base instead would be a plausible-looking wrong address, so the
+    // shift must sit under the index register.
+    let stmts = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "ldr",
+            vec![
+                op("r0", OperandKind::Register),
+                op("[r1, r2, lsl 2]", OperandKind::Memory),
+            ],
+        ),
+        Arch::Arm,
+    );
+    let address = stmts
+        .iter()
+        .find_map(|s| match s {
+            IrStmt::LoadMem { address, .. } => Some(format!("{address:?}")),
+            _ => None,
+        })
+        .expect("shifted register-offset ldr must produce a LoadMem");
+    assert!(
+        address.contains("Shl(Var(Var { name: \"r2\""),
+        "the shift must apply to the index, not the base: {address}"
     );
 }
 

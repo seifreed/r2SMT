@@ -1096,7 +1096,7 @@ pub(super) fn constant_delta(delta: i64, ptr_bits: u16) -> Expr {
     Expr::konst(u128::from(masked), ptr_bits)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BinOp {
     Add,
     Sub,

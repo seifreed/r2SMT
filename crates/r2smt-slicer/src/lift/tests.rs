@@ -882,20 +882,108 @@ fn aarch32_vstr_stores_the_register_width() {
     );
 }
 
+fn aarch32_lifts_cleanly(stmts: &[IrStmt]) -> bool {
+    !stmts
+        .iter()
+        .any(|s| matches!(s, IrStmt::Unsupported { .. }))
+}
+
 #[test]
-fn aarch32_register_post_index_declines_rather_than_dropping_the_writeback() {
-    // `ldr r0, [r1], r2` updates `r1` by `r2`. The immediate post-index
-    // guard does not claim this shape, and falling through to the plain
-    // offset arm would lift the load correctly while silently dropping
-    // the base update — a wrong `r1` for every later read.
+fn aarch32_register_post_index_updates_its_base_by_the_delta_register() {
+    // `ldr r0, [r1], r2` loads from `r1` and then adds `r2` to it. The
+    // base update is the part that used to be dropped silently.
     let stmts = lift_aarch32(
         "ldr",
         vec![reg("r0"), op("[r1]", OperandKind::Memory), reg("r2")],
     );
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    assert!(
+        stmts.iter().any(|s| matches!(
+            s,
+            IrStmt::Assign { dst, src }
+                if dst.name == "r1" && format!("{src:?}").contains("r2")
+        )),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_register_offset_load_addresses_base_plus_index() {
+    // `ldr r0, [r1, r2]` — the index is a register, not an immediate.
+    let stmts = lift_aarch32("ldr", vec![reg("r0"), op("[r1, r2]", OperandKind::Memory)]);
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    assert!(
+        stmts.iter().any(|s| matches!(
+            s,
+            IrStmt::LoadMem { address, .. }
+                if format!("{address:?}").contains("r1") && format!("{address:?}").contains("r2")
+        )),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_shifted_register_offset_scales_the_index() {
+    // radare2 spells the shift `lsl 2`, with no `#` on the amount.
+    let stmts = lift_aarch32(
+        "ldr",
+        vec![reg("r0"), op("[r1, r2, lsl 2]", OperandKind::Memory)],
+    );
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
     assert!(
         stmts
             .iter()
-            .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+            .any(|s| matches!(s, IrStmt::LoadMem { address, .. } if format!("{address:?}").contains("Shl"))),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_subtracted_register_offset_negates_the_index() {
+    let stmts = lift_aarch32("ldr", vec![reg("r0"), op("[r1, -r2]", OperandKind::Memory)]);
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::LoadMem { address, .. } if format!("{address:?}").contains("Sub"))),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_register_pre_index_writes_back_the_index_register() {
+    // `[r1, r2]!` adds `r2` to `r1` as well as addressing with it.
+    let stmts = lift_aarch32("ldr", vec![reg("r0"), op("[r1, r2]!", OperandKind::Memory)]);
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    assert!(
+        stmts.iter().any(|s| matches!(
+            s,
+            IrStmt::Assign { dst, src }
+                if dst.name == "r1" && format!("{src:?}").contains("r2")
+        )),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_rotated_register_offset_declines() {
+    // `ror` has no IR node; composing one from two shifts and an `Or`
+    // is a lowering this form does not earn.
+    let stmts = lift_aarch32(
+        "ldr",
+        vec![reg("r0"), op("[r1, r2, ror 4]", OperandKind::Memory)],
+    );
+    assert!(!aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+}
+
+#[test]
+fn aarch32_store_register_offset_addresses_base_plus_index() {
+    let stmts = lift_aarch32("str", vec![reg("r0"), op("[r1, r2]", OperandKind::Memory)]);
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::StoreMem { address, .. } if format!("{address:?}").contains("r2"))),
         "{stmts:?}"
     );
 }

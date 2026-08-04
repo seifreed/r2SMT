@@ -13,8 +13,8 @@ pub(super) mod neon;
 
 use super::{
     BinOp, FpArithOp, LiftCtx, MemAccess, PackedIntOp, PackedOp, VectorShape, Writeback,
-    aarch64_cond_suffix_to_predicate, fp_lane_result, fp_propagating_max_min, fp_sort_bits_checked,
-    is_aarch32_arith_short_form, is_aarch32_base_supported, nonzero_width,
+    aarch64_cond_suffix_to_predicate, constant_delta, fp_lane_result, fp_propagating_max_min,
+    fp_sort_bits_checked, is_aarch32_arith_short_form, is_aarch32_base_supported, nonzero_width,
     strip_aarch32_cond_suffix, strip_thumb_width_suffix, vector_shape, width_mask,
 };
 
@@ -475,7 +475,9 @@ impl LiftCtx {
             });
             return;
         };
-        let Some(access) = aarch32_mem_access(mem, insn.operands.get(2), self.bits) else {
+        let Some(access) =
+            aarch32_mem_access(mem, insn.operands.get(2..).unwrap_or_default(), self.bits)
+        else {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("vldr/vstr addressing mode not modelled: {}", mem.raw),
@@ -536,7 +538,9 @@ impl LiftCtx {
             return;
         };
         let load_width = width_override.unwrap_or(dst_width);
-        let Some(access) = aarch32_mem_access(mem, insn.operands.get(2), self.bits) else {
+        let Some(access) =
+            aarch32_mem_access(mem, insn.operands.get(2..).unwrap_or_default(), self.bits)
+        else {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("ldr addressing mode not yet modelled: {}", mem.raw),
@@ -586,7 +590,9 @@ impl LiftCtx {
             return;
         };
         let store_width = width_override.unwrap_or(src_width);
-        let Some(access) = aarch32_mem_access(mem, insn.operands.get(2), self.bits) else {
+        let Some(access) =
+            aarch32_mem_access(mem, insn.operands.get(2..).unwrap_or_default(), self.bits)
+        else {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("str addressing mode not yet modelled: {}", mem.raw),
@@ -901,7 +907,7 @@ fn aarch32_base_writeback(raw: &str) -> Option<(String, bool)> {
 /// (`[Rn, #imm]!`) and post-index (`[Rn], #imm`) writeback forms.
 /// Mirrors the `AArch64` resolver but validates the base through the
 /// `Arch::Arm` register table. Unrecognised shapes still return `None`.
-fn aarch32_mem_access(mem: &Operand, post: Option<&Operand>, ptr_bits: u16) -> Option<MemAccess> {
+fn aarch32_mem_access(mem: &Operand, post: &[Operand], ptr_bits: u16) -> Option<MemAccess> {
     if mem.kind != OperandKind::Memory {
         return None;
     }
@@ -909,31 +915,148 @@ fn aarch32_mem_access(mem: &Operand, post: Option<&Operand>, ptr_bits: u16) -> O
     if let Some(body) = raw.strip_suffix('!') {
         let (base, offset) = parse_aarch32_memory(body.trim())?;
         let parent = register_layout(&base, Arch::Arm).map(|l| l.parent)?;
+        let delta = aarch32_offset_expr(&offset, ptr_bits)?;
         return Some(MemAccess {
-            address: aarch32_addr_from(parent, offset, ptr_bits),
-            writeback: Some(Writeback::by_constant(parent, offset, ptr_bits)),
+            address: aarch32_addr_from_offset(parent, &offset, ptr_bits)?,
+            writeback: Some(Writeback {
+                base: parent.to_string(),
+                delta,
+            }),
         });
     }
     let (base, offset) = parse_aarch32_memory(raw)?;
     let parent = register_layout(&base, Arch::Arm).map(|l| l.parent)?;
-    if let Some(op) = post {
-        // A post-index operand the immediate form does not claim is a
-        // register delta (`ldr r0, [r1], r2`). Falling through to the
-        // plain arm below would lift the load correctly and drop the
-        // base update entirely, leaving a later read of `r1` bound to a
-        // value the machine never held. Decline instead.
-        if op.kind != OperandKind::Immediate || offset != 0 {
+    if !post.is_empty() {
+        // A post-index delta is written outside the brackets, so the
+        // bracketed part must be the bare base: `ldr r0, [r1], r2`.
+        if offset != MemOffset::Immediate(0) {
             return None;
         }
-        let delta = parse_aarch32_immediate(op.raw.strip_prefix('#').unwrap_or(&op.raw).trim())?;
+        let delta = parse_aarch32_offset(post)?;
         return Some(MemAccess {
             address: Expr::Var(Var::new(parent, ptr_bits)),
-            writeback: Some(Writeback::by_constant(parent, delta, ptr_bits)),
+            writeback: Some(Writeback {
+                base: parent.to_string(),
+                delta: aarch32_offset_expr(&delta, ptr_bits)?,
+            }),
         });
     }
     Some(MemAccess {
-        address: aarch32_addr_from(parent, offset, ptr_bits),
+        address: aarch32_addr_from_offset(parent, &offset, ptr_bits)?,
         writeback: None,
+    })
+}
+
+/// The offset part of an `AArch32` memory operand.
+///
+/// `AArch32` scales an index register inside the addressing mode
+/// (`[r0, r1, lsl 2]`), which `AArch64` spells with an extend operator
+/// and x86 with a scale field. Modelling it as an offset *expression*
+/// rather than a constant is what lets one resolver answer all three
+/// spellings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MemOffset {
+    /// `[Rn]` (zero) or `[Rn, #imm]`.
+    Immediate(i64),
+    /// `[Rn, Rm]`, `[Rn, -Rm]`, `[Rn, Rm, lsl 2]`.
+    Register {
+        name: String,
+        subtract: bool,
+        shift: Option<(BinOp, u32)>,
+    },
+}
+
+/// The shift applied to an index register, or `None` for a spelling
+/// this model does not carry.
+///
+/// `ror` and `rrx` are declined rather than lowered: the IR has no
+/// rotate, and composing one from two shifts plus an `Or` would be a
+/// new lowering to validate for a form that is rare in an address.
+fn aarch32_shift_op(name: &str) -> Option<BinOp> {
+    match name {
+        "lsl" => Some(BinOp::Shl),
+        "lsr" => Some(BinOp::Shr),
+        "asr" => Some(BinOp::Sar),
+        _ => None,
+    }
+}
+
+/// The offset as an expression to add to the base, at the pointer
+/// width. A subtracted index becomes `0 - Rm` so the caller adds
+/// unconditionally.
+fn aarch32_offset_expr(offset: &MemOffset, ptr_bits: u16) -> Option<Expr> {
+    match offset {
+        MemOffset::Immediate(value) => Some(constant_delta(*value, ptr_bits)),
+        MemOffset::Register {
+            name,
+            subtract,
+            shift,
+        } => {
+            let parent = register_layout(name, Arch::Arm).map(|l| l.parent)?;
+            let mut value = Expr::Var(Var::new(parent, ptr_bits));
+            if let Some((op, amount)) = shift {
+                value = op.apply(value, Expr::konst(u128::from(*amount), ptr_bits));
+            }
+            if *subtract {
+                value = Expr::sub(Expr::konst(0, ptr_bits), value);
+            }
+            Some(value)
+        }
+    }
+}
+
+/// Build `base + offset` at the pointer width, keeping a zero
+/// immediate as the bare base so the common shape is unchanged.
+fn aarch32_addr_from_offset(parent: &str, offset: &MemOffset, ptr_bits: u16) -> Option<Expr> {
+    let base_var = Expr::Var(Var::new(parent, ptr_bits));
+    if *offset == MemOffset::Immediate(0) {
+        return Some(base_var);
+    }
+    Some(Expr::add(base_var, aarch32_offset_expr(offset, ptr_bits)?))
+}
+
+/// Parse the operands that follow a bracketed memory operand into the
+/// post-index delta: `, r2` or `, r2, lsl 2` or `, #4`.
+fn parse_aarch32_offset(operands: &[Operand]) -> Option<MemOffset> {
+    let parts: Vec<&str> = operands.iter().map(|o| o.raw.trim()).collect();
+    parse_aarch32_offset_parts(&parts)
+}
+
+/// Parse the comma-separated tail of an addressing mode, shared by the
+/// in-bracket and post-index spellings.
+fn parse_aarch32_offset_parts(parts: &[&str]) -> Option<MemOffset> {
+    let (index, shift) = match parts {
+        [index] => (*index, None),
+        [index, shift] => (*index, Some(*shift)),
+        _ => return None,
+    };
+    let bare = index.strip_prefix('#').unwrap_or(index).trim();
+    if let Some(value) = parse_aarch32_immediate(bare) {
+        // An immediate takes no shift; `[r0, #4, lsl 2]` is not a form.
+        return shift.is_none().then_some(MemOffset::Immediate(value));
+    }
+    let (subtract, name) = bare
+        .strip_prefix('-')
+        .map_or((false, bare), |rest| (true, rest.trim()));
+    let name = name.to_ascii_lowercase();
+    register_layout(&name, Arch::Arm)?;
+    let shift = match shift {
+        None => None,
+        Some(spec) => {
+            let mut words = spec.split_whitespace();
+            let op = aarch32_shift_op(&words.next()?.to_ascii_lowercase())?;
+            let amount = words.next()?;
+            let amount = parse_aarch32_immediate(amount.strip_prefix('#').unwrap_or(amount))?;
+            if words.next().is_some() {
+                return None;
+            }
+            Some((op, u32::try_from(amount).ok()?))
+        }
+    };
+    Some(MemOffset::Register {
+        name,
+        subtract,
+        shift,
     })
 }
 
@@ -955,21 +1078,19 @@ pub(super) fn aarch32_addr_from(parent: &str, offset: i64, ptr_bits: u16) -> Exp
     Expr::add(base_var, Expr::konst(u128::from(masked), ptr_bits))
 }
 
-/// Split `[base{, #?imm}]` into `(base, offset)`; `None` for any shape
-/// outside the supported offset subset (writeback keeps the `!` or a
-/// post-index `, #imm` outside the brackets; register-offset yields a
-/// non-numeric second part).
-fn parse_aarch32_memory(raw: &str) -> Option<(String, i64)> {
+/// Split `[base{, offset}]` into `(base, offset)`, where the offset is
+/// an immediate, an index register, or a shifted index register.
+/// `None` for any shape outside that subset (writeback keeps the `!` or
+/// a post-index delta outside the brackets).
+fn parse_aarch32_memory(raw: &str) -> Option<(String, MemOffset)> {
     let body = raw.trim().strip_prefix('[')?.strip_suffix(']')?;
-    let parts: Vec<&str> = body.split(',').map(str::trim).collect();
-    match parts.as_slice() {
-        [base] => Some((base.to_ascii_lowercase(), 0)),
-        [base, offset] => {
-            let off = offset.strip_prefix('#').unwrap_or(offset).trim();
-            Some((base.to_ascii_lowercase(), parse_aarch32_immediate(off)?))
-        }
-        _ => None,
+    let mut parts = body.split(',').map(str::trim);
+    let base = parts.next()?.to_ascii_lowercase();
+    let tail: Vec<&str> = parts.collect();
+    if tail.is_empty() {
+        return Some((base, MemOffset::Immediate(0)));
     }
+    Some((base, parse_aarch32_offset_parts(&tail)?))
 }
 
 /// Parse a signed immediate in decimal or `0x` hex (with optional `-`).
