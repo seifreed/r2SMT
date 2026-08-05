@@ -1577,14 +1577,15 @@ mod tests {
         // still lift, still be accepted by the test above, and round
         // twice: a wrong value, silently. The exactness argument needs
         // `q >= 2p + 2`, and only binary128 gives it for `p = 53`.
-        let formats = fused_formats(FP_DOUBLE_BITS).expect("binary64 lanes are modelled");
         assert_eq!(
-            formats.wide,
-            (15, 113),
+            fused_formats(FP_DOUBLE_BITS).map(|formats| formats.wide),
+            Some((15, 113)),
             "a binary64 fused step must widen to binary128"
         );
-        assert!(
-            u32::from(formats.wide.1) >= 2 * u32::from(formats.lane.1) + 2,
+        assert_eq!(
+            fused_formats(FP_DOUBLE_BITS)
+                .map(|formats| u32::from(formats.wide.1) >= 2 * u32::from(formats.lane.1) + 2),
+            Some(true),
             "the intermediate must be wide enough for a single rounding"
         );
     }
