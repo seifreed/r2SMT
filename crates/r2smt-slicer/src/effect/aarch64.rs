@@ -43,7 +43,7 @@ pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
         // slicer sees the aliasing.
         "fadd" | "fsub" | "fmul" | "fdiv" | "fmax" | "fmin" | "fsqrt" | "fabs" | "fneg"
         | "fmov" | "fcvt" | "scvtf" | "ucvtf" | "fcvtzs" | "fcvtzu" | "frinta" | "frintn"
-        | "frintp" | "frintm" | "frintz" | "frinti" | "frintx" => {
+        | "frintp" | "frintm" | "frintz" | "frinti" | "frintx" | "frecpx" => {
             aarch64_arith3_effect(insn, InstructionKind::Simd, false)
         }
         // `fcmp` writes NZCV and defines no register — `cmp`'s shape.

@@ -157,6 +157,7 @@ impl LiftCtx {
             "frintm" => self.lift_aarch64_fp_round(insn, RoundingMode::TowardNegative),
             "frintz" => self.lift_aarch64_fp_round(insn, RoundingMode::TowardZero),
             "frinti" | "frintx" => self.lift_aarch64_fp_round(insn, FPCR_DEFAULT_ROUNDING),
+            "frecpx" => self.lift_aarch64_frecpx(insn),
             _ => self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("at {addr} (aarch64)", addr = insn.address),
@@ -1034,6 +1035,46 @@ impl LiftCtx {
         }
     }
 
+    /// `frecpx Rd, Rn` — the reciprocal *exponent*.
+    ///
+    /// Shares a prefix with `frecpe` and almost nothing else, which is
+    /// the hazard worth naming. The estimate's value is
+    /// implementation-defined inside an error bound, so it lowers to a
+    /// free value; `FPRecpX` is defined exactly — the exponent field
+    /// complemented, the significand cleared, the sign kept — so lowering
+    /// it as a free value would throw away a fact the architecture
+    /// guarantees, and lowering `frecpe` this way would invent one.
+    ///
+    /// Built on the bit pattern rather than on a float sort, which keeps
+    /// the binary16 form renderable by the text backends as well as by
+    /// Z3. The NaN arm reproduces `FPProcessNaN` under the reset FPCR
+    /// (`DN == 0`): the operand with its quiet bit forced on, which
+    /// leaves a quiet NaN alone and quietens a signalling one.
+    ///
+    /// There is no vector form of this instruction, so no arrangement
+    /// ever reaches here.
+    fn lift_aarch64_frecpx(&mut self, insn: &Instruction) {
+        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
+            self.push_aarch64_fp_unsupported(insn);
+            return;
+        };
+        let Some(lane) = self.simd_view_bits(dst) else {
+            self.push_aarch64_fp_unsupported(insn);
+            return;
+        };
+        let Some(bits) = self.read_simd_lane_bits(src, lane, 0) else {
+            self.push_aarch64_fp_unsupported(insn);
+            return;
+        };
+        let Some(result) = reciprocal_exponent(bits, lane) else {
+            self.push_aarch64_fp_unsupported(insn);
+            return;
+        };
+        if !self.write_simd_dst(dst, result, true) {
+            self.push_aarch64_fp_unsupported(insn);
+        }
+    }
+
     /// `fabs`/`fneg Rd, Rn` — sign-bit manipulation, modelled on the
     /// bit pattern rather than as arithmetic so no rounding is implied.
     fn lift_aarch64_fp_unary(&mut self, insn: &Instruction, op: FpUnaryOp) {
@@ -1287,6 +1328,44 @@ impl LiftCtx {
             comment: format!("unmodellable operand at {addr}", addr = insn.address),
         });
     }
+}
+
+/// `FPRecpX` over the stored bit pattern of a `lane`-bit float.
+///
+/// The architecture's three cases, in the order it spells them. A NaN is
+/// quietened and returned. A zero or subnormal — every encoding whose
+/// exponent field is zero — yields `Ones(E) - 1`, which is one below the
+/// infinity / NaN field and so the largest *finite* exponent; the
+/// complement would give the all-ones field and turn a zero into an
+/// infinity. Everything else takes the complemented field, which sends an
+/// infinity to a zero of the same sign because the significand is cleared
+/// either way.
+fn reciprocal_exponent(bits: Expr, lane: u16) -> Option<Expr> {
+    let (ebits, sbits) = fp_sort_bits_checked(lane)?;
+    let frac_bits = sbits.checked_sub(1)?;
+    let all_ones = 1u128.checked_shl(u32::from(ebits))?.checked_sub(1)?;
+    let sign = Expr::extract(bits.clone(), lane - 1, lane - 1);
+    let exponent = Expr::extract(bits.clone(), lane - 2, frac_bits);
+    let fraction = Expr::extract(bits.clone(), frac_bits - 1, 0);
+    let reciprocal = Expr::Ite {
+        cond: Box::new(Expr::eq(exponent.clone(), Expr::konst(0, ebits))),
+        then_expr: Box::new(Expr::konst(all_ones.checked_sub(1)?, ebits)),
+        else_expr: Box::new(Expr::bv_xor(exponent.clone(), Expr::konst(all_ones, ebits))),
+    };
+    let value = Expr::concat(Expr::concat(sign, reciprocal), Expr::konst(0, frac_bits));
+    let is_nan = Expr::bool_and(
+        Expr::eq(exponent, Expr::konst(all_ones, ebits)),
+        Expr::ne(fraction, Expr::konst(0, frac_bits)),
+    );
+    let quiet = Expr::bv_or(
+        bits,
+        Expr::konst(1u128.checked_shl(u32::from(frac_bits - 1))?, lane),
+    );
+    Some(Expr::Ite {
+        cond: Box::new(is_nan),
+        then_expr: Box::new(quiet),
+        else_expr: Box::new(value),
+    })
 }
 
 /// A bit-vector of `bits` with only the sign bit set.

@@ -185,6 +185,9 @@ fn is_aarch64_fp_instruction(insn: &Instruction) -> bool {
             | "frintz"
             | "frinti"
             | "frintx"
+            // Scalar-only: `FPRecpX` has no vector encoding, so it never
+            // reaches the NEON resolver and needs naming here.
+            | "frecpx"
     )
 }
 
