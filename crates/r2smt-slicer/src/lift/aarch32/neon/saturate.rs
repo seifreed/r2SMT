@@ -20,13 +20,14 @@
 //! from overlapping.
 
 use r2smt_ir::expr::Expr;
-use r2smt_ir::program::Instruction;
+use r2smt_ir::program::{Instruction, Operand};
 
 use crate::lift::LiftCtx;
 use crate::lift::aarch32::ElementKind;
 use crate::lift::aarch32::neon_element_type;
 use crate::lift::simd::clamp_to_element;
 
+use super::element::indexed_element;
 use super::{NeonOp, NeonShape, uniform_vector_view, vector_parent_bits, vector_view_bits};
 
 /// Widest element the saturating unary forms encode. The architecture
@@ -53,6 +54,51 @@ const DOUBLING_ELEMENT_BITS: [u16; 2] = [16, 32];
 /// mean, so one is a decline rather than a signedness to carry.
 fn is_signed_element(element: ElementKind) -> bool {
     element == ElementKind::Signed
+}
+
+/// How a doubling multiply addresses its second source.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::lift::aarch32) enum SecondSource {
+    /// The whole vector, paired lane with lane.
+    Lanewise,
+    /// One lane of it, contributing to every destination lane.
+    Element(u16),
+}
+
+/// Which of the two spellings `op` is, or `None` for a decline.
+///
+/// The by-element check has to come first and has to be exact. An
+/// indexed operand has the register kind and the operand count the plain
+/// spelling accepts, so a resolver that only asked
+/// [`vector_view_bits`] would either refuse the form outright — which is
+/// what the family did before this — or, worse, read the whole of `d2`
+/// where the instruction names one of its lanes.
+fn second_source(op: &Operand, source_bits: u16, expected: u16) -> Option<SecondSource> {
+    if let Some((view, index)) = indexed_element(op) {
+        // The index has to address an element the register holds.
+        return (index < view.checked_div(source_bits)?).then_some(SecondSource::Element(index));
+    }
+    (vector_view_bits(op)? == expected).then_some(SecondSource::Lanewise)
+}
+
+/// A doubling multiply's second source, materialised once.
+///
+/// The by-element spelling contributes the same element to every
+/// destination lane, so it is read outside the per-lane loop rather than
+/// re-extracted: identical value, and on a memory operand the difference
+/// would be one load against one per lane.
+enum Multiplier {
+    Lanewise(Expr),
+    Element(Expr),
+}
+
+impl Multiplier {
+    fn lane(&self, source_bits: u16, index: u16) -> Option<Expr> {
+        match self {
+            Self::Element(value) => Some(value.clone()),
+            Self::Lanewise(value) => LiftCtx::extract_lane(value.clone(), source_bits, index),
+        }
+    }
 }
 
 /// `vqabs` / `vqneg` — the lane-wise magnitude and negation, clamped
@@ -85,14 +131,8 @@ pub(super) fn saturating_unary_shape(insn: &Instruction, mnemonic: &str) -> Opti
     })
 }
 
-/// `vqdmulh` / `vqrdmulh` — the doubled product's high half, clamped.
-///
-/// The by-element spelling (`vqdmulh.s16 q0, q1, d2[0]`) is refused
-/// here: [`uniform_vector_view`] declines an operand carrying vector
-/// shape, and no other resolver claims the mnemonic, so it falls through
-/// to a decline rather than being read as a whole-vector multiply. That
-/// is the sound answer — reading `d2` entire where the instruction names
-/// one of its lanes would be a wrong value.
+/// `vqdmulh` / `vqrdmulh` — the doubled product's high half, clamped,
+/// in both the lane-wise and the by-element spelling.
 pub(super) fn doubling_multiply_high_shape(
     insn: &Instruction,
     mnemonic: &str,
@@ -103,6 +143,43 @@ pub(super) fn doubling_multiply_high_shape(
         "vqrdmulh" => true,
         _ => return None,
     };
+    same_width_doubling_shape(insn, ty, |source| NeonOp::DoublingMultiplyHigh {
+        rounding,
+        source,
+    })
+}
+
+/// `vqrdmlah` / `vqrdmlsh` — the rounded doubled product combined with
+/// the destination, in both spellings.
+///
+/// Separate from [`doubling_multiply_high_shape`] only because the
+/// lowering saturates once over the whole expression where that one
+/// saturates the product alone; the geometry is identical, which is why
+/// both go through the same resolver body.
+pub(super) fn doubling_multiply_accumulate_shape(
+    insn: &Instruction,
+    mnemonic: &str,
+) -> Option<NeonShape> {
+    let (base, ty) = mnemonic.split_once('.')?;
+    let subtract = match base {
+        "vqrdmlah" => false,
+        "vqrdmlsh" => true,
+        _ => return None,
+    };
+    same_width_doubling_shape(insn, ty, |source| NeonOp::DoublingMultiplyAccumulate {
+        subtract,
+        source,
+    })
+}
+
+/// The geometry the same-width doubling multiplies share: three
+/// operands, a signed halfword or word element, and a second source that
+/// is either the whole vector or one of its lanes.
+fn same_width_doubling_shape(
+    insn: &Instruction,
+    ty: &str,
+    op: impl FnOnce(SecondSource) -> NeonOp,
+) -> Option<NeonShape> {
     let (element, lane_bits) = neon_element_type(ty)?;
     if !is_signed_element(element) || !DOUBLING_ELEMENT_BITS.contains(&lane_bits) {
         return None;
@@ -110,12 +187,13 @@ pub(super) fn doubling_multiply_high_shape(
     if insn.operands.len() != 3 {
         return None;
     }
-    let view = uniform_vector_view(insn, 3)?;
-    if view % lane_bits != 0 {
+    let view = vector_view_bits(insn.operands.first()?)?;
+    if vector_view_bits(insn.operands.get(1)?)? != view || view % lane_bits != 0 {
         return None;
     }
+    let source = second_source(insn.operands.get(2)?, lane_bits, view)?;
     Some(NeonShape {
-        op: NeonOp::DoublingMultiplyHigh { rounding },
+        op: op(source),
         lane_bits,
         lanes: view.checked_div(lane_bits)?,
     })
@@ -152,13 +230,12 @@ pub(super) fn doubling_multiply_long_shape(
     }
     let lanes = destination_view.checked_div(lane_bits)?;
     let narrow_view = source_bits.checked_mul(lanes)?;
-    for operand in insn.operands.iter().skip(1) {
-        if vector_view_bits(operand)? != narrow_view {
-            return None;
-        }
+    if vector_view_bits(insn.operands.get(1)?)? != narrow_view {
+        return None;
     }
+    let source = second_source(insn.operands.get(2)?, source_bits, narrow_view)?;
     Some(NeonShape {
-        op: NeonOp::DoublingMultiplyLong { accumulate },
+        op: NeonOp::DoublingMultiplyLong { accumulate, source },
         lane_bits,
         lanes,
     })
@@ -216,15 +293,16 @@ impl LiftCtx {
         insn: &Instruction,
         shape: NeonShape,
         rounding: bool,
+        source: SecondSource,
     ) -> Option<Expr> {
         let view = shape.view_bits()?;
         let first = self.simd_operand_value(&insn.operands.get(1)?.clone(), view)?;
-        let second = self.simd_operand_value(&insn.operands.get(2)?.clone(), view)?;
+        let second = self.doubling_multiplier(insn, source, shape.lane_bits, view)?;
         let wide = shape.lane_bits.checked_mul(2)?.checked_add(1)?;
         let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
-        for index in 0..shape.lanes {
-            let a = Self::extract_lane(first.clone(), shape.lane_bits, index)?;
-            let b = Self::extract_lane(second.clone(), shape.lane_bits, index)?;
+        for lane in 0..shape.lanes {
+            let a = Self::extract_lane(first.clone(), shape.lane_bits, lane)?;
+            let b = second.lane(shape.lane_bits, lane)?;
             let mut doubled = Expr::shl(
                 Expr::mul(Expr::sign_ext(a, wide), Expr::sign_ext(b, wide)),
                 Expr::konst(1, wide),
@@ -237,6 +315,79 @@ impl LiftCtx {
             lanes.push(clamp_to_element(high, wide, shape.lane_bits, true)?);
         }
         Self::concat_lanes(lanes)
+    }
+
+    /// `vqrdmlah` / `vqrdmlsh`.
+    ///
+    /// **One** saturation, and that is the whole difference from
+    /// `vqrdmulh` followed by a saturating add. ARM scales the
+    /// accumulator up by the element width, adds the doubled product and
+    /// the rounding term to it, and clamps the shifted-down total once —
+    /// so a product that would have saturated on its own can still land
+    /// inside the range once a negative accumulator is applied. Clamping
+    /// twice would pin it at `INT_MAX` first and give a different number.
+    ///
+    /// Two bits of headroom above the double width: the scaled
+    /// accumulator and the doubled product each reach `2^(2n-1)`, so
+    /// their sum needs `2n + 1` bits and the rounding term one more.
+    pub(super) fn aarch32_doubling_multiply_accumulate_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        subtract: bool,
+        source: SecondSource,
+    ) -> Option<Expr> {
+        let view = shape.view_bits()?;
+        let first = self.simd_operand_value(&insn.operands.get(1)?.clone(), view)?;
+        let second = self.doubling_multiplier(insn, source, shape.lane_bits, view)?;
+        let previous = self.simd_operand_value(&insn.operands.first()?.clone(), view)?;
+        let wide = shape.lane_bits.checked_mul(2)?.checked_add(2)?;
+        let shift = Expr::konst(u128::from(shape.lane_bits), wide);
+        let half = Expr::konst(
+            1u128.checked_shl(u32::from(shape.lane_bits.checked_sub(1)?))?,
+            wide,
+        );
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for lane in 0..shape.lanes {
+            let a = Self::extract_lane(first.clone(), shape.lane_bits, lane)?;
+            let b = second.lane(shape.lane_bits, lane)?;
+            let accumulator = Expr::sign_ext(
+                Self::extract_lane(previous.clone(), shape.lane_bits, lane)?,
+                wide,
+            );
+            let doubled = Expr::shl(
+                Expr::mul(Expr::sign_ext(a, wide), Expr::sign_ext(b, wide)),
+                Expr::konst(1, wide),
+            );
+            let scaled = Expr::shl(accumulator, shift.clone());
+            let combined = if subtract {
+                Expr::sub(scaled, doubled)
+            } else {
+                Expr::add(scaled, doubled)
+            };
+            let total = Expr::ashr(Expr::add(combined, half.clone()), shift.clone());
+            lanes.push(clamp_to_element(total, wide, shape.lane_bits, true)?);
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// The second source of a doubling multiply, read once.
+    fn doubling_multiplier(
+        &mut self,
+        insn: &Instruction,
+        source: SecondSource,
+        source_bits: u16,
+        view: u16,
+    ) -> Option<Multiplier> {
+        let operand = insn.operands.get(2)?.clone();
+        Some(match source {
+            SecondSource::Element(position) => {
+                Multiplier::Element(self.read_simd_lane_bits(&operand, source_bits, position)?)
+            }
+            SecondSource::Lanewise => {
+                Multiplier::Lanewise(self.simd_operand_value(&operand, view)?)
+            }
+        })
     }
 
     /// `vqdmull` / `vqdmlal` / `vqdmlsl`.
@@ -253,12 +404,13 @@ impl LiftCtx {
         insn: &Instruction,
         shape: NeonShape,
         accumulate: Option<bool>,
+        source: SecondSource,
     ) -> Option<Expr> {
         let wide_view = shape.view_bits()?;
         let narrow_bits = shape.lane_bits.checked_div(2)?;
         let narrow_view = narrow_bits.checked_mul(shape.lanes)?;
         let first = self.simd_operand_value(&insn.operands.get(1)?.clone(), narrow_view)?;
-        let second = self.simd_operand_value(&insn.operands.get(2)?.clone(), narrow_view)?;
+        let second = self.doubling_multiplier(insn, source, narrow_bits, narrow_view)?;
         let previous = match accumulate {
             Some(_) => Some(self.simd_operand_value(&insn.operands.first()?.clone(), wide_view)?),
             None => None,
@@ -270,7 +422,7 @@ impl LiftCtx {
         let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
         for index in 0..shape.lanes {
             let a = Self::extract_lane(first.clone(), narrow_bits, index)?;
-            let b = Self::extract_lane(second.clone(), narrow_bits, index)?;
+            let b = second.lane(narrow_bits, index)?;
             let doubled = Expr::shl(
                 Expr::mul(Expr::sign_ext(a, wide), Expr::sign_ext(b, wide)),
                 Expr::konst(1, wide),

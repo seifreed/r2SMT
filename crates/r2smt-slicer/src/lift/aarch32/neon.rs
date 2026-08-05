@@ -29,6 +29,7 @@ mod fused;
 mod lanewise;
 pub(super) mod lower;
 mod permute;
+mod round;
 mod saturate;
 mod select;
 pub(super) mod structured;
@@ -137,12 +138,35 @@ pub(super) enum NeonOp {
     SaturatingUnary { negate: bool },
     /// `vqdmulh` / `vqrdmulh` — the doubled lane product's high half,
     /// clamped. `rounding` adds half an ulp of the discarded half.
-    DoublingMultiplyHigh { rounding: bool },
+    ///
+    /// `source` says whether the second operand is paired lane with lane
+    /// or contributes one named element to every destination lane.
+    DoublingMultiplyHigh {
+        rounding: bool,
+        source: saturate::SecondSource,
+    },
     /// `vqdmull` / `vqdmlal` / `vqdmlsl` — the doubled product whole, in
     /// a destination element twice the source's. `accumulate` is
     /// `Some(subtract)` for the forms that read the destination as an
-    /// accumulator and `None` for the plain multiply.
-    DoublingMultiplyLong { accumulate: Option<bool> },
+    /// accumulator and `None` for the plain multiply; `source` carries
+    /// the by-element spelling as above.
+    DoublingMultiplyLong {
+        accumulate: Option<bool>,
+        source: saturate::SecondSource,
+    },
+    /// `vqrdmlah` / `vqrdmlsh` — the rounded doubled product combined
+    /// with the destination and saturated **once**, over the whole
+    /// expression rather than at each step. `subtract` is `vqrdmlsh`.
+    DoublingMultiplyAccumulate {
+        subtract: bool,
+        source: saturate::SecondSource,
+    },
+    /// `vrint<mode>` — every lane rounded to an integral value, staying
+    /// in the float sort. The mode is the one the mnemonic names, or
+    /// FPSCR's default for `vrintx`.
+    RoundToIntegral {
+        rounding: r2smt_ir::expr::RoundingMode,
+    },
     /// `vfma` / `vfms` / `vrecps` / `vrsqrts` — a multiply and the
     /// combine after it, rounded **once** over the whole expression.
     ///
@@ -209,6 +233,7 @@ pub(super) fn resolve(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| fused::fused_step_shape(insn, &mnemonic))
         .or_else(|| saturate::saturating_unary_shape(insn, &mnemonic))
         .or_else(|| saturate::doubling_multiply_high_shape(insn, &mnemonic))
+        .or_else(|| saturate::doubling_multiply_accumulate_shape(insn, &mnemonic))
         .or_else(|| saturate::doubling_multiply_long_shape(insn, &mnemonic))
         // Ahead of the mnemonic families below and, more importantly,
         // ahead of the scalar VFP arm in the dispatcher: `vcvt` is
@@ -216,6 +241,10 @@ pub(super) fn resolve(insn: &Instruction) -> Option<NeonShape> {
         // convert lane zero and leave the rest of the register
         // standing — a wrong value rather than a decline.
         .or_else(|| width::convert_shape(insn, &mnemonic))
+        // Ahead of the scalar VFP arm for the same reason `vcvt` is:
+        // `vrinta.f32` names both the packed and the scalar form, and
+        // the scalar handler would round lane zero alone.
+        .or_else(|| round::round_shape(insn, &mnemonic))
         .or_else(|| element::by_element_shape(insn, &mnemonic))
         .or_else(|| accumulate::absolute_difference_shape(insn, &mnemonic))
         .or_else(|| accumulate::pairwise_long_shape(insn, &mnemonic))
