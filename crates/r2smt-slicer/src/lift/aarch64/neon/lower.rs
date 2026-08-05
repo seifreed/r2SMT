@@ -137,10 +137,19 @@ impl LiftCtx {
     }
 
     /// One source operand, materialised once at its own view width.
+    ///
+    /// An arranged operand states its view (`v1.4s` is 128 bits); a bare
+    /// SIMD register *is* its view (`b1` is 8), which is how the scalar
+    /// spellings of the saturating and converting families name theirs.
+    /// Both answers are the same quantity, so the fallback is a second
+    /// spelling of the width rather than a second policy.
     fn widen_source(&mut self, insn: &Instruction, position: usize) -> Option<Expr> {
         let operand = insn.operands.get(position)?.clone();
-        let arrangement = operand_arrangement(&operand)?;
-        self.simd_operand_value(&operand, arrangement.view_bits())
+        let view = match operand_arrangement(&operand) {
+            Some(arrangement) => arrangement.view_bits(),
+            None => super::width::scalar_vector_width(&operand)?,
+        };
+        self.simd_operand_value(&operand, view)
     }
 
     /// The destination register read as an input, at the view the shape

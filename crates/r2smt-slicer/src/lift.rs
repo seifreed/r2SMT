@@ -243,6 +243,35 @@ pub(crate) enum VectorShape {
     Declined,
 }
 
+/// Whether `insn` names a NEON family whose scalar spelling carries no
+/// vector shape on any operand at all, so the arrangement test above
+/// would send it to the scalar dispatch and out the unknown-mnemonic
+/// arm.
+///
+/// `sqabs b0, b1` is the shape: both operands are bare SIMD registers,
+/// the element width lives in the register letter, and nothing about the
+/// text says vector. That is unlike the scalar *pairwise* forms
+/// (`addp d0, v1.2d`), which resolve today only because their second
+/// operand is arranged and opens the gate for them.
+///
+/// An allowlist rather than dropping the arrangement test, and the
+/// difference is the blast radius. Without a filter every resolver in
+/// [`aarch64::neon::shape`]'s chain would start running on operands that
+/// carry no geometry, and each would have to be re-argued as declining
+/// them. Naming the families keeps that question confined to the two
+/// resolvers that answer it. It is also what `Arch::Arm` already does
+/// with `neon_packed_op` — recognise from the mnemonic, below the shape
+/// question entirely.
+fn names_scalar_neon_family(insn: &Instruction, arch: Arch) -> bool {
+    if arch != Arch::Aarch64 {
+        return false;
+    }
+    matches!(
+        insn.mnemonic.trim().to_ascii_lowercase().as_str(),
+        "sqabs" | "sqneg"
+    )
+}
+
 /// Classify `insn` against the vector shapes the lifter models.
 ///
 /// `AArch32` NEON spells its element type on the mnemonic and leaves the
@@ -256,6 +285,7 @@ pub(crate) fn vector_shape(insn: &Instruction, arch: Arch) -> VectorShape {
         .operands
         .iter()
         .any(|op| has_vector_arrangement(&op.raw, arch))
+        && !names_scalar_neon_family(insn, arch)
     {
         return VectorShape::None;
     }

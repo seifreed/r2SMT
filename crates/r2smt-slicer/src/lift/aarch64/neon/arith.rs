@@ -867,6 +867,54 @@ pub(super) fn saturating_shape(insn: &Instruction, mnemonic: &str) -> Option<Neo
     })
 }
 
+/// `sqabs` / `sqneg` in their scalar spelling (`sqabs b0, b1`).
+///
+/// A separate resolver rather than an arm of [`saturating_shape`],
+/// because the two differ in every geometry read: this one has no
+/// arranged operand at all, so `operand_arrangement` answers `None` for
+/// both and the shared body cannot get past its first line.
+///
+/// It is the same shape as [`scalar_pairwise_shape`]'s destination, read
+/// with the same [`super::width::scalar_vector_width`] — but with
+/// neither operand arranged there is nothing to check the width
+/// *against*, so the encoding's own list of element sizes stands in for
+/// it. The architecture encodes `B`, `H`, `S` and `D`; the `q` spelling
+/// `scalar_vector_width` reports as 128 is not an encoding.
+///
+/// That last check is belt and braces today — a 128-bit element also
+/// declines further down, where the clamp cannot build its bounds — and
+/// it is kept anyway because the encoding is a fact about *this* family
+/// and belongs where the family is resolved, not left to a coincidence
+/// in the lowering that a wider intermediate would remove.
+pub(super) fn saturating_scalar_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let kind = match mnemonic {
+        "sqabs" => SaturatingKind::Unary { negate: false },
+        "sqneg" => SaturatingKind::Unary { negate: true },
+        _ => return None,
+    };
+    if insn.operands.len() != 2 {
+        return None;
+    }
+    let width = super::width::scalar_vector_width(insn.operands.first()?)?;
+    if !matches!(width, 8 | 16 | 32 | 64) {
+        return None;
+    }
+    if super::width::scalar_vector_width(insn.operands.get(1)?)? != width {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::Saturating {
+            kind,
+            signed_sources: true,
+            upper: false,
+        },
+        lane_bits: width,
+        lanes: 1,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
 /// `suqadd` / `usqadd` — the mixed-signedness accumulate.
 ///
 /// Two operands, both the destination's arrangement, and the

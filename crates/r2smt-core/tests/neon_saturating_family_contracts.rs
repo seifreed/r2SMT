@@ -227,6 +227,35 @@ fn sqneg_of_the_most_negative_element_saturates_at_the_signed_maximum() {
 }
 
 #[test]
+fn sqabs_saturates_the_same_way_in_the_scalar_spelling() {
+    // `sqabs b0, b1` carries no arrangement on either operand, so it
+    // reaches the NEON resolvers only through the scalar-family
+    // allowlist in `vector_shape`. What this pins is that arriving there
+    // it gets the *clamp* and not the wrapping `abs` — the same value
+    // hazard as the vector form, one seam further out.
+    assert_computes("sqabs", &["b0", "b1"], &[("v1", 0x80)], 0x7f);
+}
+
+#[test]
+fn sqneg_saturates_the_same_way_in_the_scalar_spelling() {
+    assert_computes("sqneg", &["h0", "h1"], &[("v1", 0x8000)], 0x7fff);
+}
+
+#[test]
+fn a_scalar_saturating_write_zeroes_the_rest_of_the_vector_register() {
+    // An `AArch64` scalar SIMD write is not a merge: it clears every bit
+    // above the element. Binding `v0` to all-ones first is what makes
+    // this fail if the lowering preserved them, which is the difference
+    // between this ISA and `AArch32`'s VFP writes.
+    assert_computes(
+        "sqabs",
+        &["b0", "b1"],
+        &[("v0", u128::MAX), ("v1", 0x80)],
+        0x7f,
+    );
+}
+
+#[test]
 fn sqabs_leaves_a_representable_magnitude_alone() {
     // The negative arm has to negate and the positive arm must not, so
     // a lowering that negated unconditionally would fail here and pass

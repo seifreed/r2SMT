@@ -1358,3 +1358,44 @@ fn aarch64_bitwise_select_reads_its_destination() {
         assert!(effect.uses.contains(&"v0"), "{mnemonic}: {effect:?}");
     }
 }
+
+#[test]
+fn aarch64_scalar_saturating_unary_defines_its_destination() {
+    // The seam whose failure is silent. `sqabs b0, b1` carries no
+    // arrangement, so before the scalar-family allowlist in
+    // `vector_shape` it fell past every arm to `other_effect` — kind
+    // `Other`, `defs` empty. That does not merely truncate: with no def
+    // recorded, a later read of `v0` binds to whatever defined it
+    // *before* this instruction, which is a fabricated value rather than
+    // a lost one.
+    for mnemonic in ["sqabs", "sqneg"] {
+        let i = insn(
+            mnemonic,
+            vec![
+                op("b0", OperandKind::Register),
+                op("b1", OperandKind::Register),
+            ],
+        );
+        let effect = analyze(&i, Arch::Aarch64);
+        assert_eq!(effect.kind, InstructionKind::Simd, "{mnemonic}");
+        assert!(effect.defs.contains(&"v0"), "{mnemonic}: {effect:?}");
+        assert!(effect.uses.contains(&"v1"), "{mnemonic}: {effect:?}");
+    }
+}
+
+#[test]
+fn aarch64_scalar_saturating_unary_does_not_read_its_destination() {
+    // The other direction, and the reason it needs its own test: an
+    // `AArch64` scalar SIMD write zeroes the rest of the register rather
+    // than merging, so unlike the accumulating families the destination
+    // is a pure def. Recording it as a use as well would keep the prior
+    // definition alive and widen every slice through one of these.
+    let i = insn(
+        "sqabs",
+        vec![
+            op("s0", OperandKind::Register),
+            op("s1", OperandKind::Register),
+        ],
+    );
+    assert!(!analyze(&i, Arch::Aarch64).uses.contains(&"v0"));
+}

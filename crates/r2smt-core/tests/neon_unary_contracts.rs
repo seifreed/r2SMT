@@ -595,12 +595,25 @@ fn addhn2_writes_the_upper_half_and_preserves_the_lower_one() {
 // ===================== the boundary =====================
 
 #[test]
-fn the_saturating_unary_forms_are_not_resolved_through_the_wrapping_ones() {
-    // `sqabs` / `sqneg` now lift, with the clamp `abs` / `neg` do not
-    // have — their values live in `neon_saturating_family_contracts`.
-    // What this file still owns is the boundary between the two: the
-    // *scalar* spelling carries no arrangement, and the wrapping family
-    // must not claim it.
-    assert_declines("sqabs", &["b0", "b1"]);
-    assert_declines("sqneg", &["h0", "h1"]);
+fn the_wrapping_unary_forms_have_no_scalar_spelling_of_their_own() {
+    // The boundary this file owns, restated now that `sqabs b0, b1`
+    // lifts. `abs` and `neg` have scalar `D`-form encodings, but they
+    // are not in the scalar-family allowlist and nothing resolves them,
+    // so they must still decline rather than be swept in by the
+    // saturating family's new arm.
+    assert_declines("abs", &["d0", "d1"]);
+    assert_declines("neg", &["d0", "d1"]);
+}
+
+#[test]
+fn the_scalar_saturating_forms_reject_a_width_the_encoding_lacks() {
+    // With no arranged operand there is nothing to check the width
+    // against, so the encoding's own element list is the only check.
+    // `q` is not in it, and `scalar_vector_width` would otherwise report
+    // 128 as happily as it reports 8.
+    assert_declines("sqabs", &["q0", "q1"]);
+    // Mismatched views are not an encoding either.
+    assert_declines("sqneg", &["b0", "h1"]);
+    // And a general register is not a SIMD view at all.
+    assert_declines("sqabs", &["w0", "w1"]);
 }

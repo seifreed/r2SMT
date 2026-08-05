@@ -315,6 +315,7 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| width::widen_shape(insn, &mnemonic))
         .or_else(|| multiply::multiply_accumulate_shape(insn, &mnemonic))
         .or_else(|| arith::saturating_shape(insn, &mnemonic))
+        .or_else(|| arith::saturating_scalar_shape(insn, &mnemonic))
         .or_else(|| arith::mixed_sign_add_shape(insn, &mnemonic))
         .or_else(|| arith::doubling_long_shape(insn, &mnemonic))
         .or_else(|| arith::shift_shape(insn, &mnemonic))
