@@ -18,6 +18,22 @@ Two rules make the measurement mean anything, both learned the hard way:
   eliminating it: a branch sitting exactly on the resource boundary has
   been observed moving between two runs of an unchanged binary.
 
+  Read that rule precisely, because the obvious reading is wrong:
+  `--rlimit` does **not** replace the wall clock. `batch` applies both
+  budgets, and omitting `--timeout-ms` leaves it at its 500 ms default
+  rather than disabling it, so whichever fires first decides. What makes
+  the rule work is that at `--rlimit 2000000` the solver finishes far
+  inside 500 ms — measured byte-identical histograms between a 500 ms and
+  a 60 s wall clock over 7 151 ARM32 branches and 27 419 x86-64 branches,
+  the second at ~1.5 ms of CPU per branch. So the wall clock is a safety
+  net there, not the binding constraint.
+
+  Two things follow. Raising `--rlimit` much past 2 000 000 needs a
+  matching `--timeout-ms` or the clock silently becomes the budget again.
+  And a batch run that takes minutes per binary is not evidence that the
+  solver is the cost — radare2's own analysis dominates on samples with
+  tens of thousands of functions, and no solver budget shortens it.
+
 * **Filter by ISA.** `data/` is 75 x86-64, 16 AArch64 and 2 CIL samples
   and is near-blind to 32-bit ARM, so running all 102 for an ARM change
   costs an hour and proves nothing. Point this at the corpus whose ISA
