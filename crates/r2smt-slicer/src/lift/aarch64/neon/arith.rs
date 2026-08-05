@@ -193,24 +193,48 @@ pub(super) fn bitwise_unary_shape(insn: &Instruction, mnemonic: &str) -> Option<
 /// inexact exception, which the value model does not carry — so both pin
 /// the reset default, and [`crate::lift::pins_rounding_mode`] lists them
 /// by mnemonic, which covers the packed spelling for free.
-pub(super) fn round_to_integral_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
-    let rounding = match mnemonic {
-        "frinta" => RoundingMode::NearestTiesAway,
-        "frintn" => RoundingMode::NearestTiesEven,
-        "frintp" => RoundingMode::TowardPositive,
-        "frintm" => RoundingMode::TowardNegative,
-        "frintz" => RoundingMode::TowardZero,
-        "frinti" | "frintx" => FPCR_DEFAULT_ROUNDING,
+/// The rounding mode a `frint*` mnemonic names, and the signed integer
+/// width it saturates into when it is one of the `FEAT_FRINTTS` forms.
+///
+/// Shared with the scalar handler so the two spellings cannot disagree
+/// about either axis.
+pub(in crate::lift) fn round_to_integral_kind(
+    mnemonic: &str,
+) -> Option<(RoundingMode, Option<u16>)> {
+    Some(match mnemonic {
+        "frinta" => (RoundingMode::NearestTiesAway, None),
+        "frintn" => (RoundingMode::NearestTiesEven, None),
+        "frintp" => (RoundingMode::TowardPositive, None),
+        "frintm" => (RoundingMode::TowardNegative, None),
+        "frintz" => (RoundingMode::TowardZero, None),
+        "frinti" | "frintx" => (FPCR_DEFAULT_ROUNDING, None),
+        // `FEAT_FRINTTS`. The `z` forms name round-toward-zero; the `x`
+        // forms take the mode from FPCR, so they pin it exactly as
+        // `frinti` / `frintx` do.
+        "frint32z" => (RoundingMode::TowardZero, Some(32)),
+        "frint64z" => (RoundingMode::TowardZero, Some(64)),
+        "frint32x" => (FPCR_DEFAULT_ROUNDING, Some(32)),
+        "frint64x" => (FPCR_DEFAULT_ROUNDING, Some(64)),
         _ => return None,
-    };
+    })
+}
+
+pub(super) fn round_to_integral_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (rounding, saturate) = round_to_integral_kind(mnemonic)?;
     let destination = uniform_shape(insn, 2)?;
     // Rounding a byte lane is not an encoding the architecture spells,
     // and reading one as a float would be a wrong value.
     if !is_float_lane(destination.lane_bits) {
         return None;
     }
+    // The saturating family is single- and double-precision only:
+    // `FEAT_FRINTTS` has no half-precision encoding, and a binary16 lane
+    // cannot even hold `2^31`.
+    if saturate.is_some() && destination.lane_bits == 16 {
+        return None;
+    }
     Some(NeonShape {
-        op: NeonOp::RoundToIntegral(rounding),
+        op: NeonOp::RoundToIntegral { rounding, saturate },
         lane_bits: destination.lane_bits,
         lanes: destination.lanes,
         dest_index: 0,

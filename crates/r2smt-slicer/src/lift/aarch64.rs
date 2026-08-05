@@ -151,12 +151,15 @@ impl LiftCtx {
             // `frintx` computes the same value while additionally being
             // able to signal the inexact exception — a flag the value
             // model does not carry, so the two lower identically.
-            "frinta" => self.lift_aarch64_fp_round(insn, RoundingMode::NearestTiesAway),
-            "frintn" => self.lift_aarch64_fp_round(insn, RoundingMode::NearestTiesEven),
-            "frintp" => self.lift_aarch64_fp_round(insn, RoundingMode::TowardPositive),
-            "frintm" => self.lift_aarch64_fp_round(insn, RoundingMode::TowardNegative),
-            "frintz" => self.lift_aarch64_fp_round(insn, RoundingMode::TowardZero),
-            "frinti" | "frintx" => self.lift_aarch64_fp_round(insn, FPCR_DEFAULT_ROUNDING),
+            //
+            // The `FEAT_FRINTTS` members (`frint32z` / `frint32x` /
+            // `frint64z` / `frint64x`) come through the same arm: the
+            // table they all consult is the packed resolver's, so the
+            // scalar and packed spellings cannot drift about either the
+            // mode or the saturation width.
+            mnemonic if let Some((rounding, saturate)) = neon::round_to_integral_kind(mnemonic) => {
+                self.lift_aarch64_fp_round(insn, rounding, saturate);
+            }
             "frecpx" => self.lift_aarch64_frecpx(insn),
             _ => self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
@@ -1016,7 +1019,18 @@ impl LiftCtx {
     /// on the values an integer register can hold, and turns an
     /// infinity, a NaN or an out-of-range magnitude into some in-range
     /// number — a wrong value rather than a lost one.
-    fn lift_aarch64_fp_round(&mut self, insn: &Instruction, rounding: RoundingMode) {
+    ///
+    /// `saturate` is the `FEAT_FRINTTS` clamp (`frint32z` / `frint32x` /
+    /// `frint64z` / `frint64x`), which keeps the float sort but bounds
+    /// the value to what a signed integer of that width holds. It shares
+    /// [`neon::lower::round_to_integral_lane`] with the packed spelling
+    /// so the two cannot disagree about the bound.
+    fn lift_aarch64_fp_round(
+        &mut self,
+        insn: &Instruction,
+        rounding: RoundingMode,
+        saturate: Option<u16>,
+    ) {
         let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
             self.push_aarch64_fp_unsupported(insn);
             return;
@@ -1029,7 +1043,11 @@ impl LiftCtx {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
-        let rounded = Expr::fp_to_ieee_bv(Expr::fround_to_integral(value, rounding));
+        let Some(rounded) = neon::lower::round_to_integral_lane(value, lane, rounding, saturate)
+        else {
+            self.push_aarch64_fp_unsupported(insn);
+            return;
+        };
         if !self.write_simd_dst(dst, rounded, true) {
             self.push_aarch64_fp_unsupported(insn);
         }

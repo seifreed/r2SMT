@@ -49,22 +49,25 @@ impl LiftCtx {
     }
 
     /// `frint<mode>` — each lane rounded to an integral value, still a
-    /// float.
+    /// float. `saturate` carries the `frint32*` / `frint64*` clamp.
     pub(super) fn round_to_integral_lanes(
         &mut self,
         insn: &Instruction,
         shape: NeonShape,
         rounding: r2smt_ir::expr::RoundingMode,
+        saturate: Option<u16>,
     ) -> Option<Expr> {
         let source = self.widen_source(insn, 1)?;
         let (ebits, sbits) = fp_sort(shape.lane_bits)?;
         let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
         for index in 0..shape.lanes {
             let element = LiftCtx::extract_lane(source.clone(), shape.lane_bits, index)?;
-            lanes.push(Expr::fp_to_ieee_bv(Expr::fround_to_integral(
+            lanes.push(round_to_integral_lane(
                 Expr::bv_to_fp(element, ebits, sbits),
+                shape.lane_bits,
                 rounding,
-            )));
+                saturate,
+            )?);
         }
         Self::concat_lanes(lanes)
     }
@@ -539,4 +542,73 @@ pub(in crate::lift) fn convert_lane(
             )))
         }
     }
+}
+
+/// The IEEE bit pattern of `2^exponent` in the `(ebits, sbits)` sort,
+/// negated when `negative`.
+///
+/// Computed rather than tabulated because the `frint32*` / `frint64*`
+/// clamp needs four `(lane, integer width)` combinations and all four
+/// are legal: the saturation width comes from the mnemonic and the float
+/// sort from the register, so they vary independently.
+fn power_of_two_bits(exponent: u16, ebits: u16, sbits: u16, negative: bool) -> Option<u128> {
+    let bias = (1u128 << ebits.checked_sub(1)?) - 1;
+    let field = bias.checked_add(u128::from(exponent))?;
+    if field >= (1u128 << ebits) {
+        return None;
+    }
+    let sign = u128::from(negative) << ebits.checked_add(sbits)?.checked_sub(1)?;
+    Some(sign | (field << sbits.checked_sub(1)?))
+}
+
+/// One lane of `frint<mode>`, with the `frint32*` / `frint64*`
+/// saturation when `saturate` names an integer width.
+///
+/// `value` is FP-sorted; the result is the lane's bit pattern.
+///
+/// The clamp is what separates `FEAT_FRINTTS` from the plain family:
+/// the result stays a float, but one that the named signed integer width
+/// could hold, and everything else — a NaN, an infinity, an out-of-range
+/// magnitude — becomes the *most negative* such value rather than
+/// anything nearer.
+///
+/// The upper bound is written `2^(N-1) <= rounded` and not
+/// `rounded > 2^(N-1) - 1`, and that is not a stylistic choice:
+/// `2^31 - 1` is **not representable in binary32**, so comparing against
+/// it would compare against `2^31` after rounding and admit one value
+/// the integer cannot hold. `2^(N-1)` is a power of two and exact in
+/// both sorts. The NaN test is separate because every float comparison
+/// is false on a NaN, so neither bound would catch it.
+pub(in crate::lift) fn round_to_integral_lane(
+    value: Expr,
+    lane_bits: u16,
+    rounding: r2smt_ir::expr::RoundingMode,
+    saturate: Option<u16>,
+) -> Option<Expr> {
+    let rounded = Expr::fround_to_integral(value.clone(), rounding);
+    let Some(int_bits) = saturate else {
+        return Some(Expr::fp_to_ieee_bv(rounded));
+    };
+    let (ebits, sbits) = fp_sort(lane_bits)?;
+    let exponent = int_bits.checked_sub(1)?;
+    let limit = |negative| {
+        power_of_two_bits(exponent, ebits, sbits, negative).map(|bits| Expr::FpConst {
+            bits,
+            ebits,
+            sbits,
+        })
+    };
+    let most_negative = limit(true)?;
+    let out_of_range = Expr::bool_or(
+        Expr::fisnan(value),
+        Expr::bool_or(
+            Expr::flt(rounded.clone(), most_negative.clone()),
+            Expr::fle(limit(false)?, rounded.clone()),
+        ),
+    );
+    Some(Expr::Ite {
+        cond: Box::new(out_of_range),
+        then_expr: Box::new(Expr::fp_to_ieee_bv(most_negative)),
+        else_expr: Box::new(Expr::fp_to_ieee_bv(rounded)),
+    })
 }

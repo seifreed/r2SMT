@@ -185,6 +185,12 @@ fn is_aarch64_fp_instruction(insn: &Instruction) -> bool {
             | "frintz"
             | "frinti"
             | "frintx"
+            // `FEAT_FRINTTS`, whose scalar spellings reach the same
+            // per-mnemonic handler as the rest of the family.
+            | "frint32z"
+            | "frint32x"
+            | "frint64z"
+            | "frint64x"
             // Scalar-only: `FPRecpX` has no vector encoding, so it never
             // reaches the NEON resolver and needs naming here.
             | "frecpx"
@@ -384,6 +390,11 @@ pub(crate) fn pins_rounding_mode(insn: &Instruction, arch: Arch) -> bool {
                 | "ucvtf"
                 | "frinti"
                 | "frintx"
+                // `FEAT_FRINTTS`: the `x` forms take their mode from
+                // FPCR exactly as `frintx` does. The `z` forms name
+                // theirs and are deliberately absent.
+                | "frint32x"
+                | "frint64x"
         ),
         // `AArch32` spells the precision on the mnemonic, so the same
         // parsers that dispatch the VFP and NEON families answer this.

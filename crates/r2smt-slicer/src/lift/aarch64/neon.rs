@@ -149,7 +149,17 @@ enum NeonOp {
     /// agrees only on the values an integer lane can hold, and turns an
     /// infinity, a NaN or an out-of-range magnitude into some in-range
     /// number.
-    RoundToIntegral(RoundingMode),
+    RoundToIntegral {
+        rounding: RoundingMode,
+        /// The `frint32*` / `frint64*` clamp: the signed integer width
+        /// the integral result must fit, or `None` for the plain
+        /// family.
+        ///
+        /// Independent of `lane_bits` on purpose — `FEAT_FRINTTS`
+        /// encodes all four combinations, because the saturation width
+        /// comes from the mnemonic and the float sort from the register.
+        saturate: Option<u16>,
+    },
     /// `bsl` / `bit` / `bif` — bitwise select, where one of the three
     /// registers supplies the mask and the destination is always one of
     /// the three.
@@ -349,6 +359,8 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| multiply::fused_step_shape(insn, &mnemonic))
         .or_else(|| arith::estimate_shape(insn, &mnemonic))
 }
+
+pub(in crate::lift) use arith::round_to_integral_kind;
 
 mod arith;
 mod geometry;

@@ -21,7 +21,7 @@ use super::{NeonOp, NeonShape};
 use crate::lift::LiftCtx;
 use permute::immediate_lanes;
 
-pub(in crate::lift) use width::{convert_lane, high_narrow_lane};
+pub(in crate::lift) use width::{convert_lane, high_narrow_lane, round_to_integral_lane};
 
 impl LiftCtx {
     /// Lower a resolved NEON instruction.
@@ -102,8 +102,8 @@ impl LiftCtx {
             NeonOp::FloatToGpr { signed, rounding } => {
                 self.float_to_gpr(insn, shape, signed, rounding)
             }
-            NeonOp::RoundToIntegral(rounding) => {
-                self.round_to_integral_lanes(insn, shape, rounding)
+            NeonOp::RoundToIntegral { rounding, saturate } => {
+                self.round_to_integral_lanes(insn, shape, rounding, saturate)
             }
             NeonOp::BitwiseSelect(role) => self.bitwise_select(insn, shape, role),
             NeonOp::Reduce {

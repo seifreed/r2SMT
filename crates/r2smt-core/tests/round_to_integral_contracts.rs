@@ -632,3 +632,120 @@ fn frndint_truncates_when_the_function_reloads_the_control_word() {
         "`fldcw` must invalidate the mode `frndint` pinned"
     );
 }
+
+// ===================== FEAT_FRINTTS =====================
+//
+// `frint32z` / `frint32x` / `frint64z` / `frint64x` round to an integral
+// value and *stay a float*, like the rest of the family — but one the
+// named signed integer width could hold. Everything outside that range,
+// and every NaN and infinity, becomes the **most negative** such value
+// rather than anything nearer. That last part is what makes a wrong
+// bound a wrong value: clamping to the maximum, or leaving an out-of-
+// range magnitude alone, both look reasonable and are neither.
+
+/// `2^31` and `-2^31` in binary64: the exact edges of the `frint32*`
+/// range, and both exactly representable because they are powers of two.
+const D_TWO_POW_31: u128 = 0x41e0_0000_0000_0000;
+const D_NEG_TWO_POW_31: u128 = 0xc1e0_0000_0000_0000;
+/// `1e10`, comfortably outside a signed word and inside a signed
+/// doubleword, and `-2^63`, the `frint64*` floor.
+const D_TEN_BILLION: u128 = 0x4202_a05f_2000_0000;
+const D_NEG_TWO_POW_63: u128 = 0xc3e0_0000_0000_0000;
+const D_NAN: u128 = 0x7ff8_0000_0000_0000;
+const D_INFINITY: u128 = 0x7ff0_0000_0000_0000;
+
+#[test]
+fn frint32z_rounds_toward_zero_inside_the_range() {
+    // In range it is just `frintz`, so the clamp must not disturb it.
+    assert_aarch64_rounds("frint32z", D_2_5, D_2_0);
+    assert_aarch64_rounds("frint32z", D_NEG_2_5, D_NEG_2_0);
+}
+
+#[test]
+fn frint32z_saturates_an_out_of_range_magnitude_to_the_most_negative() {
+    // 1e10 does not fit a signed word. ARM answers `-2^31` — the most
+    // negative representable value — and not `2^31 - 1`, which is the
+    // clamp anyone would write by reflex.
+    assert_aarch64_rounds("frint32z", D_TEN_BILLION, D_NEG_TWO_POW_31);
+}
+
+#[test]
+fn frint32z_rejects_the_upper_edge_and_keeps_the_lower_one() {
+    // The asymmetry that makes the bound worth testing at the edge:
+    // `-2^31` is *in* range and survives, while `+2^31` is one past the
+    // top and saturates. Writing the upper test against `2^31 - 1`
+    // instead would be wrong twice over — that value is not
+    // representable in binary32, and after rounding it compares equal to
+    // `2^31`, so the edge would be admitted.
+    assert_aarch64_rounds("frint32z", D_NEG_TWO_POW_31, D_NEG_TWO_POW_31);
+    assert_aarch64_rounds("frint32z", D_TWO_POW_31, D_NEG_TWO_POW_31);
+}
+
+#[test]
+fn frint32z_saturates_a_nan_and_an_infinity() {
+    // Neither bound catches a NaN on its own: every float comparison is
+    // false against one, so the NaN test has to be separate.
+    assert_aarch64_rounds("frint32z", D_NAN, D_NEG_TWO_POW_31);
+    assert_aarch64_rounds("frint32z", D_INFINITY, D_NEG_TWO_POW_31);
+}
+
+#[test]
+fn frint64z_keeps_what_frint32z_saturates() {
+    // The pair that separates the two widths. Same input, same float
+    // sort, different mnemonic: 1e10 fits a signed doubleword, so
+    // `frint64z` leaves it and `frint32z` clamps it. The saturation
+    // width comes from the mnemonic, never from the register.
+    assert_aarch64_rounds("frint64z", D_TEN_BILLION, D_TEN_BILLION);
+    assert_aarch64_rounds("frint64z", D_NAN, D_NEG_TWO_POW_63);
+}
+
+#[test]
+fn frint32x_takes_the_fpcr_mode_where_frint32z_truncates() {
+    // The `z`/`x` axis, independent of the width one: `x` rounds to
+    // nearest-even out of reset, so 2.5 becomes 2 either way but -2.5
+    // separates them — truncation gives -2, nearest-even gives -2 as
+    // well, so 1.5 is the discriminator.
+    assert_aarch64_rounds("frint32x", D_1_5, D_2_0);
+    assert_aarch64_rounds("frint32z", D_1_5, D_1_0);
+}
+
+#[test]
+fn packed_frint32z_saturates_every_lane_independently() {
+    // Four binary32 lanes, two in range and two not, so a lowering that
+    // clamped the whole vector or only lane zero fails.
+    const S_TEN_BILLION: u128 = 0x5015_02f9;
+    const S_NEG_TWO_POW_31: u128 = 0xcf00_0000;
+    assert_eq!(
+        solve_arm_lowering(
+            Arch::Aarch64,
+            "frint32z",
+            &["v0.4s", "v1.4s"],
+            &[
+                ("v0", PARENT_PRESET),
+                (
+                    "v1",
+                    packed32(&[S_2_5, S_TEN_BILLION, S_NEG_2_5, S_TEN_BILLION])
+                ),
+            ],
+            packed32(&[S_2_0, S_NEG_TWO_POW_31, S_NEG_2_0, S_NEG_TWO_POW_31,]),
+        ),
+        SmtResult::AlwaysTrue,
+        "frint32z must clamp each lane on its own"
+    );
+}
+
+#[test]
+fn the_saturating_round_declines_a_half_precision_lane() {
+    // `FEAT_FRINTTS` has no half-precision encoding, and a binary16
+    // lane could not hold `2^31` to compare against in any case.
+    let lifted = lift_per_mnemonic(
+        &instruction("frint32z", vec![reg("v0.4h"), reg("v1.4h")]),
+        Arch::Aarch64,
+    );
+    assert!(
+        lifted
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+        "{lifted:?}"
+    );
+}
