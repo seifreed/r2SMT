@@ -304,3 +304,127 @@ fn the_shift_inserts_decline_an_amount_outside_the_encoding() {
     assert_declines("sli", &["v0.8b", "v1.8b", "#8"]);
     assert_declines("sri", &["v0.8b", "v1.8b", "#0"]);
 }
+
+// ===================== the saturating left shifts =====================
+
+#[test]
+fn sqshl_by_an_immediate_clamps_towards_the_sign_it_is_heading_for() {
+    // `0x40 << 1` is 128, one past the signed maximum, so it clamps up;
+    // `0xc0 << 1` is exactly `-128` and does not clamp at all; `0x80`
+    // is already the minimum and clamps down. A lowering that clamped
+    // in one direction only would get two of these three right.
+    assert_computes(
+        "sqshl",
+        &["v0.8b", "v1.8b", "#1"],
+        &[("v1", packed(8, &[0x40, 0xc0, 0x80, 0x10]))],
+        packed(8, &[0x7f, 0x80, 0x80, 0x20]),
+    );
+}
+
+#[test]
+fn uqshl_reads_the_element_unsigned_where_sqshl_reads_it_signed() {
+    // The same `0x40 << 1` that overflows the signed range is an
+    // ordinary 128 here, so a lowering that shared one signedness
+    // between the two mnemonics would answer `0x7f` for the middle
+    // lane.
+    assert_computes(
+        "uqshl",
+        &["v0.8b", "v1.8b", "#1"],
+        &[("v1", packed(8, &[0xff, 0x40, 0x80]))],
+        packed(8, &[0xff, 0x80, 0xff]),
+    );
+}
+
+#[test]
+fn sqshl_clamps_at_a_wider_element_too() {
+    assert_computes(
+        "sqshl",
+        &["v0.4h", "v1.4h", "#3"],
+        &[("v1", packed(16, &[0x1000, 0x8000, 0x0100]))],
+        packed(16, &[0x7fff, 0x8000, 0x0800]),
+    );
+}
+
+#[test]
+fn sqshl_by_a_register_shifts_right_when_the_amount_is_negative() {
+    // The per-lane amount is *signed*, so one lane can shift left while
+    // its neighbour shifts right — and the right direction is
+    // arithmetic here, not logical, so `-16 >> 1` is `-8` and not 120.
+    assert_computes(
+        "sqshl",
+        &["v0.8b", "v1.8b", "v2.8b"],
+        &[
+            ("v1", packed(8, &[0xf0, 0x40])),
+            ("v2", packed(8, &[0xff, 0x02])),
+        ],
+        packed(8, &[0xf8, 0x7f]),
+    );
+}
+
+#[test]
+fn sqshl_by_an_amount_past_the_element_width_saturates_a_nonzero_source() {
+    // The case the shift-it-back overflow test exists for: at the
+    // element's own width `1 << 8` is zero, which a magnitude
+    // comparison would read as an in-range result. Shifting back
+    // catches it — and still lets a zero source through, which is what
+    // the architecture does.
+    assert_computes(
+        "sqshl",
+        &["v0.8b", "v1.8b", "v2.8b"],
+        &[
+            ("v1", packed(8, &[0x01, 0x00])),
+            ("v2", packed(8, &[0x08, 0x08])),
+        ],
+        packed(8, &[0x7f, 0x00]),
+    );
+}
+
+#[test]
+fn uqrshl_saturates_the_left_direction_at_the_unsigned_maximum() {
+    assert_computes(
+        "uqrshl",
+        &["v0.8b", "v1.8b", "v2.8b"],
+        &[("v1", packed(8, &[0x80])), ("v2", packed(8, &[0x01]))],
+        packed(8, &[0xff]),
+    );
+}
+
+// ===================== the rounding right shifts =====================
+//
+// The half-ulp trap. ARM defines the rounding on the unbounded integer,
+// so the term has to be added one bit wider than the source: at the
+// source's own width the carry reaches the sign bit and a saturation at
+// the top of the range becomes one at the bottom.
+
+#[test]
+fn sqrshl_adds_the_half_ulp_wider_than_the_element() {
+    // `(127 + 1) >> 1` is 64. Added at eight bits, `127 + 1` is `0x80`
+    // — negative — and an arithmetic shift of it gives `0xc0`, which is
+    // `-64` rather than `64`.
+    assert_computes(
+        "sqrshl",
+        &["v0.8b", "v1.8b", "v2.8b"],
+        &[("v1", packed(8, &[0x7f])), ("v2", packed(8, &[0xff]))],
+        packed(8, &[0x40]),
+    );
+}
+
+#[test]
+fn urshl_adds_the_half_ulp_wider_than_the_element() {
+    // The unsigned twin, where the same carry leaves the element
+    // entirely: `255 + 1` is zero at eight bits, so the wrong width
+    // answers `0x00` where the architecture answers `0x80`.
+    assert_computes(
+        "urshl",
+        &["v0.8b", "v1.8b", "v2.8b"],
+        &[("v1", packed(8, &[0xff])), ("v2", packed(8, &[0xff]))],
+        packed(8, &[0x80]),
+    );
+}
+
+#[test]
+fn the_saturating_shift_left_unsigned_form_still_declines() {
+    // `sqshlu` reads its element signed and clamps into the *unsigned*
+    // range, which is neither of the two clamps this family carries.
+    assert_declines("sqshlu", &["v0.8b", "v1.8b", "#1"]);
+}

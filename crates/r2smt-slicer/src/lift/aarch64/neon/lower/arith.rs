@@ -643,6 +643,48 @@ fn shift_right(
     Some(Expr::extract(shift_by(sum, wide_amount), lane_bits - 1, 0))
 }
 
+/// Shift `value` left by `amount`, clamping instead of discarding the
+/// bits that leave the element.
+///
+/// Overflow is detected by shifting the result back rather than by
+/// computing the exact product: `(v << k) >> k` restores `v` exactly
+/// when no significant bit left the element, and the restoring shift
+/// takes the *value's* signedness so a signed element's sign bit is
+/// replayed rather than zero-filled. Computing exactly is not an
+/// option here — `k` is a run-time value on the register forms, up to
+/// 255, so the exact product has no bounded width.
+///
+/// The same test covers an amount at or past the element width with no
+/// case of its own: the shift then yields zero and the restore matches
+/// only a zero source, which is exactly when the architecture does not
+/// saturate either.
+fn saturating_shift_left(value: Expr, amount: &Expr, lane_bits: u16, signed: bool) -> Option<Expr> {
+    let shifted = Expr::shl(value.clone(), amount.clone());
+    let restored = if signed {
+        Expr::ashr(shifted.clone(), amount.clone())
+    } else {
+        Expr::lshr(shifted.clone(), amount.clone())
+    };
+    // The bound a saturating value lands on: the end of the range its
+    // sign is heading for, or the single upper bound of the unsigned
+    // range, which a left shift can only ever exceed from below.
+    let bound = if signed {
+        let magnitude = 1u128.checked_shl(u32::from(lane_bits.checked_sub(1)?))?;
+        Expr::Ite {
+            cond: Box::new(Expr::slt(value.clone(), Expr::konst(0, lane_bits))),
+            then_expr: Box::new(Expr::konst(magnitude, lane_bits)),
+            else_expr: Box::new(Expr::konst(magnitude.checked_sub(1)?, lane_bits)),
+        }
+    } else {
+        Expr::konst(unsigned_max(lane_bits)?, lane_bits)
+    };
+    Some(Expr::Ite {
+        cond: Box::new(Expr::eq(restored, value)),
+        then_expr: Box::new(shifted),
+        else_expr: Box::new(bound),
+    })
+}
+
 /// One destination lane of a same-width shift.
 ///
 /// The register forms read a *signed* per-lane amount whose sign chooses
@@ -659,8 +701,12 @@ fn shift_lane(
     lane_bits: u16,
 ) -> Option<Expr> {
     match kind {
-        ShiftKind::LeftImmediate { shift } => {
-            Some(Expr::shl(value, Expr::konst(u128::from(shift), lane_bits)))
+        ShiftKind::LeftImmediate { shift, saturate } => {
+            let by = Expr::konst(u128::from(shift), lane_bits);
+            if saturate {
+                return saturating_shift_left(value, &by, lane_bits, signed);
+            }
+            Some(Expr::shl(value, by))
         }
         ShiftKind::RightImmediate { shift, rounding } => shift_right(
             value,
@@ -669,7 +715,7 @@ fn shift_lane(
             signed,
             rounding,
         ),
-        ShiftKind::Register { rounding } => {
+        ShiftKind::Register { rounding, saturate } => {
             // Only the low byte of the amount element is read, as a
             // signed value.
             let raw = amount?;
@@ -678,7 +724,11 @@ fn shift_lane(
             } else {
                 raw
             };
-            let left = Expr::shl(value.clone(), signed_amount.clone());
+            let left = if saturate {
+                saturating_shift_left(value.clone(), &signed_amount, lane_bits, signed)?
+            } else {
+                Expr::shl(value.clone(), signed_amount.clone())
+            };
             let negated = Expr::sub(Expr::konst(0, lane_bits), signed_amount.clone());
             let right = shift_right(value, &negated, lane_bits, signed, rounding)?;
             Some(Expr::Ite {

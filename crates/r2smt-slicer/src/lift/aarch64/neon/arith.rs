@@ -343,15 +343,40 @@ fn uniform_shape(insn: &Instruction, operands: usize) -> Option<Arrangement> {
 /// time.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ShiftKind {
-    /// `shl` — shift left by an immediate.
-    LeftImmediate { shift: u16 },
+    /// `shl` / `sqshl` / `uqshl` — shift left by an immediate,
+    /// discarding the bits that leave the element or clamping instead.
+    LeftImmediate { shift: u16, saturate: bool },
     /// `ushr` / `sshr` / `urshr` / `srshr` — shift right by an
     /// immediate, optionally rounding.
     RightImmediate { shift: u16, rounding: bool },
-    /// `ushl` / `sshl` / `urshl` / `srshl` — shift by the second
-    /// source's per-lane amount, left when positive and right when
-    /// negative.
-    Register { rounding: bool },
+    /// `ushl` / `sshl` / `urshl` / `srshl` / `sqshl` / `uqshl` /
+    /// `sqrshl` / `uqrshl` — shift by the second source's per-lane
+    /// amount, left when positive and right when negative.
+    ///
+    /// `saturate` applies to the left direction only, which is not an
+    /// approximation: a right shift of an `n`-bit element always fits
+    /// `n` bits, so there is nothing for it to clamp.
+    Register { rounding: bool, saturate: bool },
+}
+
+/// The saturating left shifts, whose one mnemonic spells two shapes.
+///
+/// `sqshl v0.8b, v1.8b, #3` and `sqshl v0.8b, v1.8b, v2.8b` are
+/// genuinely different instructions — a fixed left shift and a per-lane
+/// signed amount that can go either way — and the only thing telling
+/// them apart is whether the amount operand carries an arrangement.
+fn saturating_left_shift(insn: &Instruction) -> Option<ShiftKind> {
+    let amount = insn.operands.get(2)?;
+    if operand_arrangement(amount).is_some() {
+        return Some(ShiftKind::Register {
+            rounding: false,
+            saturate: true,
+        });
+    }
+    Some(ShiftKind::LeftImmediate {
+        shift: u16::try_from(parse_immediate(&amount.raw)?).ok()?,
+        saturate: true,
+    })
 }
 
 /// The same-width shift family.
@@ -370,10 +395,12 @@ pub(super) fn shift_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShap
             rounding,
         })
     };
+    let register = |rounding, saturate| ShiftKind::Register { rounding, saturate };
     let (kind, signed) = match mnemonic {
         "shl" => (
             ShiftKind::LeftImmediate {
                 shift: immediate_shift()?,
+                saturate: false,
             },
             false,
         ),
@@ -381,10 +408,14 @@ pub(super) fn shift_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShap
         "sshr" => (right(false)?, true),
         "urshr" => (right(true)?, false),
         "srshr" => (right(true)?, true),
-        "ushl" => (ShiftKind::Register { rounding: false }, false),
-        "sshl" => (ShiftKind::Register { rounding: false }, true),
-        "urshl" => (ShiftKind::Register { rounding: true }, false),
-        "srshl" => (ShiftKind::Register { rounding: true }, true),
+        "ushl" => (register(false, false), false),
+        "sshl" => (register(false, false), true),
+        "urshl" => (register(true, false), false),
+        "srshl" => (register(true, false), true),
+        "sqshl" => (saturating_left_shift(insn)?, true),
+        "uqshl" => (saturating_left_shift(insn)?, false),
+        "sqrshl" => (register(true, true), true),
+        "uqrshl" => (register(true, true), false),
         _ => return None,
     };
     let register_form = matches!(kind, ShiftKind::Register { .. });
@@ -408,7 +439,7 @@ pub(super) fn shift_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShap
     // A left shift by the element width, or a right shift past it, is
     // outside the immediate encodings' range.
     let bounded = match kind {
-        ShiftKind::LeftImmediate { shift } => shift < destination.lane_bits,
+        ShiftKind::LeftImmediate { shift, .. } => shift < destination.lane_bits,
         ShiftKind::RightImmediate { shift, .. } => shift > 0 && shift <= destination.lane_bits,
         ShiftKind::Register { .. } => true,
     };
