@@ -448,4 +448,64 @@ mod tests {
             Ok(SmtResult::Unsound)
         );
     }
+
+    #[test]
+    fn binary128_fused_intermediate_is_declined_without_spawning_cvc5() {
+        // The second sort outside `is_renderable_fp_sort`, and the one
+        // that reaches this path from ordinary code rather than from
+        // x87: a NEON `fmla` over binary64 lanes rounds its product once
+        // in binary128, so the whole family is Z3-only downstream.
+        //
+        // Declining is a precision loss on the text backends and never a
+        // wrong verdict. What this pins is that the loss is taken at the
+        // renderer — if `is_renderable_fp_sort` ever admitted the sort,
+        // cvc5 1.3.4 would reject the query at parse time and the
+        // portfolio would disagree by parse error rather than by verdict.
+        use r2smt_common::{Address, Arch};
+        use r2smt_ir::expr::{RoundingMode, Var};
+        use r2smt_slicer::{BranchCandidate, BranchCondition, BranchKind, SliceStatus};
+
+        let at = Address::new(0x40_1000);
+        let rm = RoundingMode::NearestTiesEven;
+        let widen =
+            |name: &str| Expr::fp_to_fp(Expr::bv_to_fp(Expr::var(name, 64), 11, 53), rm, 15, 113);
+        let step = Expr::fp_to_ieee_bv(Expr::fp_to_fp(
+            Expr::fmul(widen("a"), widen("b"), rm),
+            rm,
+            11,
+            53,
+        ));
+        let slice = SsaLiftedSlice {
+            branch: BranchCandidate {
+                address: at,
+                function: at,
+                block: at,
+                kind: BranchKind::Jcc,
+                mnemonic: "b.eq".into(),
+                condition: BranchCondition::Equal,
+                formula: "fmla".into(),
+                taken_target: None,
+                fallthrough_target: None,
+                compare_register: None,
+                bit_index: None,
+                upstream_resolved: None,
+                operand_raws: Vec::new(),
+                is_thumb: false,
+            },
+            statements: vec![IrStmt::Assign {
+                dst: Var::new("t0", 1),
+                src: Expr::eq(step, Expr::konst(0x3ff0_0000_0000_0000, 64)),
+            }],
+            condition: Expr::var("t0", 1),
+            status: SliceStatus::Complete,
+            treat_truncation_as_inputs: false,
+            inputs: vec![Var::new("a", 64), Var::new("b", 64)],
+            defs: Vec::new(),
+            arch: Arch::Aarch64,
+        };
+        assert_eq!(
+            solve_branch_cvc5(&slice, SolveOptions::default()),
+            Ok(SmtResult::Unsound)
+        );
+    }
 }

@@ -475,11 +475,18 @@ const IEEE_DOUBLE: (u16, u16) = (11, 53);
 /// under Bitwuzla 0.9.1, and cvc5 1.3.4 answers with the same
 /// "only Float32 (8/24) or Float64 (11/53) types are supported in
 /// default mode" error. It reaches this pipeline as the *intermediate*
-/// a binary64 fused multiply step is computed in — never as a lane —
-/// so declining costs the text backends precision on that one family
-/// and nothing else. Bitwuzla would take it, but a sort only two of the
+/// a binary64 fused multiply step is computed in — never as a lane — so
+/// declining costs the text backends precision on that one family and
+/// nothing else. Bitwuzla would take it, but a sort only two of the
 /// three portfolio backends parse would make them disagree by parse
 /// error rather than by verdict, which is the lesson of the rotate.
+///
+/// That family stopped being hypothetical when the `AArch64` `.2d` and
+/// `AArch32` `vfma.f64` fused steps were opened: any slice carrying one
+/// is Z3-only from here on, which the two `cvc5` / `bitwuzla` decline
+/// contracts pin. The cost is bounded because the sort stays an
+/// intermediate — no *lane* is ever binary128, so a slice declines only
+/// when it actually contains a fused step over binary64.
 const fn is_renderable_fp_sort(ebits: u16, sbits: u16) -> bool {
     ebits >= MIN_FP_SORT_FIELD
         && sbits >= MIN_FP_SORT_FIELD

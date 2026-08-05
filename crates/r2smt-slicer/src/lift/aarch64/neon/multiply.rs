@@ -13,7 +13,7 @@
 
 use r2smt_ir::program::Instruction;
 
-use super::super::super::{BinOp, FusedStep};
+use super::super::super::{BinOp, FusedStep, fused_step_is_emulable};
 use super::geometry::{
     BITS_PER_BYTE, dot_product_element, indexed_element, operand_arrangement, peel_upper,
     spans_full_register,
@@ -228,9 +228,10 @@ pub(super) fn by_element_shape(insn: &Instruction, mnemonic: &str) -> Option<Neo
     // byte-element form, which is what the dot products exist for.
     let encodable = match kind {
         ByElementKind::Float => matches!(source_bits, 16 | 32 | 64),
-        // A binary64 lane would need binary128 to keep the fused step
-        // exact, so the whole-vector spelling declines there too.
-        ByElementKind::Fused { .. } => source_bits == FUSED_STEP_LANE_BITS,
+        // The fused steps are emulable at whatever width
+        // `simd::fused_formats` names a wide-enough intermediate for,
+        // which is the same set the whole-vector spelling accepts.
+        ByElementKind::Fused { .. } => fused_step_is_emulable(source_bits),
         ByElementKind::Integer { .. } | ByElementKind::Long { .. } => {
             matches!(source_bits, 16 | 32)
         }
@@ -320,18 +321,19 @@ pub(super) fn dot_product_shape(insn: &Instruction, mnemonic: &str) -> Option<Ne
 
 // ===================== fused multiply steps =====================
 
-/// Destination element width the fused steps are exactly emulable at.
-const FUSED_STEP_LANE_BITS: u16 = 32;
-
-/// `fmla` / `fmls` / `frecps` / `frsqrts` over whole binary32-lane
-/// vectors.
+/// `fmla` / `fmls` / `frecps` / `frsqrts` over whole float-lane vectors.
 ///
 /// All four round the product and the following combine together, once.
 /// Modelling them as a separate `fmul` then `fadd` would round twice and
-/// give a wrong value, so the lowering instead computes each lane in
-/// binary64 — exact for a binary32 lane — and rounds once back. Only the
-/// 32-bit arrangements (`.2s` / `.4s`) resolve: a 64-bit lane would need
-/// binary128 to stay exact, so `.2d` declines.
+/// give a wrong value, so the lowering instead computes each lane in the
+/// next format up and rounds once back — binary64 for a binary32 lane,
+/// binary128 for a binary64 one. Both are exact, so `.2s` / `.4s` and
+/// `.2d` all resolve.
+///
+/// A `.2d` slice is Z3-only downstream: `is_renderable_fp_sort` in the
+/// textual renderer whitelists binary32 and binary64, so the binary128
+/// intermediate makes the text backends decline. That is a precision
+/// loss on the text backends, never a wrong verdict.
 pub(super) fn fused_step_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     let step = match mnemonic {
         "fmla" => FusedStep::MulAdd,
@@ -344,7 +346,7 @@ pub(super) fn fused_step_shape(insn: &Instruction, mnemonic: &str) -> Option<Neo
         return None;
     }
     let destination = operand_arrangement(insn.operands.first()?)?;
-    if destination.lane_bits != FUSED_STEP_LANE_BITS {
+    if !fused_step_is_emulable(destination.lane_bits) {
         return None;
     }
     for operand in insn.operands.iter().skip(1) {

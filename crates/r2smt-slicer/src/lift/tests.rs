@@ -5217,18 +5217,27 @@ fn aarch64_fused_multiply_add_lifts_for_single_lanes() {
 }
 
 #[test]
-fn aarch64_by_element_fused_multiply_declines_double_lanes() {
-    // The by-element form inherits the whole-vector width gate: a
-    // binary64 lane would need binary128 to keep the fused step exact.
-    assert!(neon_declines("fmla", &["v0.2d", "v1.2d", "v2.d[0]"]));
+fn aarch64_by_element_fused_multiply_lifts_double_lanes() {
+    // The by-element form inherits the whole-vector width gate, and that
+    // gate now asks the lowering: binary128 is a wide-enough
+    // intermediate for a binary64 lane, so `.2d` resolves.
+    assert!(!neon_declines("fmla", &["v0.2d", "v1.2d", "v2.d[0]"]));
 }
 
 #[test]
-fn aarch64_fused_multiply_add_declines_double_lanes() {
-    // A binary64 lane would need binary128 to stay exact, so the `.2d`
-    // arrangement declines rather than round twice.
-    assert!(neon_declines("fmla", &["v0.2d", "v1.2d", "v2.2d"]));
-    assert!(neon_declines("frecps", &["v0.2d", "v1.2d", "v2.2d"]));
+fn aarch64_fused_multiply_add_lifts_double_lanes() {
+    // `2 * 53 + 2` fits binary128's significand, so the binary64 lane is
+    // as exact as the binary32 one is over binary64.
+    assert!(!neon_declines("fmla", &["v0.2d", "v1.2d", "v2.2d"]));
+    assert!(!neon_declines("frecps", &["v0.2d", "v1.2d", "v2.2d"]));
+}
+
+#[test]
+fn aarch64_fused_multiply_add_still_declines_a_half_precision_lane() {
+    // The gate is the intermediate's width, not a blanket "any float":
+    // binary32 does not cover `2 * 11 + 2`, so a binary16 lane would
+    // round twice and declines instead.
+    assert!(neon_declines("fmla", &["v0.4h", "v1.4h", "v2.4h"]));
 }
 
 #[test]

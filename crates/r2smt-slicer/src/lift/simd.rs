@@ -368,6 +368,19 @@ fn fused_formats(lane_bits: u16) -> Option<FusedFormats> {
     })
 }
 
+/// Whether a fused multiply step over `lane_bits`-wide lanes is exactly
+/// emulable, and so whether a resolver may claim that geometry.
+///
+/// Delegates to [`fused_formats`] rather than restating the widths,
+/// because the per-ISA resolvers used to restate them and drifted: the
+/// binary128 intermediate that opened binary64 lanes landed here while
+/// two `== 32` comparisons kept the resolvers on binary32 only. A
+/// resolver that answers this question by asking the lowering cannot
+/// drift from it again.
+pub(crate) fn fused_step_is_emulable(lane_bits: u16) -> bool {
+    fused_formats(lane_bits).is_some()
+}
+
 /// One lane of a fused multiply step, computed once in the wider format
 /// [`fused_formats`] names and rounded once back to the lane.
 ///

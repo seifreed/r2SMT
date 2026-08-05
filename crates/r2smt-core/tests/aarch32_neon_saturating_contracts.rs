@@ -758,10 +758,27 @@ fn vrecps_covers_every_lane_rather_than_one() {
 }
 
 #[test]
-fn vfma_declines_a_binary64_lane() {
-    // The lowering is exact because binary64 covers `2 * 24 + 2` bits of
-    // a binary32 product. Nothing covers a binary64 one, so `.f64`
-    // declines — and soundly, since no scalar VFP handler spells `vfma`
-    // either.
+fn vfma_declines_a_binary64_lane_in_a_quadword_view() {
+    // A binary64 lane is now emulable — binary128 covers `2 * 53 + 2`
+    // bits — so what this rejects is no longer the width. It is the
+    // *encoding*: Advanced SIMD has no packed `.f64`, so the only
+    // binary64 `vfma` is the one-lane VFP form. A `q` view would be two
+    // lanes, which the machine never produces.
     assert!(declines("vfma.f64", &["q0", "q1", "q2"]));
+}
+
+#[test]
+fn vfma_lifts_a_binary64_lane_in_the_scalar_vfp_view() {
+    // The other half of the pair above: the single-`d` spelling is the
+    // real encoding and it resolves.
+    assert!(!declines("vfma.f64", &["d0", "d1", "d2"]));
+}
+
+#[test]
+fn vrecps_declines_a_binary64_lane_in_every_view() {
+    // `vrecps` / `vrsqrts` are Advanced-SIMD-only and have no binary64
+    // form in any spelling, so unlike `vfma` they do not get the
+    // single-lane exception the wider intermediate would otherwise allow.
+    assert!(declines("vrecps.f64", &["d0", "d1", "d2"]));
+    assert!(declines("vrsqrts.f64", &["q0", "q1", "q2"]));
 }

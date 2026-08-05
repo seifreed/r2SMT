@@ -985,3 +985,100 @@ fn frsqrts_returns_one_point_five_for_zero_times_infinity() {
         packed(32, &[0x3fc0_0000; 4]),
     );
 }
+
+// ---------- the same family over binary64 lanes ----------
+//
+// `.2d` used to decline on the grounds that nothing could carry the
+// product exactly. Binary128 can — `2 * 53 + 2` fits its significand the
+// way binary64 fits a binary32 product — so these repeat the binary32
+// contracts one format up. The inputs are chosen the same way: on values
+// where rounding twice and rounding once disagree, because a lowering
+// that rounds twice would otherwise pass.
+
+/// `1 + 2^-27` and `-(1 + 2^-26)`: the square of the first is
+/// `1 + 2^-26 + 2^-54`, whose last term sits a quarter of an ulp below
+/// binary64's significand at that exponent.
+const F64_ONE_PLUS: u128 = 0x3ff0_0000_0200_0000;
+const F64_MINUS_ONE_PLUS_2: u128 = 0xbff0_0000_0400_0000;
+/// `2^-54`, the exact answer once the accumulator cancels the rest.
+const F64_TWO_POW_MINUS_54: u128 = 0x3c90_0000_0000_0000;
+const F64_ONE: u128 = 0x3ff0_0000_0000_0000;
+const F64_TWO: u128 = 0x4000_0000_0000_0000;
+const F64_ONE_POINT_FIVE: u128 = 0x3ff8_0000_0000_0000;
+const F64_INFINITY: u128 = 0x7ff0_0000_0000_0000;
+
+#[test]
+fn fmla_over_double_lanes_rounds_once_not_twice() {
+    // Rounding the product first drops the 2^-54 and the accumulator
+    // then cancels the rest exactly, giving 0. The fused step keeps it
+    // and the lane is 2^-54. A lowering built from a separate `fmul` and
+    // `fadd` returns zero here, which is what gives this test its teeth.
+    assert_computes(
+        "fmla",
+        &["v0.2d", "v1.2d", "v2.2d"],
+        &[
+            ("v0", packed(64, &[F64_MINUS_ONE_PLUS_2; 2])),
+            ("v1", packed(64, &[F64_ONE_PLUS; 2])),
+            ("v2", packed(64, &[F64_ONE_PLUS; 2])),
+        ],
+        packed(64, &[F64_TWO_POW_MINUS_54; 2]),
+    );
+}
+
+#[test]
+fn fmla_by_element_over_double_lanes_rounds_once_not_twice() {
+    // The by-element spelling shares the gate and the lowering, so it
+    // gets the same inputs — and would fail the same way if it were
+    // routed through a plain float multiply plus a combine.
+    assert_computes(
+        "fmla",
+        &["v0.2d", "v1.2d", "v2.d[1]"],
+        &[
+            ("v0", packed(64, &[F64_MINUS_ONE_PLUS_2; 2])),
+            ("v1", packed(64, &[F64_ONE_PLUS; 2])),
+            ("v2", packed(64, &[F64_ONE, F64_ONE_PLUS])),
+        ],
+        packed(64, &[F64_TWO_POW_MINUS_54; 2]),
+    );
+}
+
+#[test]
+fn frecps_over_double_lanes_computes_two_minus_the_product() {
+    assert_computes(
+        "frecps",
+        &["v0.2d", "v1.2d", "v2.2d"],
+        &[
+            ("v1", packed(64, &[F64_ONE; 2])),
+            ("v2", packed(64, &[F64_ONE; 2])),
+        ],
+        packed(64, &[F64_ONE; 2]),
+    );
+}
+
+#[test]
+fn frecps_over_double_lanes_returns_two_for_zero_times_infinity() {
+    // The guarded special case travels with the family rather than with
+    // the lane width, so it has to hold here too.
+    assert_computes(
+        "frecps",
+        &["v0.2d", "v1.2d", "v2.2d"],
+        &[
+            ("v1", packed(64, &[F64_INFINITY; 2])),
+            ("v2", packed(64, &[0; 2])),
+        ],
+        packed(64, &[F64_TWO; 2]),
+    );
+}
+
+#[test]
+fn frsqrts_over_double_lanes_returns_one_point_five_for_zero_times_infinity() {
+    assert_computes(
+        "frsqrts",
+        &["v0.2d", "v1.2d", "v2.2d"],
+        &[
+            ("v1", packed(64, &[0; 2])),
+            ("v2", packed(64, &[F64_INFINITY; 2])),
+        ],
+        packed(64, &[F64_ONE_POINT_FIVE; 2]),
+    );
+}

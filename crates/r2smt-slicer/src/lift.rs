@@ -50,7 +50,7 @@ pub(crate) use aarch64::neon::structured::StructuredEffect;
 use merge::lower_merge;
 pub(crate) use simd::{
     FpArithOp, FusedStep, PackedIntOp, PackedOp, fp_lane_result, fp_propagating_max_min,
-    fp_sort_bits_checked, fused_multiply_lane,
+    fp_sort_bits_checked, fused_multiply_lane, fused_step_is_emulable,
 };
 pub(crate) use x86::{
     X86SimdShape, is_fp_compare_mnemonic, is_vex, is_x86_vector_flag_compare, sse_scalar_move_lane,
