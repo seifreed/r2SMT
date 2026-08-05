@@ -414,6 +414,10 @@ impl Encoder {
                 let f = self.encode_as_fp(a);
                 Encoded::Fp(f.sqrt_with_rounding_mode(&to_z3_rm(*rm)))
             }
+            Expr::FRoundToIntegral(a, rm) => {
+                let f = self.encode_as_fp(a);
+                Encoded::Fp(f.round_to_integral_with_rounding_mode(&to_z3_rm(*rm)))
+            }
             Expr::FpConst { bits, ebits, sbits } => {
                 let bv = bv_const(*bits, ebits.saturating_add(*sbits));
                 Encoded::Fp(self.fp_from_bv(&bv, *ebits, *sbits))

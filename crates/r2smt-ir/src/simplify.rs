@@ -81,6 +81,7 @@ pub fn simplify_expr(expr: &Expr) -> Expr {
         Expr::FLe(a, b) => Expr::FLe(Box::new(simplify_expr(a)), Box::new(simplify_expr(b))),
         Expr::FIsNaN(a) => Expr::FIsNaN(Box::new(simplify_expr(a))),
         Expr::FSqrt(a, rm) => Expr::FSqrt(Box::new(simplify_expr(a)), *rm),
+        Expr::FRoundToIntegral(a, rm) => Expr::FRoundToIntegral(Box::new(simplify_expr(a)), *rm),
         Expr::BvToFp { src, ebits, sbits } => Expr::BvToFp {
             src: Box::new(simplify_expr(src)),
             ebits: *ebits,
@@ -173,8 +174,11 @@ fn expr_bits(expr: &Expr) -> Option<u16> {
         | Expr::BvToFp { ebits, sbits, .. }
         | Expr::SbvToFp { ebits, sbits, .. }
         | Expr::FpToFp { ebits, sbits, .. } => ebits.checked_add(*sbits),
-        // Square root stays in its operand's sort.
-        Expr::FpToIeeeBv(src) | Expr::FSqrt(src, _) => expr_bits(src),
+        // Square root and rounding to integral stay in their operand's
+        // sort.
+        Expr::FpToIeeeBv(src) | Expr::FSqrt(src, _) | Expr::FRoundToIntegral(src, _) => {
+            expr_bits(src)
+        }
     }
 }
 

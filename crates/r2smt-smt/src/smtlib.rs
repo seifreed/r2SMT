@@ -395,6 +395,7 @@ fn expr_uses_fp(expr: &Expr) -> bool {
         | Expr::FLe(..)
         | Expr::FIsNaN(_)
         | Expr::FSqrt(..)
+        | Expr::FRoundToIntegral(..)
         | Expr::FpConst { .. }
         | Expr::BvToFp { .. }
         | Expr::FpToIeeeBv(_)
@@ -562,6 +563,7 @@ fn render_fp(expr: &Expr, ctx: &mut RenderCtx) -> Option<FpTerm> {
             sbits,
         } => render_fp_to_fp(src, *rm, (*ebits, *sbits), ctx),
         Expr::FSqrt(a, rm) => render_fp_sqrt(a, *rm, ctx),
+        Expr::FRoundToIntegral(a, rm) => render_fp_round_to_integral(a, *rm, ctx),
         Expr::FAdd(a, b, rm) => fp_arith("fp.add", a, b, *rm, ctx),
         Expr::FSub(a, b, rm) => fp_arith("fp.sub", a, b, *rm, ctx),
         Expr::FMul(a, b, rm) => fp_arith("fp.mul", a, b, *rm, ctx),
@@ -615,6 +617,32 @@ fn render_fp_sqrt(src: &Expr, rm: RoundingMode, ctx: &mut RenderCtx) -> Option<F
     Some(FpTerm {
         text: format!(
             "(fp.sqrt {rm} {inner})",
+            rm = rm_smtlib(rm),
+            inner = inner.text
+        ),
+        ebits: inner.ebits,
+        sbits: inner.sbits,
+    })
+}
+
+/// Round a float to an integral value, keeping its sort.
+///
+/// `fp.roundToIntegral` is standard SMT-LIB and needs no decline, which
+/// was measured rather than assumed: this function's own output, for
+/// every one of the five rounding modes, is `unsat` on the negated
+/// polarity in Z3 4.13.0, CVC5 1.3.4 and Bitwuzla 0.9.1 alike — so all
+/// three parse the operator *and* agree on its value. That is the
+/// opposite of the rotate, whose `bvror` spelling only one of the three
+/// accepted, and why this renders where [`render_rotate`] declines.
+fn render_fp_round_to_integral(
+    src: &Expr,
+    rm: RoundingMode,
+    ctx: &mut RenderCtx,
+) -> Option<FpTerm> {
+    let inner = render_fp(src, ctx)?;
+    Some(FpTerm {
+        text: format!(
+            "(fp.roundToIntegral {rm} {inner})",
             rm = rm_smtlib(rm),
             inner = inner.text
         ),
@@ -880,7 +908,8 @@ fn render_expr(expr: &Expr, ctx: &mut RenderCtx) -> (String, u16) {
         | Expr::BvToFp { .. }
         | Expr::SbvToFp { .. }
         | Expr::FpToFp { .. }
-        | Expr::FSqrt(..) => fp_bridge_to_bv(expr, ctx),
+        | Expr::FSqrt(..)
+        | Expr::FRoundToIntegral(..) => fp_bridge_to_bv(expr, ctx),
         Expr::FpToSbv { src, rm, bits } => {
             let Some(f) = render_fp(src, ctx) else {
                 ctx.note_unsupported("float-to-signed conversion of a term with no float sort");
@@ -1119,6 +1148,11 @@ mod tests {
     /// IEEE-754 binary32 bit patterns used by the floating-point tests.
     const F32_ONE: u128 = 0x3f80_0000;
     const F32_TWO: u128 = 0x4000_0000;
+    const F32_TWO_AND_A_HALF: u128 = 0x4020_0000;
+    const F32_THREE: u128 = 0x4040_0000;
+    const F32_MINUS_TWO: u128 = 0xc000_0000;
+    const F32_MINUS_TWO_AND_A_HALF: u128 = 0xc020_0000;
+    const F32_MINUS_THREE: u128 = 0xc040_0000;
     const F32_QUIET_NAN: u128 = 0x7fc0_0000;
 
     fn f32_const(bits: u128) -> Expr {
@@ -1146,6 +1180,20 @@ mod tests {
         let solver = z3::Solver::new();
         solver.from_string(script);
         solver.check()
+    }
+
+    /// Solve a round-to-integral of one binary32 constant against the
+    /// emitted text, on the *negated* polarity: `Unsat` means the
+    /// rendering forces exactly `expected`, so the value is checked and
+    /// not only the shape.
+    fn round_to_integral_check(input: u128, rm: RoundingMode, expected: u128) -> z3::SatResult {
+        let slice = fp_slice(
+            Expr::fp_to_ieee_bv(Expr::fround_to_integral(f32_const(input), rm)),
+            Expr::eq(Expr::var("t0", 32), Expr::konst(expected, 32)),
+        );
+        let script = emit_query_strict(&slice, &SolveOptions::default(), false)
+            .expect("round-to-integral of a binary32 constant must render");
+        z3_check(&script)
     }
 
     #[test]
@@ -1510,5 +1558,80 @@ mod tests {
             .expect("a constant rotate must render");
         // Unsat on the negated polarity means the equality is necessary.
         assert_eq!(z3_check(&script), z3::SatResult::Unsat, "{script}");
+    }
+
+    #[test]
+    fn smtlib_renders_round_to_integral_as_the_standard_fp_operator() {
+        // Unlike the rotate, this one needs no decline: the scripts this
+        // renderer emits were replayed through Z3 4.13.0, CVC5 1.3.4 and
+        // Bitwuzla 0.9.1, and all three returned `unsat` on the negated
+        // polarity for all five rounding modes.
+        let slice = fp_slice(
+            Expr::fp_to_ieee_bv(Expr::fround_to_integral(
+                f32_const(F32_TWO_AND_A_HALF),
+                RoundingMode::TowardZero,
+            )),
+            Expr::eq(Expr::var("t0", 32), Expr::konst(F32_TWO, 32)),
+        );
+        let script = emit_query_strict(&slice, &SolveOptions::default(), true)
+            .expect("round-to-integral of a binary32 constant must render");
+        assert!(
+            script.contains("(fp.roundToIntegral RTZ "),
+            "expected the standard operator carrying its mode: {script}"
+        );
+    }
+
+    #[test]
+    fn smtlib_round_to_integral_nearest_ties_even_takes_the_even_neighbour() {
+        // 2.5 → 2.0, where ties-away would give 3.0.
+        assert_eq!(
+            round_to_integral_check(F32_TWO_AND_A_HALF, RoundingMode::NearestTiesEven, F32_TWO),
+            z3::SatResult::Unsat
+        );
+    }
+
+    #[test]
+    fn smtlib_round_to_integral_nearest_ties_away_leaves_the_even_neighbour() {
+        // 2.5 → 3.0, where ties-even would give 2.0.
+        assert_eq!(
+            round_to_integral_check(F32_TWO_AND_A_HALF, RoundingMode::NearestTiesAway, F32_THREE),
+            z3::SatResult::Unsat
+        );
+    }
+
+    #[test]
+    fn smtlib_round_to_integral_toward_positive_rounds_up() {
+        // 2.5 → 3.0, which no nearest mode reaches from below.
+        assert_eq!(
+            round_to_integral_check(F32_TWO_AND_A_HALF, RoundingMode::TowardPositive, F32_THREE),
+            z3::SatResult::Unsat
+        );
+    }
+
+    #[test]
+    fn smtlib_round_to_integral_toward_negative_rounds_down_below_zero() {
+        // -2.5 → -3.0, where toward-zero would give -2.0. Signed so the
+        // two directional modes cannot be confused for each other.
+        assert_eq!(
+            round_to_integral_check(
+                F32_MINUS_TWO_AND_A_HALF,
+                RoundingMode::TowardNegative,
+                F32_MINUS_THREE
+            ),
+            z3::SatResult::Unsat
+        );
+    }
+
+    #[test]
+    fn smtlib_round_to_integral_toward_zero_truncates_below_zero() {
+        // -2.5 → -2.0, where toward-negative would give -3.0.
+        assert_eq!(
+            round_to_integral_check(
+                F32_MINUS_TWO_AND_A_HALF,
+                RoundingMode::TowardZero,
+                F32_MINUS_TWO
+            ),
+            z3::SatResult::Unsat
+        );
     }
 }

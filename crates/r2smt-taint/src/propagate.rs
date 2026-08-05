@@ -185,6 +185,7 @@ fn taint_of_expr(
         }
         Expr::FIsNaN(s)
         | Expr::FSqrt(s, _)
+        | Expr::FRoundToIntegral(s, _)
         | Expr::FpToIeeeBv(s)
         | Expr::BvToFp { src: s, .. }
         | Expr::FpToSbv { src: s, .. }

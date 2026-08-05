@@ -179,6 +179,11 @@ fn write_expr(out: &mut String, expr: &Expr, ctx: &FmtCtx<'_>, depth: usize) {
             write_expr(out, a, ctx, depth + 1);
             let _ = write!(out, ")");
         }
+        Expr::FRoundToIntegral(a, _) => {
+            let _ = write!(out, "frint(");
+            write_expr(out, a, ctx, depth + 1);
+            let _ = write!(out, ")");
+        }
         Expr::FpConst { bits, ebits, sbits } => {
             let _ = write!(out, "fp{ebits}_{sbits}({bits:#x})");
         }

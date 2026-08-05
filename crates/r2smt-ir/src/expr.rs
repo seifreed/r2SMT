@@ -193,6 +193,17 @@ pub enum Expr {
     FIsNaN(Box<Expr>),
     /// Floating-point square root under a rounding mode.
     FSqrt(Box<Expr>, RoundingMode),
+    /// Round a float to an integral value, keeping the float sort.
+    ///
+    /// A distinct node rather than a round-trip through the integer
+    /// conversions: `FpToSbv` followed by `SbvToFp` is only the same
+    /// function on the values the destination integer width can hold,
+    /// and disagrees on everything else — an infinity, a NaN, or a
+    /// magnitude past the integer range would come back as some
+    /// in-range number instead of unchanged, which is a wrong value
+    /// rather than a lost one. The operand and the result share the
+    /// same `(ebits, sbits)` sort.
+    FRoundToIntegral(Box<Expr>, RoundingMode),
     /// Floating-point constant, as its IEEE bit pattern under the sort.
     FpConst {
         /// IEEE bit pattern (width `ebits + sbits`).
@@ -531,6 +542,12 @@ impl Expr {
         Self::FSqrt(Box::new(a), rm)
     }
 
+    /// Construct a [`Expr::FRoundToIntegral`].
+    #[must_use]
+    pub fn fround_to_integral(a: Self, rm: RoundingMode) -> Self {
+        Self::FRoundToIntegral(Box::new(a), rm)
+    }
+
     /// Construct a [`Expr::FpToFp`].
     #[must_use]
     pub fn fp_to_fp(src: Self, rm: RoundingMode, ebits: u16, sbits: u16) -> Self {
@@ -593,6 +610,7 @@ impl fmt::Display for Expr {
             Self::FLe(a, b) => write!(f, "fle({a}, {b})"),
             Self::FIsNaN(a) => write!(f, "fisnan({a})"),
             Self::FSqrt(a, rm) => write!(f, "fsqrt({a}, {rm:?})"),
+            Self::FRoundToIntegral(a, rm) => write!(f, "frint({a}, {rm:?})"),
             Self::FpConst { bits, ebits, sbits } => write!(f, "fp{ebits}_{sbits}({bits:#x})"),
             Self::BvToFp { src, ebits, sbits } => write!(f, "bv_to_fp({src}, {ebits}, {sbits})"),
             Self::FpToIeeeBv(src) => write!(f, "fp_to_bv({src})"),

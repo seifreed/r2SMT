@@ -316,6 +316,9 @@ fn rename_reads(
         ),
         Expr::FIsNaN(a) => Expr::fisnan(rename_reads(a, latest, inputs)),
         Expr::FSqrt(a, rm) => Expr::fsqrt(rename_reads(a, latest, inputs), *rm),
+        Expr::FRoundToIntegral(a, rm) => {
+            Expr::fround_to_integral(rename_reads(a, latest, inputs), *rm)
+        }
         Expr::FpConst { .. } => expr.clone(),
         Expr::BvToFp { src, ebits, sbits } => {
             Expr::bv_to_fp(rename_reads(src, latest, inputs), *ebits, *sbits)
