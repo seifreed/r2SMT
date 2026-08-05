@@ -218,6 +218,19 @@ impl LiftCtx {
             });
             return;
         }
+        // The scalar-SIMD spellings (`add d0, d1, d2`) reach here: they
+        // carry no arrangement, so the vector gate does not claim them,
+        // and this helper has no vector lowering for them. Declining up
+        // front rather than at the destination write is what keeps the
+        // reads of `d1` / `d2` out of `stmts` — a decline that has
+        // already emitted half an instruction is not a decline.
+        if self.is_simd_register(dst) {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "scalar-SIMD destination (aarch64)".into(),
+            });
+            return;
+        }
         let Some(dst_width) = nonzero_width(self.operand_width(dst)) else {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
@@ -571,7 +584,15 @@ impl LiftCtx {
         } else {
             Expr::Var(tmp)
         };
-        if !self.write_register_to(dst, value) {
+        // A vector destination takes the vector writer: `ldr d8` clears
+        // the rest of `v8`, and the scalar path would size that parent
+        // at the pointer width.
+        let written = if self.is_simd_register(dst) {
+            self.write_simd_dst(dst, value, true)
+        } else {
+            self.write_register_to(dst, value)
+        };
+        if !written {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: "ldr destination not a supported register".into(),
@@ -609,13 +630,32 @@ impl LiftCtx {
             });
             return;
         };
-        let value = self.read_operand_at(src, store_width);
+        let value = self.read_transfer_operand(src, store_width);
         self.stmts.push(IrStmt::StoreMem {
             address: access.address,
             value,
             bits: store_width,
         });
         self.emit_writeback(access.writeback);
+    }
+
+    /// Read the source of a memory transfer, which may name either
+    /// register file: `str x0, [sp]` and `str d8, [sp]` differ only in
+    /// where the source lives, and both are ordinary in a prologue.
+    ///
+    /// The vector one has to go through the lane reader. Not for
+    /// precision — [`LiftCtx::read_operand_at`] would refuse it and the
+    /// store would keep an opaque value, which is sound — but because
+    /// that refusal costs a real instruction: saving `d8`–`d15` across a
+    /// call is what the ABI asks for, so a slice that reads the slot
+    /// back would lose the value on the way through.
+    fn read_transfer_operand(&mut self, op: &Operand, width: u16) -> Expr {
+        if self.is_simd_register(op)
+            && let Some(bits) = self.read_simd_lane_bits(op, width, 0)
+        {
+            return bits;
+        }
+        self.read_operand_at(op, width)
     }
 
     /// Emit the base-register mutation for a pre/post-index memory
@@ -707,14 +747,18 @@ impl LiftCtx {
             });
             return;
         };
+        let (v0, v1) = (
+            self.read_transfer_operand(s0, w0),
+            self.read_transfer_operand(s1, w1),
+        );
         self.stmts.push(IrStmt::StoreMem {
             address: first,
-            value: self.read_operand_at(s0, w0),
+            value: v0,
             bits: w0,
         });
         self.stmts.push(IrStmt::StoreMem {
             address: second,
-            value: self.read_operand_at(s1, w1),
+            value: v1,
             bits: w1,
         });
     }
@@ -722,6 +766,11 @@ impl LiftCtx {
     /// Two-statement load: into a fresh temp at `width`, then written to
     /// `dst` so `write_register_to` zero-extends the parent X for the
     /// W-form (the P26 `ldr` stash-then-write precedent).
+    ///
+    /// A vector destination (`ldr d8, [sp, #0x10]`) takes the vector
+    /// writer instead, for the same two reasons every scalar SIMD write
+    /// here does: the parent is 128 bits wide and the write clears
+    /// everything above the element.
     fn load_into_register(&mut self, insn: &Instruction, dst: &Operand, address: Expr, width: u16) {
         let tmp = self.new_temp(insn.address, width);
         self.stmts.push(IrStmt::LoadMem {
@@ -729,7 +778,12 @@ impl LiftCtx {
             address,
             bits: width,
         });
-        if !self.write_register_to(dst, Expr::Var(tmp)) {
+        let written = if self.is_simd_register(dst) {
+            self.write_simd_dst(dst, Expr::Var(tmp), true)
+        } else {
+            self.write_register_to(dst, Expr::Var(tmp))
+        };
+        if !written {
             self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: "ldp destination not a supported register".into(),

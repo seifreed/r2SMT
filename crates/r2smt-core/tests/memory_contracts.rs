@@ -1031,6 +1031,58 @@ fn aarch32_rrx_address_is(carry: u128, expected: u128) -> SmtResult {
     solve_branch(&slice, solve_opts())
 }
 
+// --- the vector register file crossing memory ------------------------
+
+#[test]
+fn aarch64_spilling_a_vector_register_and_reloading_it_recovers_the_value() {
+    // `str d8, [sp, #0x10]` / `ldr d9, [sp, #0x10]` is the ABI's own
+    // idiom — `d8`–`d15` are callee-saved — so this pair sits in a large
+    // share of real prologues.
+    //
+    // Both ends used to take the scalar register path, which sizes the
+    // parent at the pointer width, 64, where `v8` is 128. That is a
+    // register named at two widths, which nothing downstream reports.
+    // Routing them through the vector reader and writer is what lets the
+    // value survive the round trip: the store reads lane 0 of `v8` and
+    // the load clears everything above the element of `v9`, so the
+    // 128-bit comparison below pins both halves of the answer at once.
+    let mut statements = vec![IrStmt::Assign {
+        dst: Var::new("v8", 128),
+        src: Expr::konst(0x1122_3344_5566_7788, 128),
+    }];
+    for (mnemonic, register) in [("str", "d8"), ("ldr", "d9")] {
+        statements.extend(lift_per_mnemonic(
+            &insn(
+                0x1000,
+                mnemonic,
+                vec![
+                    op(register, OperandKind::Register),
+                    op("[sp, 0x10]", OperandKind::Memory),
+                ],
+            ),
+            Arch::Aarch64,
+        ));
+    }
+    assert!(
+        statements
+            .iter()
+            .all(|s| !matches!(s, IrStmt::Unsupported { .. })),
+        "the vector spill pair must lift: {statements:?}"
+    );
+    let slice = r2smt_ssa::ssa_convert(&r2smt_slicer::LiftedSlice {
+        branch: synthetic_branch(),
+        statements,
+        condition: Expr::eq(
+            Expr::var("v9", 128),
+            Expr::konst(0x1122_3344_5566_7788, 128),
+        ),
+        status: SliceStatus::Complete,
+        treat_truncation_as_inputs: false,
+        arch: Arch::Aarch64,
+    });
+    assert_eq!(solve_branch(&slice, solve_opts()), SmtResult::AlwaysTrue);
+}
+
 #[test]
 fn aarch32_rrx_shifts_the_index_right_and_brings_the_carry_in_at_the_top() {
     // 2 >> 1 is 1, and with `CF` clear nothing enters the top.
