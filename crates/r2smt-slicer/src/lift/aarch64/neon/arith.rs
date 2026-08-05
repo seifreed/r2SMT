@@ -11,13 +11,17 @@
 //! the width — `sqadd` and `sqxtn` differ in where they saturate, not
 //! in whether they do.
 
+use r2smt_ir::expr::RoundingMode;
 use r2smt_ir::program::{Instruction, Operand};
 
 use crate::lift::simd::CompareKind;
 use crate::registers::Arrangement;
 
 use super::super::super::{BinOp, FpArithOp, PackedIntOp, PackedOp, parse_immediate};
-use super::geometry::{BITS_PER_BYTE, operand_arrangement, peel_upper, spans_full_register};
+use super::super::FPCR_DEFAULT_ROUNDING;
+use super::geometry::{
+    BITS_PER_BYTE, indexed_element, operand_arrangement, peel_upper, spans_full_register,
+};
 use super::{NeonOp, NeonShape};
 
 /// Element widths that name an IEEE interchange format.
@@ -178,6 +182,42 @@ pub(super) fn bitwise_unary_shape(insn: &Instruction, mnemonic: &str) -> Option<
     })
 }
 
+// ===================== round to integral =====================
+
+/// The packed `frint*` family — round each lane to an integral value and
+/// keep the float sort.
+///
+/// Five of the seven name their mode in the opcode and so depend on
+/// nothing FPCR holds. `frinti` reads the control register and `frintx`
+/// computes the same value while additionally being able to signal the
+/// inexact exception, which the value model does not carry — so both pin
+/// the reset default, and [`crate::lift::pins_rounding_mode`] lists them
+/// by mnemonic, which covers the packed spelling for free.
+pub(super) fn round_to_integral_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let rounding = match mnemonic {
+        "frinta" => RoundingMode::NearestTiesAway,
+        "frintn" => RoundingMode::NearestTiesEven,
+        "frintp" => RoundingMode::TowardPositive,
+        "frintm" => RoundingMode::TowardNegative,
+        "frintz" => RoundingMode::TowardZero,
+        "frinti" | "frintx" => FPCR_DEFAULT_ROUNDING,
+        _ => return None,
+    };
+    let destination = uniform_shape(insn, 2)?;
+    // Rounding a byte lane is not an encoding the architecture spells,
+    // and reading one as a float would be a wrong value.
+    if !is_float_lane(destination.lane_bits) {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::RoundToIntegral(rounding),
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
 // ===================== two-lane folds =====================
 
 /// A function of two lanes.
@@ -242,16 +282,11 @@ pub(super) fn float_min_max_shape(insn: &Instruction, mnemonic: &str) -> Option<
     })
 }
 
-/// The pairwise family: each destination lane folds two *adjacent* lanes
-/// of `vn:vm` read as one vector, `vn` at the low end.
-///
-/// So the destination's low half comes from the first source and its
-/// high half from the second — which is why an odd lane count cannot
-/// occur and is rejected rather than silently halved.
-pub(super) fn pairwise_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+/// The fold a pairwise mnemonic names.
+fn pairwise_op(mnemonic: &str) -> Option<PairOp> {
     let min_max = |signed, max| PairOp::MinMax { signed, max };
     let float_select = |max, number_wins| PairOp::FloatMinMax { max, number_wins };
-    let op = match mnemonic {
+    Some(match mnemonic {
         "addp" => PairOp::Add,
         "smaxp" => min_max(true, true),
         "sminp" => min_max(true, false),
@@ -263,7 +298,60 @@ pub(super) fn pairwise_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonS
         "fmaxnmp" => float_select(true, true),
         "fminnmp" => float_select(false, true),
         _ => return None,
+    })
+}
+
+/// The scalar pairwise forms: `addp d0, v1.2d`, `faddp s0, v1.2s` and
+/// the float selects beside them.
+///
+/// The destination is a bare scalar and so carries no arrangement at
+/// all, exactly as an across-lane reduction's does. The geometry
+/// therefore comes from operand 1, and the destination's own width is
+/// *checked* against the element it produces rather than assumed — which
+/// is what stops `faddp s0, v1.2d` resolving.
+///
+/// The float members encode a two-lane source of any IEEE width; the
+/// integer family has exactly one scalar member, `addp d0, v1.2d`, and
+/// the min / max spellings have none. Accepting `smaxp d0, v1.2d` would
+/// model an instruction the architecture does not encode.
+pub(super) fn scalar_pairwise_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    const DOUBLEWORD_BITS: u16 = 64;
+    let op = pairwise_op(mnemonic)?;
+    if insn.operands.len() != 2 {
+        return None;
+    }
+    let source = operand_arrangement(insn.operands.get(1)?)?;
+    if source.lanes != 2 {
+        return None;
+    }
+    let encodable = match op {
+        PairOp::Add => source.lane_bits == DOUBLEWORD_BITS,
+        PairOp::MinMax { .. } => false,
+        PairOp::FloatAdd | PairOp::FloatMinMax { .. } => is_float_lane(source.lane_bits),
     };
+    if !encodable {
+        return None;
+    }
+    if super::width::scalar_vector_width(insn.operands.first()?)? != source.lane_bits {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::ScalarPairwise(op),
+        lane_bits: source.lane_bits,
+        lanes: 1,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+/// The pairwise family: each destination lane folds two *adjacent* lanes
+/// of `vn:vm` read as one vector, `vn` at the low end.
+///
+/// So the destination's low half comes from the first source and its
+/// high half from the second — which is why an odd lane count cannot
+/// occur and is rejected rather than silently halved.
+pub(super) fn pairwise_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let op = pairwise_op(mnemonic)?;
     let destination = uniform_shape(insn, 3)?;
     if op.float() && !is_float_lane(destination.lane_bits) {
         return None;
@@ -343,9 +431,18 @@ fn uniform_shape(insn: &Instruction, operands: usize) -> Option<Arrangement> {
 /// time.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ShiftKind {
-    /// `shl` / `sqshl` / `uqshl` — shift left by an immediate,
-    /// discarding the bits that leave the element or clamping instead.
-    LeftImmediate { shift: u16, saturate: bool },
+    /// `shl` / `sqshl` / `uqshl` / `sqshlu` — shift left by an
+    /// immediate, discarding the bits that leave the element or clamping
+    /// into the range `saturate` names instead.
+    ///
+    /// The range is carried rather than derived from the family's
+    /// signedness because `sqshlu` separates the two: it reads its
+    /// element *signed* and clamps into the *unsigned* range, so neither
+    /// a signed nor an unsigned clamp describes it.
+    LeftImmediate {
+        shift: u16,
+        saturate: Option<SaturateTo>,
+    },
     /// `ushr` / `sshr` / `urshr` / `srshr` — shift right by an
     /// immediate, optionally rounding.
     RightImmediate { shift: u16, rounding: bool },
@@ -365,7 +462,7 @@ pub(super) enum ShiftKind {
 /// genuinely different instructions — a fixed left shift and a per-lane
 /// signed amount that can go either way — and the only thing telling
 /// them apart is whether the amount operand carries an arrangement.
-fn saturating_left_shift(insn: &Instruction) -> Option<ShiftKind> {
+fn saturating_left_shift(insn: &Instruction, to: SaturateTo) -> Option<ShiftKind> {
     let amount = insn.operands.get(2)?;
     if operand_arrangement(amount).is_some() {
         return Some(ShiftKind::Register {
@@ -375,7 +472,7 @@ fn saturating_left_shift(insn: &Instruction) -> Option<ShiftKind> {
     }
     Some(ShiftKind::LeftImmediate {
         shift: u16::try_from(parse_immediate(&amount.raw)?).ok()?,
-        saturate: true,
+        saturate: Some(to),
     })
 }
 
@@ -400,7 +497,7 @@ pub(super) fn shift_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShap
         "shl" => (
             ShiftKind::LeftImmediate {
                 shift: immediate_shift()?,
-                saturate: false,
+                saturate: None,
             },
             false,
         ),
@@ -412,8 +509,18 @@ pub(super) fn shift_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShap
         "sshl" => (register(false, false), true),
         "urshl" => (register(true, false), false),
         "srshl" => (register(true, false), true),
-        "sqshl" => (saturating_left_shift(insn)?, true),
-        "uqshl" => (saturating_left_shift(insn)?, false),
+        "sqshl" => (saturating_left_shift(insn, SaturateTo::Signed)?, true),
+        "uqshl" => (saturating_left_shift(insn, SaturateTo::Unsigned)?, false),
+        // The one member whose source signedness and clamp range
+        // disagree, and immediate-only: the architecture spells no
+        // register form of it.
+        "sqshlu" => (
+            ShiftKind::LeftImmediate {
+                shift: immediate_shift()?,
+                saturate: Some(SaturateTo::SignedToUnsigned),
+            },
+            true,
+        ),
         "sqrshl" => (register(true, true), true),
         "uqrshl" => (register(true, true), false),
         _ => return None,
@@ -814,21 +921,43 @@ pub(super) fn doubling_long_shape(insn: &Instruction, mnemonic: &str) -> Option<
     } else {
         destination.lanes
     };
-    for operand in insn.operands.iter().skip(1) {
-        let arrangement = operand_arrangement(operand)?;
+    let first = operand_arrangement(insn.operands.get(1)?)?;
+    if first.lane_bits != source_bits || first.lanes != expected_lanes {
+        return None;
+    }
+    if upper && !spans_full_register(first) {
+        return None;
+    }
+    // The second source is either the matching whole vector or a single
+    // element. The `2` suffix never halves the indexed one: an element
+    // is addressed absolutely inside the register, so `sqdmull2 v0.4s,
+    // v1.8h, v2.h[7]` reads `v1`'s upper half and `v2`'s lane seven.
+    let second = insn.operands.get(2)?;
+    let (by_element, source_index) = if let Some(arrangement) = operand_arrangement(second) {
         if arrangement.lane_bits != source_bits || arrangement.lanes != expected_lanes {
             return None;
         }
         if upper && !spans_full_register(arrangement) {
             return None;
         }
-    }
+        (false, 0)
+    } else {
+        let (element_bits, index) = indexed_element(second)?;
+        if element_bits != source_bits {
+            return None;
+        }
+        (true, index)
+    };
     Some(NeonShape {
-        op: NeonOp::DoublingLong { combine, upper },
+        op: NeonOp::DoublingLong {
+            combine,
+            upper,
+            by_element,
+        },
         lane_bits: destination.lane_bits,
         lanes: destination.lanes,
         dest_index: 0,
-        source_index: 0,
+        source_index,
     })
 }
 

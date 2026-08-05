@@ -290,16 +290,60 @@ fn frintn_at_single_precision_reads_the_register_letter() {
     );
 }
 
+/// Pack 32-bit lanes little-endian into one vector value.
+fn packed32(lanes: &[u128]) -> u128 {
+    let mut value = 0u128;
+    for (index, lane) in lanes.iter().enumerate() {
+        value |= lane << (32 * index);
+    }
+    value
+}
+
 #[test]
-fn aarch64_packed_frint_still_declines() {
-    // The packed forms are out of scope, and an arranged operand must
-    // keep failing closed rather than being lowered as one wide scalar.
-    let insn = instruction("frinta", vec![reg("v0.4s"), reg("v1.4s")]);
+fn aarch64_packed_frint_rounds_every_lane_not_just_the_first() {
+    // Four lanes at four different distances from the tie. A lowering
+    // that rounded lane zero and copied the rest fails, and so does one
+    // that read the whole register as a single wide float.
+    assert_eq!(
+        solve_arm_lowering(
+            Arch::Aarch64,
+            "frinta",
+            &["v0.4s", "v1.4s"],
+            &[("v1", packed32(&[S_2_5, S_NEG_2_5, S_1_5, S_1_0]))],
+            packed32(&[S_3_0, S_NEG_3_0, S_2_0, S_1_0]),
+        ),
+        SmtResult::AlwaysTrue,
+        "packed frinta must round each binary32 lane away from zero"
+    );
+}
+
+#[test]
+fn aarch64_packed_frintz_truncates_where_the_packed_frintn_rounds_up() {
+    // The same contrast the scalar fixtures draw, repeated packed so the
+    // mode table cannot be right in one dispatch and wrong in the other.
+    assert_eq!(
+        solve_arm_lowering(
+            Arch::Aarch64,
+            "frintz",
+            &["v0.2s", "v1.2s"],
+            &[("v0", PARENT_PRESET), ("v1", packed32(&[S_1_5, S_NEG_2_5]))],
+            packed32(&[S_1_0, S_NEG_2_0]),
+        ),
+        SmtResult::AlwaysTrue,
+        "packed frintz must truncate, and zero the register above the .2s view"
+    );
+}
+
+#[test]
+fn aarch64_packed_frint_declines_a_byte_arrangement() {
+    // `.16b` is a perfectly good arrangement and a perfectly bad float
+    // sort — rounding a byte lane is a wrong value, not a wider one.
+    let insn = instruction("frinta", vec![reg("v0.16b"), reg("v1.16b")]);
     assert!(
         lift_per_mnemonic(&insn, Arch::Aarch64)
             .iter()
             .any(|s| matches!(s, IrStmt::Unsupported { .. })),
-        "packed frinta must decline"
+        "frinta over a byte arrangement must decline"
     );
 }
 

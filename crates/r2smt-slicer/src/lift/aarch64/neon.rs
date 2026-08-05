@@ -22,6 +22,7 @@
 //! primitives all four share, and `lower` builds the expression a
 //! resolved shape describes.
 
+use r2smt_ir::expr::RoundingMode;
 use r2smt_ir::program::Instruction;
 
 use super::super::{BinOp, FusedStep, PackedOp};
@@ -89,7 +90,16 @@ enum NeonOp {
     /// narrow elements, saturated into the destination's element and
     /// optionally accumulated onto it under a second saturation.
     /// `upper` is the `2` suffix, which reads the sources' upper half.
-    DoublingLong { combine: Option<BinOp>, upper: bool },
+    ///
+    /// `by_element` marks the `v2.h[i]` spelling, where the second
+    /// source contributes one element — named by
+    /// [`NeonShape::source_index`] — to every destination lane instead of
+    /// pairing each lane with its own.
+    DoublingLong {
+        combine: Option<BinOp>,
+        upper: bool,
+        by_element: bool,
+    },
     /// `sri` / `sli` — shift one source lane and insert it over the
     /// destination lane, keeping the destination bits the shift vacated.
     ///
@@ -107,11 +117,26 @@ enum NeonOp {
     /// `fbits` is the fixed-point form's fraction width, and zero for
     /// the plain register forms — the integer side is then read as a
     /// scaled value, `Int(lane) / 2^fbits`.
+    ///
+    /// `rounding` is the mode a float-to-integer member rounds with, and
+    /// it is carried rather than fixed because `AArch64` spells five of
+    /// them: `fcvtz*` truncates, `fcvta*` rounds ties away, `fcvtn*`
+    /// ties to even, `fcvtp*` up and `fcvtm*` down. The other two
+    /// directions round to nearest and ignore this.
     Convert {
         kind: ConvertKind,
         upper: bool,
         fbits: u16,
+        rounding: RoundingMode,
     },
+    /// `frint<mode>` — round each lane to an integral value without
+    /// leaving the float sort.
+    ///
+    /// Not the integer round trip `fcvtz*` followed by `scvtf`: that
+    /// agrees only on the values an integer lane can hold, and turns an
+    /// infinity, a NaN or an out-of-range magnitude into some in-range
+    /// number.
+    RoundToIntegral(RoundingMode),
     /// `bsl` / `bit` / `bif` — bitwise select, where one of the three
     /// registers supplies the mask and the destination is always one of
     /// the three.
@@ -164,6 +189,14 @@ enum NeonOp {
     /// *adjacent* lanes of the concatenated sources rather than to the
     /// lanes at one index.
     Pairwise(PairOp),
+    /// `addp d0, v1.2d` / `faddp s0, v1.2s` — the same fold applied to
+    /// the *one* source's two lanes, producing a single element.
+    ///
+    /// Its own variant rather than [`NeonOp::Pairwise`] with one lane,
+    /// because there is no second source: the vector form's lowering
+    /// splits the destination between two operands, and at one lane it
+    /// would take the pair out of an operand that is not there.
+    ScalarPairwise(PairOp),
     /// `sabd` / `uabd` / `saba` / `uaba` / `fabd` — the magnitude of the
     /// lane difference, optionally accumulated onto the destination.
     AbsoluteDifference(AbsDiffKind),
@@ -266,8 +299,10 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
     let mnemonic = insn.mnemonic.trim().to_ascii_lowercase();
     arith::packed_shape(insn, &mnemonic)
         .or_else(|| arith::bitwise_unary_shape(insn, &mnemonic))
+        .or_else(|| arith::round_to_integral_shape(insn, &mnemonic))
         .or_else(|| arith::float_min_max_shape(insn, &mnemonic))
         .or_else(|| arith::pairwise_shape(insn, &mnemonic))
+        .or_else(|| arith::scalar_pairwise_shape(insn, &mnemonic))
         .or_else(|| arith::absolute_difference_shape(insn, &mnemonic))
         .or_else(|| width::pairwise_long_shape(insn, &mnemonic))
         .or_else(|| width::high_narrow_shape(insn, &mnemonic))
