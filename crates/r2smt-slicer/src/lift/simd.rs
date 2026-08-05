@@ -293,11 +293,17 @@ const F64_THREE: u128 = 0x4008_0000_0000_0000;
 /// The same two in binary128, the intermediate for a binary64 lane.
 const F128_TWO: u128 = 0x4000_0000_0000_0000_0000_0000_0000_0000;
 const F128_THREE: u128 = 0x4000_8000_0000_0000_0000_0000_0000_0000;
-/// binary32 bit patterns of the `(inf, 0)` special-case results.
+/// binary32 bit patterns of the `(inf, 0)` special-case results, and of
+/// the step constants when binary32 is the *intermediate* — which it is
+/// for a binary16 lane, the role `F64_TWO` plays for a binary32 one.
 const F32_TWO: u128 = 0x4000_0000;
+const F32_THREE: u128 = 0x4040_0000;
 const F32_ONE_POINT_FIVE: u128 = 0x3fc0_0000;
 /// The binary64 spelling of the second (the first is `F64_TWO`).
 const F64_ONE_POINT_FIVE: u128 = 0x3ff8_0000_0000_0000;
+/// The binary16 spellings, for a half-precision lane.
+const F16_TWO: u128 = 0x4000;
+const F16_ONE_POINT_FIVE: u128 = 0x3e00;
 /// binary32 magnitude mask and the infinity pattern with the sign
 /// cleared.
 const F32_ABS_MASK: u128 = 0x7fff_ffff;
@@ -305,6 +311,9 @@ const F32_INFINITY: u128 = 0x7f80_0000;
 /// The binary64 spelling of the same two.
 const F64_ABS_MASK: u128 = 0x7fff_ffff_ffff_ffff;
 const F64_INFINITY: u128 = 0x7ff0_0000_0000_0000;
+/// And the binary16 spelling.
+const F16_ABS_MASK: u128 = 0x7fff;
+const F16_INFINITY: u128 = 0x7c00;
 
 /// The two formats one fused step is computed in, plus the constants
 /// each of them names.
@@ -335,13 +344,35 @@ struct FusedFormats {
 /// lane values must fit the wide significand (`2·p − 1 ≤ q`), and the
 /// wide format's single rounding of the combine must agree with
 /// rounding the real result straight to the lane, which needs
-/// `q ≥ 2·p + 2`. binary64 over a binary32 lane gives `53 ≥ 50`;
-/// binary128 over a binary64 one gives `113 ≥ 108`. There is no third
-/// entry: IEEE names no interchange format wide enough to carry a
-/// binary128 lane the same way.
+/// `q ≥ 2·p + 2`:
+///
+/// | lane | wide | `2p − 1 ≤ q` | `q ≥ 2p + 2` |
+/// |---|---|---|---|
+/// | binary16 (`p = 11`) | binary32 (`q = 24`) | `21 ≤ 24` | `24 ≥ 24` |
+/// | binary32 (`p = 24`) | binary64 (`q = 53`) | `47 ≤ 53` | `53 ≥ 50` |
+/// | binary64 (`p = 53`) | binary128 (`q = 113`) | `105 ≤ 113` | `113 ≥ 108` |
+///
+/// The binary16 row holds with **no slack at all** on the second
+/// condition, which is worth stating because it is what makes the row
+/// easy to talk yourself out of: `24 ≥ 24` is satisfied, and the entry
+/// went missing for a while behind a claim that it was not.
+///
+/// There is no fourth row: IEEE names no interchange format wide enough
+/// to carry a binary128 lane the same way.
 fn fused_formats(lane_bits: u16) -> Option<FusedFormats> {
     let lane = fp_sort_bits_checked(lane_bits)?;
     Some(match lane_bits {
+        FP_HALF_BITS => FusedFormats {
+            lane_bits,
+            lane,
+            wide: fp_sort_bits_checked(FP_SINGLE_BITS)?,
+            wide_two: F32_TWO,
+            wide_three: F32_THREE,
+            lane_two: F16_TWO,
+            lane_one_and_a_half: F16_ONE_POINT_FIVE,
+            lane_abs_mask: F16_ABS_MASK,
+            lane_infinity: F16_INFINITY,
+        },
         FP_SINGLE_BITS => FusedFormats {
             lane_bits,
             lane,
@@ -1604,9 +1635,12 @@ mod tests {
     }
 
     #[test]
-    fn fused_multiply_lane_declines_a_lane_with_no_wide_enough_intermediate() {
-        // A binary16 lane has an IEEE sort but no entry in the fused
-        // table, so it declines rather than rounding twice.
+    fn fused_multiply_lane_accepts_a_binary16_lane_over_a_binary32_intermediate() {
+        // This test used to assert the opposite, and its comment gave
+        // the reason as "no entry in the fused table" — which was true
+        // and circular. The entry was missing because the exactness
+        // argument had been read as failing, and it does not fail:
+        // `p = 11` needs `q >= 24` and binary32 has exactly 24.
         assert!(
             fused_multiply_lane(
                 FusedStep::MulAdd,
@@ -1614,6 +1648,42 @@ mod tests {
                 &lane(FP_HALF_BITS),
                 Some(lane(FP_HALF_BITS)),
                 FP_HALF_BITS,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn a_binary16_lane_widens_to_binary32_and_not_to_something_narrower() {
+        // The sibling of the binary64 test above, and the one with
+        // teeth: binary32 is the *narrowest* format that works for
+        // `p = 11`, so there is no slack to lose. `q >= 2p + 2` is
+        // `24 >= 24`.
+        assert_eq!(
+            fused_formats(FP_HALF_BITS).map(|formats| formats.wide),
+            Some((8, 24)),
+            "a binary16 fused step must widen to binary32"
+        );
+        assert_eq!(
+            fused_formats(FP_HALF_BITS)
+                .map(|formats| u32::from(formats.wide.1) >= 2 * u32::from(formats.lane.1) + 2),
+            Some(true),
+            "the intermediate must be wide enough for a single rounding"
+        );
+    }
+
+    #[test]
+    fn fused_multiply_lane_declines_a_lane_that_names_no_ieee_format() {
+        // The decline that survives, and the honest one: a byte is not
+        // a float sort at all, so there is nothing to widen.
+        const BYTE_BITS: u16 = 8;
+        assert!(
+            fused_multiply_lane(
+                FusedStep::MulAdd,
+                &lane(BYTE_BITS),
+                &lane(BYTE_BITS),
+                Some(lane(BYTE_BITS)),
+                BYTE_BITS,
             )
             .is_none()
         );

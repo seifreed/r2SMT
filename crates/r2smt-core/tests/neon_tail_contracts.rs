@@ -1082,3 +1082,86 @@ fn frsqrts_over_double_lanes_returns_one_point_five_for_zero_times_infinity() {
         packed(64, &[F64_ONE_POINT_FIVE; 2]),
     );
 }
+
+// ---------- the same family over binary16 lanes ----------
+//
+// `.4h` / `.8h` declined until 2026-08-05, and the reason recorded for
+// it was wrong rather than merely stale: the claim was that binary32
+// cannot carry a binary16 product exactly. It can — `p = 11` needs
+// `q >= 2 * 11 + 2 = 24` and binary32 has exactly 24 — so the condition
+// holds, with no slack at all. These pin the value that the missing
+// entry was hiding.
+
+/// `1 + 2^-6`, whose square is `1 + 2^-5 + 2^-12`: the last term falls
+/// below binary16's significand at that exponent.
+const H_ONE_PLUS: u128 = 0x3c10;
+/// `-(1 + 2^-5)`, the accumulator that cancels everything above it.
+const H_MINUS_ONE_PLUS_2: u128 = 0xbc20;
+/// `2^-12`, the exact answer once it does.
+const H_TWO_POW_MINUS_12: u128 = 0x0c00;
+const H_ONE: u128 = 0x3c00;
+const H_TWO: u128 = 0x4000;
+const H_ONE_POINT_FIVE: u128 = 0x3e00;
+const H_INFINITY: u128 = 0x7c00;
+
+#[test]
+fn fmla_over_half_lanes_rounds_once_not_twice() {
+    // Rounding the product to binary16 first drops the 2^-12 and the
+    // accumulator then cancels the rest exactly, giving 0. The fused
+    // step keeps it. A lowering built from a separate `fmul` and `fadd`
+    // answers zero here, which is what gives this test its teeth.
+    assert_computes(
+        "fmla",
+        &["v0.8h", "v1.8h", "v2.8h"],
+        &[
+            ("v0", packed(16, &[H_MINUS_ONE_PLUS_2; 8])),
+            ("v1", packed(16, &[H_ONE_PLUS; 8])),
+            ("v2", packed(16, &[H_ONE_PLUS; 8])),
+        ],
+        packed(16, &[H_TWO_POW_MINUS_12; 8]),
+    );
+}
+
+#[test]
+fn fmla_by_element_over_half_lanes_rounds_once_not_twice() {
+    // The by-element spelling shares the gate and the lowering, on the
+    // half-precision element the architecture encodes.
+    assert_computes(
+        "fmla",
+        &["v0.4h", "v1.4h", "v2.h[2]"],
+        &[
+            ("v0", packed(16, &[H_MINUS_ONE_PLUS_2; 4])),
+            ("v1", packed(16, &[H_ONE_PLUS; 4])),
+            ("v2", packed(16, &[H_ONE, H_ONE, H_ONE_PLUS, H_ONE])),
+        ],
+        packed(16, &[H_TWO_POW_MINUS_12; 4]),
+    );
+}
+
+#[test]
+fn frecps_over_half_lanes_returns_two_for_zero_times_infinity() {
+    // The guarded special case travels with the family, not with the
+    // lane width, so it has to hold at every width the table names.
+    assert_computes(
+        "frecps",
+        &["v0.4h", "v1.4h", "v2.4h"],
+        &[
+            ("v1", packed(16, &[H_INFINITY; 4])),
+            ("v2", packed(16, &[0; 4])),
+        ],
+        packed(16, &[H_TWO; 4]),
+    );
+}
+
+#[test]
+fn frsqrts_over_half_lanes_returns_one_point_five_for_zero_times_infinity() {
+    assert_computes(
+        "frsqrts",
+        &["v0.8h", "v1.8h", "v2.8h"],
+        &[
+            ("v1", packed(16, &[0; 8])),
+            ("v2", packed(16, &[H_INFINITY; 8])),
+        ],
+        packed(16, &[H_ONE_POINT_FIVE; 8]),
+    );
+}

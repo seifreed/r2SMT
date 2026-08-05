@@ -5233,11 +5233,21 @@ fn aarch64_fused_multiply_add_lifts_double_lanes() {
 }
 
 #[test]
-fn aarch64_fused_multiply_add_still_declines_a_half_precision_lane() {
-    // The gate is the intermediate's width, not a blanket "any float":
-    // binary32 does not cover `2 * 11 + 2`, so a binary16 lane would
-    // round twice and declines instead.
-    assert!(neon_declines("fmla", &["v0.4h", "v1.4h", "v2.4h"]));
+fn aarch64_fused_multiply_add_lifts_a_half_precision_lane() {
+    // This test used to assert the opposite, on the stated grounds that
+    // "binary32 does not cover `2 * 11 + 2`". It does: `p = 11` needs a
+    // 24-bit significand and binary32 has exactly 24. The condition
+    // holds with no slack, which is what made it easy to write off.
+    assert!(!neon_declines("fmla", &["v0.4h", "v1.4h", "v2.4h"]));
+    assert!(!neon_declines("frecps", &["v0.8h", "v1.8h", "v2.8h"]));
+}
+
+#[test]
+fn aarch64_fused_multiply_add_declines_a_lane_width_that_names_no_format() {
+    // The gate really is the intermediate's width and not a blanket
+    // "any lane": a byte names no IEEE format at all, so
+    // `fused_formats` has nothing to answer with.
+    assert!(neon_declines("fmla", &["v0.8b", "v1.8b", "v2.8b"]));
 }
 
 #[test]

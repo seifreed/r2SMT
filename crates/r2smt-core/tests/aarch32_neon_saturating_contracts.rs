@@ -782,3 +782,58 @@ fn vrecps_declines_a_binary64_lane_in_every_view() {
     assert!(declines("vrecps.f64", &["d0", "d1", "d2"]));
     assert!(declines("vrsqrts.f64", &["q0", "q1", "q2"]));
 }
+
+// ---------- half precision, and the lane count an `s` register does not imply ----------
+
+/// `1 + 2^-6` and `-(1 + 2^-5)` in binary16, whose fused step leaves
+/// exactly `2^-12` where a doubly-rounded one leaves zero.
+const H_ONE_PLUS: u128 = 0x3c10;
+const H_MINUS_ONE_PLUS_2: u128 = 0xbc20;
+const H_TWO_POW_MINUS_12: u128 = 0x0c00;
+
+/// Pack `lanes` little-endian at `bits` each, starting at bit 0.
+fn packed_at(bits: u32, lanes: &[u128]) -> u128 {
+    let mut value = 0u128;
+    for (index, lane) in lanes.iter().enumerate() {
+        value |= lane << (bits * u32::try_from(index).unwrap_or(0));
+    }
+    value
+}
+
+#[test]
+fn vfma_over_half_lanes_rounds_once_not_twice() {
+    // A `d` view of `.f16` really is four lanes, and each of them gets
+    // the single rounding.
+    //
+    // `d0` / `d2` / `d4` rather than `d0` / `d1` / `d2`: on `AArch32`
+    // consecutive `d` registers are the two halves of one vector
+    // parent, so `d1` is the *upper* half of `v0` and binding three
+    // separate parents needs every other one.
+    assert_computes(
+        "vfma.f16",
+        &["d0", "d2", "d4"],
+        &[
+            ("v0", packed_at(16, &[H_MINUS_ONE_PLUS_2; 4])),
+            ("v1", packed_at(16, &[H_ONE_PLUS; 4])),
+            ("v2", packed_at(16, &[H_ONE_PLUS; 4])),
+        ],
+        packed_at(16, &[H_TWO_POW_MINUS_12; 4]),
+    );
+}
+
+#[test]
+fn vfma_over_a_half_lane_in_a_scalar_register_declines() {
+    // The hazard this exists for, and it is a wrong value rather than a
+    // decline if it is missed. `vector_view_bits` reports a register's
+    // width, so an `s` register answers 32 whatever the element is —
+    // and 32 / 16 is two lanes where `VFMA.F16 <Sd>, <Sn>, <Sm>` has
+    // one, in the low half.
+    //
+    // It declines rather than resolving as one lane, and the reason is
+    // mechanical: the shape's view is `lanes * lane_bits`, and that is
+    // what the destination write splices, so a one-lane binary16 shape
+    // would splice 16 bits into an operand whose own view is 32. The
+    // packed `d` spelling above is unaffected.
+    assert!(declines("vfma.f16", &["s0", "s1", "s2"]));
+    assert!(declines("vfms.f16", &["s0", "s1", "s2"]));
+}
