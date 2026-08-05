@@ -655,8 +655,18 @@ fn aarch32_mov_effect(insn: &Instruction, sets_flags: bool) -> InstructionEffect
     {
         defs.push(reg);
     }
-    if let Some(src) = insn.operands.get(1) {
-        uses.extend(registers_in_operand(src, Arch::Arm));
+    // Every source, not just operand 1. `mvn r0, r1, lsl r3` puts a
+    // register in the *shift specifier*, and dropping it from `uses`
+    // lets the backward walk discard whatever defined `r3` — SSA then
+    // binds it to a stale free input, which is a fabricated verdict
+    // rather than a lost one. The arithmetic and compare helpers next
+    // door already scan every operand; this one did not.
+    for src in insn.operands.iter().skip(1) {
+        for reg in registers_in_operand(src, Arch::Arm) {
+            if !uses.contains(&reg) {
+                uses.push(reg);
+            }
+        }
     }
     InstructionEffect {
         kind: InstructionKind::Mov,

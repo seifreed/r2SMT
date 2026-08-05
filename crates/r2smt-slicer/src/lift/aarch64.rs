@@ -200,7 +200,7 @@ impl LiftCtx {
     }
 
     pub(super) fn lift_aarch64_arith3(&mut self, insn: &Instruction, op: BinOp, sets_flags: bool) {
-        let (Some(dst), Some(src1), Some(src2)) = (
+        let (Some(dst), Some(src1), Some(_)) = (
             insn.operands.first(),
             insn.operands.get(1),
             insn.operands.get(2),
@@ -239,21 +239,45 @@ impl LiftCtx {
             return;
         };
         let lhs = self.read_operand_at(src1, dst_width);
-        let rhs = self.read_operand_at(src2, dst_width);
-        // Stash the computed result in a temp and emit the flag updates
-        // *before* writing the destination. AArch64 `adds Rd, Rn, Rm`
-        // is normally 3-operand with `Rd` distinct from `Rn`/`Rm`, but
-        // the architecture allows `adds x0, x0, x1`. Without the
-        // pre-write flag emission the `x0` reads inside CF (and any
-        // other lhs/rhs-derived flag) would be renamed by SSA to the
-        // post-write version, breaking the flag value. See
-        // `lift_add_sub` for the x86 analogue and the recorded
-        // regression in `r2smt_lifter_sub_flag_bug.md`.
-        let tmp = self.new_temp(insn.address, dst_width);
+        // The last source can carry a shift or extend specifier as one
+        // more operand (`eor r0, r1, r2, lsl 2`); reading it alone drops
+        // the shift and computes a wrong value.
+        let rhs = self.read_source_with_shift(insn, 2, dst_width);
+        self.emit_arith3(insn, op, &lhs, &rhs, dst_width, sets_flags);
+    }
+
+    /// Commit a three-operand arithmetic result: temp, flags, then the
+    /// destination write.
+    ///
+    /// Separate from [`Self::lift_aarch64_arith3`] because `rsb` needs
+    /// the same tail with its sources the other way round, and cloning
+    /// the instruction to swap its operands — which is what it used to
+    /// do — cannot survive a trailing shift specifier: the specifier
+    /// belongs to `Operand2`, and after the swap that operand is no
+    /// longer where the reader looks for it.
+    ///
+    /// The temp is what makes the flag order right. `adds x0, x0, x1` is
+    /// legal, and without stashing the result first the `x0` reads
+    /// inside CF would be renamed by SSA to the post-write version. See
+    /// `lift_add_sub` for the x86 analogue and the recorded regression
+    /// in `r2smt_lifter_sub_flag_bug.md`.
+    pub(super) fn emit_arith3(
+        &mut self,
+        insn: &Instruction,
+        op: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        width: u16,
+        sets_flags: bool,
+    ) {
+        let Some(dst) = insn.operands.first() else {
+            return;
+        };
+        let tmp = self.new_temp(insn.address, width);
         self.assign(tmp.clone(), op.apply(lhs.clone(), rhs.clone()));
         let tmp_expr = Expr::Var(tmp);
         if sets_flags {
-            self.aarch64_set_arith_flags(op, &lhs, &rhs, &tmp_expr, dst_width);
+            self.aarch64_set_arith_flags(op, lhs, rhs, &tmp_expr, width);
         }
         if !self.write_register_to(dst, tmp_expr) {
             self.stmts.push(IrStmt::Unsupported {
@@ -314,7 +338,9 @@ impl LiftCtx {
         };
         let width = self.binop_width(lhs_op, rhs_op);
         let lhs = self.read_operand_at(lhs_op, width);
-        let rhs = self.read_operand_at(rhs_op, width);
+        // `cmp r0, r1, lsl 2` is three operands, one more than this
+        // reads, so the shift has to be folded in here too.
+        let rhs = self.read_source_with_shift(insn, 1, width);
         let tmp = self.new_temp(insn.address, width);
         self.assign(tmp.clone(), Expr::sub(lhs.clone(), rhs.clone()));
         let tmp_expr = Expr::Var(tmp);
@@ -509,7 +535,7 @@ impl LiftCtx {
         };
         let width = self.binop_width(lhs_op, rhs_op);
         let lhs = self.read_operand_at(lhs_op, width);
-        let rhs = self.read_operand_at(rhs_op, width);
+        let rhs = self.read_source_with_shift(insn, 1, width);
         let tmp = self.new_temp(insn.address, width);
         self.assign(tmp.clone(), Expr::bv_and(lhs, rhs));
         let tmp_expr = Expr::Var(tmp);

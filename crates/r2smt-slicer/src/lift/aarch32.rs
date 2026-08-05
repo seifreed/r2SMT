@@ -10,7 +10,7 @@ use r2smt_ir::stmt::IrStmt;
 use crate::registers::register_layout;
 
 pub(super) mod memory;
-pub(super) mod shift;
+pub(in crate::lift) mod shift;
 pub(super) mod vfp;
 
 use shift::{ShiftForm, rotate_right_through_carry};
@@ -262,7 +262,7 @@ impl LiftCtx {
     /// ordering fix and operand-validation invariants stay in one
     /// place.
     fn lift_aarch32_rsb(&mut self, insn: &Instruction, sets_flags: bool) {
-        let (Some(dst), Some(src1), Some(src2)) = (
+        let (Some(dst), Some(src1), Some(_)) = (
             insn.operands.first(),
             insn.operands.get(1),
             insn.operands.get(2),
@@ -273,14 +273,26 @@ impl LiftCtx {
             });
             return;
         };
-        let mut swapped = insn.clone();
-        swapped.operands = vec![dst.clone(), src2.clone(), src1.clone()];
-        self.lift_aarch64_arith3(&swapped, BinOp::Sub, sets_flags);
+        if dst.kind != OperandKind::Register {
+            self.unsupported_aarch32(insn, "rsb non-register destination");
+            return;
+        }
+        let Some(width) = nonzero_width(self.operand_width(dst)) else {
+            self.unsupported_aarch32(insn, "rsb zero-width destination");
+            return;
+        };
+        // `rsb Rd, Rn, Op` is `sub Rd, Op, Rn`. The reversal is why this
+        // cannot delegate by cloning the instruction with its operands
+        // swapped: a shift specifier belongs to `Op`, and after the swap
+        // that operand is no longer the one the reader folds it into.
+        let lhs = self.read_source_with_shift(insn, 2, width);
+        let rhs = self.read_operand_at(src1, width);
+        self.emit_arith3(insn, BinOp::Sub, &lhs, &rhs, width, sets_flags);
     }
 
     /// `bic Rd, Rn, Op` — bit-clear: `Rd := Rn & ~Op`.
     fn lift_aarch32_bic(&mut self, insn: &Instruction, sets_flags: bool) {
-        let (Some(dst), Some(src1), Some(src2)) = (
+        let (Some(dst), Some(src1), Some(_)) = (
             insn.operands.first(),
             insn.operands.get(1),
             insn.operands.get(2),
@@ -306,7 +318,7 @@ impl LiftCtx {
             return;
         };
         let lhs = self.read_operand_at(src1, dst_width);
-        let rhs = self.read_operand_at(src2, dst_width);
+        let rhs = self.read_source_with_shift(insn, 2, dst_width);
         // ~Op = Op XOR all-ones.
         let ones = Expr::konst(u128::from(width_mask(dst_width)), dst_width);
         let not_rhs = Expr::bv_xor(rhs.clone(), ones);
@@ -341,7 +353,7 @@ impl LiftCtx {
         };
         let width = self.binop_width(lhs_op, rhs_op);
         let lhs = self.read_operand_at(lhs_op, width);
-        let rhs = self.read_operand_at(rhs_op, width);
+        let rhs = self.read_source_with_shift(insn, 1, width);
         let tmp = self.new_temp(insn.address, width);
         self.assign(tmp.clone(), Expr::add(lhs, rhs));
         let tmp_expr = Expr::Var(tmp);
@@ -363,7 +375,7 @@ impl LiftCtx {
         };
         let width = self.binop_width(lhs_op, rhs_op);
         let lhs = self.read_operand_at(lhs_op, width);
-        let rhs = self.read_operand_at(rhs_op, width);
+        let rhs = self.read_source_with_shift(insn, 1, width);
         let tmp = self.new_temp(insn.address, width);
         self.assign(tmp.clone(), Expr::bv_xor(lhs, rhs));
         let tmp_expr = Expr::Var(tmp);
@@ -467,7 +479,7 @@ impl LiftCtx {
     fn lift_aarch32_mvn(&mut self, insn: &Instruction) {
         // `mvn Rd, Op` = bitwise NOT. Encoded as Xor with -1 of the
         // destination width.
-        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
+        let (Some(dst), Some(_)) = (insn.operands.first(), insn.operands.get(1)) else {
             return;
         };
         if dst.kind != OperandKind::Register {
@@ -480,7 +492,7 @@ impl LiftCtx {
         let Some(dst_width) = nonzero_width(self.operand_width(dst)) else {
             return;
         };
-        let value = self.read_operand_at(src, dst_width);
+        let value = self.read_source_with_shift(insn, 1, dst_width);
         let result = Expr::bv_xor(
             value,
             Expr::konst(u128::from(width_mask(dst_width)), dst_width),
@@ -628,7 +640,7 @@ impl LiftCtx {
     /// `Ult(lhs, rhs)`, which ignores the borrow-in and so would be a
     /// definite *wrong* carry rather than an imprecise one.
     fn lift_aarch32_carry_arith(&mut self, insn: &Instruction, op: BinOp, sets_flags: bool) {
-        let (Some(dst), Some(src1), Some(src2)) = (
+        let (Some(dst), Some(src1), Some(_)) = (
             insn.operands.first(),
             insn.operands.get(1),
             insn.operands.get(2),
@@ -645,7 +657,7 @@ impl LiftCtx {
             return;
         };
         let lhs = self.read_operand_at(src1, width);
-        let rhs = self.read_operand_at(src2, width);
+        let rhs = self.read_source_with_shift(insn, 2, width);
         // `CF` is stored in x86 borrow polarity, the inverse of ARM's
         // `C` (see `shift::arm_carry`). `adc` adds ARM's `C` and `sbc`
         // subtracts its complement, so the two operations want the two
@@ -673,7 +685,7 @@ impl LiftCtx {
     /// `sxtb`/`sxth`/`uxtb`/`uxth Rd, Rm` — take the low `bits` of the
     /// source and extend them across the destination.
     fn lift_aarch32_extend(&mut self, insn: &Instruction, bits: u16, signed: bool) {
-        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
+        let (Some(dst), Some(_)) = (insn.operands.first(), insn.operands.get(1)) else {
             self.unsupported_aarch32(insn, "extend expects Rd, Rm");
             return;
         };
@@ -685,7 +697,11 @@ impl LiftCtx {
             self.unsupported_aarch32(insn, "extend zero-width destination");
             return;
         };
-        let low = Expr::extract(self.read_operand_at(src, width), bits - 1, 0);
+        // `sxtb r0, r1, ror 8` rotates *before* taking the low bits,
+        // which is the whole point of the optional rotate: it selects
+        // which byte gets extended.
+        let rotated = self.read_source_with_shift(insn, 1, width);
+        let low = Expr::extract(rotated, bits - 1, 0);
         let result = if signed {
             Expr::sign_ext(low, width)
         } else {

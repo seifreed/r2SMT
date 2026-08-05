@@ -73,6 +73,11 @@ fn operand(raw: &str) -> Operand {
         raw: raw.into(),
         kind: if raw.starts_with('r') {
             OperandKind::Register
+        } else if raw.contains(char::is_whitespace) {
+            // What the real parser gives a shift specifier: it splits on
+            // top-level commas only, so `lsl 2` arrives whole and its
+            // internal space makes `classify_operand` answer `Unknown`.
+            OperandKind::Unknown
         } else {
             OperandKind::Immediate
         },
@@ -388,6 +393,97 @@ fn a_shift_by_zero_leaves_the_carry_it_found() {
             &[("r1", 1, WORD), ("CF", stored(1), 1)],
             ("CF", 1),
             stored(1),
+        ),
+        SmtResult::AlwaysTrue,
+    );
+}
+
+// --- the specifier that follows a register operand -------------------
+
+#[test]
+fn an_arithmetic_operand_carries_its_shift() {
+    // `eor r0, r1, r2, lsl 2` is **four** operands, one more than the
+    // three-operand handler reads. Dropping the fourth computes
+    // `r1 ^ r2` — a wrong value, not a decline, and the reason this
+    // whole family needed auditing.
+    assert_eq!(
+        solve_shift(
+            "eor",
+            &["r0", "r1", "r2", "lsl 2"],
+            &[("r1", 0, WORD), ("r2", 3, WORD)],
+            ("r0", WORD),
+            0xc,
+        ),
+        SmtResult::AlwaysTrue,
+    );
+}
+
+#[test]
+fn a_compare_carries_its_shift_into_the_flags() {
+    // `cmp r0, r1, lsl 1` is three operands where the handler reads two,
+    // so the shape hides the extra one. With `r0 == 4` and `r1 == 2` the
+    // shifted compare is equal and `ZF` is set; ignoring the shift makes
+    // it `4 - 2` and clears `ZF`.
+    assert_eq!(
+        solve_shift(
+            "cmp",
+            &["r0", "r1", "lsl 1"],
+            &[("r0", 4, WORD), ("r1", 2, WORD)],
+            ("ZF", 1),
+            1,
+        ),
+        SmtResult::AlwaysTrue,
+    );
+}
+
+#[test]
+fn a_reverse_subtract_shifts_the_operand_it_subtracts_from() {
+    // `rsb Rd, Rn, Op` is `Op - Rn`, and the specifier belongs to `Op`.
+    // The handler used to swap the operands by cloning the instruction,
+    // which puts `Op` where nothing folds its shift — so this asserts
+    // the reversal and the shift at once: `(1 << 4) - 6` is 10.
+    assert_eq!(
+        solve_shift(
+            "rsb",
+            &["r0", "r1", "r2", "lsl 4"],
+            &[("r1", 6, WORD), ("r2", 1, WORD)],
+            ("r0", WORD),
+            10,
+        ),
+        SmtResult::AlwaysTrue,
+    );
+}
+
+#[test]
+fn an_extend_rotates_before_it_takes_the_byte() {
+    // `sxtb r0, r1, ror 8` rotates first and extends the byte the
+    // rotation brought down, which is the entire purpose of the
+    // optional rotate. `0x0000_ff00` rotated right by 8 is `0xff`, and
+    // the signed byte extends to `0xffff_ffff`; ignoring the rotate
+    // would extend the original low byte, which is zero.
+    assert_eq!(
+        solve_shift(
+            "sxtb",
+            &["r0", "r1", "ror 8"],
+            &[("r1", 0x0000_ff00, WORD)],
+            ("r0", WORD),
+            0xffff_ffff,
+        ),
+        SmtResult::AlwaysTrue,
+    );
+}
+
+#[test]
+fn a_shifted_operand_can_take_its_amount_from_a_register() {
+    // The register-amount spelling, which is also the one whose shift
+    // register has to survive into the effect table's `uses`.
+    assert_eq!(
+        solve_shift(
+            "eor",
+            &["r0", "r1", "r2", "lsl r3"],
+            &[("r1", 0, WORD), ("r2", 1, WORD), ("r3", 5, WORD)],
+            ("r0", WORD),
+            0x20,
         ),
         SmtResult::AlwaysTrue,
     );

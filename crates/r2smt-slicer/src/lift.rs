@@ -38,6 +38,7 @@ use crate::slice::{Slice, SliceMerge, SliceStatus};
 mod aarch32;
 mod aarch64;
 mod merge;
+mod shifted_operand;
 mod simd;
 mod x86;
 mod x87;

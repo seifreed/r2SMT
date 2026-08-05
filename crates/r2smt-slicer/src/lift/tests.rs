@@ -5775,3 +5775,28 @@ fn the_x86_scalar_read_path_declines_a_vector_register_by_width() {
     assert!(ctx.read_register(&reg("ymm0")).is_none());
     assert!(ctx.read_register(&reg("rax")).is_some());
 }
+
+#[test]
+fn aarch32_a_shift_specifier_register_is_a_use() {
+    // `mvn r0, r1, lsl r3` reads `r3`. The mov-shaped effect entry used
+    // to scan operand 1 only, so `r3` never reached `uses` and the
+    // backward walk would drop whatever defined it — SSA then binds a
+    // stale free input, which fabricates a verdict instead of losing
+    // one. The shift mnemonics themselves resolve to no register, so
+    // scanning every operand adds nothing spurious.
+    let effect = crate::effect::analyze(
+        &insn(
+            0x1000,
+            4,
+            "mvn",
+            vec![reg("r0"), reg("r1"), op("lsl r3", OperandKind::Unknown)],
+        ),
+        Arch::Arm,
+    );
+    assert_eq!(effect.defs, vec!["r0"]);
+    assert!(
+        effect.uses.contains(&"r3"),
+        "the shift amount register is a use: {effect:?}"
+    );
+    assert!(effect.uses.contains(&"r1"));
+}

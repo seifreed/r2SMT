@@ -100,7 +100,7 @@ fn stored_carry(arm: Expr) -> Expr {
 /// with the addressing model so the two spellings of one operation
 /// cannot drift apart. The bit that enters is ARM's `C`, so it crosses
 /// [`arm_carry`] on the way in.
-pub(super) fn rotate_right_through_carry(value: Expr, bits: u16) -> Expr {
+pub(in crate::lift) fn rotate_right_through_carry(value: Expr, bits: u16) -> Expr {
     let through = Expr::concat(arm_carry(Expr::Var(Var::new("CF", 1))), value);
     Expr::extract(through, bits, 1)
 }
