@@ -5598,3 +5598,88 @@ fn the_scalar_write_path_refuses_a_simd_parent() {
         );
     }
 }
+
+#[test]
+fn the_scalar_read_path_refuses_a_simd_parent() {
+    // The reading half of the same defect, and the half that was left
+    // unaudited when the write guard landed. It is reachable: `scvtf
+    // d0, d1`, `str d8, [sp, #0x10]` and the scalar-SIMD `add d0, d1,
+    // d2` all arrive here with a bare vector operand, because the
+    // `vector_shape` gate is syntactic and `d1` carries no arrangement.
+    for (arch, simd, general) in [
+        (Arch::Aarch64, "s0", "w0"),
+        (Arch::Aarch64, "d0", "x0"),
+        (Arch::Aarch64, "b0", "x0"),
+        (Arch::Arm, "s0", "r0"),
+    ] {
+        let ctx = LiftCtx::new(arch);
+        assert!(
+            ctx.read_register(&reg(simd)).is_none(),
+            "{arch:?}: {simd} is a vector view and must not take the scalar path"
+        );
+        assert!(
+            ctx.read_register(&reg(general)).is_some(),
+            "{arch:?}: {general} must still take it"
+        );
+    }
+}
+
+/// Whether any statement names `name` at `bits` wide. The width is the
+/// whole point: a vector register is legitimately named at 128, and the
+/// defect is naming that same register at the pointer width.
+fn names_var_at_width(stmts: &[IrStmt], name: &str, bits: u16) -> bool {
+    format!("{stmts:?}").contains(&format!("name: \"{name}\", bits: {bits}"))
+}
+
+#[test]
+fn no_aarch64_handler_names_a_vector_register_at_the_pointer_width() {
+    // The invariant the read and write guards exist to hold, stated
+    // once over the three instructions that reached the scalar path
+    // with a bare vector operand. It survives the follow-up that
+    // reroutes these through the vector reader, because what it forbids
+    // is the *width*, not the register.
+    for (mnemonic, operands) in [
+        ("scvtf", vec!["d0", "d1"]),
+        ("ucvtf", vec!["s0", "s1"]),
+        ("str", vec!["d1", "[sp, 0x10]"]),
+        ("add", vec!["d0", "d1", "d1"]),
+    ] {
+        let i = insn(
+            0x40_1000,
+            4,
+            mnemonic,
+            operands
+                .iter()
+                .map(|raw| {
+                    op(
+                        raw,
+                        if raw.starts_with('[') {
+                            OperandKind::Memory
+                        } else {
+                            OperandKind::Register
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let stmts = lift_per_mnemonic(&i, Arch::Aarch64);
+        assert!(
+            !names_var_at_width(&stmts, "v1", 64),
+            "{mnemonic}: v1 is a 128-bit register and must not be named at the pointer width: {stmts:?}"
+        );
+    }
+}
+
+#[test]
+fn the_x86_scalar_read_path_declines_a_vector_register_by_width() {
+    // x86 needs no guard to be safe here and it is worth writing down
+    // which mechanism covers it, so nobody reads the absence of a
+    // failure as a decision. Its narrowest vector view is `xmm` at 128
+    // bits, which the `hi >= self.bits` test rejects on its own — the
+    // opposite of `AArch64`, where every scalar view sits *under* the
+    // 64-bit pointer width.
+    let ctx = LiftCtx::new(Arch::X86_64);
+    assert!(ctx.read_register(&reg("xmm0")).is_none());
+    assert!(ctx.read_register(&reg("ymm0")).is_none());
+    assert!(ctx.read_register(&reg("rax")).is_some());
+}

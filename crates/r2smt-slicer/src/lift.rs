@@ -767,8 +767,26 @@ impl LiftCtx {
     /// Read a register operand, returning the matching parent slice
     /// (full register or [`Expr::Extract`] of the parent). Returns
     /// `None` if the operand is not a recognised GPR.
+    ///
+    /// **General registers only**, and for the same reason
+    /// [`LiftCtx::build_parent_write`] refuses one: this path sizes the
+    /// parent at [`LiftCtx::bits`], the *pointer* width, where a vector
+    /// register is 128. A read minted here and a vector write of the
+    /// same register are two `Var`s with one name and two widths, which
+    /// nothing downstream reports — SSA versions by name and the
+    /// encoder keeps the first width it saw.
+    ///
+    /// The width test below does not cover it. It is what makes x86
+    /// safe, since the narrowest x86 vector view is `xmm` at 128 bits,
+    /// but on `AArch64` `d0` / `s0` / `h0` / `b0` all sit under the
+    /// 64-bit pointer width and pass straight through. A SIMD source
+    /// belongs in [`LiftCtx::read_simd_lane_bits`], which sizes the
+    /// parent from the register file instead.
     fn read_register(&self, op: &Operand) -> Option<Expr> {
         let layout = register_layout(&op.raw, self.arch)?;
+        if is_simd_parent(layout.parent, self.arch) {
+            return None;
+        }
         // `AArch64` zero registers always read as 0 regardless of
         // which alias is named. Modelling this lets opaque-predicate
         // patterns like `mov x0, xzr; cbz x0, …` resolve to
@@ -910,8 +928,12 @@ impl LiftCtx {
     /// to. Used by paths that build their own right-hand side (`lea`,
     /// the unsupported-destination fall-throughs); `lea` always targets
     /// a register, so a non-register operand yields `None`.
+    ///
+    /// Refuses a SIMD parent for the reason [`LiftCtx::build_parent_write`]
+    /// does: it would mint the vector register at the pointer width.
     fn dst_var(&self, op: &Operand) -> Option<Var> {
         if let Some(layout) = register_layout(&op.raw, self.arch)
+            && !is_simd_parent(layout.parent, self.arch)
             && layout.hi < self.bits
         {
             return Some(Var::new(layout.parent, self.bits));

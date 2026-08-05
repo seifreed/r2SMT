@@ -40,6 +40,7 @@ const S_NEG_2_5: u128 = 0xc020_0000;
 const S_1_5: u128 = 0x3fc0_0000;
 const S_NEG_1_5: u128 = 0xbfc0_0000;
 const S_3_5: u128 = 0x4060_0000;
+const S_3_0: u128 = 0x4040_0000;
 
 // Two's-complement 32-bit results.
 const I_1: u128 = 0x0000_0001;
@@ -362,14 +363,11 @@ fn the_scalar_converts_that_already_had_a_handler_still_lift() {
     // lowerings. This is the cheap guard against the allowlist growing
     // to swallow them.
     //
-    // Only that they lift, not what they compute, and the reason is a
-    // seam worth knowing about. The scalar-FP handlers write through
-    // `build_parent_write`, which sizes the parent at `LiftCtx::bits`
-    // — 64 on `AArch64` — while every NEON lowering writes `v0` at 128.
-    // So the two paths name the same register at two widths, and the
-    // 128-bit binding this file's harness uses cannot express what the
-    // scalar-FP path produces. Pinning a value here would be asserting
-    // on the harness rather than on the lowering. See
+    // Only that they lift, which is the property the allowlist change
+    // could break. What they *compute* is pinned for `scvtf` by the
+    // contract below; it could not be pinned here while the scalar-FP
+    // path named `v0` at the pointer width, because the 128-bit binding
+    // this harness uses could not reach it. See
     // `.planning/2026-08-05-parent-width-scalar-fp.md`.
     for (mnemonic, operands) in [
         ("fcvtzs", ["s0", "s1"]),
@@ -385,6 +383,22 @@ fn the_scalar_converts_that_already_had_a_handler_still_lift() {
             "{mnemonic} {operands:?} should still lift: {lifted:?}"
         );
     }
+}
+
+#[test]
+fn scvtf_reads_the_integer_out_of_the_vector_register() {
+    // `scvtf s0, s1` converts an integer held *in* the vector file, so
+    // both ends of it are `v` registers. Reading the source through the
+    // general-register path would name `v1` at the pointer width — 64
+    // here, where the register is 128 — and this harness binds `v1` at
+    // 128, so that spelling cannot see the binding at all. The value is
+    // what proves the read reaches it: 3 becomes binary32 `3.0`, with
+    // the rest of the destination cleared as an `AArch64` scalar SIMD
+    // write does.
+    assert_eq!(
+        solve_lowering("scvtf", &["s0", "s1"], &[("v1", I_3)], S_3_0),
+        SmtResult::AlwaysTrue,
+    );
 }
 
 #[test]

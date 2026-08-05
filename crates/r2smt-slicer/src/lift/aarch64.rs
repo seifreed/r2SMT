@@ -1314,7 +1314,19 @@ impl LiftCtx {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
-        let Some(int) = self.read_register(src) else {
+        // The source may be a general register (`scvtf s0, w0`) or a
+        // vector one (`scvtf s0, s1`, the integer held *in* the vector
+        // file). They are two register files, not two widths: reading
+        // the vector one through `read_register` would size `v1` at the
+        // pointer width, which is the mirror image of the write-side
+        // defect `lift_aarch64_fp_to_int` branches around.
+        let source_bits = self.operand_width(src);
+        let int = if self.is_simd_register(src) {
+            self.read_simd_lane_bits(src, source_bits, 0)
+        } else {
+            self.read_register(src)
+        };
+        let Some(int) = int else {
             self.push_aarch64_fp_unsupported(insn);
             return;
         };
@@ -1329,8 +1341,7 @@ impl LiftCtx {
         let source = if signed {
             int
         } else {
-            let width = self.operand_width(src);
-            let Some(wider) = width.checked_add(1) else {
+            let Some(wider) = source_bits.checked_add(1) else {
                 self.push_aarch64_fp_unsupported(insn);
                 return;
             };
