@@ -118,6 +118,15 @@ impl LiftCtx {
             NeonOp::PairwiseLong { signed, accumulate } => {
                 self.aarch32_pairwise_long_lanes(insn, shape, signed, accumulate)
             }
+            NeonOp::SaturatingUnary { negate } => {
+                self.aarch32_saturating_unary_lanes(insn, shape, negate)
+            }
+            NeonOp::DoublingMultiplyHigh { rounding } => {
+                self.aarch32_doubling_multiply_high_lanes(insn, shape, rounding)
+            }
+            NeonOp::DoublingMultiplyLong { accumulate } => {
+                self.aarch32_doubling_multiply_long_lanes(insn, shape, accumulate)
+            }
             // Handled by the caller; it writes two destinations and so
             // does not fit the one-value contract here.
             NeonOp::PermutePair(_) => None,
