@@ -287,3 +287,93 @@ fn vcvt_fixed_point_scales_by_the_fraction_width() {
         0x3fc0_0000,
     );
 }
+
+// ===================== the half-precision pair =====================
+//
+// `vcvtb` / `vcvtt` are the same conversion as `vcvt` plus a statement
+// of *which half* of a 32-bit register the binary16 end occupies — the
+// only reason they are two mnemonics. Getting the half wrong reads or
+// writes the neighbouring 16 bits, which is a wrong value and not a
+// decline, so every one of these binds both halves and checks both.
+
+/// Whether the lifter refuses `mnemonic` with these operands.
+fn declines(mnemonic: &str, operands: &[&str]) -> bool {
+    let insn = Instruction {
+        address: Address::new(0x1000),
+        size: 4,
+        bytes: vec![],
+        mnemonic: mnemonic.into(),
+        operands: operands.iter().map(|o| operand(o)).collect(),
+        esil: None,
+        pcode: None,
+        is_thumb: false,
+    };
+    lift_per_mnemonic(&insn, Arch::Arm)
+        .iter()
+        .any(|s| matches!(s, IrStmt::Unsupported { .. }))
+}
+
+/// `1.5` and `-2.5` in binary16 and binary32.
+const H_ONE_POINT_FIVE: u128 = 0x3e00;
+const H_MINUS_TWO_POINT_FIVE: u128 = 0xc100;
+const S_ONE_POINT_FIVE: u128 = 0x3fc0_0000;
+const S_MINUS_TWO_POINT_FIVE: u128 = 0xc020_0000;
+
+#[test]
+fn vcvtb_widens_the_low_half_of_the_source() {
+    // `s4` holds `-2.5` in its top half and `1.5` in its bottom. `vcvtb`
+    // must take the bottom one, so a lowering that ignored the index
+    // would answer the binary32 spelling of -2.5 instead.
+    assert_computes(
+        "vcvtb.f32.f16",
+        &[DEST, SOURCE],
+        &from_source((H_MINUS_TWO_POINT_FIVE << 16) | H_ONE_POINT_FIVE),
+        S_ONE_POINT_FIVE,
+    );
+}
+
+#[test]
+fn vcvtt_widens_the_top_half_of_the_source() {
+    // The mirror, on the same source word: this is the pair that makes
+    // the two mnemonics impossible to satisfy with one index.
+    assert_computes(
+        "vcvtt.f32.f16",
+        &[DEST, SOURCE],
+        &from_source((H_MINUS_TWO_POINT_FIVE << 16) | H_ONE_POINT_FIVE),
+        S_MINUS_TWO_POINT_FIVE,
+    );
+}
+
+#[test]
+fn vcvtb_narrows_into_the_low_half_and_preserves_the_top() {
+    // The write direction. `v0` is preset with ones in `s0`'s upper
+    // half, which `vcvtb` must leave standing — an `AArch32` VFP write
+    // merges. A lowering that wrote the whole `s` register would clear
+    // them.
+    assert_computes(
+        "vcvtb.f16.f32",
+        &[DEST, SOURCE],
+        &[("v0", 0xffff_0000), ("v1", S_ONE_POINT_FIVE)],
+        0xffff_0000 | H_ONE_POINT_FIVE,
+    );
+}
+
+#[test]
+fn vcvtt_narrows_into_the_top_half_and_preserves_the_bottom() {
+    assert_computes(
+        "vcvtt.f16.f32",
+        &[DEST, SOURCE],
+        &[("v0", 0x0000_ffff), ("v1", S_ONE_POINT_FIVE)],
+        (H_ONE_POINT_FIVE << 16) | 0xffff,
+    );
+}
+
+#[test]
+fn the_half_precision_pair_rejects_shapes_that_are_not_encodings() {
+    // Both ends must be floats and exactly one of them 16 bits: the
+    // mnemonics exist only to index a half-precision value, so an
+    // integer end or two equal widths names nothing.
+    assert!(declines("vcvtb.s32.f32", &[DEST, SOURCE]));
+    assert!(declines("vcvtt.f32.f32", &[DEST, SOURCE]));
+    assert!(declines("vcvtb.f16.s32", &[DEST, SOURCE]));
+}

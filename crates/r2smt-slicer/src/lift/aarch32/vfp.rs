@@ -85,6 +85,15 @@ pub(crate) struct VfpConvert {
     /// only `vcvtr` — and every conversion *into* a float — depends on
     /// FPSCR.
     pub(crate) reads_control: bool,
+    /// Which half of an `s` register the half-precision end occupies:
+    /// `0` for `vcvtb` and every other spelling, `1` for `vcvtt`.
+    ///
+    /// Applies to whichever end is 16 bits wide, which is unambiguous
+    /// because exactly one of them can be — the pair exists precisely
+    /// because a binary16 value is half of the register that holds it,
+    /// so the encoding has to say which half. Ignored when neither end
+    /// is 16 bits.
+    pub(crate) half_index: u16,
 }
 
 /// The fraction width of a fixed-point `vcvt`, or zero for the
@@ -126,18 +135,28 @@ fn vfp_convert_fraction_bits(
 /// existed rather than lifting wrongly.
 pub(in crate::lift::aarch32) fn vfp_convert(base: &str, ty: &str) -> Option<(VfpConvert, u16)> {
     // `vcvtr` differs from `vcvt` only in taking its rounding from
-    // FPSCR instead of the opcode; `vcvtb` / `vcvtt` address the halves
-    // of a half-precision pair and are a different operand shape, so
-    // they are deliberately absent.
-    let (to_int_rounding, reads_control) = match base {
-        "vcvt" => (RoundingMode::TowardZero, false),
-        "vcvtr" => (RoundingMode::NearestTiesEven, true),
-        "vcvta" => (RoundingMode::NearestTiesAway, false),
-        "vcvtn" => (RoundingMode::NearestTiesEven, false),
-        "vcvtp" => (RoundingMode::TowardPositive, false),
-        "vcvtm" => (RoundingMode::TowardNegative, false),
+    // FPSCR instead of the opcode. `vcvtb` / `vcvtt` are the
+    // half-precision pair: same conversion, plus a statement of which
+    // half of the register the binary16 end sits in. They round to the
+    // FPSCR default like every other conversion into a float.
+    let (to_int_rounding, reads_control, half_index) = match base {
+        "vcvt" => (RoundingMode::TowardZero, false, 0),
+        // `vcvtr` and `vcvtb` land on the same row for different
+        // reasons: `vcvtr`'s whole difference from `vcvt` is reading
+        // FPSCR for its float-to-integer mode, while `vcvtb` is
+        // float-to-float, so its `to_int_rounding` is never consulted
+        // and `reads_control` is true because every conversion *into* a
+        // float rounds per FPSCR. The half index is what separates
+        // `vcvtb` from `vcvtt`.
+        "vcvtr" | "vcvtb" => (RoundingMode::NearestTiesEven, true, 0),
+        "vcvta" => (RoundingMode::NearestTiesAway, false, 0),
+        "vcvtn" => (RoundingMode::NearestTiesEven, false, 0),
+        "vcvtp" => (RoundingMode::TowardPositive, false, 0),
+        "vcvtm" => (RoundingMode::TowardNegative, false, 0),
+        "vcvtt" => (RoundingMode::NearestTiesEven, true, 1),
         _ => return None,
     };
+    let half_pair = matches!(base, "vcvtb" | "vcvtt");
     let (dest_ty, source_ty) = ty.split_once('.')?;
     let (dest_kind, dest_bits) = neon_element_type(dest_ty)?;
     let source = neon_element_type(source_ty)?;
@@ -148,12 +167,20 @@ pub(in crate::lift::aarch32) fn vfp_convert(base: &str, ty: &str) -> Option<(Vfp
     if float_ends == 0 || dest_kind == ElementKind::Untyped || source.0 == ElementKind::Untyped {
         return None;
     }
+    // `vcvtb` / `vcvtt` name a half-precision *pair*, so both ends are
+    // floats and exactly one of them is 16 bits. Anything else with
+    // those mnemonics is not an encoding.
+    let half_ends = u8::from(dest_bits == HALF_BITS) + u8::from(source.1 == HALF_BITS);
+    if half_pair && (float_ends != 2 || half_ends != 1) {
+        return None;
+    }
     Some((
         VfpConvert {
             source,
             dest_kind,
             to_int_rounding,
             reads_control,
+            half_index,
         },
         dest_bits,
     ))
@@ -219,6 +246,10 @@ pub(crate) fn vfp_scalar(mnemonic: &str) -> Option<(VfpOp, u16)> {
     Some((op, lane))
 }
 
+/// Width of a binary16 element, the one that shares a register with
+/// another of its kind and so needs an index.
+const HALF_BITS: u16 = 16;
+
 /// The rounding mode FPSCR holds out of reset (`RMode == 0b00`), which
 /// the forms that read the control word are lifted against.
 const FPSCR_DEFAULT_ROUNDING: RoundingMode = RoundingMode::NearestTiesEven;
@@ -256,7 +287,15 @@ impl LiftCtx {
         // `AArch32` VFP writes the addressed slice and preserves the
         // rest of the register file — the opposite of `AArch64`, and
         // the reason `write_simd_lane` has to honour the view's offset.
-        if !self.write_simd_lane(&dst, value, lane, 0) {
+        //
+        // The index is zero for everything except a `vcvtt` writing the
+        // *upper* half of an `s` register, which is the whole content of
+        // the `b`/`t` distinction.
+        let dest_index = match op {
+            VfpOp::Convert(convert) if lane == HALF_BITS => convert.half_index,
+            _ => 0,
+        };
+        if !self.write_simd_lane(&dst, value, lane, dest_index) {
             self.push_aarch32_vfp_unsupported(insn);
         }
     }
@@ -308,7 +347,14 @@ impl LiftCtx {
                 return None;
             }
         }
-        let element = self.read_simd_lane_bits(&src, source_bits, 0)?;
+        // The half-precision end is indexed; everything else is lane
+        // zero of its own view.
+        let source_index = if source_bits == HALF_BITS {
+            convert.half_index
+        } else {
+            0
+        };
+        let element = self.read_simd_lane_bits(&src, source_bits, source_index)?;
         convert_lane(
             kind,
             element,
