@@ -25,9 +25,11 @@ use crate::registers::{has_vector_arrangement, is_simd_parent, register_layout};
 mod accumulate;
 mod element;
 mod estimate;
+mod fused;
 mod lanewise;
 pub(super) mod lower;
 mod permute;
+mod saturate;
 mod select;
 pub(super) mod structured;
 mod table;
@@ -130,6 +132,25 @@ pub(super) enum NeonOp {
     /// destination element twice as wide, added onto the destination
     /// when `accumulate` is set.
     PairwiseLong { signed: bool, accumulate: bool },
+    /// `vqabs` / `vqneg` — the lane's magnitude or its negation, clamped
+    /// into the element. `negate` is `vqneg`.
+    SaturatingUnary { negate: bool },
+    /// `vqdmulh` / `vqrdmulh` — the doubled lane product's high half,
+    /// clamped. `rounding` adds half an ulp of the discarded half.
+    DoublingMultiplyHigh { rounding: bool },
+    /// `vqdmull` / `vqdmlal` / `vqdmlsl` — the doubled product whole, in
+    /// a destination element twice the source's. `accumulate` is
+    /// `Some(subtract)` for the forms that read the destination as an
+    /// accumulator and `None` for the plain multiply.
+    DoublingMultiplyLong { accumulate: Option<bool> },
+    /// `vfma` / `vfms` / `vrecps` / `vrsqrts` — a multiply and the
+    /// combine after it, rounded **once** over the whole expression.
+    ///
+    /// Shares [`crate::lift::FusedStep`] and the neutral
+    /// [`crate::lift::fused_multiply_lane`] with `AArch64`: the ISAs
+    /// disagree about how to spell the lane geometry and about nothing
+    /// else here.
+    FusedStep(crate::lift::FusedStep),
 }
 
 /// A resolved `AArch32` NEON instruction: what to compute, and at what
@@ -184,6 +205,11 @@ pub(super) fn resolve(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| width::widen_long_shape(insn, &mnemonic))
         .or_else(|| width::narrow_shape(insn, &mnemonic))
         .or_else(|| width::saturating_narrow_shape(insn, &mnemonic))
+        .or_else(|| width::high_narrow_shape(insn, &mnemonic))
+        .or_else(|| fused::fused_step_shape(insn, &mnemonic))
+        .or_else(|| saturate::saturating_unary_shape(insn, &mnemonic))
+        .or_else(|| saturate::doubling_multiply_high_shape(insn, &mnemonic))
+        .or_else(|| saturate::doubling_multiply_long_shape(insn, &mnemonic))
         // Ahead of the mnemonic families below and, more importantly,
         // ahead of the scalar VFP arm in the dispatcher: `vcvt` is
         // spelled identically in both, and the scalar handler would
