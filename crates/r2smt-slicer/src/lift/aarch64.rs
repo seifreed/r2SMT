@@ -1284,9 +1284,25 @@ impl LiftCtx {
         }
     }
 
-    /// `fcvtzs`/`fcvtzu Rd, Rn` — floating point to integer register.
-    /// The `z` in the mnemonic is round-toward-zero, so the rounding
-    /// mode is carried by the opcode and no control register is assumed.
+    /// `fcvtzs`/`fcvtzu Rd, Rn` — floating point to integer, into
+    /// either a general register or a SIMD one. The `z` in the mnemonic
+    /// is round-toward-zero, so the rounding mode is carried by the
+    /// opcode and no control register is assumed.
+    ///
+    /// The destination's *class* decides how the result is written, and
+    /// this used to ignore it — the doc said "integer register", which
+    /// is the form it was written for, and the SIMD-destination form
+    /// arrived at the same code without a branch. Two things then go
+    /// wrong at once, and both are wrong values rather than declines.
+    ///
+    /// `write_register_to` sizes the parent at [`LiftCtx::bits`], 64 on
+    /// this ISA, where the vector register is 128 — and the SSA pass
+    /// versions by name alone, so a later vector read binds to that
+    /// 64-bit definition. And its partial-write branch *preserves* the
+    /// bits above the element, where an `AArch64` scalar SIMD write
+    /// clears them. `write_simd_dst` answers both, which is why every
+    /// other scalar-FP handler here already uses it and why
+    /// `lift_aarch64_fmov` branches the same way.
     fn lift_aarch64_fp_to_int(&mut self, insn: &Instruction, signed: bool) {
         let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
             self.push_aarch64_fp_unsupported(insn);
@@ -1317,7 +1333,12 @@ impl LiftCtx {
                 0,
             )
         };
-        if !self.write_register_to(dst, converted) {
+        let written = if self.is_simd_register(dst) {
+            self.write_simd_dst(dst, converted, true)
+        } else {
+            self.write_register_to(dst, converted)
+        };
+        if !written {
             self.push_aarch64_fp_unsupported(insn);
         }
     }

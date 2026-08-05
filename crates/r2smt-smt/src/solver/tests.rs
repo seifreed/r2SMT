@@ -3284,3 +3284,130 @@ fn x87_conditional_move_keeps_the_destination_when_it_does_not() {
     let program = x87_conditional_move_program("fcmovne", "0x3ff0000000000000");
     assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
 }
+
+#[test]
+fn aarch64_scalar_convert_zeroes_the_vector_register_above_the_element() {
+    // The seam between the scalar-FP write path and the vector one.
+    //
+    // `fcvtzs s0, s1` writes a *SIMD* register, and on `AArch64` a
+    // scalar SIMD write clears every bit above the element. Reading
+    // lane 1 of the same register as a vector must therefore give zero,
+    // and `cbz` must be always-taken.
+    //
+    // Before the fix this was `BothPossible`, for two stacked reasons
+    // that a single-instruction harness cannot show: the scalar path
+    // wrote `v0` through `build_parent_write`, which sizes the parent
+    // at `LiftCtx::bits` — 64 on this ISA, not the 128 the register has
+    // — and took its partial-write branch, which *preserves* the bits
+    // above the element instead of clearing them. Lane 1 then read a
+    // free input.
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "mov",
+            vec![
+                op("w0", OperandKind::Register),
+                op("0", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "scvtf",
+            vec![
+                op("s1", OperandKind::Register),
+                op("w0", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            4,
+            "fcvtzs",
+            vec![
+                op("s0", OperandKind::Register),
+                op("s1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_100c,
+            4,
+            "umov",
+            vec![
+                op("w1", OperandKind::Register),
+                op("v0.s[1]", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1010,
+            4,
+            "cbz",
+            vec![
+                op("w1", OperandKind::Register),
+                op("0x401080", OperandKind::Immediate),
+            ],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn aarch64_scalar_convert_and_a_vector_read_agree_on_the_register_width() {
+    // The same seam read from above bit 63, which is where the width
+    // collision stops being a wrong value and becomes a crash: the
+    // encoder keys its declarations by name and keeps the *first*
+    // width it saw, so a `v0` minted at 64 bits by the scalar write
+    // meets an `Extract(.., 127, 64)` from the vector read. That is an
+    // out-of-range `Z3_mk_extract`, and the `z3` crate unwraps it.
+    //
+    // Passing at all is most of what this asserts; the verdict pins the
+    // value on top.
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "mov",
+            vec![
+                op("w0", OperandKind::Register),
+                op("0", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "scvtf",
+            vec![
+                op("s1", OperandKind::Register),
+                op("w0", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            4,
+            "fcvtzs",
+            vec![
+                op("s0", OperandKind::Register),
+                op("s1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_100c,
+            4,
+            "umov",
+            vec![
+                op("x1", OperandKind::Register),
+                op("v0.d[1]", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1010,
+            4,
+            "cbz",
+            vec![
+                op("x1", OperandKind::Register),
+                op("0x401080", OperandKind::Immediate),
+            ],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
