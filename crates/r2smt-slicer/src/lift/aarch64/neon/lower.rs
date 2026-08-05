@@ -122,6 +122,7 @@ impl LiftCtx {
             NeonOp::BitwiseUnary(kind) => self.bitwise_unary_lanes(insn, shape, kind),
             NeonOp::LaneCombine(op) => self.lane_combine_lanes(insn, shape, op),
             NeonOp::Pairwise(op) => self.pairwise_lanes(insn, shape, op),
+            NeonOp::ScalarPairwise(op) => self.scalar_pairwise_element(insn, shape, op),
             NeonOp::AbsoluteDifference(kind) => self.absolute_difference_lanes(insn, shape, kind),
             NeonOp::PairwiseLong { signed, accumulate } => {
                 self.pairwise_long_lanes(insn, shape, signed, accumulate)

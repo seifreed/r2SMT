@@ -189,6 +189,14 @@ enum NeonOp {
     /// *adjacent* lanes of the concatenated sources rather than to the
     /// lanes at one index.
     Pairwise(PairOp),
+    /// `addp d0, v1.2d` / `faddp s0, v1.2s` — the same fold applied to
+    /// the *one* source's two lanes, producing a single element.
+    ///
+    /// Its own variant rather than [`NeonOp::Pairwise`] with one lane,
+    /// because there is no second source: the vector form's lowering
+    /// splits the destination between two operands, and at one lane it
+    /// would take the pair out of an operand that is not there.
+    ScalarPairwise(PairOp),
     /// `sabd` / `uabd` / `saba` / `uaba` / `fabd` — the magnitude of the
     /// lane difference, optionally accumulated onto the destination.
     AbsoluteDifference(AbsDiffKind),
@@ -294,6 +302,7 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| arith::round_to_integral_shape(insn, &mnemonic))
         .or_else(|| arith::float_min_max_shape(insn, &mnemonic))
         .or_else(|| arith::pairwise_shape(insn, &mnemonic))
+        .or_else(|| arith::scalar_pairwise_shape(insn, &mnemonic))
         .or_else(|| arith::absolute_difference_shape(insn, &mnemonic))
         .or_else(|| width::pairwise_long_shape(insn, &mnemonic))
         .or_else(|| width::high_narrow_shape(insn, &mnemonic))

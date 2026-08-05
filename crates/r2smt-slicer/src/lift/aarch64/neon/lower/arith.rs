@@ -384,6 +384,20 @@ impl LiftCtx {
         Self::concat_lanes(lanes)
     }
 
+    /// The scalar pairwise forms: the one source's two lanes folded into
+    /// the single element the scalar destination holds.
+    pub(super) fn scalar_pairwise_element(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        op: PairOp,
+    ) -> Option<Expr> {
+        let source = self.widen_source(insn, 1)?;
+        let a = LiftCtx::extract_lane(source.clone(), shape.lane_bits, 0)?;
+        let b = LiftCtx::extract_lane(source, shape.lane_bits, 1)?;
+        pair_lane(op, a, b, shape.lane_bits)
+    }
+
     /// `sabd` / `uabd` / `saba` / `uaba` / `fabd`.
     pub(super) fn absolute_difference_lanes(
         &mut self,

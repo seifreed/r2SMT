@@ -535,7 +535,10 @@ pub(super) fn reduce_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonSha
 ///
 /// An arranged or indexed spelling is rejected: those name a lane
 /// geometry, and the whole point here is an operand that names none.
-fn scalar_vector_width(op: &Operand) -> Option<u16> {
+///
+/// Shared with the scalar pairwise forms next door, which spell their
+/// destination the same way and for the same reason.
+pub(super) fn scalar_vector_width(op: &Operand) -> Option<u16> {
     if op.kind != OperandKind::Register {
         return None;
     }

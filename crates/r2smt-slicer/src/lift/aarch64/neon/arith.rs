@@ -282,16 +282,11 @@ pub(super) fn float_min_max_shape(insn: &Instruction, mnemonic: &str) -> Option<
     })
 }
 
-/// The pairwise family: each destination lane folds two *adjacent* lanes
-/// of `vn:vm` read as one vector, `vn` at the low end.
-///
-/// So the destination's low half comes from the first source and its
-/// high half from the second — which is why an odd lane count cannot
-/// occur and is rejected rather than silently halved.
-pub(super) fn pairwise_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+/// The fold a pairwise mnemonic names.
+fn pairwise_op(mnemonic: &str) -> Option<PairOp> {
     let min_max = |signed, max| PairOp::MinMax { signed, max };
     let float_select = |max, number_wins| PairOp::FloatMinMax { max, number_wins };
-    let op = match mnemonic {
+    Some(match mnemonic {
         "addp" => PairOp::Add,
         "smaxp" => min_max(true, true),
         "sminp" => min_max(true, false),
@@ -303,7 +298,60 @@ pub(super) fn pairwise_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonS
         "fmaxnmp" => float_select(true, true),
         "fminnmp" => float_select(false, true),
         _ => return None,
+    })
+}
+
+/// The scalar pairwise forms: `addp d0, v1.2d`, `faddp s0, v1.2s` and
+/// the float selects beside them.
+///
+/// The destination is a bare scalar and so carries no arrangement at
+/// all, exactly as an across-lane reduction's does. The geometry
+/// therefore comes from operand 1, and the destination's own width is
+/// *checked* against the element it produces rather than assumed — which
+/// is what stops `faddp s0, v1.2d` resolving.
+///
+/// The float members encode a two-lane source of any IEEE width; the
+/// integer family has exactly one scalar member, `addp d0, v1.2d`, and
+/// the min / max spellings have none. Accepting `smaxp d0, v1.2d` would
+/// model an instruction the architecture does not encode.
+pub(super) fn scalar_pairwise_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    const DOUBLEWORD_BITS: u16 = 64;
+    let op = pairwise_op(mnemonic)?;
+    if insn.operands.len() != 2 {
+        return None;
+    }
+    let source = operand_arrangement(insn.operands.get(1)?)?;
+    if source.lanes != 2 {
+        return None;
+    }
+    let encodable = match op {
+        PairOp::Add => source.lane_bits == DOUBLEWORD_BITS,
+        PairOp::MinMax { .. } => false,
+        PairOp::FloatAdd | PairOp::FloatMinMax { .. } => is_float_lane(source.lane_bits),
     };
+    if !encodable {
+        return None;
+    }
+    if super::width::scalar_vector_width(insn.operands.first()?)? != source.lane_bits {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::ScalarPairwise(op),
+        lane_bits: source.lane_bits,
+        lanes: 1,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+/// The pairwise family: each destination lane folds two *adjacent* lanes
+/// of `vn:vm` read as one vector, `vn` at the low end.
+///
+/// So the destination's low half comes from the first source and its
+/// high half from the second — which is why an odd lane count cannot
+/// occur and is rejected rather than silently halved.
+pub(super) fn pairwise_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let op = pairwise_op(mnemonic)?;
     let destination = uniform_shape(insn, 3)?;
     if op.float() && !is_float_lane(destination.lane_bits) {
         return None;
