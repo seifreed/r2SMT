@@ -91,8 +91,14 @@ impl LiftCtx {
                 self.doubling_long_lanes(insn, shape, combine, upper)
             }
             NeonOp::Compare { kind, zero } => self.compare_lanes(insn, shape, kind, zero),
-            NeonOp::Convert { kind, upper, fbits } => {
-                self.convert_lanes(insn, shape, kind, upper, fbits)
+            NeonOp::Convert {
+                kind,
+                upper,
+                fbits,
+                rounding,
+            } => self.convert_lanes(insn, shape, kind, upper, fbits, rounding),
+            NeonOp::RoundToIntegral(rounding) => {
+                self.round_to_integral_lanes(insn, shape, rounding)
             }
             NeonOp::BitwiseSelect(role) => self.bitwise_select(insn, shape, role),
             NeonOp::Reduce {

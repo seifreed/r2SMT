@@ -22,6 +22,7 @@
 //! primitives all four share, and `lower` builds the expression a
 //! resolved shape describes.
 
+use r2smt_ir::expr::RoundingMode;
 use r2smt_ir::program::Instruction;
 
 use super::super::{BinOp, FusedStep, PackedOp};
@@ -107,11 +108,26 @@ enum NeonOp {
     /// `fbits` is the fixed-point form's fraction width, and zero for
     /// the plain register forms — the integer side is then read as a
     /// scaled value, `Int(lane) / 2^fbits`.
+    ///
+    /// `rounding` is the mode a float-to-integer member rounds with, and
+    /// it is carried rather than fixed because `AArch64` spells five of
+    /// them: `fcvtz*` truncates, `fcvta*` rounds ties away, `fcvtn*`
+    /// ties to even, `fcvtp*` up and `fcvtm*` down. The other two
+    /// directions round to nearest and ignore this.
     Convert {
         kind: ConvertKind,
         upper: bool,
         fbits: u16,
+        rounding: RoundingMode,
     },
+    /// `frint<mode>` — round each lane to an integral value without
+    /// leaving the float sort.
+    ///
+    /// Not the integer round trip `fcvtz*` followed by `scvtf`: that
+    /// agrees only on the values an integer lane can hold, and turns an
+    /// infinity, a NaN or an out-of-range magnitude into some in-range
+    /// number.
+    RoundToIntegral(RoundingMode),
     /// `bsl` / `bit` / `bif` — bitwise select, where one of the three
     /// registers supplies the mask and the destination is always one of
     /// the three.
@@ -266,6 +282,7 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
     let mnemonic = insn.mnemonic.trim().to_ascii_lowercase();
     arith::packed_shape(insn, &mnemonic)
         .or_else(|| arith::bitwise_unary_shape(insn, &mnemonic))
+        .or_else(|| arith::round_to_integral_shape(insn, &mnemonic))
         .or_else(|| arith::float_min_max_shape(insn, &mnemonic))
         .or_else(|| arith::pairwise_shape(insn, &mnemonic))
         .or_else(|| arith::absolute_difference_shape(insn, &mnemonic))

@@ -12,6 +12,7 @@
 //! is why that family reads its geometry from operand 1.
 
 use r2smt_common::Arch;
+use r2smt_ir::expr::RoundingMode;
 use r2smt_ir::program::{Instruction, Operand, OperandKind};
 
 use crate::registers::{is_simd_parent, register_layout};
@@ -297,18 +298,54 @@ impl ConvertKind {
     }
 }
 
+/// A conversion mnemonic's operation, the mode a float-to-integer member
+/// rounds with, and whether the architecture spells a fixed-point form
+/// of it.
+///
+/// The three travel together because they are one decision. Only
+/// `fcvtzs` / `fcvtzu` carry a fraction width: the four directed
+/// spellings have register forms only, so accepting a third operand for
+/// them would model an encoding that does not exist.
+fn convert_kind(base: &str) -> Option<(ConvertKind, RoundingMode, bool)> {
+    let to_int = |signed, rounding| {
+        (
+            ConvertKind::FloatToInt { signed },
+            rounding,
+            matches!(rounding, RoundingMode::TowardZero),
+        )
+    };
+    // The mode a conversion out of float rounds with, spelled by the
+    // mnemonic's fourth letter: `z` truncates, `a` rounds ties away, `n`
+    // ties to even, `p` toward `+inf` and `m` toward `-inf`. The other
+    // two directions round to nearest and ignore it.
+    let nearest = RoundingMode::NearestTiesEven;
+    Some(match base {
+        "scvtf" => (ConvertKind::IntToFloat { signed: true }, nearest, true),
+        "ucvtf" => (ConvertKind::IntToFloat { signed: false }, nearest, true),
+        "fcvtzs" => to_int(true, RoundingMode::TowardZero),
+        "fcvtzu" => to_int(false, RoundingMode::TowardZero),
+        "fcvtas" => to_int(true, RoundingMode::NearestTiesAway),
+        "fcvtau" => to_int(false, RoundingMode::NearestTiesAway),
+        "fcvtns" => to_int(true, RoundingMode::NearestTiesEven),
+        "fcvtnu" => to_int(false, RoundingMode::NearestTiesEven),
+        "fcvtps" => to_int(true, RoundingMode::TowardPositive),
+        "fcvtpu" => to_int(false, RoundingMode::TowardPositive),
+        "fcvtms" => to_int(true, RoundingMode::TowardNegative),
+        "fcvtmu" => to_int(false, RoundingMode::TowardNegative),
+        "fcvtl" => (ConvertKind::FloatToFloat { widening: true }, nearest, false),
+        "fcvtn" => (
+            ConvertKind::FloatToFloat { widening: false },
+            nearest,
+            false,
+        ),
+        _ => return None,
+    })
+}
+
 /// The lane-wise conversion family.
 pub(super) fn convert_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     let (base, upper) = peel_upper(mnemonic);
-    let kind = match base {
-        "scvtf" => ConvertKind::IntToFloat { signed: true },
-        "ucvtf" => ConvertKind::IntToFloat { signed: false },
-        "fcvtzs" => ConvertKind::FloatToInt { signed: true },
-        "fcvtzu" => ConvertKind::FloatToInt { signed: false },
-        "fcvtl" => ConvertKind::FloatToFloat { widening: true },
-        "fcvtn" => ConvertKind::FloatToFloat { widening: false },
-        _ => return None,
-    };
+    let (kind, rounding, scales) = convert_kind(base)?;
     let widths_differ = matches!(kind, ConvertKind::FloatToFloat { .. });
     if upper && !widths_differ {
         return None;
@@ -319,7 +356,7 @@ pub(super) fn convert_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonSh
     // there is no fixed-point `2` form.
     let fbits = match insn.operands.len() {
         2 => 0,
-        3 if kind.scales() && !upper => {
+        3 if scales && !upper => {
             let raw = u16::try_from(parse_immediate(&insn.operands.get(2)?.raw)?).ok()?;
             if raw == 0 || raw > destination.lane_bits {
                 return None;
@@ -375,7 +412,12 @@ pub(super) fn convert_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonSh
         return None;
     }
     Some(NeonShape {
-        op: NeonOp::Convert { kind, upper, fbits },
+        op: NeonOp::Convert {
+            kind,
+            upper,
+            fbits,
+            rounding,
+        },
         lane_bits: destination.lane_bits,
         lanes: written,
         dest_index: 0,

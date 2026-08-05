@@ -11,12 +11,14 @@
 //! the width — `sqadd` and `sqxtn` differ in where they saturate, not
 //! in whether they do.
 
+use r2smt_ir::expr::RoundingMode;
 use r2smt_ir::program::{Instruction, Operand};
 
 use crate::lift::simd::CompareKind;
 use crate::registers::Arrangement;
 
 use super::super::super::{BinOp, FpArithOp, PackedIntOp, PackedOp, parse_immediate};
+use super::super::FPCR_DEFAULT_ROUNDING;
 use super::geometry::{BITS_PER_BYTE, operand_arrangement, peel_upper, spans_full_register};
 use super::{NeonOp, NeonShape};
 
@@ -171,6 +173,42 @@ pub(super) fn bitwise_unary_shape(insn: &Instruction, mnemonic: &str) -> Option<
     }
     Some(NeonShape {
         op: NeonOp::BitwiseUnary(kind),
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+// ===================== round to integral =====================
+
+/// The packed `frint*` family — round each lane to an integral value and
+/// keep the float sort.
+///
+/// Five of the seven name their mode in the opcode and so depend on
+/// nothing FPCR holds. `frinti` reads the control register and `frintx`
+/// computes the same value while additionally being able to signal the
+/// inexact exception, which the value model does not carry — so both pin
+/// the reset default, and [`crate::lift::pins_rounding_mode`] lists them
+/// by mnemonic, which covers the packed spelling for free.
+pub(super) fn round_to_integral_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let rounding = match mnemonic {
+        "frinta" => RoundingMode::NearestTiesAway,
+        "frintn" => RoundingMode::NearestTiesEven,
+        "frintp" => RoundingMode::TowardPositive,
+        "frintm" => RoundingMode::TowardNegative,
+        "frintz" => RoundingMode::TowardZero,
+        "frinti" | "frintx" => FPCR_DEFAULT_ROUNDING,
+        _ => return None,
+    };
+    let destination = uniform_shape(insn, 2)?;
+    // Rounding a byte lane is not an encoding the architecture spells,
+    // and reading one as a float would be a wrong value.
+    if !is_float_lane(destination.lane_bits) {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::RoundToIntegral(rounding),
         lane_bits: destination.lane_bits,
         lanes: destination.lanes,
         dest_index: 0,

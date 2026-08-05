@@ -48,6 +48,27 @@ impl LiftCtx {
         accumulator
     }
 
+    /// `frint<mode>` — each lane rounded to an integral value, still a
+    /// float.
+    pub(super) fn round_to_integral_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        rounding: r2smt_ir::expr::RoundingMode,
+    ) -> Option<Expr> {
+        let source = self.widen_source(insn, 1)?;
+        let (ebits, sbits) = fp_sort(shape.lane_bits)?;
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let element = LiftCtx::extract_lane(source.clone(), shape.lane_bits, index)?;
+            lanes.push(Expr::fp_to_ieee_bv(Expr::fround_to_integral(
+                Expr::bv_to_fp(element, ebits, sbits),
+                rounding,
+            )));
+        }
+        Self::concat_lanes(lanes)
+    }
+
     /// The lane-wise conversions.
     pub(super) fn convert_lanes(
         &mut self,
@@ -56,6 +77,7 @@ impl LiftCtx {
         kind: ConvertKind,
         upper: bool,
         fbits: u16,
+        rounding: r2smt_ir::expr::RoundingMode,
     ) -> Option<Expr> {
         let source = self.widen_source(insn, 1)?;
         let source_bits = match kind {
@@ -74,16 +96,17 @@ impl LiftCtx {
                     index
                 };
             let element = LiftCtx::extract_lane(source.clone(), source_bits, source_lane)?;
-            // The `z` in `fcvtzs` / `fcvtzu` is round-toward-zero, so
-            // no control register is assumed. `AArch64` spells no
-            // other packed float-to-integer rounding.
+            // The mode comes from the mnemonic on every one of these —
+            // `fcvtz*` truncates, `fcvta*` / `fcvtn*` / `fcvtp*` /
+            // `fcvtm*` name the other four — so no control register is
+            // assumed and none of them pins one.
             lanes.push(convert_lane(
                 kind,
                 element,
                 source_bits,
                 shape.lane_bits,
                 fbits,
-                r2smt_ir::expr::RoundingMode::TowardZero,
+                rounding,
             )?);
         }
         let converted = Self::concat_lanes(lanes)?;
