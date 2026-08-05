@@ -422,6 +422,153 @@ fn urshl_adds_the_half_ulp_wider_than_the_element() {
     );
 }
 
+// ===================== the mixed-signedness accumulates =====================
+
+#[test]
+fn suqadd_reads_its_source_unsigned() {
+    // `-128 + 255` is `127`. Reading the source signed instead makes it
+    // `-128 + -1`, which saturates at the *bottom* of the range — the
+    // opposite end from the right answer.
+    assert_computes(
+        "suqadd",
+        &["v0.8b", "v1.8b"],
+        &[("v0", packed(8, &[0x80])), ("v1", packed(8, &[0xff]))],
+        packed(8, &[0x7f]),
+    );
+}
+
+#[test]
+fn suqadd_clamps_a_sum_that_needs_two_extra_bits() {
+    // `127 + 255` is 382, past the `n+1`-bit signed range the
+    // same-signedness adds compute in. Computed there it wraps onto
+    // `-130` and clamps at `0x80`, the wrong end again.
+    assert_computes(
+        "suqadd",
+        &["v0.8b", "v1.8b"],
+        &[("v0", packed(8, &[0x7f])), ("v1", packed(8, &[0xff]))],
+        packed(8, &[0x7f]),
+    );
+}
+
+#[test]
+fn suqadd_leaves_a_representable_sum_alone() {
+    assert_computes(
+        "suqadd",
+        &["v0.8b", "v1.8b"],
+        &[("v0", packed(8, &[0xf0])), ("v1", packed(8, &[0x08]))],
+        packed(8, &[0xf8]),
+    );
+}
+
+#[test]
+fn usqadd_reads_its_source_signed_and_clamps_a_negative_sum_at_zero() {
+    // The destination is unsigned here and the source signed, so the
+    // sum can go below zero — which is why the clamp is the
+    // signed-into-unsigned one and not a plain upper bound.
+    assert_computes(
+        "usqadd",
+        &["v0.8b", "v1.8b"],
+        &[
+            ("v0", packed(8, &[0x00, 0x80, 0x40])),
+            ("v1", packed(8, &[0xff, 0x80, 0x10])),
+        ],
+        packed(8, &[0x00, 0x00, 0x50]),
+    );
+}
+
+#[test]
+fn usqadd_clamps_at_the_unsigned_maximum() {
+    // The second lane is the two-extra-bits case: `255 + 127` is 382,
+    // which at `n+1` bits wraps negative and would clamp to zero.
+    assert_computes(
+        "usqadd",
+        &["v0.8b", "v1.8b"],
+        &[
+            ("v0", packed(8, &[0xff, 0xff])),
+            ("v1", packed(8, &[0x01, 0x7f])),
+        ],
+        packed(8, &[0xff, 0xff]),
+    );
+}
+
+// ===================== the doubling long multiplies =====================
+
+#[test]
+fn sqdmull_saturates_only_at_the_two_most_negative_elements() {
+    // `2 * -32768 * -32768` is `2^31`, one past the doubled element's
+    // signed maximum and the only input pair where this saturates. The
+    // other two lanes are ordinary doubled products, one of them
+    // negative, so a lowering that clamped everything fails here.
+    assert_computes(
+        "sqdmull",
+        &["v0.4s", "v1.4h", "v2.4h"],
+        &[
+            ("v1", packed(16, &[0x8000, 0x0002, 0xffff])),
+            ("v2", packed(16, &[0x8000, 0x0003, 0x0002])),
+        ],
+        packed(32, &[0x7fff_ffff, 0x0000_000c, 0xffff_fffc]),
+    );
+}
+
+#[test]
+fn sqdmull2_reads_the_sources_upper_half() {
+    // The lower half of both sources is zero, so a lowering that
+    // ignored the `2` suffix would answer zero everywhere.
+    assert_computes(
+        "sqdmull2",
+        &["v0.4s", "v1.8h", "v2.8h"],
+        &[
+            ("v1", packed(16, &[0, 0, 0, 0, 0x0002])),
+            ("v2", packed(16, &[0, 0, 0, 0, 0x0003])),
+        ],
+        packed(32, &[0x0000_000c]),
+    );
+}
+
+#[test]
+fn sqdmlal_saturates_the_accumulation_as_well_as_the_product() {
+    // The second clamp: the product is representable and the *sum* is
+    // not.
+    assert_computes(
+        "sqdmlal",
+        &["v0.4s", "v1.4h", "v2.4h"],
+        &[
+            ("v0", packed(32, &[0x0000_0064, 0x7fff_ffff])),
+            ("v1", packed(16, &[0x0002, 0x0001])),
+            ("v2", packed(16, &[0x0003, 0x0001])),
+        ],
+        packed(32, &[0x0000_0070, 0x7fff_ffff]),
+    );
+}
+
+#[test]
+fn sqdmlsl_subtracts_the_product_after_it_has_already_saturated() {
+    // The first clamp, isolated. `2 * -32768 * -32768` saturates to
+    // `2^31 - 1`, and subtracting *that* from zero gives
+    // `0x8000_0001`. Without the inner clamp the true `2^31` would be
+    // subtracted instead and the answer would be `0x8000_0000` — a
+    // difference of one, visible only because the saturation happens
+    // before the accumulate and not after.
+    assert_computes(
+        "sqdmlsl",
+        &["v0.4s", "v1.4h", "v2.4h"],
+        &[
+            ("v0", packed(32, &[0x0000_0000, 0x0000_0064])),
+            ("v1", packed(16, &[0x8000, 0x0002])),
+            ("v2", packed(16, &[0x8000, 0x0003])),
+        ],
+        packed(32, &[0x8000_0001, 0x0000_0058]),
+    );
+}
+
+#[test]
+fn the_doubling_multiplies_decline_the_by_element_spelling() {
+    // `v2.h[0]` names one element rather than a vector, which is a
+    // different instruction with a different source for every lane.
+    assert_declines("sqdmull", &["v0.4s", "v1.4h", "v2.h[0]"]);
+    assert_declines("sqdmlal", &["v0.4s", "v1.4h", "v2.h[0]"]);
+}
+
 #[test]
 fn the_saturating_shift_left_unsigned_form_still_declines() {
     // `sqshlu` reads its element signed and clamps into the *unsigned*

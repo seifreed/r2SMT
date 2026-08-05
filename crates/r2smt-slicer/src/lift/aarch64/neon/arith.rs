@@ -760,6 +760,78 @@ pub(super) fn saturating_shape(insn: &Instruction, mnemonic: &str) -> Option<Neo
     })
 }
 
+/// `suqadd` / `usqadd` — the mixed-signedness accumulate.
+///
+/// Two operands, both the destination's arrangement, and the
+/// destination is an input: it is the accumulator. What separates this
+/// from the ordinary saturating add is that the two addends are read
+/// with *different* signednesses and the clamp is into the range of the
+/// destination, which is neither addend's.
+pub(super) fn mixed_sign_add_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let destination_signed = match mnemonic {
+        "suqadd" => true,
+        "usqadd" => false,
+        _ => return None,
+    };
+    let destination = uniform_shape(insn, 2)?;
+    Some(NeonShape {
+        op: NeonOp::MixedSignAdd { destination_signed },
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+/// `sqdmull` / `sqdmlal` / `sqdmlsl` — the doubling long multiplies.
+///
+/// A product, and yet resolved here rather than beside the other
+/// multiplies, for the reason the module header gives: what defines the
+/// family is the clamp. `2 * INT_MIN * INT_MIN` is `2^(2n-1)`, one past
+/// the top of the doubled element's signed range, and it is the only
+/// input pair at which these saturate at all.
+pub(super) fn doubling_long_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (base, upper) = peel_upper(mnemonic);
+    let combine = match base {
+        "sqdmull" => None,
+        "sqdmlal" => Some(BinOp::Add),
+        "sqdmlsl" => Some(BinOp::Sub),
+        _ => return None,
+    };
+    if insn.operands.len() != 3 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    // The architecture encodes a 16- or 32-bit source element only, so
+    // the destination is 32 or 64. Without this a `.8h` destination
+    // would resolve against byte sources the encoding does not spell.
+    if !matches!(destination.lane_bits, 32 | 64) {
+        return None;
+    }
+    let source_bits = destination.lane_bits / 2;
+    let expected_lanes = if upper {
+        destination.lanes.checked_mul(2)?
+    } else {
+        destination.lanes
+    };
+    for operand in insn.operands.iter().skip(1) {
+        let arrangement = operand_arrangement(operand)?;
+        if arrangement.lane_bits != source_bits || arrangement.lanes != expected_lanes {
+            return None;
+        }
+        if upper && !spans_full_register(arrangement) {
+            return None;
+        }
+    }
+    Some(NeonShape {
+        op: NeonOp::DoublingLong { combine, upper },
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
 // ===================== estimates =====================
 
 /// `frecpe` / `frsqrte` / `urecpe` / `ursqrte`, the reciprocal and

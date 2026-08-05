@@ -16,7 +16,7 @@ use crate::lift::aarch64::neon::arith::{
 };
 use crate::lift::aarch64::neon::geometry::{BITS_PER_BYTE, operand_arrangement};
 use crate::lift::simd::{CompareKind, compare_lane};
-use crate::lift::{FpArithOp, LiftCtx, fp_lane_result, fp_propagating_max_min};
+use crate::lift::{BinOp, FpArithOp, LiftCtx, fp_lane_result, fp_propagating_max_min};
 
 impl LiftCtx {
     /// `frecpe` / `frsqrte` — a fresh value that is never assigned.
@@ -143,6 +143,97 @@ impl LiftCtx {
                 shifted,
                 Expr::bv_and(previous, Expr::konst(kept, lane_bits)),
             ));
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// `suqadd` / `usqadd` — the accumulator and the source read with
+    /// opposite signednesses and clamped into the destination's range.
+    pub(super) fn mixed_sign_add_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        destination_signed: bool,
+    ) -> Option<Expr> {
+        // Two extra bits, not the one the same-signedness adds take. An
+        // `n`-bit signed value plus an `n`-bit unsigned one reaches
+        // `3 * 2^(n-1) - 2`, which is past the `n+1`-bit signed range;
+        // computed there the largest sums would wrap onto negatives and
+        // the clamp would push them to the *bottom* of the destination's
+        // range instead of the top.
+        let wide = shape.lane_bits.checked_add(2)?;
+        let accumulator = self.destination_value(insn, shape)?;
+        let source = self.widen_source(insn, 1)?;
+        // A value that can be negative clamped into the unsigned range
+        // is `SignedToUnsigned`, not `Unsigned`: `usqadd` adds a signed
+        // source, so its sum can go below zero.
+        let to = if destination_signed {
+            SaturateTo::Signed
+        } else {
+            SaturateTo::SignedToUnsigned
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let previous = LiftCtx::extract_lane(accumulator.clone(), shape.lane_bits, index)?;
+            let addend = LiftCtx::extract_lane(source.clone(), shape.lane_bits, index)?;
+            let sum = Expr::add(
+                extend(previous, wide, destination_signed),
+                extend(addend, wide, !destination_signed),
+            );
+            lanes.push(clamp(sum, wide, shape.lane_bits, to)?);
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// `sqdmull` / `sqdmlal` / `sqdmlsl` — the doubled product of two
+    /// narrow elements, saturated, and for the accumulating members
+    /// combined with the destination under a *second* saturation.
+    ///
+    /// Two clamps and not one, because the architecture spells two: the
+    /// product saturates before the accumulate sees it, so a `sqdmlal`
+    /// whose product saturated adds the clamped value rather than the
+    /// true one.
+    pub(super) fn doubling_long_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        combine: Option<BinOp>,
+        upper: bool,
+    ) -> Option<Expr> {
+        // One bit above the destination element. `2 * INT_MIN * INT_MIN`
+        // is `2^(2n-1)`, one past the top of the doubled element's
+        // signed range and the only place this family saturates — at the
+        // destination's own width the doubling would wrap onto `INT_MIN`
+        // and the clamp would find an in-range value to leave alone.
+        let wide = shape.lane_bits.checked_add(1)?;
+        let narrow = shape.lane_bits / 2;
+        let first = self.widen_source(insn, 1)?;
+        let second = self.widen_source(insn, 2)?;
+        let accumulator = match combine {
+            Some(_) => Some(self.destination_value(insn, shape)?),
+            None => None,
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let source_lane = if upper {
+                index.checked_add(shape.lanes)?
+            } else {
+                index
+            };
+            let a = LiftCtx::extract_lane(first.clone(), narrow, source_lane)?;
+            let b = LiftCtx::extract_lane(second.clone(), narrow, source_lane)?;
+            let product = Expr::mul(extend(a, wide, true), extend(b, wide, true));
+            let doubled = Expr::shl(product, Expr::konst(1, wide));
+            let saturated = clamp(doubled, wide, shape.lane_bits, SaturateTo::Signed)?;
+            lanes.push(match (combine, accumulator.as_ref()) {
+                (Some(op), Some(previous)) => {
+                    let prior = LiftCtx::extract_lane(previous.clone(), shape.lane_bits, index)?;
+                    let combined =
+                        op.apply(extend(prior, wide, true), extend(saturated, wide, true));
+                    clamp(combined, wide, shape.lane_bits, SaturateTo::Signed)?
+                }
+                _ => saturated,
+            });
         }
         Self::concat_lanes(lanes)
     }

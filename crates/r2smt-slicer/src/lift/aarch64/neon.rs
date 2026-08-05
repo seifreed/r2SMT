@@ -24,7 +24,7 @@
 
 use r2smt_ir::program::Instruction;
 
-use super::super::{FusedStep, PackedOp};
+use super::super::{BinOp, FusedStep, PackedOp};
 use crate::lift::simd::CompareKind;
 use arith::{AbsDiffKind, BitwiseUnary, PairOp, SaturatingKind, ShiftKind};
 use multiply::{AccumulateKind, ByElementKind};
@@ -77,6 +77,19 @@ enum NeonOp {
     },
     /// A same-width shift, by an immediate or by a per-lane amount.
     Shift { kind: ShiftKind, signed: bool },
+    /// `suqadd` / `usqadd` — an accumulator and a source read with
+    /// *opposite* signednesses, clamped into the destination's range.
+    ///
+    /// Which is neither operand's range: `suqadd` adds an unsigned
+    /// source onto a signed accumulator and saturates signed, `usqadd`
+    /// the other way round. Reading both with one signedness, as the
+    /// ordinary saturating add does, is a wrong value.
+    MixedSignAdd { destination_signed: bool },
+    /// `sqdmull` / `sqdmlal` / `sqdmlsl` — the *doubled* product of two
+    /// narrow elements, saturated into the destination's element and
+    /// optionally accumulated onto it under a second saturation.
+    /// `upper` is the `2` suffix, which reads the sources' upper half.
+    DoublingLong { combine: Option<BinOp>, upper: bool },
     /// `sri` / `sli` — shift one source lane and insert it over the
     /// destination lane, keeping the destination bits the shift vacated.
     ///
@@ -221,7 +234,11 @@ impl NeonShape {
                 accumulate: true, ..
             }
             | NeonOp::HighNarrow { upper: true, .. }
-            | NeonOp::ShiftInsert { .. } => true,
+            | NeonOp::ShiftInsert { .. }
+            | NeonOp::MixedSignAdd { .. }
+            | NeonOp::DoublingLong {
+                combine: Some(_), ..
+            } => true,
             NeonOp::ByElement { kind, .. } => kind.combines(),
             NeonOp::FusedStep(step) => step.reads_accumulator(),
             // `tbx` preserves the destination byte for an out-of-range
@@ -263,6 +280,8 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| width::widen_shape(insn, &mnemonic))
         .or_else(|| multiply::multiply_accumulate_shape(insn, &mnemonic))
         .or_else(|| arith::saturating_shape(insn, &mnemonic))
+        .or_else(|| arith::mixed_sign_add_shape(insn, &mnemonic))
+        .or_else(|| arith::doubling_long_shape(insn, &mnemonic))
         .or_else(|| arith::shift_shape(insn, &mnemonic))
         .or_else(|| arith::shift_insert_shape(insn, &mnemonic))
         .or_else(|| arith::compare_shape(insn, &mnemonic))

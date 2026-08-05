@@ -84,6 +84,12 @@ impl LiftCtx {
             NeonOp::ShiftInsert { left, shift } => {
                 self.shift_insert_lanes(insn, shape, left, shift)
             }
+            NeonOp::MixedSignAdd { destination_signed } => {
+                self.mixed_sign_add_lanes(insn, shape, destination_signed)
+            }
+            NeonOp::DoublingLong { combine, upper } => {
+                self.doubling_long_lanes(insn, shape, combine, upper)
+            }
             NeonOp::Compare { kind, zero } => self.compare_lanes(insn, shape, kind, zero),
             NeonOp::Convert { kind, upper, fbits } => {
                 self.convert_lanes(insn, shape, kind, upper, fbits)
