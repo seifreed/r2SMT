@@ -5800,3 +5800,89 @@ fn aarch32_a_shift_specifier_register_is_a_use() {
     );
     assert!(effect.uses.contains(&"r1"));
 }
+
+#[test]
+fn x86_conditional_instructions_declare_that_they_read_flags() {
+    // `setcc` and `cmovcc` decide on a flag, so the backward walk has to
+    // keep that flag's definer alive. With `reads_flags: false` it did
+    // not, and the failure is a fabrication rather than a loss: if some
+    // *other* flag-setting instruction is retained for an unrelated
+    // register, SSA binds the condition to **that** one. Both ARM effect
+    // tables have said `true` for these shapes all along.
+    for mnemonic in ["setne", "sete", "cmovne", "cmove"] {
+        let operands = if mnemonic.starts_with("set") {
+            vec![reg_x86("al")]
+        } else {
+            vec![reg_x86("rax"), reg_x86("rbx")]
+        };
+        let effect = crate::effect::analyze(&insn(0x40_1000, 3, mnemonic, operands), Arch::X86_64);
+        assert!(effect.reads_flags, "{mnemonic} decides on a flag");
+    }
+}
+
+#[test]
+fn x86_setcc_to_memory_still_reads_its_address_registers() {
+    // The other half of the same entry: it scanned no operand at all, so
+    // a memory destination lost the registers forming its address.
+    let effect = crate::effect::analyze(
+        &insn(
+            0x40_1000,
+            3,
+            "setne",
+            vec![op("[rbp - 1]", OperandKind::Memory)],
+        ),
+        Arch::X86_64,
+    );
+    assert!(effect.uses.contains(&"rbp"), "{effect:?}");
+    assert!(effect.defs.is_empty(), "{effect:?}");
+}
+
+#[test]
+fn x86_a_shift_by_a_literal_zero_leaves_every_flag_alone() {
+    // The SDM is explicit: "If the count is 0, the flags are not
+    // affected." Writing them anyway decides a branch — after
+    // `cmp eax, ebx ; shl ecx, 0`, a `je` would read ZF from `ecx`.
+    let stmts = {
+        let mut ctx = LiftCtx::new(Arch::X86_64);
+        ctx.lift_instruction(&insn(
+            0x40_1000,
+            3,
+            "shl",
+            vec![
+                op("eax", OperandKind::Register),
+                op("0", OperandKind::Immediate),
+            ],
+        ));
+        ctx.stmts
+    };
+    assert!(
+        !stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == "ZF")),
+        "a zero shift defines no flag: {stmts:?}"
+    );
+    // And a non-zero literal still does.
+    let shifted = {
+        let mut ctx = LiftCtx::new(Arch::X86_64);
+        ctx.lift_instruction(&insn(
+            0x40_1000,
+            3,
+            "shl",
+            vec![
+                op("eax", OperandKind::Register),
+                op("0x2", OperandKind::Immediate),
+            ],
+        ));
+        ctx.stmts
+    };
+    assert!(
+        shifted
+            .iter()
+            .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == "ZF"))
+    );
+}
+
+/// An x86 register operand, for the tests above.
+fn reg_x86(name: &str) -> Operand {
+    op(name, OperandKind::Register)
+}

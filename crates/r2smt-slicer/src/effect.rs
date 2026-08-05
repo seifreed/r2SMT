@@ -172,12 +172,6 @@ pub fn registers_in_operand(op: &Operand, arch: Arch) -> Vec<&'static str> {
     out
 }
 
-fn first_register(operands: &[Operand]) -> Option<&'static str> {
-    operands
-        .first()
-        .and_then(|o| canonical_register(&o.raw, Arch::X86_64))
-}
-
 fn any_memory_operand(operands: &[Operand]) -> bool {
     operands.iter().any(|o| o.kind == OperandKind::Memory)
 }

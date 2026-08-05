@@ -1,8 +1,8 @@
 //! x86 per-instruction effect tables.
 
 use super::{
-    InstructionEffect, InstructionKind, any_memory_operand, canonical_register, first_register,
-    other_effect, registers_in_operand,
+    InstructionEffect, InstructionKind, any_memory_operand, canonical_register, other_effect,
+    registers_in_operand,
 };
 use crate::lift::X86SimdShape;
 use r2smt_common::Arch;
@@ -182,19 +182,38 @@ fn jcc_effect(insn: &Instruction) -> InstructionEffect {
     }
 }
 
+/// `set<cc> dst` — writes 0 or 1 from a flag it **reads**.
+///
+/// Both fields below were wrong in the direction that fabricates. With
+/// `reads_flags: false` the backward walk never marks the flags live, so
+/// the `cmp` that produced them is not retained; if some *other*
+/// flag-setting instruction is retained for an unrelated register, SSA
+/// binds this instruction's flag read to **that** one — a definite wrong
+/// value deciding a branch, not a lost one. And scanning no operands at
+/// all lost the address registers of a memory destination.
+///
+/// `AArch64` and `AArch32` have said `reads_flags: true` for exactly
+/// this shape all along; x86 said it nowhere.
 fn setcc_effect(insn: &Instruction) -> InstructionEffect {
     let mut defs = Vec::new();
-    if let Some(reg) = first_register(&insn.operands) {
-        defs.push(reg);
+    let mut uses = Vec::new();
+    if let Some(dst) = insn.operands.first() {
+        if let Some(reg) = canonical_register(&dst.raw, Arch::X86_64) {
+            defs.push(reg);
+        } else {
+            // A memory destination defines no register but reads the
+            // ones that form its address.
+            uses.extend(registers_in_operand(dst, Arch::X86_64));
+        }
     }
     InstructionEffect {
         kind: InstructionKind::SetCc,
         defs,
-        uses: Vec::new(),
+        uses,
         defines_flags: false,
         has_memory_access: any_memory_operand(&insn.operands),
         is_call: false,
-        reads_flags: false,
+        reads_flags: true,
     }
 }
 
@@ -224,7 +243,11 @@ fn cmovcc_effect(insn: &Instruction) -> InstructionEffect {
         defines_flags: false,
         has_memory_access: any_memory_operand(&insn.operands),
         is_call: false,
-        reads_flags: false,
+        // The condition is a flag read, and its ESIL lowering really
+        // does emit one (`zf,!,?{,…,}`), so leaving this false let the
+        // walk drop the flag's definer while the lifted IR still read
+        // it — the same fabrication as `setcc` next door.
+        reads_flags: true,
     }
 }
 

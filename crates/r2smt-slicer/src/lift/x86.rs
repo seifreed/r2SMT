@@ -500,6 +500,20 @@ impl LiftCtx {
             });
             return;
         }
+        // "If the count is 0, the flags are not affected" (SDM, SAL /
+        // SAR / SHL / SHR). Writing them anyway decides a branch rather
+        // than widening it: after `cmp eax, ebx ; shl ecx, 0`, a `je`
+        // would take ZF from `ecx` instead of from the compare.
+        //
+        // Only a literal zero is handled. A register count can also be
+        // zero, but guarding that needs an `Ite` over the count, which
+        // makes every flag read its own prior value — and that costs the
+        // differential harness the ability to compare them at all, which
+        // its own teeth test catches. The register form keeps the old,
+        // imprecise answer.
+        if parse_immediate(&count.raw).is_some_and(|value| value & count_mask == 0) {
+            return;
+        }
         self.set_flag("ZF", Expr::eq(tmp_expr.clone(), Expr::konst(0, dst_width)));
         self.set_flag("SF", Expr::slt(tmp_expr, Expr::konst(0, dst_width)));
         // CF/OF for shifts depend on shift count and direction; not yet
