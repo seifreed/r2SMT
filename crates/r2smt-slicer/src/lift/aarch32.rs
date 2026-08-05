@@ -1605,6 +1605,17 @@ pub(crate) enum VfpOp {
     Sign { negate: bool },
     /// `vsqrt`.
     Sqrt,
+    /// `vrint<mode>` — round to an integral value, keeping the float
+    /// sort.
+    Round {
+        /// The mode the result rounds with.
+        rounding: RoundingMode,
+        /// Whether that mode is FPSCR's default rather than one the
+        /// encoding fixes. Only `vrintr` / `vrintx` read the control
+        /// word; the directed forms each name their own, exactly as
+        /// `vcvta` / `vcvtn` / `vcvtp` / `vcvtm` do beside `vcvtr`.
+        reads_control: bool,
+    },
     /// `vcvt` and its directed-rounding cousins — the one VFP family
     /// naming **two** element types (`vcvt.f32.s32`). The width
     /// [`vfp_scalar`] returns beside this is the *destination*
@@ -1738,10 +1749,41 @@ pub(crate) fn vfp_scalar(mnemonic: &str) -> Option<(VfpOp, u16)> {
         "vneg" => VfpOp::Sign { negate: true },
         "vabs" => VfpOp::Sign { negate: false },
         "vsqrt" => VfpOp::Sqrt,
+        "vrinta" => VfpOp::Round {
+            rounding: RoundingMode::NearestTiesAway,
+            reads_control: false,
+        },
+        "vrintn" => VfpOp::Round {
+            rounding: RoundingMode::NearestTiesEven,
+            reads_control: false,
+        },
+        "vrintp" => VfpOp::Round {
+            rounding: RoundingMode::TowardPositive,
+            reads_control: false,
+        },
+        "vrintm" => VfpOp::Round {
+            rounding: RoundingMode::TowardNegative,
+            reads_control: false,
+        },
+        "vrintz" => VfpOp::Round {
+            rounding: RoundingMode::TowardZero,
+            reads_control: false,
+        },
+        // `vrintr` rounds by FPSCR, and `vrintx` computes the same value
+        // while additionally being able to signal the inexact exception,
+        // which the value model does not carry.
+        "vrintr" | "vrintx" => VfpOp::Round {
+            rounding: FPSCR_DEFAULT_ROUNDING,
+            reads_control: true,
+        },
         _ => return None,
     };
     Some((op, lane))
 }
+
+/// The rounding mode FPSCR holds out of reset (`RMode == 0b00`), which
+/// the forms that read the control word are lifted against.
+const FPSCR_DEFAULT_ROUNDING: RoundingMode = RoundingMode::NearestTiesEven;
 
 impl LiftCtx {
     /// The VFP scalar family. Operand shapes mirror `AArch64`, so the
@@ -1756,6 +1798,7 @@ impl LiftCtx {
         let result = match op {
             VfpOp::Arith(arith) => self.vfp_arith_value(insn, arith, lane),
             VfpOp::Sqrt => self.vfp_sqrt_value(insn, lane),
+            VfpOp::Round { rounding, .. } => self.vfp_round_value(insn, lane, rounding),
             VfpOp::Sign { negate } => self.vfp_sign_value(insn, lane, negate),
             VfpOp::Move => insn
                 .operands
@@ -1862,6 +1905,39 @@ impl LiftCtx {
         Some(Expr::fp_to_ieee_bv(Expr::fsqrt(
             value,
             r2smt_ir::expr::RoundingMode::NearestTiesEven,
+        )))
+    }
+
+    /// `vrint<mode>.f32 Sd, Sm` / `.f64 Dd, Dm` — round to an integral
+    /// value without leaving the float sort.
+    ///
+    /// The register classes are checked rather than assumed, unlike
+    /// every other VFP shape here: `vrint` also has a NEON form
+    /// (`vrinta.f32 q0, q1`) spelling the identical mnemonic, and
+    /// `neon_packed_op` does not claim the family, so nothing above
+    /// this arm separates the two. Lowering the packed form here would
+    /// round lane zero and leave the rest of the register standing —
+    /// a wrong value rather than a decline.
+    fn vfp_round_value(
+        &mut self,
+        insn: &Instruction,
+        lane: u16,
+        rounding: RoundingMode,
+    ) -> Option<Expr> {
+        let src = insn.operands.get(1)?.clone();
+        let dst = insn.operands.first()?.clone();
+        // A half-precision element lives in the low half of an `s`
+        // register, so the rule is the register class the width needs
+        // rather than equality with the element — as in `vcvt`.
+        let expected = if lane > 32 { lane } else { 32 };
+        for operand in [&dst, &src] {
+            if self.simd_view_bits(operand)? != expected {
+                return None;
+            }
+        }
+        let value = self.read_simd_lane_fp(&src, lane, 0)?;
+        Some(Expr::fp_to_ieee_bv(Expr::fround_to_integral(
+            value, rounding,
         )))
     }
 

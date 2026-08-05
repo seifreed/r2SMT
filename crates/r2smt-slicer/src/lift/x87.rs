@@ -516,6 +516,9 @@ enum UnaryOp {
     Chs,
     /// `fsqrt` — square root under the default rounding mode.
     Sqrt,
+    /// `frndint` — round `ST(0)` to an integral value under the control
+    /// word's rounding mode, staying in the extended sort.
+    RoundToIntegral,
 }
 
 /// A recognised x87 instruction, resolved to what it does to the stack.
@@ -661,6 +664,7 @@ fn classify(insn: &Instruction) -> Option<X87Form> {
         "fabs" => no_operands(ops, X87Form::Unary(UnaryOp::Abs)),
         "fchs" => no_operands(ops, X87Form::Unary(UnaryOp::Chs)),
         "fsqrt" => no_operands(ops, X87Form::Unary(UnaryOp::Sqrt)),
+        "frndint" => no_operands(ops, X87Form::Unary(UnaryOp::RoundToIntegral)),
         "fxch" => classify_exchange(ops),
         "fld" => classify_load(ops, MemFormat::Float, &X87_FLOAT_WIDTHS),
         "fild" => classify_load(ops, MemFormat::Integer, &X87_INT_WIDTHS),
@@ -1416,15 +1420,18 @@ impl LiftCtx {
     }
 
     /// The in-place unaries. Total rather than fallible: `fabs` and
-    /// `fchs` are bit manipulations and `fsqrt` runs at the sort the
-    /// slot already holds, so none of them can present an unmodelled
-    /// width.
+    /// `fchs` are bit manipulations, and `fsqrt` / `frndint` run at the
+    /// sort the slot already holds, so none of them can present an
+    /// unmodelled width.
     fn x87_unary(&mut self, op: UnaryOp) {
         let top = self.x87.read(0);
         let result = match op {
             UnaryOp::Abs => Expr::bv_and(top, Expr::konst(X87_MAGNITUDE_MASK, X87_SLOT_BITS)),
             UnaryOp::Chs => Expr::bv_xor(top, Expr::konst(X87_SIGN_BIT, X87_SLOT_BITS)),
             UnaryOp::Sqrt => from_extended(Expr::fsqrt(as_extended(top), X87_ROUNDING)),
+            UnaryOp::RoundToIntegral => {
+                from_extended(Expr::fround_to_integral(as_extended(top), X87_ROUNDING))
+            }
         };
         self.x87.write(0, result);
     }

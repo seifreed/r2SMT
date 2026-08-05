@@ -145,6 +145,18 @@ impl LiftCtx {
             "ucvtf" => self.lift_aarch64_int_to_fp(insn, false),
             "fcvtzs" => self.lift_aarch64_fp_to_int(insn, true),
             "fcvtzu" => self.lift_aarch64_fp_to_int(insn, false),
+            // Round to an integral value *keeping the float sort*. Five
+            // of the seven name their mode in the opcode, so they are
+            // exact whatever FPCR holds. `frinti` reads FPCR, and
+            // `frintx` computes the same value while additionally being
+            // able to signal the inexact exception — a flag the value
+            // model does not carry, so the two lower identically.
+            "frinta" => self.lift_aarch64_fp_round(insn, RoundingMode::NearestTiesAway),
+            "frintn" => self.lift_aarch64_fp_round(insn, RoundingMode::NearestTiesEven),
+            "frintp" => self.lift_aarch64_fp_round(insn, RoundingMode::TowardPositive),
+            "frintm" => self.lift_aarch64_fp_round(insn, RoundingMode::TowardNegative),
+            "frintz" => self.lift_aarch64_fp_round(insn, RoundingMode::TowardZero),
+            "frinti" | "frintx" => self.lift_aarch64_fp_round(insn, FPCR_DEFAULT_ROUNDING),
             _ => self.stmts.push(IrStmt::Unsupported {
                 mnemonic: insn.mnemonic.clone(),
                 comment: format!("at {addr} (aarch64)", addr = insn.address),
@@ -914,6 +926,14 @@ fn parse_signed_immediate(raw: &str) -> Option<i64> {
     Some(if negative { -magnitude } else { magnitude })
 }
 
+/// The rounding mode FPCR holds out of reset (`RMode == 0b00`), which
+/// the forms that read the control register are lifted against.
+///
+/// Pinning it is the same bargain the arithmetic already takes, and
+/// [`crate::lift::pins_rounding_mode`] lists those forms so a function
+/// that reprograms FPCR truncates the slice instead of trusting this.
+const FPCR_DEFAULT_ROUNDING: RoundingMode = RoundingMode::NearestTiesEven;
+
 /// Unary scalar floating-point operation.
 #[derive(Clone, Copy)]
 pub(super) enum FpUnaryOp {
@@ -984,6 +1004,32 @@ impl LiftCtx {
         };
         let root = Expr::fp_to_ieee_bv(Expr::fsqrt(value, RoundingMode::NearestTiesEven));
         if !self.write_simd_dst(dst, root, true) {
+            self.push_aarch64_fp_unsupported(insn);
+        }
+    }
+
+    /// `frint<mode> Rd, Rn` — round to an integral value without
+    /// leaving the float sort.
+    ///
+    /// Not the integer round trip `fcvtzs` + `scvtf`: that agrees only
+    /// on the values an integer register can hold, and turns an
+    /// infinity, a NaN or an out-of-range magnitude into some in-range
+    /// number — a wrong value rather than a lost one.
+    fn lift_aarch64_fp_round(&mut self, insn: &Instruction, rounding: RoundingMode) {
+        let (Some(dst), Some(src)) = (insn.operands.first(), insn.operands.get(1)) else {
+            self.push_aarch64_fp_unsupported(insn);
+            return;
+        };
+        let Some(lane) = self.simd_view_bits(dst) else {
+            self.push_aarch64_fp_unsupported(insn);
+            return;
+        };
+        let Some(value) = self.read_simd_lane_fp(src, lane, 0) else {
+            self.push_aarch64_fp_unsupported(insn);
+            return;
+        };
+        let rounded = Expr::fp_to_ieee_bv(Expr::fround_to_integral(value, rounding));
+        if !self.write_simd_dst(dst, rounded, true) {
             self.push_aarch64_fp_unsupported(insn);
         }
     }

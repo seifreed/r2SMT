@@ -178,6 +178,13 @@ fn is_aarch64_fp_instruction(insn: &Instruction) -> bool {
             | "ucvtf"
             | "fcvtzs"
             | "fcvtzu"
+            | "frinta"
+            | "frintn"
+            | "frintp"
+            | "frintm"
+            | "frintz"
+            | "frinti"
+            | "frintx"
     )
 }
 
@@ -330,9 +337,21 @@ pub(crate) fn pins_rounding_mode(insn: &Instruction, arch: Arch) -> bool {
         Arch::X86 | Arch::X86_64 => x86::pins_rounding_mode(insn),
         // Same mnemonics scalar and packed, so the arrangement never
         // enters this question.
+        // `frinti` and `frintx` take their mode from FPCR; the other
+        // five `frint` forms name theirs in the opcode and so depend on
+        // nothing, exactly as `fcvtzs` does.
         Arch::Aarch64 => matches!(
             lower.as_str(),
-            "fadd" | "fsub" | "fmul" | "fdiv" | "fsqrt" | "fcvt" | "scvtf" | "ucvtf"
+            "fadd"
+                | "fsub"
+                | "fmul"
+                | "fdiv"
+                | "fsqrt"
+                | "fcvt"
+                | "scvtf"
+                | "ucvtf"
+                | "frinti"
+                | "frintx"
         ),
         // `AArch32` spells the precision on the mnemonic, so the same
         // parsers that dispatch the VFP and NEON families answer this.
@@ -354,6 +373,17 @@ pub(crate) fn pins_rounding_mode(insn: &Instruction, arch: Arch) -> bool {
                 // word's default and `vcvtr` reads it outright.
                 Some((VfpOp::Convert(convert), _))
                     if convert.reads_control || convert.dest_kind == aarch32::ElementKind::Float
+            ) || matches!(
+                vfp_scalar(&lower),
+                // Same split one family over: only `vrintr` / `vrintx`
+                // read FPSCR, the directed forms name their mode.
+                Some((
+                    VfpOp::Round {
+                        reads_control: true,
+                        ..
+                    },
+                    _
+                ))
             );
             // Same narrowness as the scalar arm above: the packed
             // `vmax` / `vmin` select an operand rather than computing
