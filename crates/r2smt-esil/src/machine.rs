@@ -202,11 +202,23 @@ impl Machine {
                 // (`ZF`, `CF`, …) the per-mnemonic lifter, slicer,
                 // and branch-condition predicate share. Everything
                 // else passes through unchanged.
+                //
+                // `nf` and `vf` are ARM's spelling of the same two
+                // flags this pipeline calls `SF` and `OF`, and both
+                // ARM ISAs write all four (verified against r2 6.1.8:
+                // `cmp` yields `…,$z,zf,:=,31,$s,nf,:=,32,$b,!,cf,:=,
+                // 31,$o,vf,:=`). Without them every ESIL-lifted ARM
+                // instruction left `SF` and `OF` undefined while every
+                // signed condition — `lt`, `ge`, `gt`, `le`, `mi`,
+                // `vs` — reads exactly those two, so the predicate got
+                // a free input. Sound, but blind. The polarity matches
+                // directly: `SF` is `msb(result)`, which is ARM's `N`,
+                // and `OF` is signed overflow, which is its `V`.
                 let canonical = match name.as_str() {
                     "zf" => "ZF",
                     "cf" => "CF",
-                    "sf" => "SF",
-                    "of" => "OF",
+                    "sf" | "nf" => "SF",
+                    "of" | "vf" => "OF",
                     "pf" => "PF",
                     _ => name.as_str(),
                 }

@@ -283,3 +283,63 @@ fn memory_store_emits_storemem() {
         IrStmt::StoreMem { bits: 64, .. }
     ));
 }
+
+// --- ARM, which this file did not cover at all until now -------------
+
+#[test]
+fn arm_negative_flag_lands_in_the_sign_flag() {
+    // `nf` is ARM's name for the flag this pipeline calls `SF`, and
+    // every signed ARM condition (`lt`, `ge`, `gt`, `le`, `mi`, `pl`)
+    // reads `SF`. Left unmapped, an ESIL-lifted ARM instruction defined
+    // a register nothing consults and the branch predicate took a free
+    // input — sound, and blind on every signed comparison.
+    let lift = lift_esil("1,nf,=", Arch::Arm).expect("lift ok");
+    match &lift.statements[0] {
+        IrStmt::Assign { dst, .. } => assert_eq!(dst.name, "SF"),
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}
+
+#[test]
+fn arm_overflow_flag_lands_in_the_overflow_flag() {
+    // The same for `vf`, which the signed conditions read alongside
+    // `SF`: `lt` is `SF != OF`, so one of the two being blind is enough
+    // to lose the branch.
+    let lift = lift_esil("1,vf,=", Arch::Arm).expect("lift ok");
+    match &lift.statements[0] {
+        IrStmt::Assign { dst, .. } => assert_eq!(dst.name, "OF"),
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_arm_flag_names_do_not_disturb_x86() {
+    // The mapping is unconditional, so it is worth pinning that x86
+    // never spells a flag `nf` or `vf` — the names are ARM vocabulary
+    // and x86 ESIL keeps using `sf` / `of`.
+    let lift = lift_esil("1,sf,=", Arch::X86_64).expect("lift ok");
+    match &lift.statements[0] {
+        IrStmt::Assign { dst, .. } => assert_eq!(dst.name, "SF"),
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_arm_flag_writing_operator_is_still_unsupported() {
+    // What the mapping above does *not* buy, stated so nobody reads its
+    // presence as coverage. radare2 writes ARM flags with `:=` — the
+    // whole tail of `ands r0, r1, r2` is
+    // `…,$z,zf,:=,31,$s,nf,:=` — and this machine has no such token, so
+    // the lift fails and the ladder falls through to the per-mnemonic
+    // handler for **every flag-setting ARM instruction**.
+    //
+    // Supporting it is not just a parser entry: ARM's ESIL writes ARM's
+    // own `C` into `cf`, while this pipeline stores its inverse (see
+    // `aarch32_carry_convention_contracts.rs`), so the bridge would
+    // need to invert on the ARM path before that family may lift here.
+    let err = lift_esil("$z,zf,:=", Arch::Arm).expect_err("`:=` is unsupported");
+    assert!(
+        matches!(err, EsilError::UnknownToken(ref t) if t == ":="),
+        "{err:?}"
+    );
+}
