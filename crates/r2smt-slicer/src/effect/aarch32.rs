@@ -169,6 +169,24 @@ fn aarch32_data_processing_effect(
             InstructionKind::Sar,
             dispatch_mnemonic.ends_with('s') && dispatch_mnemonic != "asr",
         ),
+        // `InstructionKind` spells no rotate; the kind is descriptive
+        // here, and every consumer of it groups the right-moving shifts
+        // together anyway.
+        "ror" | "rors" => {
+            aarch32_arith_effect(insn, InstructionKind::Shr, dispatch_mnemonic.ends_with('s'))
+        }
+        // `rrx Rd, Rm` **reads** C — it is a 33-bit rotate with the flag
+        // as the extra bit. Without that, the backward walk drops
+        // whatever defined C and SSA binds it to a stale free input,
+        // which is a fabricated verdict rather than a lost one. The
+        // 2-operand shape overwrites `Rd`, so it takes the mov-shaped
+        // def/use rather than the narrow-form-aware arithmetic one.
+        "rrx" | "rrxs" => {
+            let mut effect = aarch32_mov_effect(insn, dispatch_mnemonic.ends_with('s'));
+            effect.kind = InstructionKind::Shr;
+            effect.reads_flags = true;
+            effect
+        }
         _ => return None,
     })
 }

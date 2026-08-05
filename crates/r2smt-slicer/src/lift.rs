@@ -1216,11 +1216,11 @@ const AARCH_COND_SUFFIXES: &[&str] = &[
 const AARCH32_BASE_MNEMONICS: &[&str] = &[
     "mov", "movs", "mvn", "add", "adds", "sub", "subs", "rsb", "rsbs", "and", "ands", "bic",
     "bics", "orr", "orrs", "eor", "eors", "mul", "muls", "udiv", "sdiv", "lsl", "lsls", "lsr",
-    "lsrs", "asr", "asrs", "cmp", "cmn", "tst", "teq", "adc", "adcs", "sbc", "sbcs", "movw",
-    "movt", "sxtb", "sxth", "uxtb", "uxth", "rev", "mla", "mls", "umull", "smull", "ldr", "ldrb",
-    "ldrh", "ldrsb", "ldrsh", "ldrd", "str", "strb", "strh", "strd", "push", "pop", "ldm", "ldmia",
-    "ldmib", "ldmda", "ldmdb", "ldmfd", "ldmea", "ldmfa", "ldmed", "stm", "stmia", "stmib",
-    "stmda", "stmdb", "stmfd", "stmea", "stmfa", "stmed",
+    "lsrs", "asr", "asrs", "cmp", "cmn", "tst", "teq", "adc", "adcs", "sbc", "sbcs", "movw", "ror",
+    "rors", "rrx", "rrxs", "movt", "sxtb", "sxth", "uxtb", "uxth", "rev", "mla", "mls", "umull",
+    "smull", "ldr", "ldrb", "ldrh", "ldrsb", "ldrsh", "ldrd", "str", "strb", "strh", "strd",
+    "push", "pop", "ldm", "ldmia", "ldmib", "ldmda", "ldmdb", "ldmfd", "ldmea", "ldmfa", "ldmed",
+    "stm", "stmia", "stmib", "stmda", "stmdb", "stmfd", "stmea", "stmfa", "stmed",
 ];
 
 pub(crate) fn is_aarch32_base_supported(base: &str) -> bool {
@@ -1244,7 +1244,8 @@ pub(crate) fn strip_thumb_width_suffix(mnem: &str) -> &str {
 /// first source (`add r0, r1` ≡ `add r0, r0, r1`). Restricted to the
 /// bases that dispatch through the shared 3-operand handler; `mov` /
 /// `mvn` / the compares are genuinely 2-operand and excluded, and
-/// `rsb` / `bic` have no standard 2-operand narrow form.
+/// `rsb` / `bic` have no standard 2-operand narrow form. Nor does
+/// `rrx`, whose two operands are its only shape.
 pub(crate) fn is_aarch32_arith_short_form(base: &str) -> bool {
     matches!(
         base,
@@ -1268,6 +1269,8 @@ pub(crate) fn is_aarch32_arith_short_form(base: &str) -> bool {
             | "lsrs"
             | "asr"
             | "asrs"
+            | "ror"
+            | "rors"
     )
 }
 

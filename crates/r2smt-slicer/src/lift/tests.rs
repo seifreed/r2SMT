@@ -1463,6 +1463,79 @@ fn aarch32_rrx_register_offset_lifts_and_reads_the_carry() {
     assert!(!crate::effect::analyze(&plain, Arch::Arm).reads_flags);
 }
 
+#[test]
+fn aarch32_standalone_rrx_lifts_and_reads_the_carry() {
+    // The other spelling of the same operation. The mnemonic form was
+    // absent for as long as it was because `aarch32_shift_op` has a
+    // single caller, the shifted-index parser, so `ror` had no
+    // standalone spelling either — one gap, not two.
+    for mnemonic in ["rrx", "rrxs"] {
+        let insn = insn(0x1000, 4, mnemonic, vec![reg("r0"), reg("r1")]);
+        let stmts = crate::lift::lift_per_mnemonic(&insn, Arch::Arm);
+        assert!(aarch32_lifts_cleanly(&stmts), "{mnemonic}: {stmts:?}");
+        assert!(
+            crate::effect::analyze(&insn, Arch::Arm).reads_flags,
+            "{mnemonic} reads CF"
+        );
+    }
+    // `rrx Rd, Rm` overwrites `Rd`, so unlike the Thumb narrow form of
+    // the arithmetic family its destination is not also a source. Its
+    // two operands are its only shape.
+    let effect = crate::effect::analyze(
+        &insn(0x1000, 4, "rrx", vec![reg("r0"), reg("r1")]),
+        Arch::Arm,
+    );
+    assert_eq!(effect.defs, vec!["r0"]);
+    assert_eq!(effect.uses, vec!["r1"]);
+}
+
+#[test]
+fn aarch32_standalone_rotate_lifts_in_both_flag_forms() {
+    for mnemonic in ["ror", "rors"] {
+        let insn = insn(
+            0x1000,
+            4,
+            mnemonic,
+            vec![reg("r0"), reg("r1"), op("4", OperandKind::Immediate)],
+        );
+        let stmts = crate::lift::lift_per_mnemonic(&insn, Arch::Arm);
+        assert!(aarch32_lifts_cleanly(&stmts), "{mnemonic}: {stmts:?}");
+        // A rotate reads no flag, unlike `rrx` next door.
+        assert!(!crate::effect::analyze(&insn, Arch::Arm).reads_flags);
+    }
+}
+
+#[test]
+fn aarch32_shifts_leave_the_overflow_flag_alone() {
+    // The architecture does not define V for a shift, and the shared
+    // arithmetic helper used to write it. Assigning a free value there
+    // loses whatever the slice had already established about V.
+    let stmts = crate::lift::lift_per_mnemonic(
+        &insn(
+            0x1000,
+            4,
+            "lsls",
+            vec![reg("r0"), reg("r1"), op("1", OperandKind::Immediate)],
+        ),
+        Arch::Arm,
+    );
+    assert!(
+        !stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == "OF")),
+        "a shift must not define V: {stmts:?}"
+    );
+    // And it does define the ones it owns.
+    for flag in ["ZF", "SF", "CF"] {
+        assert!(
+            stmts
+                .iter()
+                .any(|s| matches!(s, IrStmt::Assign { dst, .. } if dst.name == flag)),
+            "lsls must define {flag}: {stmts:?}"
+        );
+    }
+}
+
 fn insn_at_1000_ldr_shifted(mem: &str) -> Instruction {
     insn(
         0x1000,
