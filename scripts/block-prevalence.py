@@ -84,6 +84,59 @@ def blocks(path, addresses):
                     yield mnemonics
 
 
+ARM_CONDITIONS = (
+    "eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl",
+    "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le",
+)
+COMPARE_AND_BRANCH = ("cbz", "cbnz", "tbz", "tbnz")
+
+
+def is_conditional_branch(mnemonic):
+    """Whether `mnemonic` ends a block on a condition, on any supported ISA.
+
+    Not x86-only: an ARM corpus measured with an x86-shaped test reports
+    zero everywhere, which reads exactly like "this family never matters"
+    and is instead "this script cannot see this ISA".
+
+    The three spellings are genuinely different. x86 puts every
+    conditional branch behind a `j` prefix and `jmp` is the one
+    unconditional member. AArch64 spells the condition after a dot
+    (`b.eq`). AArch32 glues it to the mnemonic (`beq`), which is why the
+    bare `b` has to be excluded explicitly. Both ARM ISAs also branch on
+    a register rather than on flags (`cbz`, `tbnz`), with no condition
+    spelled anywhere.
+    """
+    mnemonic = mnemonic.lower()
+    if mnemonic in COMPARE_AND_BRANCH:
+        return True
+    if mnemonic.startswith("b."):
+        return mnemonic[2:] in ARM_CONDITIONS
+    if mnemonic.startswith("j"):
+        return mnemonic != "jmp"
+    if mnemonic.startswith("b") and mnemonic != "b":
+        return mnemonic[1:] in ARM_CONDITIONS
+    return False
+
+
+def count_family(mnemonics, family):
+    """How many of `mnemonics` belong to `family`.
+
+    Not equality. ARM spells the element type onto the mnemonic
+    (`vcvt.f64.f32`, `vadd.i32`) and the condition too (`vaddeq.f32`),
+    so an exact match finds nothing at all — measured against a sample
+    objdump credits with 10 596 `vcvt`, exact matching reported zero.
+    That reads as "this family never appears" and is really "this
+    comparison cannot see ARM".
+
+    x86 mnemonics carry no suffix, so the prefix test is exact there.
+    """
+    return sum(
+        1
+        for mnemonic in mnemonics
+        if mnemonic == family or mnemonic.startswith(f"{family}.")
+    )
+
+
 def main(argv):
     if "--" not in argv:
         print(f"usage: {argv[0]} mnem1,mnem2 -- sample ...", file=sys.stderr)
@@ -99,9 +152,9 @@ def main(argv):
         if not addresses:
             continue
         for mnemonics in blocks(path, addresses):
-            ends_conditional = mnemonics[-1].startswith("j") and mnemonics[-1] != "jmp"
+            ends_conditional = is_conditional_branch(mnemonics[-1])
             for family in families:
-                count = mnemonics.count(family)
+                count = count_family(mnemonics, family)
                 if not count:
                     continue
                 total[family] += count
@@ -110,9 +163,9 @@ def main(argv):
         analysed += 1
 
     print(f"samples analysed: {analysed}")
-    print(f"{'mnemonic':14} {'total':>7} {'in a block ending in jcc':>26}")
+    print(f"{'mnemonic':14} {'total':>7} {'in a conditional block':>24}")
     for family in families:
-        print(f"{family:14} {total[family]:7} {conditional[family]:26}")
+        print(f"{family:14} {total[family]:7} {conditional[family]:24}")
     return 0
 
 
