@@ -487,6 +487,7 @@ fn count_unknowns(expr: &Expr) -> usize {
         Expr::Unknown(_) => 1,
         Expr::Var(_) | Expr::Const { .. } => 0,
         Expr::Add(a, b)
+        | Expr::Ror(a, b)
         | Expr::Sub(a, b)
         | Expr::Mul(a, b)
         | Expr::UDiv(a, b)

@@ -37,6 +37,7 @@ pub fn simplify_expr(expr: &Expr) -> Expr {
         Expr::Or(a, b) => fold_or(simplify_expr(a), simplify_expr(b)),
         Expr::Xor(a, b) => fold_xor(simplify_expr(a), simplify_expr(b)),
         Expr::Shl(a, b) => Expr::shl(simplify_expr(a), simplify_expr(b)),
+        Expr::Ror(a, b) => Expr::ror(simplify_expr(a), simplify_expr(b)),
         Expr::LShr(a, b) => Expr::lshr(simplify_expr(a), simplify_expr(b)),
         Expr::AShr(a, b) => Expr::ashr(simplify_expr(a), simplify_expr(b)),
         Expr::Eq(a, b) => fold_eq(simplify_expr(a), simplify_expr(b)),
@@ -125,6 +126,7 @@ fn expr_bits(expr: &Expr) -> Option<u16> {
         Expr::Var(v) => Some(v.bits),
         Expr::Const { bits, .. } | Expr::FpToSbv { bits, .. } => Some(*bits),
         Expr::Add(a, _)
+        | Expr::Ror(a, _)
         | Expr::Sub(a, _)
         | Expr::Mul(a, _)
         | Expr::UDiv(a, _)

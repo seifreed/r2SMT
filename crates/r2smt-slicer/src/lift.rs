@@ -1049,6 +1049,7 @@ pub(crate) enum BinOp {
     Shl,
     Shr,
     Sar,
+    Ror,
 }
 
 /// Else-branch shape selected by an `AArch64` conditional-select
@@ -1078,6 +1079,7 @@ impl BinOp {
             Self::Shl => Expr::shl(lhs, rhs),
             Self::Shr => Expr::lshr(lhs, rhs),
             Self::Sar => Expr::ashr(lhs, rhs),
+            Self::Ror => Expr::ror(lhs, rhs),
         }
     }
 }

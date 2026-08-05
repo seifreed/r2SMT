@@ -1371,12 +1371,32 @@ fn aarch32_register_pre_index_writes_back_the_index_register() {
 }
 
 #[test]
-fn aarch32_rotated_register_offset_declines() {
-    // `ror` has no IR node; composing one from two shifts and an `Or`
-    // is a lowering this form does not earn.
+fn aarch32_rotated_register_offset_lifts() {
+    // Used to decline for want of an IR rotate. The whole access
+    // declined, not just the shift, so a single `ror` in an address
+    // truncated the slice.
     let stmts = lift_aarch32(
         "ldr",
         vec![reg("r0"), op("[r1, r2, ror 4]", OperandKind::Memory)],
+    );
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::LoadMem { address, .. } if format!("{address:?}").contains("Ror"))),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_rrx_register_offset_still_declines() {
+    // `rrx` rotates *through the carry flag* by one, so it is a 33-bit
+    // operation and not a rotate of the register at all. Lowering it as
+    // `Ror(x, 1)` would drop the carry bit and shift the wrong value
+    // into the top — a wrong address, not a decline.
+    let stmts = lift_aarch32(
+        "ldr",
+        vec![reg("r0"), op("[r1, r2, rrx]", OperandKind::Memory)],
     );
     assert!(!aarch32_lifts_cleanly(&stmts), "{stmts:?}");
 }

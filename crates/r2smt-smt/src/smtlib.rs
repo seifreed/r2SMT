@@ -33,18 +33,22 @@ use r2smt_ssa::SsaLiftedSlice;
 /// Why the renderer could not produce a faithful script.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderError {
-    /// A floating-point term the textual backend cannot encode
-    /// portably. Carries an open-domain description of the offending
-    /// shape: the set of rejectable shapes is not a closed enumeration
-    /// (it grows with the IR), so a typed kind would be a lie.
-    UnrenderableFloat(String),
+    /// A term the textual backend cannot encode portably. Carries an
+    /// open-domain description of the offending shape: the set of
+    /// rejectable shapes is not a closed enumeration (it grows with the
+    /// IR), so a typed kind would be a lie.
+    ///
+    /// Started as floating-point only and is no longer: a rotate by a
+    /// non-constant amount belongs here too, since SMT-LIB spells only
+    /// the constant-amount form and the extension is not portable.
+    Unrenderable(String),
 }
 
 impl std::fmt::Display for RenderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnrenderableFloat(detail) => {
-                write!(f, "floating-point term not renderable in SMT-LIB: {detail}")
+            Self::Unrenderable(detail) => {
+                write!(f, "term not renderable in SMT-LIB: {detail}")
             }
         }
     }
@@ -86,7 +90,7 @@ impl RenderCtx {
     /// needs a single reason to decline the whole slice.
     fn note_unsupported(&mut self, detail: impl Into<String>) {
         if self.unsupported.is_none() {
-            self.unsupported = Some(RenderError::UnrenderableFloat(detail.into()));
+            self.unsupported = Some(RenderError::Unrenderable(detail.into()));
         }
     }
 
@@ -415,6 +419,7 @@ fn expr_uses_fp(expr: &Expr) -> bool {
         | Expr::Shl(a, b)
         | Expr::LShr(a, b)
         | Expr::AShr(a, b)
+        | Expr::Ror(a, b)
         | Expr::Eq(a, b)
         | Expr::Ne(a, b)
         | Expr::Ult(a, b)
@@ -580,6 +585,7 @@ fn render_fp(expr: &Expr, ctx: &mut RenderCtx) -> Option<FpTerm> {
         | Expr::Shl(..)
         | Expr::LShr(..)
         | Expr::AShr(..)
+        | Expr::Ror(..)
         | Expr::Eq(..)
         | Expr::Ne(..)
         | Expr::Ult(..)
@@ -791,6 +797,7 @@ fn render_expr(expr: &Expr, ctx: &mut RenderCtx) -> (String, u16) {
         Expr::URem(a, b) => bin_op("bvurem", a, b, Signedness::Unsigned, ctx),
         Expr::SDiv(a, b) => bin_op("bvsdiv", a, b, Signedness::Signed, ctx),
         Expr::SRem(a, b) => bin_op("bvsrem", a, b, Signedness::Signed, ctx),
+        Expr::Ror(a, b) => render_rotate(a, b, ctx),
         Expr::And(a, b) => bin_op("bvand", a, b, Signedness::Unsigned, ctx),
         Expr::Or(a, b) => bin_op("bvor", a, b, Signedness::Unsigned, ctx),
         Expr::Xor(a, b) => bin_op("bvxor", a, b, Signedness::Unsigned, ctx),
@@ -908,6 +915,35 @@ fn bin_op(name: &str, a: &Expr, b: &Expr, sign: Signedness, ctx: &mut RenderCtx)
     let lhs = coerce_with_sign(&a_str, a_bits, target, sign);
     let rhs = coerce_with_sign(&b_str, b_bits, target, sign);
     (format!("({name} {lhs} {rhs})"), target)
+}
+
+/// Render a rotate-right.
+///
+/// SMT-LIB spells only the **constant**-amount form,
+/// `((_ rotate_right n) x)`. The variable-amount extension is not
+/// portable and this was checked rather than assumed: `bvror` over two
+/// terms is accepted by Bitwuzla, and rejected as an unknown constant
+/// by both CVC5 and Z3's own parser. So a non-constant amount declines
+/// here, which `emit_query_strict` turns into a sound refusal rather
+/// than a wrong answer.
+///
+/// The declined case is currently unreachable from the lifter —
+/// `AArch32` spells its rotate amounts as immediates — but the guard is
+/// what keeps that a fact about the lifter rather than a coincidence.
+fn render_rotate(a: &Expr, b: &Expr, ctx: &mut RenderCtx) -> (String, u16) {
+    let (a_str, a_bits) = render_expr(a, ctx);
+    let Expr::Const { value, .. } = b else {
+        ctx.note_unsupported("rotate by a non-constant amount");
+        return (a_str, a_bits);
+    };
+    // The rotate is modulo the width, which is what the architecture
+    // means and what keeps a large immediate from being a parse error.
+    let amount = if a_bits == 0 {
+        0
+    } else {
+        value % u128::from(a_bits)
+    };
+    (format!("((_ rotate_right {amount}) {a_str})"), a_bits)
 }
 
 fn bool_op(name: &str, a: &Expr, b: &Expr, sign: Signedness, ctx: &mut RenderCtx) -> (String, u16) {
@@ -1285,7 +1321,7 @@ mod tests {
         );
         assert!(matches!(
             emit_query_strict(&slice, &SolveOptions::default(), true),
-            Err(RenderError::UnrenderableFloat(_))
+            Err(RenderError::Unrenderable(_))
         ));
     }
 
@@ -1305,7 +1341,7 @@ mod tests {
         );
         assert!(matches!(
             emit_query_strict(&slice, &SolveOptions::default(), true),
-            Err(RenderError::UnrenderableFloat(_))
+            Err(RenderError::Unrenderable(_))
         ));
     }
 
@@ -1408,5 +1444,71 @@ mod tests {
             !script.contains("(ite "),
             "a load with no prior store must not build an ite chain: {script}"
         );
+    }
+
+    #[test]
+    fn smtlib_renders_a_constant_rotate_as_the_portable_indexed_form() {
+        // SMT-LIB spells only `((_ rotate_right n) x)`. Checked against
+        // the real solvers rather than assumed: `bvror` over two terms
+        // is accepted by Bitwuzla and rejected as an unknown constant by
+        // both CVC5 and Z3, so emitting it would have made the portfolio
+        // backends disagree by parse error.
+        let slice = fp_slice(
+            Expr::ror(Expr::var("a", 32), Expr::konst(4, 32)),
+            Expr::eq(Expr::var("t0", 32), Expr::konst(0, 32)),
+        );
+        let script = emit_query_strict(&slice, &SolveOptions::default(), true)
+            .expect("a constant rotate must render");
+        assert!(
+            script.contains("(_ rotate_right 4)"),
+            "expected the indexed form: {script}"
+        );
+        assert!(!script.contains("bvror"), "{script}");
+    }
+
+    #[test]
+    fn smtlib_rotate_amount_is_taken_modulo_the_width() {
+        // A rotate by the width is the identity, and `(_ rotate_right
+        // 32)` on a 32-bit term is not something every parser accepts.
+        let slice = fp_slice(
+            Expr::ror(Expr::var("a", 32), Expr::konst(36, 32)),
+            Expr::eq(Expr::var("t0", 32), Expr::konst(0, 32)),
+        );
+        let script = emit_query_strict(&slice, &SolveOptions::default(), true)
+            .expect("a constant rotate must render");
+        assert!(
+            script.contains("(_ rotate_right 4)"),
+            "36 mod 32 is 4: {script}"
+        );
+    }
+
+    #[test]
+    fn smtlib_declines_a_rotate_by_a_non_constant_amount() {
+        // The variable-amount rotate has no portable spelling, so the
+        // strict emitter refuses rather than emitting something one
+        // backend parses and two do not.
+        let slice = fp_slice(
+            Expr::ror(Expr::var("a", 32), Expr::var("n", 32)),
+            Expr::eq(Expr::var("t0", 32), Expr::konst(0, 32)),
+        );
+        assert!(matches!(
+            emit_query_strict(&slice, &SolveOptions::default(), true),
+            Err(RenderError::Unrenderable(_))
+        ));
+    }
+
+    #[test]
+    fn smtlib_constant_rotate_solves_to_the_architectural_value() {
+        // Solved with the linked Z3 against the emitted text, so the
+        // rendering is checked by value and not only by shape:
+        // `0x12345678` rotated right by 8 is `0x78123456`.
+        let slice = fp_slice(
+            Expr::ror(Expr::konst(0x1234_5678, 32), Expr::konst(8, 32)),
+            Expr::eq(Expr::var("t0", 32), Expr::konst(0x7812_3456, 32)),
+        );
+        let script = emit_query_strict(&slice, &SolveOptions::default(), false)
+            .expect("a constant rotate must render");
+        // Unsat on the negated polarity means the equality is necessary.
+        assert_eq!(z3_check(&script), z3::SatResult::Unsat, "{script}");
     }
 }

@@ -94,6 +94,15 @@ pub enum Expr {
     LShr(Box<Expr>, Box<Expr>),
     /// Arithmetic right shift.
     AShr(Box<Expr>, Box<Expr>),
+    /// Rotate right, at the width of the left operand.
+    ///
+    /// A distinct node rather than the classic `(x >> n) | (x << (w -
+    /// n))` because that identity is wrong at `n == 0`: the left term
+    /// shifts by the full width, which every SMT-LIB backend defines as
+    /// zero, so the rotation would lose the whole value. The rotate
+    /// amount is architecturally free to be zero on `AArch32`, so the
+    /// wrong case is the common one.
+    Ror(Box<Expr>, Box<Expr>),
     /// Bit-vector equality, yields a 1-bit value.
     Eq(Box<Expr>, Box<Expr>),
     /// Bit-vector inequality, yields a 1-bit value.
@@ -343,6 +352,11 @@ impl Expr {
     pub fn bv_xor(lhs: Self, rhs: Self) -> Self {
         Self::Xor(Box::new(lhs), Box::new(rhs))
     }
+    /// Rotate right at the width of `lhs`.
+    #[must_use]
+    pub fn ror(lhs: Self, rhs: Self) -> Self {
+        Self::Ror(Box::new(lhs), Box::new(rhs))
+    }
     /// Logical left shift.
     #[must_use]
     pub fn shl(lhs: Self, rhs: Self) -> Self {
@@ -547,6 +561,7 @@ impl fmt::Display for Expr {
             Self::Shl(a, b) => write!(f, "({a} << {b})"),
             Self::LShr(a, b) => write!(f, "({a} >>u {b})"),
             Self::AShr(a, b) => write!(f, "({a} >>s {b})"),
+            Self::Ror(a, b) => write!(f, "({a} ror {b})"),
             Self::Eq(a, b) => write!(f, "({a} == {b})"),
             Self::Ne(a, b) => write!(f, "({a} != {b})"),
             Self::Ult(a, b) => write!(f, "({a} <u {b})"),

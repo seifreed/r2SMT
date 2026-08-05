@@ -236,6 +236,7 @@ fn expr_is_tainted(expr: &Expr, tainted: &BTreeSet<String>, depth: u32) -> Optio
         Expr::Const { .. } => false,
         Expr::BoolNot(a) => expr_is_tainted(a, tainted, next)?,
         Expr::Add(a, b)
+        | Expr::Ror(a, b)
         | Expr::Sub(a, b)
         | Expr::Mul(a, b)
         | Expr::UDiv(a, b)
@@ -364,6 +365,7 @@ fn namespace_expr(expr: &Expr, pfx: &str, depth: u32) -> Option<Expr> {
         Expr::Var(v) => Expr::Var(namespace_var(v, pfx)),
         Expr::Const { .. } | Expr::Unknown(_) => expr.clone(),
         Expr::Add(a, b) => bin(Expr::Add, a, b)?,
+        Expr::Ror(a, b) => bin(Expr::Ror, a, b)?,
         Expr::Sub(a, b) => bin(Expr::Sub, a, b)?,
         Expr::Mul(a, b) => bin(Expr::Mul, a, b)?,
         Expr::UDiv(a, b) => bin(Expr::UDiv, a, b)?,

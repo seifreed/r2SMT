@@ -154,6 +154,7 @@ fn substitute(expr: &Expr, map: &HashMap<String, Expr>, depth: usize) -> Expr {
         Expr::Var(v) => map.get(&v.name).cloned().unwrap_or_else(|| expr.clone()),
         Expr::Const { .. } | Expr::Unknown(_) => expr.clone(),
         Expr::Add(a, b) => Expr::add(substitute(a, map, d), substitute(b, map, d)),
+        Expr::Ror(a, b) => Expr::ror(substitute(a, map, d), substitute(b, map, d)),
         Expr::Sub(a, b) => Expr::sub(substitute(a, map, d), substitute(b, map, d)),
         Expr::Mul(a, b) => Expr::mul(substitute(a, map, d), substitute(b, map, d)),
         Expr::UDiv(a, b) => Expr::udiv(substitute(a, map, d), substitute(b, map, d)),
@@ -284,6 +285,7 @@ fn collect_var_names(expr: &Expr, out: &mut HashSet<String>) {
         }
         Expr::Const { .. } | Expr::Unknown(_) => {}
         Expr::Add(a, b)
+        | Expr::Ror(a, b)
         | Expr::Sub(a, b)
         | Expr::Mul(a, b)
         | Expr::UDiv(a, b)
@@ -389,6 +391,7 @@ fn collect_vars(expr: &Expr, out: &mut Vec<Var>) {
         Expr::Var(v) => out.push(v.clone()),
         Expr::Const { .. } | Expr::Unknown(_) => {}
         Expr::Add(a, b)
+        | Expr::Ror(a, b)
         | Expr::Sub(a, b)
         | Expr::Mul(a, b)
         | Expr::UDiv(a, b)

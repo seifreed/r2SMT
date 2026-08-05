@@ -108,6 +108,7 @@ fn write_expr(out: &mut String, expr: &Expr, ctx: &FmtCtx<'_>, depth: usize) {
         Expr::Shl(a, b) => write_binary(out, ctx, depth, a, "<<", b),
         Expr::LShr(a, b) => write_binary(out, ctx, depth, a, ">>u", b),
         Expr::AShr(a, b) => write_binary(out, ctx, depth, a, ">>s", b),
+        Expr::Ror(a, b) => write_binary(out, ctx, depth, a, "ror", b),
         Expr::Eq(a, b) => write_binary(out, ctx, depth, a, "==", b),
         Expr::Ne(a, b) => write_binary(out, ctx, depth, a, "!=", b),
         Expr::Ult(a, b) => write_binary(out, ctx, depth, a, "<u", b),

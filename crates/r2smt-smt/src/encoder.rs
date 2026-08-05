@@ -287,6 +287,9 @@ impl Encoder {
             Expr::Xor(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvxor(&y)),
             Expr::Shl(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvshl(&y)),
             Expr::LShr(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvlshr(&y)),
+            // `bvror` at the operand width, so the identity that would
+            // lose the value at a zero rotate never arises.
+            Expr::Ror(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvrotr(&y)),
             Expr::AShr(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvashr(&y)),
             Expr::Eq(a, b) => {
                 let lhs = self.encode_as_bv(a);

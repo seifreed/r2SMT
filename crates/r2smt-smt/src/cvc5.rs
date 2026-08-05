@@ -112,6 +112,7 @@ fn expr_has_unknown(expr: &Expr) -> bool {
         Expr::Unknown(_) => true,
         Expr::Var(_) | Expr::Const { .. } => false,
         Expr::Add(a, b)
+        | Expr::Ror(a, b)
         | Expr::Sub(a, b)
         | Expr::Mul(a, b)
         | Expr::UDiv(a, b)

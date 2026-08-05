@@ -176,6 +176,10 @@ fn rename_reads(
             rename_reads(a, latest, inputs),
             rename_reads(b, latest, inputs),
         ),
+        Expr::Ror(a, b) => Expr::ror(
+            rename_reads(a, latest, inputs),
+            rename_reads(b, latest, inputs),
+        ),
         Expr::Sub(a, b) => Expr::sub(
             rename_reads(a, latest, inputs),
             rename_reads(b, latest, inputs),

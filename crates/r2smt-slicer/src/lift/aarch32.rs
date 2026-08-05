@@ -1097,14 +1097,14 @@ enum MemOffset {
 /// The shift applied to an index register, or `None` for a spelling
 /// this model does not carry.
 ///
-/// `ror` and `rrx` are declined rather than lowered: the IR has no
-/// rotate, and composing one from two shifts plus an `Or` would be a
-/// new lowering to validate for a form that is rare in an address.
+/// `rrx` is still declined: it rotates *through the carry flag* by one,
+/// so it is a 33-bit operation and not a rotate of the register at all.
 fn aarch32_shift_op(name: &str) -> Option<BinOp> {
     match name {
         "lsl" => Some(BinOp::Shl),
         "lsr" => Some(BinOp::Shr),
         "asr" => Some(BinOp::Sar),
+        "ror" => Some(BinOp::Ror),
         _ => None,
     }
 }

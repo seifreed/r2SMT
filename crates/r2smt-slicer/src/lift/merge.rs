@@ -212,6 +212,7 @@ fn expr_has_unknown(expr: &Expr) -> bool {
         | Expr::ZeroExtend { src: a, .. }
         | Expr::SignExtend { src: a, .. } => expr_has_unknown(a),
         Expr::Add(a, b)
+        | Expr::Ror(a, b)
         | Expr::Sub(a, b)
         | Expr::Mul(a, b)
         | Expr::UDiv(a, b)
@@ -270,6 +271,7 @@ fn subst_expr(expr: &Expr, env: &HashMap<String, Expr>) -> Expr {
             bits: *bits,
         },
         Expr::Add(a, b) => Expr::add(subst_expr(a, env), subst_expr(b, env)),
+        Expr::Ror(a, b) => Expr::ror(subst_expr(a, env), subst_expr(b, env)),
         Expr::Sub(a, b) => Expr::sub(subst_expr(a, env), subst_expr(b, env)),
         Expr::Mul(a, b) => Expr::mul(subst_expr(a, env), subst_expr(b, env)),
         Expr::UDiv(a, b) => Expr::udiv(subst_expr(a, env), subst_expr(b, env)),

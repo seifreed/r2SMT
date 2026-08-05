@@ -134,6 +134,7 @@ fn taint_of_expr(
             taint_of_expr(src, taint, opaque, next)?
         }
         Expr::Add(a, b)
+        | Expr::Ror(a, b)
         | Expr::Sub(a, b)
         | Expr::Mul(a, b)
         | Expr::UDiv(a, b)
