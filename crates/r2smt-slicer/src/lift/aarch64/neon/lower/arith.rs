@@ -794,10 +794,31 @@ fn shift_lane(
     match kind {
         ShiftKind::LeftImmediate { shift, saturate } => {
             let by = Expr::konst(u128::from(shift), lane_bits);
-            if saturate {
-                return saturating_shift_left(value, &by, lane_bits, signed);
+            match saturate {
+                None => Some(Expr::shl(value, by)),
+                // `sqshlu` — the source read signed, the clamp into the
+                // unsigned range. The restore test below cannot express
+                // that: it asks whether the *source* survived the round
+                // trip, a question with one range in it, and would leave
+                // a negative element negative instead of clamping it to
+                // zero. An immediate bounds the shift, so the exact
+                // product fits `lane_bits + shift`, and one bit above
+                // that is what lets the clamp hold `2^lane_bits - 1` as
+                // a *positive* signed bound — at the tighter width a
+                // shift of zero would compare against `-1` and clamp
+                // every non-negative element to the maximum.
+                Some(SaturateTo::SignedToUnsigned) => {
+                    let wide = lane_bits.checked_add(shift)?.checked_add(1)?;
+                    let exact = Expr::shl(
+                        Expr::sign_ext(value, wide),
+                        Expr::konst(u128::from(shift), wide),
+                    );
+                    clamp(exact, wide, lane_bits, SaturateTo::SignedToUnsigned)
+                }
+                Some(SaturateTo::Signed | SaturateTo::Unsigned) => {
+                    saturating_shift_left(value, &by, lane_bits, signed)
+                }
             }
-            Some(Expr::shl(value, by))
         }
         ShiftKind::RightImmediate { shift, rounding } => shift_right(
             value,

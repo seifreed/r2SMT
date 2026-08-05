@@ -343,9 +343,18 @@ fn uniform_shape(insn: &Instruction, operands: usize) -> Option<Arrangement> {
 /// time.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ShiftKind {
-    /// `shl` / `sqshl` / `uqshl` — shift left by an immediate,
-    /// discarding the bits that leave the element or clamping instead.
-    LeftImmediate { shift: u16, saturate: bool },
+    /// `shl` / `sqshl` / `uqshl` / `sqshlu` — shift left by an
+    /// immediate, discarding the bits that leave the element or clamping
+    /// into the range `saturate` names instead.
+    ///
+    /// The range is carried rather than derived from the family's
+    /// signedness because `sqshlu` separates the two: it reads its
+    /// element *signed* and clamps into the *unsigned* range, so neither
+    /// a signed nor an unsigned clamp describes it.
+    LeftImmediate {
+        shift: u16,
+        saturate: Option<SaturateTo>,
+    },
     /// `ushr` / `sshr` / `urshr` / `srshr` — shift right by an
     /// immediate, optionally rounding.
     RightImmediate { shift: u16, rounding: bool },
@@ -365,7 +374,7 @@ pub(super) enum ShiftKind {
 /// genuinely different instructions — a fixed left shift and a per-lane
 /// signed amount that can go either way — and the only thing telling
 /// them apart is whether the amount operand carries an arrangement.
-fn saturating_left_shift(insn: &Instruction) -> Option<ShiftKind> {
+fn saturating_left_shift(insn: &Instruction, to: SaturateTo) -> Option<ShiftKind> {
     let amount = insn.operands.get(2)?;
     if operand_arrangement(amount).is_some() {
         return Some(ShiftKind::Register {
@@ -375,7 +384,7 @@ fn saturating_left_shift(insn: &Instruction) -> Option<ShiftKind> {
     }
     Some(ShiftKind::LeftImmediate {
         shift: u16::try_from(parse_immediate(&amount.raw)?).ok()?,
-        saturate: true,
+        saturate: Some(to),
     })
 }
 
@@ -400,7 +409,7 @@ pub(super) fn shift_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShap
         "shl" => (
             ShiftKind::LeftImmediate {
                 shift: immediate_shift()?,
-                saturate: false,
+                saturate: None,
             },
             false,
         ),
@@ -412,8 +421,18 @@ pub(super) fn shift_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShap
         "sshl" => (register(false, false), true),
         "urshl" => (register(true, false), false),
         "srshl" => (register(true, false), true),
-        "sqshl" => (saturating_left_shift(insn)?, true),
-        "uqshl" => (saturating_left_shift(insn)?, false),
+        "sqshl" => (saturating_left_shift(insn, SaturateTo::Signed)?, true),
+        "uqshl" => (saturating_left_shift(insn, SaturateTo::Unsigned)?, false),
+        // The one member whose source signedness and clamp range
+        // disagree, and immediate-only: the architecture spells no
+        // register form of it.
+        "sqshlu" => (
+            ShiftKind::LeftImmediate {
+                shift: immediate_shift()?,
+                saturate: Some(SaturateTo::SignedToUnsigned),
+            },
+            true,
+        ),
         "sqrshl" => (register(true, true), true),
         "uqrshl" => (register(true, true), false),
         _ => return None,
