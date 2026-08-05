@@ -377,3 +377,72 @@ fn the_half_precision_pair_rejects_shapes_that_are_not_encodings() {
     assert!(declines("vcvtt.f32.f32", &[DEST, SOURCE]));
     assert!(declines("vcvtb.f16.s32", &[DEST, SOURCE]));
 }
+
+// ===================== the packed half-precision forms =====================
+//
+// `vcvt.f16.f32 d0, q1` and its inverse. These change each lane's width
+// without changing the lane *count*, so the two operands name views of
+// different sizes — the one packed family here whose operands are not a
+// uniform view. Missing them is the hazard `neon/width.rs`'s doc
+// describes: the scalar VFP arm spells the same mnemonic, so a packed
+// form the resolver drops is lowered as a conversion of lane zero with
+// the rest of the register standing, not declined.
+
+#[test]
+fn packed_vcvt_narrows_every_lane_into_a_doubleword() {
+    // Four binary32 lanes in `q1` become four binary16 lanes in `d0`.
+    // The four values differ so a lowering that converted lane zero and
+    // copied, or that read the source at the destination's width, fails.
+    assert_computes(
+        "vcvt.f16.f32",
+        &["d0", "q1"],
+        &[
+            ("v0", 0),
+            (
+                "v1",
+                S_ONE_POINT_FIVE
+                    | (S_MINUS_TWO_POINT_FIVE << 32)
+                    | (S_ONE_POINT_FIVE << 64)
+                    | (S_MINUS_TWO_POINT_FIVE << 96),
+            ),
+        ],
+        H_ONE_POINT_FIVE
+            | (H_MINUS_TWO_POINT_FIVE << 16)
+            | (H_ONE_POINT_FIVE << 32)
+            | (H_MINUS_TWO_POINT_FIVE << 48),
+    );
+}
+
+#[test]
+fn packed_vcvt_widens_every_lane_into_a_quadword() {
+    // The inverse, whose destination is the wider operand. Only the low
+    // 64 bits of `v0` are asserted by this harness, which is two of the
+    // four widened lanes — enough to fail a lowering that read the
+    // source at the wrong width, since lane 1 would then be wrong.
+    assert_computes(
+        "vcvt.f32.f16",
+        &["q0", "d2"],
+        &[
+            ("v0", 0),
+            (
+                "v1",
+                H_ONE_POINT_FIVE
+                    | (H_MINUS_TWO_POINT_FIVE << 16)
+                    | (H_ONE_POINT_FIVE << 32)
+                    | (H_MINUS_TWO_POINT_FIVE << 48),
+            ),
+        ],
+        S_ONE_POINT_FIVE | (S_MINUS_TWO_POINT_FIVE << 32),
+    );
+}
+
+#[test]
+fn packed_vcvt_rejects_a_view_pair_that_is_not_an_encoding() {
+    // The lane count has to agree even though the widths do not, so a
+    // narrowing form whose source is only a doubleword names nothing.
+    // And the float-to-float direction has no fixed-point form, so a
+    // third operand is the parser having mis-read the shape.
+    assert!(declines("vcvt.f16.f32", &["d0", "d2"]));
+    assert!(declines("vcvt.f32.f16", &["q0", "q1"]));
+    assert!(declines("vcvt.f16.f32", &["d0", "q1", "#1"]));
+}

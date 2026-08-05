@@ -3840,16 +3840,31 @@ fn aarch32_packed_vcvt_resolves_at_both_register_classes() {
 }
 
 #[test]
-fn aarch32_packed_half_precision_vcvt_declines() {
-    // `vcvt.f16.f32` halves the lane count, a geometry nothing here
-    // models, and it renders only on Z3. It must decline rather than
-    // being taken for a same-width conversion.
+fn aarch32_packed_half_precision_vcvt_lifts() {
+    // This used to assert the opposite, on the grounds that
+    // `vcvt.f16.f32` "halves the lane count". It does not: four lanes
+    // stay four and each lane's *width* halves, which is the geometry
+    // `WidenKind` already relates next door and which `convert_lane`
+    // has always taken as two separate widths.
+    //
+    // What the operands stop being is a *uniform view* — `d0, q1` is a
+    // pair of different sizes — so the resolver sizes the source
+    // against the destination instead of requiring them equal.
     let stmts = lift_aarch32("vcvt.f16.f32", vec![reg("d0"), reg("q1")]);
     assert!(
         stmts
             .iter()
-            .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+            .all(|s| !matches!(s, IrStmt::Unsupported { .. })),
         "{stmts:?}"
+    );
+    // The lane count still has to agree, so a source that is only a
+    // doubleword names nothing.
+    let mismatched = lift_aarch32("vcvt.f16.f32", vec![reg("d0"), reg("d2")]);
+    assert!(
+        mismatched
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+        "{mismatched:?}"
     );
 }
 

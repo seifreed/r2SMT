@@ -28,7 +28,7 @@ use crate::lift::aarch32::ElementKind;
 use crate::lift::aarch32::neon_element_type;
 use crate::lift::parse_immediate;
 
-use super::{NeonOp, NeonShape, uniform_vector_view, vector_parent_bits, vector_view_bits};
+use super::{NeonOp, NeonShape, vector_parent_bits, vector_view_bits};
 use crate::lift::aarch64::neon::width::ConvertKind;
 
 /// The packed lane-wise conversions `vcvt.{s32,u32}.f32` and
@@ -47,34 +47,61 @@ use crate::lift::aarch64::neon::width::ConvertKind;
 /// standing. Same hazard as the by-element multiplies, and the reason
 /// both sit ahead of the families whose operand shape they overlap.
 ///
-/// The half-precision pair `vcvt.f16.f32` / `vcvt.f32.f16` declines:
-/// it halves or doubles the lane count, which is a different geometry
-/// from everything here, and it renders only on Z3.
+/// The half-precision forms `vcvt.f16.f32` / `vcvt.f32.f16` resolve
+/// here too. They do **not** change the lane count — four lanes stay
+/// four — they change each lane's *width*, so the two operands name
+/// views of different sizes (`vcvt.f16.f32 d0, q1`) and the uniform-view
+/// check every other family here uses does not apply. The lane count
+/// comes from the destination's own view and the source is sized against
+/// it, which is the same shape `WidenKind` already handles next door.
+///
+/// A binary16 lane renders only on Z3, since `is_renderable_fp_sort`
+/// admits binary32 and binary64 alone. That is a precision loss on the
+/// text backends, never a wrong verdict, and it is already contracted.
 pub(super) fn convert_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
     let (base, ty) = mnemonic.split_once('.')?;
     let (convert, dest_bits) = crate::lift::aarch32::vfp_convert(base, ty)?;
     let (source_kind, source_bits) = convert.source;
-    // NEON spells only the 32-bit conversions between float and
-    // integer; there is no packed `.f64` form and no packed integer to
-    // integer one.
-    if dest_bits != 32 || source_bits != 32 {
-        return None;
-    }
     let kind = match (convert.dest_kind, source_kind) {
-        (ElementKind::Float, ElementKind::Float) => return None,
-        (ElementKind::Float, signedness) => ConvertKind::IntToFloat {
-            signed: signedness == ElementKind::Signed,
-        },
-        (signedness, ElementKind::Float) => ConvertKind::FloatToInt {
-            signed: signedness == ElementKind::Signed,
-        },
+        // Between float formats the two ends differ, and only by a
+        // factor of two: NEON spells `f16` against `f32` and nothing
+        // else.
+        (ElementKind::Float, ElementKind::Float) => {
+            if !matches!((dest_bits, source_bits), (16, 32) | (32, 16)) {
+                return None;
+            }
+            ConvertKind::FloatToFloat {
+                widening: dest_bits > source_bits,
+            }
+        }
+        // Between float and integer NEON spells only the 32-bit forms:
+        // there is no packed `.f64`, and no packed integer-to-integer.
+        (ElementKind::Float, signedness) => {
+            if dest_bits != 32 || source_bits != 32 {
+                return None;
+            }
+            ConvertKind::IntToFloat {
+                signed: signedness == ElementKind::Signed,
+            }
+        }
+        (signedness, ElementKind::Float) => {
+            if dest_bits != 32 || source_bits != 32 {
+                return None;
+            }
+            ConvertKind::FloatToInt {
+                signed: signedness == ElementKind::Signed,
+            }
+        }
         // `vfp_convert` requires a float on one side, so this arm is
         // unreachable through the parser.
         _ => return None,
     };
     let fbits = match insn.operands.get(2) {
-        // The fraction width is bounded by the element it scales, which
-        // is 32 for every form reaching here.
+        // Only the integer directions have a fixed-point form; a third
+        // operand on a float-to-float one means the parser mis-read the
+        // shape. The fraction width is bounded by the element it
+        // scales, which is 32 for every form that has one.
+        Some(_) if !kind.scales() => return None,
         Some(operand) => {
             let amount = u16::try_from(parse_immediate(&operand.raw)?).ok()?;
             if amount == 0 || amount > dest_bits {
@@ -87,7 +114,18 @@ pub(super) fn convert_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonSh
     if insn.operands.len() != usize::from(fbits > 0) + 2 {
         return None;
     }
-    let view = uniform_vector_view(insn, 2)?;
+    // Each operand states its own view, so the lane count comes from
+    // the destination and the source is checked against it. The
+    // same-width families can use `uniform_vector_view` instead; this
+    // one cannot, because `vcvt.f16.f32 d0, q1` is a `d`/`q` pair.
+    let dest_view = vector_view_bits(insn.operands.first()?)?;
+    let lanes = dest_view.checked_div(dest_bits)?;
+    if lanes == 0 || dest_view % dest_bits != 0 {
+        return None;
+    }
+    if vector_view_bits(insn.operands.get(1)?)? != lanes.checked_mul(source_bits)? {
+        return None;
+    }
     Some(NeonShape {
         op: NeonOp::Convert {
             kind,
@@ -95,7 +133,7 @@ pub(super) fn convert_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonSh
             rounding: convert.to_int_rounding,
         },
         lane_bits: dest_bits,
-        lanes: view.checked_div(dest_bits)?,
+        lanes,
     })
 }
 

@@ -586,10 +586,12 @@ impl LiftCtx {
 
     /// `vcvt` over every lane of the source view.
     ///
-    /// Source and destination elements are both 32 bits here — the
-    /// resolver admits no other packed geometry — so one lane index
-    /// serves both sides and `convert_lane` is called with equal
-    /// widths.
+    /// The lane *count* is the same on both sides — `vcvt.f16.f32`
+    /// converts four lanes into four — so one index serves both. Their
+    /// *widths* need not match: the float-to-float forms halve or double
+    /// the element, which is why the source width is derived from the
+    /// kind rather than reused from the destination, exactly as
+    /// `AArch64`'s `fcvtl` / `fcvtn` lowering does.
     fn aarch32_convert_lanes(
         &mut self,
         insn: &Instruction,
@@ -598,15 +600,20 @@ impl LiftCtx {
         fbits: u16,
         rounding: r2smt_ir::expr::RoundingMode,
     ) -> Option<Expr> {
+        let source_bits = match kind {
+            ConvertKind::FloatToFloat { widening: true } => shape.lane_bits.checked_div(2)?,
+            ConvertKind::FloatToFloat { widening: false } => shape.lane_bits.checked_mul(2)?,
+            _ => shape.lane_bits,
+        };
         let source = insn.operands.get(1)?.clone();
-        let value = self.simd_operand_value(&source, shape.view_bits()?)?;
+        let value = self.simd_operand_value(&source, shape.lanes.checked_mul(source_bits)?)?;
         let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
         for index in 0..shape.lanes {
-            let element = Self::extract_lane(value.clone(), shape.lane_bits, index)?;
+            let element = Self::extract_lane(value.clone(), source_bits, index)?;
             lanes.push(convert_lane(
                 kind,
                 element,
-                shape.lane_bits,
+                source_bits,
                 shape.lane_bits,
                 fbits,
                 rounding,
