@@ -19,7 +19,9 @@ use crate::registers::Arrangement;
 
 use super::super::super::{BinOp, FpArithOp, PackedIntOp, PackedOp, parse_immediate};
 use super::super::FPCR_DEFAULT_ROUNDING;
-use super::geometry::{BITS_PER_BYTE, operand_arrangement, peel_upper, spans_full_register};
+use super::geometry::{
+    BITS_PER_BYTE, indexed_element, operand_arrangement, peel_upper, spans_full_register,
+};
 use super::{NeonOp, NeonShape};
 
 /// Element widths that name an IEEE interchange format.
@@ -871,21 +873,43 @@ pub(super) fn doubling_long_shape(insn: &Instruction, mnemonic: &str) -> Option<
     } else {
         destination.lanes
     };
-    for operand in insn.operands.iter().skip(1) {
-        let arrangement = operand_arrangement(operand)?;
+    let first = operand_arrangement(insn.operands.get(1)?)?;
+    if first.lane_bits != source_bits || first.lanes != expected_lanes {
+        return None;
+    }
+    if upper && !spans_full_register(first) {
+        return None;
+    }
+    // The second source is either the matching whole vector or a single
+    // element. The `2` suffix never halves the indexed one: an element
+    // is addressed absolutely inside the register, so `sqdmull2 v0.4s,
+    // v1.8h, v2.h[7]` reads `v1`'s upper half and `v2`'s lane seven.
+    let second = insn.operands.get(2)?;
+    let (by_element, source_index) = if let Some(arrangement) = operand_arrangement(second) {
         if arrangement.lane_bits != source_bits || arrangement.lanes != expected_lanes {
             return None;
         }
         if upper && !spans_full_register(arrangement) {
             return None;
         }
-    }
+        (false, 0)
+    } else {
+        let (element_bits, index) = indexed_element(second)?;
+        if element_bits != source_bits {
+            return None;
+        }
+        (true, index)
+    };
     Some(NeonShape {
-        op: NeonOp::DoublingLong { combine, upper },
+        op: NeonOp::DoublingLong {
+            combine,
+            upper,
+            by_element,
+        },
         lane_bits: destination.lane_bits,
         lanes: destination.lanes,
         dest_index: 0,
-        source_index: 0,
+        source_index,
     })
 }
 

@@ -562,11 +562,80 @@ fn sqdmlsl_subtracts_the_product_after_it_has_already_saturated() {
 }
 
 #[test]
-fn the_doubling_multiplies_decline_the_by_element_spelling() {
-    // `v2.h[0]` names one element rather than a vector, which is a
-    // different instruction with a different source for every lane.
-    assert_declines("sqdmull", &["v0.4s", "v1.4h", "v2.h[0]"]);
-    assert_declines("sqdmlal", &["v0.4s", "v1.4h", "v2.h[0]"]);
+fn sqdmull_by_element_hands_the_same_element_to_every_lane() {
+    // The whole point of the spelling. `v2.h[1]` is `3`, and every lane
+    // multiplies by it — a lowering that read `v2` as a vector would
+    // pair lane zero with `v2`'s lane zero, which is zero here, and
+    // answer zero.
+    assert_computes(
+        "sqdmull",
+        &["v0.4s", "v1.4h", "v2.h[1]"],
+        &[
+            ("v1", packed(16, &[0x0002, 0x0005, 0xffff, 0x0004])),
+            ("v2", packed(16, &[0x0000, 0x0003])),
+        ],
+        packed(32, &[0x0000_000c, 0x0000_001e, 0xffff_fffa, 0x0000_0018]),
+    );
+}
+
+#[test]
+fn sqdmull_by_element_still_saturates_at_the_two_most_negative_elements() {
+    // The clamp that defines the family survives the new source shape:
+    // `2 * -32768 * -32768` is `2^31`, one past the doubled element's
+    // signed maximum, while the neighbouring lane is left alone.
+    assert_computes(
+        "sqdmull",
+        &["v0.4s", "v1.4h", "v2.h[0]"],
+        &[
+            ("v1", packed(16, &[0x8000, 0x0001])),
+            ("v2", packed(16, &[0x8000])),
+        ],
+        packed(32, &[0x7fff_ffff, 0xffff_0000]),
+    );
+}
+
+#[test]
+fn sqdmlal_by_element_accumulates_onto_the_destination() {
+    // The accumulating member of the pair, so the destination-as-input
+    // path is exercised through the indexed source too.
+    assert_computes(
+        "sqdmlal",
+        &["v0.4s", "v1.4h", "v2.h[0]"],
+        &[
+            ("v0", packed(32, &[0x0000_0064])),
+            ("v1", packed(16, &[0x0002])),
+            ("v2", packed(16, &[0x0003])),
+        ],
+        packed(32, &[0x0000_0070]),
+    );
+}
+
+#[test]
+fn sqdmull2_by_element_halves_the_vector_source_and_not_the_indexed_one() {
+    // An element is addressed absolutely inside its register, so the `2`
+    // suffix reads `v1`'s upper half and `v2`'s lane *seven* — not lane
+    // seven plus four. The low half of `v1` is zero, so a lowering that
+    // ignored the suffix answers zero everywhere.
+    assert_computes(
+        "sqdmull2",
+        &["v0.4s", "v1.8h", "v2.h[7]"],
+        &[
+            (
+                "v1",
+                packed(16, &[0, 0, 0, 0, 0x0002, 0x0003, 0x0004, 0x0005]),
+            ),
+            ("v2", packed(16, &[0, 0, 0, 0, 0, 0, 0, 0x0002])),
+        ],
+        packed(32, &[0x0000_0008, 0x0000_000c, 0x0000_0010, 0x0000_0014]),
+    );
+}
+
+#[test]
+fn the_doubling_multiplies_decline_an_element_of_the_wrong_width() {
+    // `v2.s[0]` is a 32-bit element where the sources are 16-bit ones.
+    // The architecture encodes no such form, and resolving it would read
+    // the wrong half of the register.
+    assert_declines("sqdmull", &["v0.4s", "v1.4h", "v2.s[0]"]);
 }
 
 // ===================== the saturating shift left unsigned =====================

@@ -90,7 +90,16 @@ enum NeonOp {
     /// narrow elements, saturated into the destination's element and
     /// optionally accumulated onto it under a second saturation.
     /// `upper` is the `2` suffix, which reads the sources' upper half.
-    DoublingLong { combine: Option<BinOp>, upper: bool },
+    ///
+    /// `by_element` marks the `v2.h[i]` spelling, where the second
+    /// source contributes one element — named by
+    /// [`NeonShape::source_index`] — to every destination lane instead of
+    /// pairing each lane with its own.
+    DoublingLong {
+        combine: Option<BinOp>,
+        upper: bool,
+        by_element: bool,
+    },
     /// `sri` / `sli` — shift one source lane and insert it over the
     /// destination lane, keeping the destination bits the shift vacated.
     ///

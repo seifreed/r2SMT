@@ -199,6 +199,7 @@ impl LiftCtx {
         shape: NeonShape,
         combine: Option<BinOp>,
         upper: bool,
+        by_element: bool,
     ) -> Option<Expr> {
         // One bit above the destination element. `2 * INT_MIN * INT_MIN`
         // is `2^(2n-1)`, one past the top of the doubled element's
@@ -208,7 +209,20 @@ impl LiftCtx {
         let wide = shape.lane_bits.checked_add(1)?;
         let narrow = shape.lane_bits / 2;
         let first = self.widen_source(insn, 1)?;
-        let second = self.widen_source(insn, 2)?;
+        // The by-element spelling reads *one* element, once, and hands
+        // the same value to every destination lane. Reading it as a
+        // whole vector would pair each lane with a different element —
+        // a wrong value, and the reason this family declined the
+        // spelling rather than guessing at it.
+        let second = if by_element {
+            Element::One(self.read_simd_lane_bits(
+                &insn.operands.get(2)?.clone(),
+                narrow,
+                shape.source_index,
+            )?)
+        } else {
+            Element::PerLane(self.widen_source(insn, 2)?)
+        };
         let accumulator = match combine {
             Some(_) => Some(self.destination_value(insn, shape)?),
             None => None,
@@ -221,7 +235,12 @@ impl LiftCtx {
                 index
             };
             let a = LiftCtx::extract_lane(first.clone(), narrow, source_lane)?;
-            let b = LiftCtx::extract_lane(second.clone(), narrow, source_lane)?;
+            let b = match &second {
+                Element::One(value) => value.clone(),
+                Element::PerLane(vector) => {
+                    LiftCtx::extract_lane(vector.clone(), narrow, source_lane)?
+                }
+            };
             let product = Expr::mul(extend(a, wide, true), extend(b, wide, true));
             let doubled = Expr::shl(product, Expr::konst(1, wide));
             let saturated = clamp(doubled, wide, shape.lane_bits, SaturateTo::Signed)?;
@@ -395,6 +414,15 @@ impl LiftCtx {
         }
         Self::concat_lanes(lanes)
     }
+}
+
+/// A second source that is either one element broadcast to every
+/// destination lane or a whole vector read lane by lane.
+enum Element {
+    /// The `v2.h[i]` spelling, materialised once.
+    One(Expr),
+    /// The whole-vector spelling.
+    PerLane(Expr),
 }
 
 /// One destination lane of a two-lane fold, shared by the lane-wise
