@@ -1083,23 +1083,31 @@ fn aarch64_spilling_a_vector_register_and_reloading_it_recovers_the_value() {
     assert_eq!(solve_branch(&slice, solve_opts()), SmtResult::AlwaysTrue);
 }
 
+/// ARM's carry in the polarity this pipeline stores, which is its
+/// inverse. See `aarch32_carry_convention_contracts.rs`; the helper
+/// exists so these two read as what the architecture does rather than as
+/// a flipped literal.
+const fn stored(arm_carry: u128) -> u128 {
+    arm_carry ^ 1
+}
+
 #[test]
 fn aarch32_rrx_shifts_the_index_right_and_brings_the_carry_in_at_the_top() {
-    // 2 >> 1 is 1, and with `CF` clear nothing enters the top.
-    assert_eq!(aarch32_rrx_address_is(0, 1), SmtResult::AlwaysTrue);
+    // 2 >> 1 is 1, and with ARM's carry clear nothing enters the top.
+    assert_eq!(aarch32_rrx_address_is(stored(0), 1), SmtResult::AlwaysTrue);
 }
 
 #[test]
 fn aarch32_rrx_puts_a_set_carry_into_the_index_sign_bit() {
     // The whole point of the family, and what makes it a 33-bit
-    // operation rather than a rotate of the register: with `CF` set the
-    // same index gives `0x8000_0001`, not `1`. A lowering as
+    // operation rather than a rotate of the register: with ARM's carry
+    // set the same index gives `0x8000_0001`, not `1`. A lowering as
     // `Ror(x, 1)` would answer `1` here — the register's own low bit
     // would come back round instead of the carry — so this is the pair
     // that separates the two, and it is a wrong *address* rather than a
     // decline.
     assert_eq!(
-        aarch32_rrx_address_is(1, 0x8000_0001),
+        aarch32_rrx_address_is(stored(1), 0x8000_0001),
         SmtResult::AlwaysTrue
     );
 }

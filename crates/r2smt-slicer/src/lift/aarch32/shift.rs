@@ -71,14 +71,37 @@ fn shift_carry_out(op: BinOp, src: &Expr, amount: u16, width: u16) -> CarryOut {
     }
 }
 
+/// Cross between ARM's `C` and the carry this pipeline stores.
+///
+/// `CF` here is **x86 borrow polarity** — the inverse of ARM's `C` —
+/// because `lift_branch_condition` is shared with x86 and lowers ARM
+/// `cs` / `hs` to `CF == 0` (`condition.rs` documents the choice). Every
+/// ARM producer and consumer of the carry has to cross that line
+/// explicitly, and the inversion is its own function so a reader can see
+/// which side of it a given expression is on.
+///
+/// Reading a raw `CF` as if it were ARM's `C` is a wrong *value*, and
+/// writing ARM's `C` raw is a wrong *branch* — neither shows up in a
+/// contract that pins a flag's value, which is how both survived.
+pub(super) fn arm_carry(stored: Expr) -> Expr {
+    Expr::bv_xor(stored, Expr::konst(1, 1))
+}
+
+/// The pipeline's `CF` from an ARM carry bit. Same inversion, named for
+/// the direction so call sites read as what they mean.
+fn stored_carry(arm: Expr) -> Expr {
+    Expr::bv_xor(arm, Expr::konst(1, 1))
+}
+
 /// `rrx` — rotate `value` right through the carry flag by one.
 ///
 /// The carry becomes the new top bit and every other bit moves down one,
 /// which is exactly bits `[bits:1]` of the 33-bit concatenation. Shared
 /// with the addressing model so the two spellings of one operation
-/// cannot drift apart.
+/// cannot drift apart. The bit that enters is ARM's `C`, so it crosses
+/// [`arm_carry`] on the way in.
 pub(super) fn rotate_right_through_carry(value: Expr, bits: u16) -> Expr {
-    let through = Expr::concat(Expr::Var(Var::new("CF", 1)), value);
+    let through = Expr::concat(arm_carry(Expr::Var(Var::new("CF", 1))), value);
     Expr::extract(through, bits, 1)
 }
 
@@ -153,7 +176,9 @@ impl LiftCtx {
             self.set_flag("ZF", Expr::eq(result.clone(), Expr::konst(0, width)));
             self.set_flag("SF", Expr::slt(result.clone(), Expr::konst(0, width)));
             match carry_out {
-                CarryOut::Bit(carry) => self.set_flag("CF", carry),
+                // The shifter carry-out is ARM's `C`; what this
+                // pipeline stores is its inverse.
+                CarryOut::Bit(carry) => self.set_flag("CF", stored_carry(carry)),
                 // A shift by a register amount can be zero, and then C
                 // keeps its value — so which of the two happens is not
                 // known at lift time and a free value is the honest

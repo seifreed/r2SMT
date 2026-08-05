@@ -57,6 +57,17 @@ fn branch() -> BranchCandidate {
     }
 }
 
+/// ARM's carry, expressed in the polarity this pipeline stores.
+///
+/// `CF` here is the *inverse* of ARM's `C` — x86 borrow polarity, so the
+/// one `lift_branch_condition` can serve both ISAs. Contracts say what
+/// the architecture does and convert here, rather than repeating a
+/// flipped literal that reads like a typo. See
+/// `aarch32_carry_convention_contracts.rs`.
+const fn stored(arm_carry: u128) -> u128 {
+    arm_carry ^ 1
+}
+
 fn operand(raw: &str) -> Operand {
     Operand {
         raw: raw.into(),
@@ -116,6 +127,90 @@ fn solve_shift(
     solve_branch(&ssa_convert(&slice), solve_opts())
 }
 
+/// Lift `mnemonic operands` with `bindings` applied, then ask whether
+/// the branch predicate `condition` necessarily holds — the same
+/// lowering a real `b<cond>` goes through.
+///
+/// The value harness above cannot answer this. A flag's *value* and the
+/// *branch it decides* are two questions, and this pipeline deliberately
+/// stores `CF` in x86 polarity (`condition.rs` documents it: the lifter
+/// inverts ARM's C so `lift_branch_condition` needs no per-arch
+/// dispatch), so a contract that only pins the value passes while the
+/// branch resolves backwards.
+fn solve_predicate(
+    mnemonic: &str,
+    operands: &[&str],
+    bindings: &[(&str, u128, u16)],
+    condition: BranchCondition,
+) -> SmtResult {
+    let insn = Instruction {
+        address: Address::new(0x1000),
+        size: 4,
+        bytes: vec![],
+        mnemonic: mnemonic.into(),
+        operands: operands.iter().map(|raw| operand(raw)).collect(),
+        esil: None,
+        pcode: None,
+        is_thumb: false,
+    };
+    let mut statements: Vec<IrStmt> = bindings
+        .iter()
+        .map(|(name, value, bits)| IrStmt::Assign {
+            dst: Var::new(*name, *bits),
+            src: Expr::konst(*value, *bits),
+        })
+        .collect();
+    statements.extend(lift_per_mnemonic(&insn, Arch::Arm));
+    let mut candidate = branch();
+    candidate.condition = condition;
+    let slice = LiftedSlice {
+        branch: candidate.clone(),
+        statements,
+        condition: r2smt_slicer::lift_branch_condition(&candidate, Arch::Arm),
+        status: SliceStatus::Complete,
+        treat_truncation_as_inputs: false,
+        arch: Arch::Arm,
+    };
+    solve_branch(&ssa_convert(&slice), solve_opts())
+}
+
+#[test]
+fn a_carry_out_of_a_shift_decides_a_carry_set_branch() {
+    // `lsls r0, r1, #1` on `0x8000_0000` shifts a one out of the top, so
+    // ARM sets C and `bcs` is taken.
+    //
+    // Getting the *value* of `CF` right is not enough to get this right,
+    // and that is the whole point of the test: this pipeline stores the
+    // inverse of ARM's C, because every other flag producer here follows
+    // x86 borrow polarity and `b.cs` lowers to `CF == 0`. A shifter
+    // carry-out written raw makes the branch resolve backwards — a
+    // fabricated verdict, not a lost one.
+    assert_eq!(
+        solve_predicate(
+            "lsls",
+            &["r0", "r1", "1"],
+            &[("r1", 0x8000_0000, WORD)],
+            BranchCondition::AboveOrEqual,
+        ),
+        SmtResult::AlwaysTrue,
+    );
+}
+
+#[test]
+fn no_carry_out_of_a_shift_decides_a_carry_clear_branch() {
+    // The other side, so the pair cannot be satisfied by a constant:
+    // shifting a zero out leaves ARM's C clear and `bcc` is taken.
+    assert_eq!(
+        solve_predicate(
+            "lsls",
+            &["r0", "r1", "1"],
+            &[("r1", 0x4000_0000, WORD)],
+            BranchCondition::Below,
+        ),
+        SmtResult::AlwaysTrue,
+    );
+}
+
 #[test]
 fn rrx_brings_a_clear_carry_into_the_top_bit() {
     // 2 >> 1 is 1, and with C clear nothing enters above it.
@@ -123,7 +218,7 @@ fn rrx_brings_a_clear_carry_into_the_top_bit() {
         solve_shift(
             "rrx",
             &["r0", "r1"],
-            &[("r1", 2, WORD), ("CF", 0, 1)],
+            &[("r1", 2, WORD), ("CF", stored(0), 1)],
             ("r0", WORD),
             1,
         ),
@@ -141,7 +236,7 @@ fn rrx_brings_a_set_carry_into_the_top_bit() {
         solve_shift(
             "rrx",
             &["r0", "r1"],
-            &[("r1", 2, WORD), ("CF", 1, 1)],
+            &[("r1", 2, WORD), ("CF", stored(1), 1)],
             ("r0", WORD),
             0x8000_0001,
         ),
@@ -157,9 +252,9 @@ fn rrxs_puts_the_bit_that_fell_off_into_the_carry() {
         solve_shift(
             "rrxs",
             &["r0", "r1"],
-            &[("r1", 2, WORD), ("CF", 1, 1)],
+            &[("r1", 2, WORD), ("CF", stored(1), 1)],
             ("CF", 1),
-            0,
+            stored(0),
         ),
         SmtResult::AlwaysTrue,
     );
@@ -174,9 +269,9 @@ fn rrx_without_the_s_suffix_leaves_the_carry_alone() {
         solve_shift(
             "rrx",
             &["r0", "r1"],
-            &[("r1", 3, WORD), ("CF", 1, 1)],
+            &[("r1", 3, WORD), ("CF", stored(1), 1)],
             ("CF", 1),
-            1,
+            stored(1),
         ),
         SmtResult::AlwaysTrue,
     );
@@ -209,7 +304,7 @@ fn lsls_carries_out_the_bit_that_left_the_top() {
             &["r0", "r1", "1"],
             &[("r1", 0x8000_0000, WORD)],
             ("CF", 1),
-            1,
+            stored(1),
         ),
         SmtResult::AlwaysTrue,
     );
@@ -225,7 +320,7 @@ fn lsrs_carries_out_the_bit_that_left_the_bottom() {
             &["r0", "r1", "1"],
             &[("r1", 0x8000_0001, WORD)],
             ("CF", 1),
-            1,
+            stored(1),
         ),
         SmtResult::AlwaysTrue,
     );
@@ -242,7 +337,7 @@ fn asrs_by_the_full_width_carries_out_the_sign() {
             &["r0", "r1", "32"],
             &[("r1", 0x8000_0000, WORD)],
             ("CF", 1),
-            1,
+            stored(1),
         ),
         SmtResult::AlwaysTrue,
     );
@@ -290,9 +385,9 @@ fn a_shift_by_zero_leaves_the_carry_it_found() {
         solve_shift(
             "lsls",
             &["r0", "r1", "0"],
-            &[("r1", 1, WORD), ("CF", 1, 1)],
+            &[("r1", 1, WORD), ("CF", stored(1), 1)],
             ("CF", 1),
-            1,
+            stored(1),
         ),
         SmtResult::AlwaysTrue,
     );

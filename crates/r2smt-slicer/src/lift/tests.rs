@@ -1065,15 +1065,34 @@ fn aarch32_adc_adds_the_carry_flag() {
 }
 
 #[test]
-fn aarch32_sbc_subtracts_the_borrow_not_the_carry() {
-    // `sbc` subtracts `NOT C`, so the lowering must carry a `1 - CF`
-    // term. Subtracting `CF` directly would be off by one whenever the
-    // carry is clear — a wrong value, not a decline.
-    let stmts = lift_aarch32("sbc", vec![reg("r0"), reg("r1"), reg("r2")]);
-    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
-    let assigns = format!("{stmts:?}");
-    assert!(assigns.contains("CF"), "{stmts:?}");
-    assert!(assigns.contains("value: 1"), "{stmts:?}");
+fn aarch32_adc_and_sbc_sit_on_opposite_sides_of_the_carry_inversion() {
+    // `CF` is stored in x86 borrow polarity, the inverse of ARM's `C`.
+    // `adc` adds ARM's `C`, so it needs the inversion (`1 - CF`); `sbc`
+    // subtracts the complement of ARM's `C`, which *is* the stored bit,
+    // so it must not invert. Exactly one of the two carries the `1 -`
+    // term, and which one is the whole question — reading the stored
+    // carry as if it were ARM's is a wrong value, not a decline.
+    //
+    // The structural check is cheap insurance; the semantics are pinned
+    // by `r2smt-core/tests/aarch32_carry_convention_contracts.rs`, which
+    // solves a `cmp` and an `adc` in one block.
+    let adc = format!(
+        "{:?}",
+        lift_aarch32("adc", vec![reg("r0"), reg("r1"), reg("r2")])
+    );
+    let sbc = format!(
+        "{:?}",
+        lift_aarch32("sbc", vec![reg("r0"), reg("r1"), reg("r2")])
+    );
+    assert!(adc.contains("CF") && sbc.contains("CF"));
+    assert!(
+        adc.contains("value: 1"),
+        "adc must invert the stored carry: {adc}"
+    );
+    assert!(
+        !sbc.contains("value: 1"),
+        "sbc reads the stored carry directly: {sbc}"
+    );
 }
 
 #[test]

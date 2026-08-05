@@ -646,11 +646,15 @@ impl LiftCtx {
         };
         let lhs = self.read_operand_at(src1, width);
         let rhs = self.read_operand_at(src2, width);
-        let carry = Expr::zero_ext(Expr::Var(Var::new("CF", 1)), width);
+        // `CF` is stored in x86 borrow polarity, the inverse of ARM's
+        // `C` (see `shift::arm_carry`). `adc` adds ARM's `C` and `sbc`
+        // subtracts its complement, so the two operations want the two
+        // sides of that inversion — and reading the stored bit as if it
+        // were ARM's `C` was a definite wrong value, not a lost one.
+        let stored = Expr::Var(Var::new("CF", 1));
         let term = match op {
-            // `sbc` subtracts the *borrow*, which is `NOT C`.
-            BinOp::Sub => Expr::sub(Expr::konst(1, width), carry),
-            _ => carry,
+            BinOp::Sub => Expr::zero_ext(stored, width),
+            _ => Expr::zero_ext(shift::arm_carry(stored), width),
         };
         let tmp = self.new_temp(insn.address, width);
         self.assign(tmp.clone(), op.apply(op.apply(lhs, rhs), term));
