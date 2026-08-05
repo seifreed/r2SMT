@@ -129,6 +129,11 @@ pub(in crate::lift::aarch32) enum WidenKind {
         shift: u16,
         rounding: bool,
     },
+    /// `vaddhn` / `vsubhn` and their rounding forms `vraddhn` /
+    /// `vrsubhn` — the **high** half of a double-width sum or
+    /// difference, which is what makes them narrowing without any shift
+    /// being spelled.
+    HighNarrow { subtract: bool, rounding: bool },
 }
 
 /// `vmovl` / `vaddl` / `vsubl` / `vmull` / `vaddw` / `vsubw` — a
@@ -306,6 +311,61 @@ pub(super) fn saturating_narrow_shape(insn: &Instruction, mnemonic: &str) -> Opt
                 rounding,
             },
             signed: source_signed,
+        },
+        lane_bits,
+        lanes,
+    })
+}
+
+/// `vaddhn` / `vsubhn` — a destination element half the width of its
+/// two sources, holding the high half of their sum or difference.
+///
+/// No headroom bit here, and that is the interesting difference from the
+/// saturating narrows above rather than an omission. The window ARM
+/// keeps, `sum<2n-1:n>`, sits entirely inside the low `2n` bits that a
+/// wrapping add preserves exactly — including for the rounding forms,
+/// whose added half ulp can carry out of the top without touching a bit
+/// the window keeps. Next door the same carry reaches the sign bit the
+/// clamp compares against, which is why *that* family computes wider.
+pub(super) fn high_narrow_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (base, ty) = mnemonic.split_once('.')?;
+    let (subtract, rounding) = match base {
+        "vaddhn" => (false, false),
+        "vraddhn" => (false, true),
+        "vsubhn" => (true, false),
+        "vrsubhn" => (true, true),
+        _ => return None,
+    };
+    // Keeping a high half discards the low one whatever the sign, which
+    // is why the architecture spells these `I` and gives them no signed
+    // or unsigned encoding to tell apart.
+    let (element, source_bits) = neon_element_type(ty)?;
+    if element != ElementKind::Untyped || insn.operands.len() != 3 {
+        return None;
+    }
+    let lane_bits = source_bits.checked_div(2)?;
+    // Nothing narrower than a byte is an element.
+    if lane_bits < 8 {
+        return None;
+    }
+    let source_view = vector_parent_bits()?;
+    let destination_view = vector_view_bits(insn.operands.first()?)?;
+    if destination_view != source_view / 2 {
+        return None;
+    }
+    let lanes = destination_view.checked_div(lane_bits)?;
+    if source_bits.checked_mul(lanes)? != source_view {
+        return None;
+    }
+    for operand in insn.operands.iter().skip(1) {
+        if vector_view_bits(operand)? != source_view {
+            return None;
+        }
+    }
+    Some(NeonShape {
+        op: NeonOp::Widen {
+            kind: WidenKind::HighNarrow { subtract, rounding },
+            signed: false,
         },
         lane_bits,
         lanes,

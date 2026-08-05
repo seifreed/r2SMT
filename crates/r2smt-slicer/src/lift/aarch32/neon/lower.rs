@@ -19,7 +19,7 @@ use super::permute::{PairKind, PairSource, paired_source};
 use super::width::WidenKind;
 use super::{BITS_PER_BYTE, NeonOp, NeonShape};
 use crate::lift::BinOp;
-use crate::lift::aarch64::neon::lower::convert_lane;
+use crate::lift::aarch64::neon::lower::{convert_lane, high_narrow_lane};
 use crate::lift::aarch64::neon::width::ConvertKind;
 use crate::lift::{FpArithOp, fp_lane_result};
 
@@ -94,6 +94,9 @@ impl LiftCtx {
                 WidenKind::Long => self.aarch32_long_lanes(insn, shape, None, false, signed),
                 WidenKind::LongArith { op, wide_first } => {
                     self.aarch32_long_lanes(insn, shape, Some(op), wide_first, signed)
+                }
+                WidenKind::HighNarrow { subtract, rounding } => {
+                    self.aarch32_high_narrow_lanes(insn, shape, subtract, rounding)
                 }
             },
             NeonOp::ByElement { kind, index } => {
@@ -314,6 +317,35 @@ impl LiftCtx {
                 }
             };
             lanes.push(Expr::extract(shifted, shape.lane_bits.checked_sub(1)?, 0));
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// `vaddhn` / `vsubhn` — the high half of each double-width sum or
+    /// difference.
+    ///
+    /// The lane itself is [`high_narrow_lane`], the `AArch64` lowering,
+    /// reused rather than restated: the ISAs differ in how they spell
+    /// the family and not in what it computes. What differs here is the
+    /// geometry — an `AArch32` source is a `q` register and the
+    /// destination a `d`, where `AArch64` reads both off an operand
+    /// arrangement.
+    fn aarch32_high_narrow_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        subtract: bool,
+        rounding: bool,
+    ) -> Option<Expr> {
+        let source_bits = shape.lane_bits.checked_mul(2)?;
+        let source_view = source_bits.checked_mul(shape.lanes)?;
+        let first = self.simd_operand_value(&insn.operands.get(1)?.clone(), source_view)?;
+        let second = self.simd_operand_value(&insn.operands.get(2)?.clone(), source_view)?;
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let a = Self::extract_lane(first.clone(), source_bits, index)?;
+            let b = Self::extract_lane(second.clone(), source_bits, index)?;
+            lanes.push(high_narrow_lane(subtract, rounding, a, b, shape.lane_bits)?);
         }
         Self::concat_lanes(lanes)
     }

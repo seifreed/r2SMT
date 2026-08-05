@@ -196,6 +196,7 @@ pub(super) fn resolve(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| width::widen_long_shape(insn, &mnemonic))
         .or_else(|| width::narrow_shape(insn, &mnemonic))
         .or_else(|| width::saturating_narrow_shape(insn, &mnemonic))
+        .or_else(|| width::high_narrow_shape(insn, &mnemonic))
         .or_else(|| saturate::saturating_unary_shape(insn, &mnemonic))
         .or_else(|| saturate::doubling_multiply_high_shape(insn, &mnemonic))
         .or_else(|| saturate::doubling_multiply_long_shape(insn, &mnemonic))

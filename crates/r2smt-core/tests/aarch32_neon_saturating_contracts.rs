@@ -185,6 +185,22 @@ const QUAD_PAIR: [&str; 2] = ["q0", "q1"];
 /// A widening shape: a `q` destination over two `d` sources that are
 /// the low halves of *different* parents, so each binds independently.
 const LONG: [&str; 3] = ["q0", "d2", "d4"];
+/// A narrowing shape: a `d` destination — the *low* half of `v0`, so the
+/// high half has to survive the write — over two `q` sources.
+const NARROW: [&str; 3] = ["d0", "q1", "q2"];
+
+/// A mask with the low 64 bits set — the low `d` half of a `q`.
+const LOW_HALF_MASK: u128 = u64::MAX as u128;
+
+/// What a `d0` destination leaves behind: `written` in the low half of
+/// the parent and `poison` untouched in the high half.
+///
+/// An `AArch32` NEON write merges, so a lowering that zeroed the upper
+/// half — which is what `AArch64` does — fails every assertion built
+/// from this.
+fn merged_low_half(poison: u128, written: u128) -> u128 {
+    (poison & !LOW_HALF_MASK) | (written & LOW_HALF_MASK)
+}
 
 // ---------------------------------------------------------------
 // `vqabs` / `vqneg` — the one value whose magnitude the element
@@ -466,4 +482,118 @@ fn vqdmull_declines_a_doubleword_source() {
     // A doubled word product would need a 128-bit destination element,
     // which the architecture does not encode.
     assert!(declines("vqdmull.s64", &LONG));
+}
+
+// ---------------------------------------------------------------
+// `vaddhn` / `vsubhn` — the high half, and the window a wrap keeps
+// ---------------------------------------------------------------
+
+#[test]
+fn vaddhn_keeps_the_high_half_of_the_sum() {
+    // `0x1234 + 0x1111 = 0x2345`, whose high byte is `0x23`. The
+    // destination is `d0`, the low half of `v0`, so the poisoned high
+    // half has to survive: an `AArch32` NEON write merges.
+    assert_computes(
+        "vaddhn.i16",
+        &NARROW,
+        &[
+            ("v0", splat_byte(0xaa)),
+            ("v1", splat_halfword(0x1234)),
+            ("v2", splat_halfword(0x1111)),
+        ],
+        merged_low_half(splat_byte(0xaa), splat_byte(0x23)),
+    );
+}
+
+#[test]
+fn vaddhn_keeps_the_window_a_wrapping_sum_preserves() {
+    // `0xffff + 0x0002` is `0x10001` on the unbounded integer and
+    // `0x0001` wrapped, and the window kept — bits `<15:8>` — is `0x00`
+    // either way. This is where the family differs from the saturating
+    // narrows: no headroom bit is needed, because the carry that leaves
+    // the top never touches a bit the window keeps.
+    assert_computes(
+        "vaddhn.i16",
+        &NARROW,
+        &[
+            ("v0", splat_byte(0xaa)),
+            ("v1", splat_halfword(0xffff)),
+            ("v2", splat_halfword(0x0002)),
+        ],
+        merged_low_half(splat_byte(0xaa), 0),
+    );
+}
+
+#[test]
+fn vsubhn_keeps_the_high_half_of_the_difference() {
+    // The teeth for the operation: `vaddhn` over the same operands gives
+    // `0x0004`, so a lowering that added where it should subtract passes
+    // the test above and fails here.
+    assert_computes(
+        "vsubhn.i32",
+        &NARROW,
+        &[
+            ("v0", splat_word(0xdead_beef)),
+            ("v1", splat_word(0x0003_0000)),
+            ("v2", splat_word(0x0001_0000)),
+        ],
+        merged_low_half(splat_word(0xdead_beef), splat_halfword(0x0002)),
+    );
+}
+
+#[test]
+fn vraddhn_rounds_the_discarded_half_up() {
+    // `0x1280`'s discarded low byte is exactly half an ulp, so the
+    // rounding form gives `0x13` where the plain one gives `0x12`. The
+    // teeth for the rounding term, and for adding it before the window
+    // is taken rather than after.
+    assert_computes(
+        "vraddhn.i16",
+        &NARROW,
+        &[
+            ("v0", splat_byte(0xaa)),
+            ("v1", splat_halfword(0x1280)),
+            ("v2", splat_halfword(0x0000)),
+        ],
+        merged_low_half(splat_byte(0xaa), splat_byte(0x13)),
+    );
+}
+
+#[test]
+fn vaddhn_does_not_round() {
+    // The other half of that pair.
+    assert_computes(
+        "vaddhn.i16",
+        &NARROW,
+        &[
+            ("v0", splat_byte(0xaa)),
+            ("v1", splat_halfword(0x1280)),
+            ("v2", splat_halfword(0x0000)),
+        ],
+        merged_low_half(splat_byte(0xaa), splat_byte(0x12)),
+    );
+}
+
+#[test]
+fn vaddhn_covers_the_whole_destination_view_rather_than_one_lane() {
+    // The poison is a word no lane of the answer holds, and it must
+    // survive in the *upper* half of the parent while every one of the
+    // four written halfword lanes changes.
+    assert_computes(
+        "vaddhn.i32",
+        &NARROW,
+        &[
+            ("v0", splat_word(0xdead_beef)),
+            ("v1", splat_word(0x0007_0000)),
+            ("v2", splat_word(0x0002_0000)),
+        ],
+        merged_low_half(splat_word(0xdead_beef), splat_halfword(0x0009)),
+    );
+}
+
+#[test]
+fn vaddhn_declines_a_signed_element() {
+    // Keeping a high half discards the low one whatever the sign, so the
+    // architecture spells this family `I` alone.
+    assert!(declines("vaddhn.s16", &NARROW));
 }

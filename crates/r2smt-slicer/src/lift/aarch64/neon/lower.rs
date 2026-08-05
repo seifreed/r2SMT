@@ -1213,7 +1213,12 @@ fn magnitude_mask(bits: u16) -> Option<Expr> {
 /// narrows next door: there the same carry reaches the *sign* bit the
 /// clamp compares against, turning a saturation at `INT_MAX` into one at
 /// `INT_MIN`, and the lowering has to compute a bit wider to avoid it.
-fn high_narrow_lane(
+///
+/// Shared with the `AArch32` `vaddhn` / `vsubhn` resolver: the two ISAs
+/// differ in how they *spell* the family — an arrangement on the operand
+/// against a `d`-versus-`q` register class — and not in what it
+/// computes.
+pub(in crate::lift) fn high_narrow_lane(
     subtract: bool,
     rounding: bool,
     a: Expr,
