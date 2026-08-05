@@ -468,6 +468,18 @@ const IEEE_DOUBLE: (u16, u16) = (11, 53);
 /// bit of the *stored* 80-bit image is bridged in the lifter
 /// (`r2smt-slicer`'s `lift/x87.rs`), outside every width computation
 /// here and in the Z3 encoder.
+///
+/// binary128 `(15, 113)` is the second such sort, and the measurement
+/// says the same thing as x87's rather than something new: a minimal
+/// query naming `(_ FloatingPoint 15 113)` is `sat` under Z3 4.13.0 and
+/// under Bitwuzla 0.9.1, and cvc5 1.3.4 answers with the same
+/// "only Float32 (8/24) or Float64 (11/53) types are supported in
+/// default mode" error. It reaches this pipeline as the *intermediate*
+/// a binary64 fused multiply step is computed in — never as a lane —
+/// so declining costs the text backends precision on that one family
+/// and nothing else. Bitwuzla would take it, but a sort only two of the
+/// three portfolio backends parse would make them disagree by parse
+/// error rather than by verdict, which is the lesson of the rotate.
 const fn is_renderable_fp_sort(ebits: u16, sbits: u16) -> bool {
     ebits >= MIN_FP_SORT_FIELD
         && sbits >= MIN_FP_SORT_FIELD
@@ -1633,5 +1645,125 @@ mod tests {
             ),
             z3::SatResult::Unsat
         );
+    }
+
+    /// IEEE-754 binary128, the format a binary64 fused multiply step is
+    /// computed in so that it rounds once.
+    const IEEE_QUAD: (u16, u16) = (15, 113);
+
+    /// The binary64 fixture that separates one rounding from two.
+    ///
+    /// `(1 + 2⁻⁵²)²` is exactly `1 + 2⁻⁵¹ + 2⁻¹⁰⁴`. That low term sits
+    /// far below half an ulp of binary64, so a product rounded on its
+    /// own discards it; adding `−(1 + 2⁻⁵¹)` then leaves exactly
+    /// `2⁻¹⁰⁴` when the whole step rounds once, and exactly zero when it
+    /// rounds twice.
+    const F64_ONE_PLUS_ULP: u128 = 0x3ff0_0000_0000_0001;
+    const F64_MINUS_ONE_PLUS_TWO_ULP: u128 = 0xbff0_0000_0000_0002;
+    const F64_TWO_POW_MINUS_104: u128 = 0x3970_0000_0000_0000;
+    const F64_ZERO: u128 = 0;
+
+    /// The lowering `r2smt-slicer`'s `fused_multiply_lane` builds for one
+    /// lane: both sources and the accumulator widened to `wide`, one
+    /// multiply, one add, and a single rounding back to binary64.
+    ///
+    /// Restated here rather than called because that helper is private
+    /// to the lifter, and what is under test is what a solver does with
+    /// the sorts rather than the helper's plumbing. Passing `IEEE_DOUBLE`
+    /// as the intermediate degenerates the widening to the identity and
+    /// so yields the *double-rounded* lowering, which is what makes the
+    /// two spellings comparable on one fixture.
+    fn multiply_add_via(wide: (u16, u16), a: u128, b: u128, acc: u128) -> Expr {
+        let rm = RoundingMode::NearestTiesEven;
+        let widen = |bits: u128| {
+            Expr::fp_to_fp(
+                Expr::bv_to_fp(Expr::konst(bits, 64), IEEE_DOUBLE.0, IEEE_DOUBLE.1),
+                rm,
+                wide.0,
+                wide.1,
+            )
+        };
+        let product = Expr::fmul(widen(a), widen(b), rm);
+        let sum = Expr::fadd(widen(acc), product, rm);
+        Expr::fp_to_ieee_bv(Expr::fp_to_fp(sum, rm, IEEE_DOUBLE.0, IEEE_DOUBLE.1))
+    }
+
+    /// The fused step of the fixture above, computed in `wide`.
+    fn fused_fixture(wide: (u16, u16)) -> Expr {
+        multiply_add_via(
+            wide,
+            F64_ONE_PLUS_ULP,
+            F64_ONE_PLUS_ULP,
+            F64_MINUS_ONE_PLUS_TWO_ULP,
+        )
+    }
+
+    /// A slice whose single statement defines a 64-bit `t0` from `src`,
+    /// with `t0 == expected` as the branch predicate.
+    fn f64_slice(src: Expr, expected: u128) -> SsaLiftedSlice {
+        let mut slice = mem_slice(vec![IrStmt::Assign {
+            dst: r2smt_ir::expr::Var::new("t0", 64),
+            src,
+        }]);
+        slice.condition = Expr::eq(Expr::var("t0", 64), Expr::konst(expected, 64));
+        slice
+    }
+
+    /// Budget for the floating-point solves below. Well above the
+    /// production default, because `cargo test --all` runs every crate's
+    /// binary concurrently and a 113-bit significand is not free.
+    fn quad_solve_options() -> SolveOptions {
+        SolveOptions {
+            timeout_ms: 120_000,
+            ..SolveOptions::default()
+        }
+    }
+
+    #[test]
+    fn binary128_intermediate_makes_a_binary64_fused_step_round_once() {
+        // `AlwaysTrue` means the encoding forces exactly 2⁻¹⁰⁴, which is
+        // the architecture's answer for a single rounding.
+        let slice = f64_slice(fused_fixture(IEEE_QUAD), F64_TWO_POW_MINUS_104);
+        assert_eq!(
+            crate::solver::solve_branch(&slice, quad_solve_options()),
+            r2smt_common::smt::SmtResult::AlwaysTrue
+        );
+    }
+
+    #[test]
+    fn binary64_intermediate_rounds_the_same_step_twice_and_gives_zero() {
+        // The teeth of the test above: on the same inputs the
+        // double-rounded lowering is forced to zero, so a test that
+        // passed for both spellings would be measuring nothing.
+        let slice = f64_slice(fused_fixture(IEEE_DOUBLE), F64_ZERO);
+        assert_eq!(
+            crate::solver::solve_branch(&slice, quad_solve_options()),
+            r2smt_common::smt::SmtResult::AlwaysTrue
+        );
+    }
+
+    #[test]
+    fn smtlib_declines_the_binary128_intermediate_of_a_fused_step() {
+        // Measured against the three installed binaries, not assumed:
+        // `(_ FloatingPoint 15 113)` is accepted by Z3 4.13.0 and by
+        // Bitwuzla 0.9.1, and rejected by CVC5 1.3.4 — "only Float32
+        // (8/24) or Float64 (11/53) types are supported in default
+        // mode". So the portable text path refuses the sort exactly as
+        // it refuses x87's `(15, 64)`, and `emit_query_strict` turns
+        // that into a decline rather than a wrong verdict.
+        let slice = f64_slice(fused_fixture(IEEE_QUAD), F64_TWO_POW_MINUS_104);
+        assert!(matches!(
+            emit_query_strict(&slice, &SolveOptions::default(), true),
+            Err(RenderError::Unrenderable(_))
+        ));
+    }
+
+    #[test]
+    fn smtlib_renders_the_same_fused_step_shape_at_a_binary64_intermediate() {
+        // Teeth for the decline above: the identical expression shape
+        // renders once its sorts are ones cvc5 admits, so the refusal is
+        // about the sort and not about the widen-multiply-add shape.
+        let slice = f64_slice(fused_fixture(IEEE_DOUBLE), F64_ZERO);
+        assert!(emit_query_strict(&slice, &SolveOptions::default(), true).is_ok());
     }
 }

@@ -275,36 +275,115 @@ impl FusedStep {
     }
 }
 
-/// binary64 bit patterns of the step constants.
+/// IEEE binary128, the format a binary64 lane's fused step is computed
+/// in.
+///
+/// Deliberately absent from [`fp_sort_bits_checked`]: that table answers
+/// "what float is a lane of this width", and no ISA here has a 128-bit
+/// float lane. This sort exists only as an intermediate, which is also
+/// why it costs nothing on the text backends — `is_renderable_fp_sort`
+/// already refuses it, measured below.
+const FP_QUAD_SORT: (u16, u16) = (15, 113);
+
+/// binary64 bit patterns of the step constants — the intermediate
+/// format for a binary32 lane, and the lane format for a binary64 one,
+/// which is why `F64_TWO` serves both roles.
 const F64_TWO: u128 = 0x4000_0000_0000_0000;
 const F64_THREE: u128 = 0x4008_0000_0000_0000;
+/// The same two in binary128, the intermediate for a binary64 lane.
+const F128_TWO: u128 = 0x4000_0000_0000_0000_0000_0000_0000_0000;
+const F128_THREE: u128 = 0x4000_8000_0000_0000_0000_0000_0000_0000;
 /// binary32 bit patterns of the `(inf, 0)` special-case results.
 const F32_TWO: u128 = 0x4000_0000;
 const F32_ONE_POINT_FIVE: u128 = 0x3fc0_0000;
+/// The binary64 spelling of the second (the first is `F64_TWO`).
+const F64_ONE_POINT_FIVE: u128 = 0x3ff8_0000_0000_0000;
 /// binary32 magnitude mask and the infinity pattern with the sign
 /// cleared.
 const F32_ABS_MASK: u128 = 0x7fff_ffff;
 const F32_INFINITY: u128 = 0x7f80_0000;
+/// The binary64 spelling of the same two.
+const F64_ABS_MASK: u128 = 0x7fff_ffff_ffff_ffff;
+const F64_INFINITY: u128 = 0x7ff0_0000_0000_0000;
 
-/// One binary32 lane of a fused multiply step, computed once in binary64
-/// and rounded once back to binary32.
+/// The two formats one fused step is computed in, plus the constants
+/// each of them names.
+#[derive(Debug, Clone, Copy)]
+struct FusedFormats {
+    /// Width of the architectural lane, in bits.
+    lane_bits: u16,
+    /// IEEE sort of the lane.
+    lane: (u16, u16),
+    /// IEEE sort the step is computed in before rounding once back.
+    wide: (u16, u16),
+    /// `2.0` and `3.0` in the wide format — the reciprocal steps' terms.
+    wide_two: u128,
+    wide_three: u128,
+    /// `2.0` and `1.5` in the lane format — the `inf · 0` answers.
+    lane_two: u128,
+    lane_one_and_a_half: u128,
+    /// Magnitude mask and infinity pattern in the lane format.
+    lane_abs_mask: u128,
+    lane_infinity: u128,
+}
+
+/// The formats a fused step at `lane_bits` is exactly emulable in, or
+/// `None` when no wide-enough format is available.
 ///
-/// The intermediate is exact: a binary32 product fits binary64's
-/// significand (`2·24 − 1 < 53`), and `53 ≥ 2·24 + 2` makes the single
-/// binary64 rounding of the sum equivalent to rounding the real result
-/// straight to binary32 — so this reproduces the architecture's single
-/// rounding rather than the double rounding a separate `fmul` + `fadd`
-/// would give. `acc_bits` is the accumulator lane for `fmla` / `fmls`;
-/// the step forms ignore it.
+/// Two conditions make the emulation exact, and both are why this is a
+/// closed table rather than "the next format up". The product of two
+/// lane values must fit the wide significand (`2·p − 1 ≤ q`), and the
+/// wide format's single rounding of the combine must agree with
+/// rounding the real result straight to the lane, which needs
+/// `q ≥ 2·p + 2`. binary64 over a binary32 lane gives `53 ≥ 50`;
+/// binary128 over a binary64 one gives `113 ≥ 108`. There is no third
+/// entry: IEEE names no interchange format wide enough to carry a
+/// binary128 lane the same way.
+fn fused_formats(lane_bits: u16) -> Option<FusedFormats> {
+    let lane = fp_sort_bits_checked(lane_bits)?;
+    Some(match lane_bits {
+        FP_SINGLE_BITS => FusedFormats {
+            lane_bits,
+            lane,
+            wide: fp_sort_bits_checked(FP_DOUBLE_BITS)?,
+            wide_two: F64_TWO,
+            wide_three: F64_THREE,
+            lane_two: F32_TWO,
+            lane_one_and_a_half: F32_ONE_POINT_FIVE,
+            lane_abs_mask: F32_ABS_MASK,
+            lane_infinity: F32_INFINITY,
+        },
+        FP_DOUBLE_BITS => FusedFormats {
+            lane_bits,
+            lane,
+            wide: FP_QUAD_SORT,
+            wide_two: F128_TWO,
+            wide_three: F128_THREE,
+            lane_two: F64_TWO,
+            lane_one_and_a_half: F64_ONE_POINT_FIVE,
+            lane_abs_mask: F64_ABS_MASK,
+            lane_infinity: F64_INFINITY,
+        },
+        _ => return None,
+    })
+}
+
+/// One lane of a fused multiply step, computed once in the wider format
+/// [`fused_formats`] names and rounded once back to the lane.
+///
+/// The intermediate is exact — see [`fused_formats`] for the two width
+/// conditions — so this reproduces the architecture's single rounding
+/// rather than the double rounding a separate `fmul` + `fadd` would
+/// give. `acc_bits` is the accumulator lane for `fmla` / `fmls`; the
+/// step forms ignore it.
 ///
 /// `frecps` / `frsqrts` return `2.0` / `1.5` when one operand is zero and
 /// the other infinite, where the fused arithmetic alone would give a NaN
 /// — the one input on which the naive lowering is a wrong *value* rather
 /// than a wider one, so it is guarded explicitly.
 ///
-/// `None` for any lane width but binary32: a binary64 lane would need
-/// binary128 to stay exact, so the caller declines rather than round
-/// twice.
+/// `None` for a lane width with no wide-enough intermediate, so the
+/// caller declines rather than round twice.
 pub(crate) fn fused_multiply_lane(
     step: FusedStep,
     a_bits: &Expr,
@@ -312,47 +391,45 @@ pub(crate) fn fused_multiply_lane(
     acc_bits: Option<Expr>,
     lane_bits: u16,
 ) -> Option<Expr> {
-    const SINGLE: (u16, u16) = (8, 24);
-    const DOUBLE: (u16, u16) = (11, 53);
-    if lane_bits != FP_SINGLE_BITS {
-        return None;
-    }
+    let formats = fused_formats(lane_bits)?;
+    let (lane_e, lane_s) = formats.lane;
+    let (wide_e, wide_s) = formats.wide;
     let rm = RoundingMode::NearestTiesEven;
-    let widen = |bits: Expr| {
-        Expr::fp_to_fp(
-            Expr::bv_to_fp(bits, SINGLE.0, SINGLE.1),
-            rm,
-            DOUBLE.0,
-            DOUBLE.1,
-        )
-    };
-    let double_const = |bits: u128| Expr::FpConst {
+    let widen =
+        |bits: Expr| Expr::fp_to_fp(Expr::bv_to_fp(bits, lane_e, lane_s), rm, wide_e, wide_s);
+    let wide_const = |bits: u128| Expr::FpConst {
         bits,
-        ebits: DOUBLE.0,
-        sbits: DOUBLE.1,
+        ebits: wide_e,
+        sbits: wide_s,
     };
     let product = Expr::fmul(widen(a_bits.clone()), widen(b_bits.clone()), rm);
     let value = match step {
         FusedStep::MulAdd => Expr::fadd(widen(acc_bits?), product, rm),
         FusedStep::MulSub => Expr::fsub(widen(acc_bits?), product, rm),
-        FusedStep::RecipStep => Expr::fsub(double_const(F64_TWO), product, rm),
+        FusedStep::RecipStep => Expr::fsub(wide_const(formats.wide_two), product, rm),
         FusedStep::RsqrtStep => Expr::fdiv(
-            Expr::fsub(double_const(F64_THREE), product, rm),
-            double_const(F64_TWO),
+            Expr::fsub(wide_const(formats.wide_three), product, rm),
+            wide_const(formats.wide_two),
             rm,
         ),
     };
-    let narrowed = Expr::fp_to_ieee_bv(Expr::fp_to_fp(value, rm, SINGLE.0, SINGLE.1));
+    let narrowed = Expr::fp_to_ieee_bv(Expr::fp_to_fp(value, rm, lane_e, lane_s));
     Some(match step {
         FusedStep::MulAdd | FusedStep::MulSub => narrowed,
-        FusedStep::RecipStep => zero_times_infinity_result(a_bits, b_bits, F32_TWO, narrowed),
-        FusedStep::RsqrtStep => {
-            zero_times_infinity_result(a_bits, b_bits, F32_ONE_POINT_FIVE, narrowed)
+        FusedStep::RecipStep => {
+            zero_times_infinity_result(a_bits, b_bits, formats.lane_two, narrowed, &formats)
         }
+        FusedStep::RsqrtStep => zero_times_infinity_result(
+            a_bits,
+            b_bits,
+            formats.lane_one_and_a_half,
+            narrowed,
+            &formats,
+        ),
     })
 }
 
-/// Select `result_bits` when one binary32 operand is zero and the other
+/// Select `result_bits` when one lane operand is zero and the other
 /// infinite, otherwise `otherwise` — the `frecps` / `frsqrts` special
 /// case, tested on the raw bit patterns since the IR has no is-infinite
 /// or is-zero predicate.
@@ -361,17 +438,21 @@ fn zero_times_infinity_result(
     b_bits: &Expr,
     result_bits: u128,
     otherwise: Expr,
+    formats: &FusedFormats,
 ) -> Expr {
-    let magnitude = |bits: &Expr| Expr::bv_and(bits.clone(), Expr::konst(F32_ABS_MASK, 32));
-    let is_zero = |bits: &Expr| Expr::eq(magnitude(bits), Expr::konst(0, 32));
-    let is_infinite = |bits: &Expr| Expr::eq(magnitude(bits), Expr::konst(F32_INFINITY, 32));
+    let width = formats.lane_bits;
+    let magnitude =
+        |bits: &Expr| Expr::bv_and(bits.clone(), Expr::konst(formats.lane_abs_mask, width));
+    let is_zero = |bits: &Expr| Expr::eq(magnitude(bits), Expr::konst(0, width));
+    let is_infinite =
+        |bits: &Expr| Expr::eq(magnitude(bits), Expr::konst(formats.lane_infinity, width));
     let special = Expr::bool_or(
         Expr::bool_and(is_infinite(a_bits), is_zero(b_bits)),
         Expr::bool_and(is_zero(a_bits), is_infinite(b_bits)),
     );
     Expr::Ite {
         cond: Box::new(special),
-        then_expr: Box::new(Expr::konst(result_bits, 32)),
+        then_expr: Box::new(Expr::konst(result_bits, width)),
         else_expr: Box::new(otherwise),
     }
 }
@@ -1447,5 +1528,59 @@ impl LiftCtx {
         };
         self.assign(Var::new(layout.parent, parent_bits), full);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FP_DOUBLE_BITS, FP_HALF_BITS, FP_SINGLE_BITS, FusedStep, fused_multiply_lane};
+    use r2smt_ir::expr::Expr;
+
+    fn lane(bits: u16) -> Expr {
+        Expr::konst(0, bits)
+    }
+
+    #[test]
+    fn fused_multiply_lane_accepts_a_binary32_lane_over_a_binary64_intermediate() {
+        assert!(
+            fused_multiply_lane(
+                FusedStep::MulAdd,
+                &lane(FP_SINGLE_BITS),
+                &lane(FP_SINGLE_BITS),
+                Some(lane(FP_SINGLE_BITS)),
+                FP_SINGLE_BITS,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn fused_multiply_lane_accepts_a_binary64_lane_over_a_binary128_intermediate() {
+        assert!(
+            fused_multiply_lane(
+                FusedStep::MulAdd,
+                &lane(FP_DOUBLE_BITS),
+                &lane(FP_DOUBLE_BITS),
+                Some(lane(FP_DOUBLE_BITS)),
+                FP_DOUBLE_BITS,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn fused_multiply_lane_declines_a_lane_with_no_wide_enough_intermediate() {
+        // A binary16 lane has an IEEE sort but no entry in the fused
+        // table, so it declines rather than rounding twice.
+        assert!(
+            fused_multiply_lane(
+                FusedStep::MulAdd,
+                &lane(FP_HALF_BITS),
+                &lane(FP_HALF_BITS),
+                Some(lane(FP_HALF_BITS)),
+                FP_HALF_BITS,
+            )
+            .is_none()
+        );
     }
 }
