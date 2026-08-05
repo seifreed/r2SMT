@@ -7,6 +7,7 @@ use r2smt_ir::stmt::IrStmt;
 
 use crate::registers::register_layout;
 
+use super::shifted_operand::{OPERAND2_INDEX_ARITH3, OPERAND2_INDEX_COMPARE};
 use super::{
     BinOp, CsArithOp, FpArithOp, LiftCtx, MemAccess, VectorShape, Writeback,
     aarch64_cond_suffix_to_predicate, constant_delta, fp_lane_result, fp_propagating_max_min,
@@ -277,7 +278,7 @@ impl LiftCtx {
         self.assign(tmp.clone(), op.apply(lhs.clone(), rhs.clone()));
         let tmp_expr = Expr::Var(tmp);
         if sets_flags {
-            self.aarch64_set_arith_flags(op, lhs, rhs, &tmp_expr, width);
+            self.aarch64_set_arith_flags(insn, op, lhs, rhs, &tmp_expr, width);
         }
         if !self.write_register_to(dst, tmp_expr) {
             self.stmts.push(IrStmt::Unsupported {
@@ -301,8 +302,17 @@ impl LiftCtx {
     ///   downstream confidence machinery already downgrades
     ///   signed-comparison verdicts when OF is Unknown.
     /// - PF — irrelevant on `AArch64`; left Unknown.
+    ///
+    /// The logical and multiply families are **not** the same on the two
+    /// ISAs, and one shared arm would fabricate a flag on whichever ISA
+    /// lost. A64 `ANDS` clears C and V; A32 `ANDS` / `ORRS` / `EORS`
+    /// takes C from the shifter carry-out of Operand2 and leaves V alone,
+    /// and `MULS` from ARM v6 on leaves both alone. A32 has no `ORRS` / `EORS`
+    /// counterpart on A64 at all, so those two arms used to be reachable
+    /// only from `AArch32` and were unconditionally wrong there.
     fn aarch64_set_arith_flags(
         &mut self,
+        insn: &Instruction,
         op: BinOp,
         lhs: &Expr,
         rhs: &Expr,
@@ -311,22 +321,27 @@ impl LiftCtx {
     ) {
         self.set_flag("ZF", Expr::eq(result.clone(), Expr::konst(0, width)));
         self.set_flag("SF", Expr::slt(result.clone(), Expr::konst(0, width)));
-        let cf = match op {
-            BinOp::Sub => Expr::ult(lhs.clone(), rhs.clone()),
-            // Logical ops clear C/V on AArch64. `adds` / `mul` etc.
-            // need a full extension to compute carry precisely; mark
-            // Unknown rather than fabricate a value.
-            BinOp::And | BinOp::Or | BinOp::Xor => Expr::konst(0, 1),
-            _ => Expr::Unknown(String::new()),
-        };
-        self.set_flag("CF", cf);
-        // OF clears for logical ops, Unknown otherwise (until we add
-        // signed-overflow modelling).
-        let of = match op {
-            BinOp::And | BinOp::Or | BinOp::Xor => Expr::konst(0, 1),
-            _ => Expr::Unknown(String::new()),
-        };
-        self.set_flag("OF", of);
+        let arm32 = self.arch == Arch::Arm;
+        match op {
+            BinOp::Sub => {
+                self.set_flag("CF", Expr::ult(lhs.clone(), rhs.clone()));
+                self.set_flag("OF", Expr::Unknown(String::new()));
+            }
+            BinOp::And | BinOp::Or | BinOp::Xor if arm32 => {
+                self.set_aarch32_logical_carry(insn, OPERAND2_INDEX_ARITH3);
+            }
+            BinOp::And | BinOp::Or | BinOp::Xor => {
+                self.set_flag("CF", Expr::konst(0, 1));
+                self.set_flag("OF", Expr::konst(0, 1));
+            }
+            BinOp::Mul if arm32 => {}
+            // `adds` and the rest need a full extension to compute carry
+            // precisely; mark Unknown rather than fabricate a value.
+            _ => {
+                self.set_flag("CF", Expr::Unknown(String::new()));
+                self.set_flag("OF", Expr::Unknown(String::new()));
+            }
+        }
         self.set_flag("PF", Expr::Unknown(String::new()));
     }
 
@@ -527,9 +542,11 @@ impl LiftCtx {
         }
     }
 
+    /// `tst Rn, Operand` = `ands xzr, Rn, Operand` — flags from
+    /// `Rn AND Operand`, no register destination. `AArch32` `tst` routes
+    /// here too, and the two ISAs part company on C and V exactly as they
+    /// do for `ands`; see [`Self::aarch64_set_arith_flags`].
     pub(super) fn lift_aarch64_tst(&mut self, insn: &Instruction) {
-        // AArch64 `tst Rn, Operand` = `ands xzr, Rn, Operand` — sets
-        // flags from Rn AND Operand, no register destination.
         let (Some(lhs_op), Some(rhs_op)) = (insn.operands.first(), insn.operands.get(1)) else {
             return;
         };
@@ -541,8 +558,12 @@ impl LiftCtx {
         let tmp_expr = Expr::Var(tmp);
         self.set_flag("ZF", Expr::eq(tmp_expr.clone(), Expr::konst(0, width)));
         self.set_flag("SF", Expr::slt(tmp_expr, Expr::konst(0, width)));
-        self.set_flag("CF", Expr::konst(0, 1));
-        self.set_flag("OF", Expr::konst(0, 1));
+        if self.arch == Arch::Arm {
+            self.set_aarch32_logical_carry(insn, OPERAND2_INDEX_COMPARE);
+        } else {
+            self.set_flag("CF", Expr::konst(0, 1));
+            self.set_flag("OF", Expr::konst(0, 1));
+        }
         self.set_flag("PF", Expr::Unknown(String::new()));
     }
 

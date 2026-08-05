@@ -15,6 +15,8 @@ pub(super) mod vfp;
 
 use shift::{ShiftForm, rotate_right_through_carry};
 
+use super::shifted_operand::{OPERAND2_INDEX_ARITH3, OPERAND2_INDEX_COMPARE};
+
 // Re-exported so the split is invisible from outside: `lift.rs`,
 // `effect/aarch32.rs`, `lift/tests.rs` and the two `neon/` consumers all
 // keep the paths they used when this lived in the parent.
@@ -327,14 +329,14 @@ impl LiftCtx {
         self.assign(tmp.clone(), computed);
         let tmp_expr = Expr::Var(tmp);
         if sets_flags {
-            // Logical-op flag policy mirrors AArch64 `ands` (CF/OF clear,
-            // ZF/SF from the result). Emit before the destination write
-            // so any dst/src overlap doesn't rename the lhs/rhs reads
-            // — see `lift_aarch64_arith3`.
+            // Emit before the destination write so any dst/src overlap
+            // doesn't rename the lhs/rhs reads — see
+            // `lift_aarch64_arith3`. C comes from the shifter carry-out
+            // of Operand2 and V is not written; the AArch64 `ands` policy
+            // this used to mirror clears both, which on A32 fabricates.
             self.set_flag("ZF", Expr::eq(tmp_expr.clone(), Expr::konst(0, dst_width)));
             self.set_flag("SF", Expr::slt(tmp_expr.clone(), Expr::konst(0, dst_width)));
-            self.set_flag("CF", Expr::konst(0, 1));
-            self.set_flag("OF", Expr::konst(0, 1));
+            self.set_aarch32_logical_carry(insn, OPERAND2_INDEX_ARITH3);
             self.set_flag("PF", Expr::Unknown(String::new()));
         }
         if !self.write_register_to(dst, tmp_expr) {
@@ -381,9 +383,9 @@ impl LiftCtx {
         let tmp_expr = Expr::Var(tmp);
         self.set_flag("ZF", Expr::eq(tmp_expr.clone(), Expr::konst(0, width)));
         self.set_flag("SF", Expr::slt(tmp_expr, Expr::konst(0, width)));
-        // `teq` clears C and V on AArch32 (architectural behaviour).
-        self.set_flag("CF", Expr::konst(0, 1));
-        self.set_flag("OF", Expr::konst(0, 1));
+        // `teq` does *not* clear C and V, which this used to claim: C is
+        // the shifter carry-out of Operand2 and V is untouched.
+        self.set_aarch32_logical_carry(insn, OPERAND2_INDEX_COMPARE);
         self.set_flag("PF", Expr::Unknown(String::new()));
     }
 
