@@ -26,7 +26,7 @@ use r2smt_ir::program::Instruction;
 
 use super::super::{FusedStep, PackedOp};
 use crate::lift::simd::CompareKind;
-use arith::{SaturatingKind, ShiftKind};
+use arith::{AbsDiffKind, BitwiseUnary, PairOp, SaturatingKind, ShiftKind};
 use multiply::{AccumulateKind, ByElementKind};
 use permute::{PermuteKind, SelectRole};
 use width::{ConvertKind, ReduceKind, WidenKind};
@@ -132,6 +132,33 @@ enum NeonOp {
     /// over binary32 lanes, rounded once. `MulAdd` / `MulSub` read the
     /// destination as an accumulator.
     FusedStep(FusedStep),
+    /// `cnt` / `clz` / `cls` / `rbit` — a function of a lane's
+    /// individual bits rather than of its value.
+    BitwiseUnary(BitwiseUnary),
+    /// A lane-wise fold of two lanes at the same index, for the members
+    /// whose lane operation the lane-wise [`NeonOp::Packed`] family
+    /// cannot spell — today the four floating-point selects, whose ARM
+    /// semantics differ from the Intel ones [`PackedOp::Fp`] carries.
+    LaneCombine(PairOp),
+    /// `addp` / `smaxp` / `faddp` / … — the same fold applied to
+    /// *adjacent* lanes of the concatenated sources rather than to the
+    /// lanes at one index.
+    Pairwise(PairOp),
+    /// `sabd` / `uabd` / `saba` / `uaba` / `fabd` — the magnitude of the
+    /// lane difference, optionally accumulated onto the destination.
+    AbsoluteDifference(AbsDiffKind),
+    /// `saddlp` / `uaddlp` / `sadalp` / `uadalp` — adjacent source lanes
+    /// summed into a destination element twice their width, optionally
+    /// accumulated onto the destination's prior value.
+    PairwiseLong { signed: bool, accumulate: bool },
+    /// `addhn` / `subhn` and their rounding forms — the high half of a
+    /// double-width sum or difference. `upper` is the `2` suffix, which
+    /// writes the destination's top half.
+    HighNarrow {
+        subtract: bool,
+        rounding: bool,
+        upper: bool,
+    },
     /// `frecpe` / `frsqrte` — the reciprocal and reciprocal-square-root
     /// estimates, whose result is a free value.
     ///
@@ -179,7 +206,14 @@ impl NeonShape {
                 kind: WidenKind::Narrow,
                 upper: true,
                 ..
-            } => true,
+            }
+            | NeonOp::AbsoluteDifference(AbsDiffKind::Integer {
+                accumulate: true, ..
+            })
+            | NeonOp::PairwiseLong {
+                accumulate: true, ..
+            }
+            | NeonOp::HighNarrow { upper: true, .. } => true,
             NeonOp::ByElement { kind, .. } => kind.combines(),
             NeonOp::FusedStep(step) => step.reads_accumulator(),
             // `tbx` preserves the destination byte for an out-of-range
@@ -206,6 +240,12 @@ impl NeonShape {
 pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
     let mnemonic = insn.mnemonic.trim().to_ascii_lowercase();
     arith::packed_shape(insn, &mnemonic)
+        .or_else(|| arith::bitwise_unary_shape(insn, &mnemonic))
+        .or_else(|| arith::float_min_max_shape(insn, &mnemonic))
+        .or_else(|| arith::pairwise_shape(insn, &mnemonic))
+        .or_else(|| arith::absolute_difference_shape(insn, &mnemonic))
+        .or_else(|| width::pairwise_long_shape(insn, &mnemonic))
+        .or_else(|| width::high_narrow_shape(insn, &mnemonic))
         .or_else(|| permute::immediate_shape(insn, &mnemonic))
         .or_else(|| permute::duplicate_shape(insn, &mnemonic))
         .or_else(|| permute::extract_shape(insn, &mnemonic))

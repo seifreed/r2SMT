@@ -177,6 +177,100 @@ pub(super) fn widen_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShap
     })
 }
 
+// ===================== long pairwise addition =====================
+
+/// `saddlp` / `uaddlp` and the accumulating `sadalp` / `uadalp`.
+///
+/// Adjacent source lanes are extended to twice their width and summed
+/// there, so the destination holds half as many lanes of twice the size.
+/// Extending first is the whole point: the same sum at the source width
+/// would wrap exactly where the instruction exists not to.
+pub(super) fn pairwise_long_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (signed, accumulate) = match mnemonic {
+        "saddlp" => (true, false),
+        "uaddlp" => (false, false),
+        "sadalp" => (true, true),
+        "uadalp" => (false, true),
+        _ => return None,
+    };
+    if insn.operands.len() != 2 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    let source = operand_arrangement(insn.operands.get(1)?)?;
+    if source.lane_bits.checked_mul(2)? != destination.lane_bits {
+        return None;
+    }
+    if source.lanes != destination.lanes.checked_mul(2)? {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::PairwiseLong { signed, accumulate },
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+// ===================== high-half narrowing =====================
+
+/// `addhn` / `subhn` and their rounding forms `raddhn` / `rsubhn`.
+///
+/// Both sources are double-width and the destination keeps only the
+/// *high* half of each result, which is what makes the family a
+/// narrowing one without any shift being spelled.
+pub(super) fn high_narrow_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (base, upper) = peel_upper(mnemonic);
+    let (subtract, rounding) = match base {
+        "addhn" => (false, false),
+        "raddhn" => (false, true),
+        "subhn" => (true, false),
+        "rsubhn" => (true, true),
+        _ => return None,
+    };
+    if insn.operands.len() != 3 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    // The architecture encodes `8H`/`4S`/`2D` sources, so the narrow
+    // element is one of three widths and never a 64-bit one.
+    if !matches!(destination.lane_bits, 8 | 16 | 32) {
+        return None;
+    }
+    let source_bits = destination.lane_bits.checked_mul(2)?;
+    // A `2` form writes the destination's upper half, so the destination
+    // holds twice the lanes the instruction produces.
+    let written = if upper {
+        destination.lanes / 2
+    } else {
+        destination.lanes
+    };
+    if written == 0 {
+        return None;
+    }
+    if upper && !spans_full_register(destination) {
+        return None;
+    }
+    for operand in insn.operands.iter().skip(1) {
+        let arrangement = operand_arrangement(operand)?;
+        if arrangement.lane_bits != source_bits || arrangement.lanes != written {
+            return None;
+        }
+    }
+    Some(NeonShape {
+        op: NeonOp::HighNarrow {
+            subtract,
+            rounding,
+            upper,
+        },
+        lane_bits: destination.lane_bits,
+        lanes: written,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
 // ===================== lane-wise conversions =====================
 
 /// The lane-wise conversions.
