@@ -597,3 +597,169 @@ fn vaddhn_declines_a_signed_element() {
     // architecture spells this family `I` alone.
     assert!(declines("vaddhn.s16", &NARROW));
 }
+
+// ---------------------------------------------------------------
+// `vfma` / `vfms` / `vrecps` / `vrsqrts` — one rounding, not two
+// ---------------------------------------------------------------
+
+/// The binary32 pair whose exact product rounds to `1.0` while sitting
+/// strictly above it: `(1 + 2^-23) * (1 - 2^-24)` is
+/// `1 + 2^-24 - 2^-47`.
+///
+/// That gap is what separates a fused step from a multiply followed by a
+/// combine. Round the product first and the residue is gone; keep it and
+/// it survives into the result. Every teeth test below is built on this
+/// pair.
+const NEAR_ONE_ABOVE: u32 = 0x3F80_0001;
+const NEAR_ONE_BELOW: u32 = 0x3F7F_FFFF;
+
+const F32_ZERO: u32 = 0x0000_0000;
+const F32_ONE: u32 = 0x3F80_0000;
+const F32_MINUS_ONE: u32 = 0xBF80_0000;
+const F32_ONE_POINT_FIVE: u32 = 0x3FC0_0000;
+const F32_TWO: u32 = 0x4000_0000;
+const F32_HALF: u32 = 0x3F00_0000;
+const F32_FOUR: u32 = 0x4080_0000;
+const F32_INFINITY: u32 = 0x7F80_0000;
+
+#[test]
+fn vfma_rounds_the_product_and_the_accumulate_together() {
+    // `-1 + (1 + 2^-24 - 2^-47)` is `2^-24 - 2^-47`, which binary32
+    // holds exactly. Rounding the product first makes it `1.0`, and the
+    // answer becomes `0.0` — a definite wrong number, and the whole
+    // reason `vfma` is not `vmla`.
+    assert_computes(
+        "vfma.f32",
+        &QUADS,
+        &[
+            ("v0", splat_word(F32_MINUS_ONE)),
+            ("v1", splat_word(NEAR_ONE_ABOVE)),
+            ("v2", splat_word(NEAR_ONE_BELOW)),
+        ],
+        splat_word(0x337F_FFFE),
+    );
+}
+
+#[test]
+fn vfms_subtracts_the_unrounded_product() {
+    // The same residue with the opposite sign, which is also the teeth
+    // for `vfma` against `vfms`: a lowering that added where it should
+    // subtract passes the test above and fails here.
+    assert_computes(
+        "vfms.f32",
+        &QUADS,
+        &[
+            ("v0", splat_word(F32_ONE)),
+            ("v1", splat_word(NEAR_ONE_ABOVE)),
+            ("v2", splat_word(NEAR_ONE_BELOW)),
+        ],
+        splat_word(0xB37F_FFFE),
+    );
+}
+
+#[test]
+fn vfma_covers_every_lane_rather_than_one() {
+    // The accumulator is `0.0` in all four lanes and the product is
+    // `1.0`, so a lowering computing only the low lane leaves three
+    // zeros behind.
+    assert_computes(
+        "vfma.f32",
+        &QUADS,
+        &[
+            ("v0", splat_word(F32_ZERO)),
+            ("v1", splat_word(F32_TWO)),
+            ("v2", splat_word(F32_HALF)),
+        ],
+        splat_word(F32_ONE),
+    );
+}
+
+#[test]
+fn vrecps_computes_two_minus_the_unrounded_product() {
+    // `2 - (1 + 2^-24 - 2^-47)` is `1 - 2^-24 + 2^-47`, which rounds to
+    // the representable `1 - 2^-24`. Round the product first and the
+    // answer is `1.0` instead.
+    assert_computes(
+        "vrecps.f32",
+        &QUADS,
+        &[
+            ("v0", splat_word(0xdead_beef)),
+            ("v1", splat_word(NEAR_ONE_ABOVE)),
+            ("v2", splat_word(NEAR_ONE_BELOW)),
+        ],
+        splat_word(0x3F7F_FFFF),
+    );
+}
+
+#[test]
+fn vrsqrts_halves_three_minus_the_product() {
+    // The teeth for `vrecps` against `vrsqrts`: same operands, and
+    // `(3 - 2) / 2` is `0.5` where `2 - 2` is `0.0`.
+    assert_computes(
+        "vrsqrts.f32",
+        &QUADS,
+        &[
+            ("v0", splat_word(0xdead_beef)),
+            ("v1", splat_word(F32_FOUR)),
+            ("v2", splat_word(F32_HALF)),
+        ],
+        splat_word(F32_HALF),
+    );
+}
+
+#[test]
+fn vrecps_gives_two_for_zero_times_infinity() {
+    // The guarded special case: the arithmetic alone gives a NaN, and
+    // the architecture defines `2.0`. It is checked on the raw bit
+    // patterns because the IR has no is-infinite or is-zero predicate.
+    assert_computes(
+        "vrecps.f32",
+        &QUADS,
+        &[
+            ("v0", splat_word(0xdead_beef)),
+            ("v1", splat_word(F32_INFINITY)),
+            ("v2", splat_word(F32_ZERO)),
+        ],
+        splat_word(F32_TWO),
+    );
+}
+
+#[test]
+fn vrsqrts_gives_one_and_a_half_for_zero_times_infinity() {
+    // The same case with the other constant — `1.5`, not `2.0`.
+    assert_computes(
+        "vrsqrts.f32",
+        &QUADS,
+        &[
+            ("v0", splat_word(0xdead_beef)),
+            ("v1", splat_word(F32_ZERO)),
+            ("v2", splat_word(F32_INFINITY)),
+        ],
+        splat_word(F32_ONE_POINT_FIVE),
+    );
+}
+
+#[test]
+fn vrecps_covers_every_lane_rather_than_one() {
+    // Poisoned destination, and `vrecps` never reads it — so every one
+    // of the four lanes has to change.
+    assert_computes(
+        "vrecps.f32",
+        &QUADS,
+        &[
+            ("v0", splat_word(0xdead_beef)),
+            ("v1", splat_word(F32_TWO)),
+            ("v2", splat_word(F32_HALF)),
+        ],
+        splat_word(F32_ONE),
+    );
+}
+
+#[test]
+fn vfma_declines_a_binary64_lane() {
+    // The lowering is exact because binary64 covers `2 * 24 + 2` bits of
+    // a binary32 product. Nothing covers a binary64 one, so `.f64`
+    // declines — and soundly, since no scalar VFP handler spells `vfma`
+    // either.
+    assert!(declines("vfma.f64", &["q0", "q1", "q2"]));
+}

@@ -21,7 +21,7 @@ use super::{BITS_PER_BYTE, NeonOp, NeonShape};
 use crate::lift::BinOp;
 use crate::lift::aarch64::neon::lower::{convert_lane, high_narrow_lane};
 use crate::lift::aarch64::neon::width::ConvertKind;
-use crate::lift::{FpArithOp, fp_lane_result};
+use crate::lift::{FpArithOp, FusedStep, fp_lane_result, fused_multiply_lane};
 
 /// Widen `value` to `target` bits, replicating the sign bit or not.
 pub(super) fn extend(value: Expr, target: u16, signed: bool) -> Expr {
@@ -130,6 +130,7 @@ impl LiftCtx {
             NeonOp::DoublingMultiplyLong { accumulate } => {
                 self.aarch32_doubling_multiply_long_lanes(insn, shape, accumulate)
             }
+            NeonOp::FusedStep(step) => self.aarch32_fused_step_lanes(insn, shape, step),
             // Handled by the caller; it writes two destinations and so
             // does not fit the one-value contract here.
             NeonOp::PermutePair(_) => None,
@@ -317,6 +318,48 @@ impl LiftCtx {
                 }
             };
             lanes.push(Expr::extract(shifted, shape.lane_bits.checked_sub(1)?, 0));
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// `vfma` / `vfms` / `vrecps` / `vrsqrts` — each binary32 lane
+    /// computed as one fused multiply step.
+    ///
+    /// `vfma` / `vfms` read the destination lane as the accumulator; the
+    /// reciprocal steps read only their two sources, which is what
+    /// [`FusedStep::reads_accumulator`] answers. The lane itself is the
+    /// arch-neutral [`fused_multiply_lane`], including the guarded
+    /// `inf * 0` special case that makes `vrecps` give `2.0` and
+    /// `vrsqrts` `1.5` where the arithmetic alone would give a NaN.
+    fn aarch32_fused_step_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        step: FusedStep,
+    ) -> Option<Expr> {
+        let view = shape.view_bits()?;
+        let first = self.simd_operand_value(&insn.operands.get(1)?.clone(), view)?;
+        let second = self.simd_operand_value(&insn.operands.get(2)?.clone(), view)?;
+        let accumulator = if step.reads_accumulator() {
+            Some(self.simd_operand_value(&insn.operands.first()?.clone(), view)?)
+        } else {
+            None
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let a = Self::extract_lane(first.clone(), shape.lane_bits, index)?;
+            let b = Self::extract_lane(second.clone(), shape.lane_bits, index)?;
+            let previous = match accumulator.as_ref() {
+                Some(value) => Some(Self::extract_lane(value.clone(), shape.lane_bits, index)?),
+                None => None,
+            };
+            lanes.push(fused_multiply_lane(
+                step,
+                &a,
+                &b,
+                previous,
+                shape.lane_bits,
+            )?);
         }
         Self::concat_lanes(lanes)
     }

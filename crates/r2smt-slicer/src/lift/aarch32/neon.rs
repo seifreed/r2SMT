@@ -25,6 +25,7 @@ use crate::registers::{has_vector_arrangement, is_simd_parent, register_layout};
 mod accumulate;
 mod element;
 mod estimate;
+mod fused;
 mod lanewise;
 pub(super) mod lower;
 mod permute;
@@ -142,6 +143,14 @@ pub(super) enum NeonOp {
     /// `Some(subtract)` for the forms that read the destination as an
     /// accumulator and `None` for the plain multiply.
     DoublingMultiplyLong { accumulate: Option<bool> },
+    /// `vfma` / `vfms` / `vrecps` / `vrsqrts` — a multiply and the
+    /// combine after it, rounded **once** over the whole expression.
+    ///
+    /// Shares [`crate::lift::FusedStep`] and the neutral
+    /// [`crate::lift::fused_multiply_lane`] with `AArch64`: the ISAs
+    /// disagree about how to spell the lane geometry and about nothing
+    /// else here.
+    FusedStep(crate::lift::FusedStep),
 }
 
 /// A resolved `AArch32` NEON instruction: what to compute, and at what
@@ -197,6 +206,7 @@ pub(super) fn resolve(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| width::narrow_shape(insn, &mnemonic))
         .or_else(|| width::saturating_narrow_shape(insn, &mnemonic))
         .or_else(|| width::high_narrow_shape(insn, &mnemonic))
+        .or_else(|| fused::fused_step_shape(insn, &mnemonic))
         .or_else(|| saturate::saturating_unary_shape(insn, &mnemonic))
         .or_else(|| saturate::doubling_multiply_high_shape(insn, &mnemonic))
         .or_else(|| saturate::doubling_multiply_long_shape(insn, &mnemonic))
