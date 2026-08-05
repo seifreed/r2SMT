@@ -12,7 +12,7 @@ use r2smt_ir::program::{Instruction, Operand};
 use super::super::super::{
     FpArithOp, FusedStep, LiftCtx, fp_lane_result, fp_propagating_max_min, fused_multiply_lane,
 };
-use super::arith::{SaturateTo, SaturatingKind, ShiftKind};
+use super::arith::{AbsDiffKind, BitwiseUnary, PairOp, SaturateTo, SaturatingKind, ShiftKind};
 use super::geometry::{BITS_PER_BYTE, dot_product_element, operand_arrangement};
 use super::multiply::{AccumulateKind, AccumulateSources, ByElementKind, DOT_PRODUCT_TERMS};
 use super::permute::{PermuteKind, PermuteSource, SelectRole, table_registers};
@@ -99,6 +99,18 @@ impl LiftCtx {
                 self.polynomial_multiply_lanes(insn, shape, upper)
             }
             NeonOp::FusedStep(step) => self.fused_step_lanes(insn, shape, step),
+            NeonOp::BitwiseUnary(kind) => self.bitwise_unary_lanes(insn, shape, kind),
+            NeonOp::LaneCombine(op) => self.lane_combine_lanes(insn, shape, op),
+            NeonOp::Pairwise(op) => self.pairwise_lanes(insn, shape, op),
+            NeonOp::AbsoluteDifference(kind) => self.absolute_difference_lanes(insn, shape, kind),
+            NeonOp::PairwiseLong { signed, accumulate } => {
+                self.pairwise_long_lanes(insn, shape, signed, accumulate)
+            }
+            NeonOp::HighNarrow {
+                subtract,
+                rounding,
+                upper,
+            } => self.high_narrow_lanes(insn, shape, subtract, rounding, upper),
             NeonOp::Estimate => self.estimate_value(insn, shape),
         }
     }
@@ -908,6 +920,178 @@ impl LiftCtx {
         })
     }
 
+    /// `cnt` / `clz` / `cls` / `rbit` — one lane at a time, since every
+    /// member is a function of the lane's own bits alone.
+    fn bitwise_unary_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        kind: BitwiseUnary,
+    ) -> Option<Expr> {
+        let source = self.widen_source(insn, 1)?;
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let element = LiftCtx::extract_lane(source.clone(), shape.lane_bits, index)?;
+            lanes.push(bitwise_unary_lane(kind, &element, shape.lane_bits)?);
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// The lane-wise selects: each destination lane folds the two source
+    /// lanes at its own index.
+    fn lane_combine_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        op: PairOp,
+    ) -> Option<Expr> {
+        let first = self.widen_source(insn, 1)?;
+        let second = self.widen_source(insn, 2)?;
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let a = LiftCtx::extract_lane(first.clone(), shape.lane_bits, index)?;
+            let b = LiftCtx::extract_lane(second.clone(), shape.lane_bits, index)?;
+            lanes.push(pair_lane(op, a, b, shape.lane_bits)?);
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// The pairwise family: the destination's low half folds the first
+    /// source's neighbouring lanes and its high half the second's.
+    ///
+    /// That split is the whole shape of the family — reading both
+    /// sources at the destination lane's own index, as the lane-wise
+    /// fold next door does, would pair lanes the instruction never
+    /// brings together.
+    fn pairwise_lanes(&mut self, insn: &Instruction, shape: NeonShape, op: PairOp) -> Option<Expr> {
+        let first = self.widen_source(insn, 1)?;
+        let second = self.widen_source(insn, 2)?;
+        let half = shape.lanes / 2;
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let (source, pair) = if index < half {
+                (&first, index)
+            } else {
+                (&second, index.checked_sub(half)?)
+            };
+            let low = pair.checked_mul(2)?;
+            let a = LiftCtx::extract_lane(source.clone(), shape.lane_bits, low)?;
+            let b = LiftCtx::extract_lane(source.clone(), shape.lane_bits, low.checked_add(1)?)?;
+            lanes.push(pair_lane(op, a, b, shape.lane_bits)?);
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// `sabd` / `uabd` / `saba` / `uaba` / `fabd`.
+    fn absolute_difference_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        kind: AbsDiffKind,
+    ) -> Option<Expr> {
+        let first = self.widen_source(insn, 1)?;
+        let second = self.widen_source(insn, 2)?;
+        let accumulator = match kind {
+            AbsDiffKind::Integer {
+                accumulate: true, ..
+            } => Some(self.destination_value(insn, shape)?),
+            _ => None,
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let a = LiftCtx::extract_lane(first.clone(), shape.lane_bits, index)?;
+            let b = LiftCtx::extract_lane(second.clone(), shape.lane_bits, index)?;
+            let difference = absolute_difference_lane(kind, a, b, shape.lane_bits)?;
+            lanes.push(match accumulator.as_ref() {
+                Some(previous) => Expr::add(
+                    LiftCtx::extract_lane(previous.clone(), shape.lane_bits, index)?,
+                    difference,
+                ),
+                None => difference,
+            });
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// `saddlp` / `uaddlp` / `sadalp` / `uadalp` — adjacent source lanes
+    /// extended to the destination's element width and summed there.
+    ///
+    /// The extension happens before the addition, so the sum is exact:
+    /// two `n`-bit values always fit `n + 1` bits, and the destination
+    /// holds `2n`.
+    fn pairwise_long_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        signed: bool,
+        accumulate: bool,
+    ) -> Option<Expr> {
+        let narrow = shape.lane_bits / 2;
+        let source = self.widen_source(insn, 1)?;
+        let accumulator = if accumulate {
+            Some(self.destination_value(insn, shape)?)
+        } else {
+            None
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let low = index.checked_mul(2)?;
+            let a = LiftCtx::extract_lane(source.clone(), narrow, low)?;
+            let b = LiftCtx::extract_lane(source.clone(), narrow, low.checked_add(1)?)?;
+            let sum = Expr::add(
+                extend(a, shape.lane_bits, signed),
+                extend(b, shape.lane_bits, signed),
+            );
+            lanes.push(match accumulator.as_ref() {
+                Some(previous) => Expr::add(
+                    LiftCtx::extract_lane(previous.clone(), shape.lane_bits, index)?,
+                    sum,
+                ),
+                None => sum,
+            });
+        }
+        Self::concat_lanes(lanes)
+    }
+
+    /// `addhn` / `subhn` / `raddhn` / `rsubhn`.
+    fn high_narrow_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        subtract: bool,
+        rounding: bool,
+        upper: bool,
+    ) -> Option<Expr> {
+        let source_bits = shape.lane_bits.checked_mul(2)?;
+        let first = self.widen_source(insn, 1)?;
+        let second = self.widen_source(insn, 2)?;
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let a = LiftCtx::extract_lane(first.clone(), source_bits, index)?;
+            let b = LiftCtx::extract_lane(second.clone(), source_bits, index)?;
+            lanes.push(high_narrow_lane(subtract, rounding, a, b, shape.lane_bits)?);
+        }
+        let narrowed = Self::concat_lanes(lanes)?;
+        if !upper {
+            return Some(narrowed);
+        }
+        // A `2` form writes the destination's upper half and preserves
+        // the lower one.
+        let view = shape.lane_bits.checked_mul(shape.lanes)?;
+        let destination = self.simd_operand_value(&insn.operands.first()?.clone(), view * 2)?;
+        Some(Expr::concat(
+            narrowed,
+            Expr::extract(destination, view - 1, 0),
+        ))
+    }
+
+    /// The destination register read as an input, at the view the shape
+    /// describes — what an accumulating form's prior value is.
+    fn destination_value(&mut self, insn: &Instruction, shape: NeonShape) -> Option<Expr> {
+        let view = shape.lane_bits.checked_mul(shape.lanes)?;
+        self.simd_operand_value(&insn.operands.first()?.clone(), view)
+    }
+
     fn push_neon_unsupported(&mut self, insn: &Instruction) {
         self.stmts.push(r2smt_ir::stmt::IrStmt::Unsupported {
             mnemonic: insn.mnemonic.clone(),
@@ -937,20 +1121,184 @@ fn reduce_step(kind: ReduceKind, a: Expr, b: Expr, lane_bits: u16) -> Option<Exp
         ReduceKind::Float { max, number_wins } => {
             return fp_propagating_max_min(a, b, lane_bits, max, number_wins);
         }
-        ReduceKind::MinMax { signed, max } => {
+        ReduceKind::MinMax { signed, max } => integer_min_max(a, b, signed, max),
+    })
+}
+
+/// The integer ordered select: the larger of the two when `max`, the
+/// smaller otherwise.
+///
+/// Written as one comparison with the operands swapped rather than as
+/// four predicates, so the two directions cannot drift apart.
+fn integer_min_max(a: Expr, b: Expr, signed: bool, max: bool) -> Expr {
+    let cond = if signed {
+        Expr::slt(a.clone(), b.clone())
+    } else {
+        Expr::ult(a.clone(), b.clone())
+    };
+    let (taken, other) = if max { (b, a) } else { (a, b) };
+    Expr::Ite {
+        cond: Box::new(cond),
+        then_expr: Box::new(taken),
+        else_expr: Box::new(other),
+    }
+}
+
+/// One destination lane of a two-lane fold, shared by the lane-wise
+/// selects and the pairwise family.
+///
+/// The float selects go through [`fp_propagating_max_min`] and never
+/// through [`fp_lane_result`]'s `Max` / `Min`: the latter is Intel's
+/// `MAXPS`, which returns its second operand on unordered where ARM
+/// propagates the NaN, and takes the second operand on a signed-zero tie
+/// where ARM combines the two signs. Both are wrong *values*.
+fn pair_lane(op: PairOp, a: Expr, b: Expr, lane_bits: u16) -> Option<Expr> {
+    match op {
+        PairOp::Add => Some(Expr::add(a, b)),
+        PairOp::FloatAdd => fp_lane_result(FpArithOp::Add, a, b, lane_bits),
+        PairOp::MinMax { signed, max } => Some(integer_min_max(a, b, signed, max)),
+        PairOp::FloatMinMax { max, number_wins } => {
+            fp_propagating_max_min(a, b, lane_bits, max, number_wins)
+        }
+    }
+}
+
+/// One destination lane of an absolute difference.
+///
+/// The integer forms subtract in whichever direction the comparison
+/// chooses, at the element's own width and with no widening. That is
+/// exact rather than lucky: the magnitude of the difference of two
+/// `n`-bit values always fits `n` unsigned bits, and the wrapping
+/// subtraction of the smaller from the larger *is* that magnitude —
+/// `sabd` of `-128` and `127` gives `0xff`, which is the 255 ARM
+/// defines and not an overflow.
+///
+/// `fabd` is `FPAbs(FPSub(a, b))`, and clearing the sign bit of the
+/// difference is exact at every value, NaNs and infinities included.
+fn absolute_difference_lane(kind: AbsDiffKind, a: Expr, b: Expr, lane_bits: u16) -> Option<Expr> {
+    match kind {
+        AbsDiffKind::Integer { signed, .. } => {
             let cond = if signed {
                 Expr::slt(a.clone(), b.clone())
             } else {
                 Expr::ult(a.clone(), b.clone())
             };
-            let (taken, other) = if max { (b, a) } else { (a, b) };
-            Expr::Ite {
+            Some(Expr::Ite {
                 cond: Box::new(cond),
-                then_expr: Box::new(taken),
-                else_expr: Box::new(other),
-            }
+                then_expr: Box::new(Expr::sub(b.clone(), a.clone())),
+                else_expr: Box::new(Expr::sub(a, b)),
+            })
         }
-    })
+        AbsDiffKind::Float => {
+            let difference = fp_lane_result(FpArithOp::Sub, a, b, lane_bits)?;
+            Some(Expr::bv_and(difference, magnitude_mask(lane_bits)?))
+        }
+    }
+}
+
+/// A `bits`-wide mask with every bit but the sign one set.
+fn magnitude_mask(bits: u16) -> Option<Expr> {
+    Some(Expr::konst(unsigned_max(bits.checked_sub(1)?)?, bits))
+}
+
+/// One destination lane of `addhn` / `subhn` and their rounding forms:
+/// the high half of the double-width sum or difference.
+///
+/// The arithmetic wraps at the source width and that loses nothing. ARM
+/// defines the result on the unbounded integer, but the window kept
+/// (`sum<2n-1:n>`) sits entirely inside the low `2n` bits, which
+/// wrapping preserves exactly — including for the rounding forms, whose
+/// added half ulp can carry out of the top without touching a bit the
+/// window keeps. This is where the family differs from the saturating
+/// narrows next door: there the same carry reaches the *sign* bit the
+/// clamp compares against, turning a saturation at `INT_MAX` into one at
+/// `INT_MIN`, and the lowering has to compute a bit wider to avoid it.
+fn high_narrow_lane(
+    subtract: bool,
+    rounding: bool,
+    a: Expr,
+    b: Expr,
+    lane_bits: u16,
+) -> Option<Expr> {
+    let source_bits = lane_bits.checked_mul(2)?;
+    let mut value = if subtract {
+        Expr::sub(a, b)
+    } else {
+        Expr::add(a, b)
+    };
+    if rounding {
+        // Half an ulp of the discarded low half.
+        let half = 1u128.checked_shl(u32::from(lane_bits.checked_sub(1)?))?;
+        value = Expr::add(value, Expr::konst(half, source_bits));
+    }
+    Some(Expr::extract(value, source_bits - 1, lane_bits))
+}
+
+/// One destination lane of `cnt` / `clz` / `cls` / `rbit`.
+///
+/// None of the four has an `Expr` node, so each is built from
+/// single-bit slices: a running sum for the population count, an `Ite`
+/// ladder for the leading-zero counts, and a reversed concatenation for
+/// the bit reversal.
+fn bitwise_unary_lane(kind: BitwiseUnary, value: &Expr, lane_bits: u16) -> Option<Expr> {
+    match kind {
+        BitwiseUnary::PopulationCount => {
+            let mut count = Expr::konst(0, lane_bits);
+            for bit in 0..lane_bits {
+                count = Expr::add(
+                    count,
+                    Expr::zero_ext(Expr::extract(value.clone(), bit, bit), lane_bits),
+                );
+            }
+            Some(count)
+        }
+        BitwiseUnary::LeadingZeros => Some(leading_zeros(value, lane_bits)),
+        BitwiseUnary::LeadingSignBits => {
+            // The bits that repeat their neighbour are the zeros of the
+            // lane exclusive-ORed with itself shifted one place, so the
+            // leading sign bits are the leading zeros of that fold. It
+            // is one bit narrower, which is also why `cls` can never
+            // reach the element width: the sign bit itself is not
+            // counted.
+            let width = lane_bits.checked_sub(1)?;
+            let folded = Expr::bv_xor(
+                Expr::extract(value.clone(), lane_bits - 1, 1),
+                Expr::extract(value.clone(), width - 1, 0),
+            );
+            Some(Expr::zero_ext(leading_zeros(&folded, width), lane_bits))
+        }
+        BitwiseUnary::ReverseBits => {
+            let mut bits = Vec::with_capacity(usize::from(lane_bits));
+            // `concat_lanes` puts the first element at the low end, so
+            // pushing from the top down is the reversal.
+            for bit in (0..lane_bits).rev() {
+                bits.push(Expr::extract(value.clone(), bit, bit));
+            }
+            LiftCtx::concat_lanes(bits)
+        }
+    }
+}
+
+/// The number of leading zero bits of a `bits`-wide value, as a
+/// `bits`-wide result.
+///
+/// The ladder is built from the least significant bit upwards, so the
+/// layer testing the *most* significant one ends up outermost and its
+/// answer wins — which is what makes the count that of the highest set
+/// bit rather than of the lowest.
+fn leading_zeros(value: &Expr, bits: u16) -> Expr {
+    let mut count = Expr::konst(u128::from(bits), bits);
+    for bit in 0..bits {
+        count = Expr::Ite {
+            cond: Box::new(Expr::eq(
+                Expr::extract(value.clone(), bit, bit),
+                Expr::konst(1, 1),
+            )),
+            then_expr: Box::new(Expr::konst(u128::from(bits - 1 - bit), bits)),
+            else_expr: Box::new(count),
+        };
+    }
+    count
 }
 
 /// Extend `value` from `from` bits to `to` bits.

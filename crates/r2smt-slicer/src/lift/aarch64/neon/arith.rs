@@ -17,8 +17,18 @@ use crate::lift::simd::CompareKind;
 use crate::registers::Arrangement;
 
 use super::super::super::{BinOp, FpArithOp, PackedIntOp, PackedOp, parse_immediate};
-use super::geometry::{operand_arrangement, peel_upper, spans_full_register};
+use super::geometry::{BITS_PER_BYTE, operand_arrangement, peel_upper, spans_full_register};
 use super::{NeonOp, NeonShape};
+
+/// Element widths that name an IEEE interchange format.
+///
+/// Checked wherever a resolver would otherwise accept an arrangement its
+/// mnemonic does not encode: `.16b` is a perfectly good arrangement and
+/// a perfectly bad float sort, and reading a byte lane as a float is a
+/// wrong value rather than a decline.
+const fn is_float_lane(lane_bits: u16) -> bool {
+    matches!(lane_bits, 16 | 32 | 64)
+}
 
 // ===================== lane-wise arithmetic and logic =====================
 
@@ -35,6 +45,28 @@ fn packed_op(mnemonic: &str) -> Option<PackedOp> {
         "bic" => PackedOp::Int(PackedIntOp::BitClear),
         "mvn" | "not" => PackedOp::Int(PackedIntOp::Not),
         "mov" => PackedOp::Int(PackedIntOp::Copy),
+        "abs" => PackedOp::Int(PackedIntOp::Abs),
+        "neg" => PackedOp::Int(PackedIntOp::Neg),
+        // Both are sign-bit manipulations, exact at every value
+        // including the NaNs, so neither needs a float sort.
+        "fabs" => PackedOp::Int(PackedIntOp::SignBit { negate: false }),
+        "fneg" => PackedOp::Int(PackedIntOp::SignBit { negate: true }),
+        "smax" => PackedOp::Int(PackedIntOp::MinMax {
+            max: true,
+            signed: true,
+        }),
+        "smin" => PackedOp::Int(PackedIntOp::MinMax {
+            max: false,
+            signed: true,
+        }),
+        "umax" => PackedOp::Int(PackedIntOp::MinMax {
+            max: true,
+            signed: false,
+        }),
+        "umin" => PackedOp::Int(PackedIntOp::MinMax {
+            max: false,
+            signed: false,
+        }),
         "fadd" => PackedOp::Fp(FpArithOp::Add),
         "fsub" => PackedOp::Fp(FpArithOp::Sub),
         "fmul" => PackedOp::Fp(FpArithOp::Mul),
@@ -65,7 +97,15 @@ pub(super) fn packed_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonSha
     }
     let arrangement = shared?;
     // A floating-point lane has to name a float sort; `.16b` does not.
-    if matches!(op, PackedOp::Fp(_)) && !matches!(arrangement.lane_bits, 16 | 32 | 64) {
+    // `fabs` / `fneg` are checked here too even though their lowering is
+    // a bit mask that would run happily on a byte lane: the architecture
+    // encodes no such form, so accepting one would model an instruction
+    // that cannot occur.
+    let names_float_lane = matches!(
+        op,
+        PackedOp::Fp(_) | PackedOp::Int(PackedIntOp::SignBit { .. })
+    );
+    if names_float_lane && !is_float_lane(arrangement.lane_bits) {
         return None;
     }
     Some(NeonShape {
@@ -75,6 +115,221 @@ pub(super) fn packed_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonSha
         dest_index: 0,
         source_index: 0,
     })
+}
+
+// ===================== per-lane bit functions =====================
+
+/// The unary operations whose result depends on a lane's individual
+/// *bits* rather than on the value they denote.
+///
+/// Kept apart from the lane-wise family next door for a reason that is
+/// not stylistic: the IR has no population-count, no count-leading-zeros
+/// and no bit-reversal node, so each of these is a construction over
+/// single-bit slices rather than one `Expr` operator.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum BitwiseUnary {
+    /// `cnt` — the number of set bits in each byte.
+    PopulationCount,
+    /// `clz` — the leading zero bits of each element.
+    LeadingZeros,
+    /// `cls` — the bits below the sign bit that repeat it, the sign bit
+    /// itself excluded, so the count never reaches the element width.
+    LeadingSignBits,
+    /// `rbit` — each byte's bits in the opposite order.
+    ReverseBits,
+}
+
+/// The per-lane bit functions.
+pub(super) fn bitwise_unary_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let kind = match mnemonic {
+        "cnt" => BitwiseUnary::PopulationCount,
+        "clz" => BitwiseUnary::LeadingZeros,
+        "cls" => BitwiseUnary::LeadingSignBits,
+        "rbit" => BitwiseUnary::ReverseBits,
+        _ => return None,
+    };
+    if insn.operands.len() != 2 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    if operand_arrangement(insn.operands.get(1)?)? != destination {
+        return None;
+    }
+    // ARM ARM C7.2 — `cnt` and `rbit` encode the byte arrangements only,
+    // and the two leading-bit counts stop at a 32-bit element. A wider
+    // spelling is one the architecture does not produce.
+    let encodable = match kind {
+        BitwiseUnary::PopulationCount | BitwiseUnary::ReverseBits => {
+            destination.lane_bits == BITS_PER_BYTE
+        }
+        BitwiseUnary::LeadingZeros | BitwiseUnary::LeadingSignBits => {
+            matches!(destination.lane_bits, 8 | 16 | 32)
+        }
+    };
+    if !encodable {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::BitwiseUnary(kind),
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+// ===================== two-lane folds =====================
+
+/// A function of two lanes.
+///
+/// One vocabulary for two families, because the lane-wise selects and
+/// the pairwise family differ only in *which* two lanes each destination
+/// lane is handed: `fmaxp` is `fmax` over the two neighbours instead of
+/// over the two operands at the same index.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum PairOp {
+    /// `addp` — wrapping integer addition.
+    Add,
+    /// `faddp` — one IEEE lane sum.
+    FloatAdd,
+    /// `smax` / `umin` / `smaxp` / … — the integer ordered select.
+    MinMax { signed: bool, max: bool },
+    /// `fmax` / `fmin` / `fmaxp` / … — ARM's `FPMax` and `FPMin`, which
+    /// propagate a NaN and combine the signs of a zero tie, or, when
+    /// `number_wins`, `FPMaxNum` / `FPMinNum`, where a quiet NaN loses to
+    /// a number.
+    ///
+    /// Neither is Intel's `MAXPS`, which is what
+    /// [`super::super::super::fp_lane_result`]'s `Max` / `Min` spell and
+    /// which returns its *second operand* on unordered — an ordinary
+    /// number where ARM yields a NaN. That is a wrong value, not a wider
+    /// one, which is why these do not reuse [`FpArithOp`].
+    FloatMinMax { max: bool, number_wins: bool },
+}
+
+impl PairOp {
+    /// Whether the lanes have to name an IEEE interchange format.
+    const fn float(self) -> bool {
+        matches!(self, Self::FloatAdd | Self::FloatMinMax { .. })
+    }
+}
+
+/// The floating-point lane-wise selects.
+///
+/// Their integer twins (`smax` / `smin` / `umax` / `umin`) are members of
+/// the lane-wise family instead, since the packed vocabulary already
+/// spells an integer ordered select correctly. There is no such
+/// shortcut here: the packed float vocabulary spells Intel's ordering.
+pub(super) fn float_min_max_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let select = |max, number_wins| PairOp::FloatMinMax { max, number_wins };
+    let op = match mnemonic {
+        "fmax" => select(true, false),
+        "fmin" => select(false, false),
+        "fmaxnm" => select(true, true),
+        "fminnm" => select(false, true),
+        _ => return None,
+    };
+    let destination = uniform_shape(insn, 3)?;
+    if !is_float_lane(destination.lane_bits) {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::LaneCombine(op),
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+/// The pairwise family: each destination lane folds two *adjacent* lanes
+/// of `vn:vm` read as one vector, `vn` at the low end.
+///
+/// So the destination's low half comes from the first source and its
+/// high half from the second — which is why an odd lane count cannot
+/// occur and is rejected rather than silently halved.
+pub(super) fn pairwise_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let min_max = |signed, max| PairOp::MinMax { signed, max };
+    let float_select = |max, number_wins| PairOp::FloatMinMax { max, number_wins };
+    let op = match mnemonic {
+        "addp" => PairOp::Add,
+        "smaxp" => min_max(true, true),
+        "sminp" => min_max(true, false),
+        "umaxp" => min_max(false, true),
+        "uminp" => min_max(false, false),
+        "faddp" => PairOp::FloatAdd,
+        "fmaxp" => float_select(true, false),
+        "fminp" => float_select(false, false),
+        "fmaxnmp" => float_select(true, true),
+        "fminnmp" => float_select(false, true),
+        _ => return None,
+    };
+    let destination = uniform_shape(insn, 3)?;
+    if op.float() && !is_float_lane(destination.lane_bits) {
+        return None;
+    }
+    if destination.lanes < 2 || destination.lanes % 2 != 0 {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::Pairwise(op),
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+// ===================== absolute differences =====================
+
+/// The absolute-difference family.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum AbsDiffKind {
+    /// `sabd` / `uabd`, and the accumulating `saba` / `uaba`, whose
+    /// destination is an input.
+    Integer { signed: bool, accumulate: bool },
+    /// `fabd` — `FPAbs(FPSub(a, b))`. There is no accumulating float
+    /// spelling, which is why this variant carries no flag.
+    Float,
+}
+
+/// The absolute-difference family.
+pub(super) fn absolute_difference_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let integer = |signed, accumulate| AbsDiffKind::Integer { signed, accumulate };
+    let kind = match mnemonic {
+        "sabd" => integer(true, false),
+        "uabd" => integer(false, false),
+        "saba" => integer(true, true),
+        "uaba" => integer(false, true),
+        "fabd" => AbsDiffKind::Float,
+        _ => return None,
+    };
+    let destination = uniform_shape(insn, 3)?;
+    if matches!(kind, AbsDiffKind::Float) && !is_float_lane(destination.lane_bits) {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::AbsoluteDifference(kind),
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+/// The arrangement every operand of an `operands`-long instruction
+/// shares, or `None` when they differ or the count is wrong.
+fn uniform_shape(insn: &Instruction, operands: usize) -> Option<Arrangement> {
+    if insn.operands.len() != operands {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    for operand in insn.operands.iter().skip(1) {
+        if operand_arrangement(operand)? != destination {
+            return None;
+        }
+    }
+    Some(destination)
 }
 
 // ===================== same-width shifts =====================
