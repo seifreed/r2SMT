@@ -22,11 +22,13 @@ use r2smt_ir::program::{Instruction, Operand, OperandKind};
 
 use crate::registers::{has_vector_arrangement, is_simd_parent, register_layout};
 
+mod accumulate;
 mod element;
 mod estimate;
 mod lanewise;
 pub(super) mod lower;
 mod permute;
+mod select;
 pub(super) mod structured;
 mod table;
 mod width;
@@ -114,6 +116,20 @@ pub(super) enum NeonOp {
     /// estimates, whose result is a free value: the architecture fixes
     /// only an error bound, so there is no definite value to compute.
     Estimate,
+    /// `vbsl` / `vbit` / `vbif` — a bit-granular select over the whole
+    /// view, where the role carries which register supplies the mask.
+    BitwiseSelect(select::SelectRole),
+    /// `vsli` / `vsri` — the source element shifted by `shift` and
+    /// inserted over the destination, which keeps the bits the shift
+    /// vacated.
+    ShiftInsert { left: bool, shift: u16 },
+    /// `vabd` / `vaba` — the magnitude of the lane-wise difference,
+    /// added onto the destination when `accumulate` is set.
+    AbsoluteDifference { signed: bool, accumulate: bool },
+    /// `vpaddl` / `vpadal` — adjacent source elements summed into one
+    /// destination element twice as wide, added onto the destination
+    /// when `accumulate` is set.
+    PairwiseLong { signed: bool, accumulate: bool },
 }
 
 /// A resolved `AArch32` NEON instruction: what to compute, and at what
@@ -175,6 +191,10 @@ pub(super) fn resolve(insn: &Instruction) -> Option<NeonShape> {
         // standing — a wrong value rather than a decline.
         .or_else(|| width::convert_shape(insn, &mnemonic))
         .or_else(|| element::by_element_shape(insn, &mnemonic))
+        .or_else(|| accumulate::absolute_difference_shape(insn, &mnemonic))
+        .or_else(|| accumulate::pairwise_long_shape(insn, &mnemonic))
+        .or_else(|| select::bitwise_select_shape(insn, &mnemonic))
+        .or_else(|| select::shift_insert_shape(insn, &mnemonic))
         .or_else(|| table::table_lookup_shape(insn, &mnemonic))
         .or_else(|| lanewise::compare_shape(insn, &mnemonic))
         .or_else(|| lanewise::pairwise_shape(insn, &mnemonic))

@@ -24,7 +24,7 @@ use crate::lift::aarch64::neon::width::ConvertKind;
 use crate::lift::{FpArithOp, fp_lane_result};
 
 /// Widen `value` to `target` bits, replicating the sign bit or not.
-fn extend(value: Expr, target: u16, signed: bool) -> Expr {
+pub(super) fn extend(value: Expr, target: u16, signed: bool) -> Expr {
     if signed {
         Expr::sign_ext(value, target)
     } else {
@@ -108,6 +108,16 @@ impl LiftCtx {
             }
             NeonOp::CountBits { leading } => self.aarch32_count_lanes(insn, shape, leading),
             NeonOp::Estimate => self.aarch32_estimate_value(insn, shape),
+            NeonOp::BitwiseSelect(role) => self.aarch32_bitwise_select(insn, shape, role),
+            NeonOp::ShiftInsert { left, shift } => {
+                self.aarch32_shift_insert(insn, shape, left, shift)
+            }
+            NeonOp::AbsoluteDifference { signed, accumulate } => {
+                self.aarch32_absolute_difference_lanes(insn, shape, signed, accumulate)
+            }
+            NeonOp::PairwiseLong { signed, accumulate } => {
+                self.aarch32_pairwise_long_lanes(insn, shape, signed, accumulate)
+            }
             // Handled by the caller; it writes two destinations and so
             // does not fit the one-value contract here.
             NeonOp::PermutePair(_) => None,
