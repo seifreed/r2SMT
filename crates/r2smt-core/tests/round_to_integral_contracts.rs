@@ -360,11 +360,14 @@ fn vrintn_at_double_precision_reads_the_mnemonic_not_the_operand() {
 }
 
 #[test]
-fn aarch32_packed_vrint_declines_rather_than_rounding_lane_zero() {
-    // `vrinta.f32 q0, q1` is the NEON form of the same mnemonic and
-    // `neon_packed_op` does not claim the family, so nothing above the
-    // VFP arm separates the two. Lowering it there would round lane
-    // zero and leave three lanes standing — a wrong value.
+fn aarch32_packed_vrint_rounds_every_lane_rather_than_lane_zero() {
+    // `vrinta.f32 q0, q1` is the NEON form of the same mnemonic, and
+    // nothing but the operand's register class separates it from the VFP
+    // one. It used to decline here, on the strength of the scalar
+    // handler's register-class check alone; the NEON seam now resolves
+    // it ahead of that arm, so the requirement is that it lifts. What
+    // each lane computes is bound against hand-computed ARM values in
+    // `aarch32_round_packed_contracts.rs`.
     for operands in [["q0", "q1"], ["d0", "d2"]] {
         let insn = instruction(
             "vrinta.f32",
@@ -373,8 +376,8 @@ fn aarch32_packed_vrint_declines_rather_than_rounding_lane_zero() {
         assert!(
             lift_per_mnemonic(&insn, Arch::Arm)
                 .iter()
-                .any(|s| matches!(s, IrStmt::Unsupported { .. })),
-            "packed vrinta.f32 {operands:?} must decline"
+                .all(|s| !matches!(s, IrStmt::Unsupported { .. })),
+            "packed vrinta.f32 {operands:?} must lift"
         );
     }
 }

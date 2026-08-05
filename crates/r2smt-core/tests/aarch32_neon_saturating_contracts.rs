@@ -359,11 +359,13 @@ fn vqdmulh_declines_a_byte_element() {
 }
 
 #[test]
-fn vqdmulh_declines_the_by_element_form() {
-    // `d2[0]` names one lane, and no resolver here understands it. The
-    // decline is the sound answer — reading `d2` entire would be a wrong
-    // value, not a wider one.
-    assert!(declines("vqdmulh.s16", &["q0", "q1", "d2[0]"]));
+fn vqdmulh_lifts_the_by_element_form() {
+    // The by-element spelling declined until the resolver learned to
+    // read `d2[0]` as one lane rather than as a whole register. What it
+    // computes lives in `aarch32_doubling_element_contracts.rs`, which
+    // binds concrete lanes; here the point is only that the form no
+    // longer truncates the slice.
+    assert!(!declines("vqdmulh.s16", &["q0", "q1", "d2[0]"]));
 }
 
 // ---------------------------------------------------------------

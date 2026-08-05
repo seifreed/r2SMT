@@ -124,11 +124,17 @@ impl LiftCtx {
             NeonOp::SaturatingUnary { negate } => {
                 self.aarch32_saturating_unary_lanes(insn, shape, negate)
             }
-            NeonOp::DoublingMultiplyHigh { rounding } => {
-                self.aarch32_doubling_multiply_high_lanes(insn, shape, rounding)
+            NeonOp::DoublingMultiplyHigh { rounding, source } => {
+                self.aarch32_doubling_multiply_high_lanes(insn, shape, rounding, source)
             }
-            NeonOp::DoublingMultiplyLong { accumulate } => {
-                self.aarch32_doubling_multiply_long_lanes(insn, shape, accumulate)
+            NeonOp::DoublingMultiplyLong { accumulate, source } => {
+                self.aarch32_doubling_multiply_long_lanes(insn, shape, accumulate, source)
+            }
+            NeonOp::DoublingMultiplyAccumulate { subtract, source } => {
+                self.aarch32_doubling_multiply_accumulate_lanes(insn, shape, subtract, source)
+            }
+            NeonOp::RoundToIntegral { rounding } => {
+                self.aarch32_round_to_integral_lanes(insn, shape, rounding)
             }
             NeonOp::FusedStep(step) => self.aarch32_fused_step_lanes(insn, shape, step),
             // Handled by the caller; it writes two destinations and so
