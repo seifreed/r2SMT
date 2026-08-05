@@ -31,6 +31,12 @@ use super::{BinOp, LiftCtx, parse_immediate};
 /// only immediates, so masking is a no-op there.
 const SHIFT_AMOUNT_MASK: u128 = 0xff;
 
+/// Where `Operand2` sits in the three-operand shape `ands Rd, Rn, Op`.
+pub(super) const OPERAND2_INDEX_ARITH3: usize = 2;
+
+/// Where `Operand2` sits in the destination-less shape `tst Rn, Op`.
+pub(super) const OPERAND2_INDEX_COMPARE: usize = 1;
+
 /// What a specifier does to the register it follows.
 enum ShiftSpec<'a> {
     /// `lsl` / `lsr` / `asr` / `ror` by an immediate or a register.
@@ -140,6 +146,30 @@ impl LiftCtx {
                     Expr::shl(extended, amount)
                 }
             }
+        }
+    }
+
+    /// Write the `C` an `AArch32` logical s-form leaves behind, given the
+    /// operand index its `Operand2` sits at.
+    ///
+    /// C is the **shifter carry-out of Operand2** (ARM DDI 0487, A32
+    /// `ANDS` / `ORRS` / `EORS` / `BICS` / `TST` / `TEQ`), and V is not
+    /// written at all — which is why neither flag is assigned here unless
+    /// there is a specifier to take a carry from.
+    ///
+    /// With no specifier the shifter carry-out *is* the carry-in, so C
+    /// keeps its value and nothing may be emitted: assigning even a free
+    /// value there would destroy a carry the slice already holds, and
+    /// assigning a constant would fabricate one. With a specifier C is a
+    /// bit of the *unshifted* source, which this caller no longer has, so
+    /// a free value is the honest answer — it can only widen a verdict.
+    pub(super) fn set_aarch32_logical_carry(&mut self, insn: &Instruction, index: usize) {
+        let shifted = insn
+            .operands
+            .get(index + 1)
+            .is_some_and(|next| parse_shift_spec(&next.raw).is_some());
+        if shifted {
+            self.set_flag("CF", Expr::Unknown(String::new()));
         }
     }
 
