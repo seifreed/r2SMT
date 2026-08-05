@@ -70,6 +70,36 @@ impl LiftCtx {
     }
 
     /// The lane-wise conversions.
+    /// `fcvtas w0, s1` — one float element converted into a general
+    /// register, at the register's own width.
+    ///
+    /// The two widths are independent here, which is exactly the shape
+    /// [`convert_lane`] already takes: it has carried a separate
+    /// `source_bits` and `lane_bits` since the widening conversions
+    /// needed them. So this reads the element and hands both widths
+    /// over, and the unsigned spellings keep the extra bit of range that
+    /// makes them cover the whole unsigned interval rather than
+    /// saturating at the signed maximum.
+    pub(super) fn float_to_gpr(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        signed: bool,
+        rounding: r2smt_ir::expr::RoundingMode,
+    ) -> Option<Expr> {
+        let source = self.widen_source(insn, 1)?;
+        let element = LiftCtx::extract_lane(source, shape.lane_bits, 0)?;
+        let destination_bits = self.operand_width(insn.operands.first()?);
+        convert_lane(
+            ConvertKind::FloatToInt { signed },
+            element,
+            shape.lane_bits,
+            destination_bits,
+            0,
+            rounding,
+        )
+    }
+
     pub(super) fn convert_lanes(
         &mut self,
         insn: &Instruction,

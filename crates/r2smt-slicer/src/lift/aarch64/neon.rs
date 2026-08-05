@@ -129,6 +129,19 @@ enum NeonOp {
         fbits: u16,
         rounding: RoundingMode,
     },
+    /// `fcvtas w0, s1` — one float element converted to an integer in a
+    /// **general** register, at the destination's own width.
+    ///
+    /// A variant of its own rather than a flag on [`NeonOp::Convert`]
+    /// because it differs in the two things a lowering is made of: where
+    /// the result goes, and how wide it is. Source and destination
+    /// decouple here — `fcvtas x0, s1` is a legal encoding — so there is
+    /// no single `lane_bits` describing both, and `lane_bits` carries the
+    /// *source* the way [`NeonOp::ElementToGpr`] already does.
+    FloatToGpr {
+        signed: bool,
+        rounding: RoundingMode,
+    },
     /// `frint<mode>` — round each lane to an integral value without
     /// leaving the float sort.
     ///
@@ -284,7 +297,10 @@ impl NeonShape {
     /// Whether the destination is a general-purpose register rather than
     /// a vector one.
     const fn writes_gpr(&self) -> bool {
-        matches!(self.op, NeonOp::ElementToGpr { .. })
+        matches!(
+            self.op,
+            NeonOp::ElementToGpr { .. } | NeonOp::FloatToGpr { .. }
+        )
     }
 }
 
@@ -323,6 +339,7 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| arith::compare_shape(insn, &mnemonic))
         .or_else(|| width::convert_shape(insn, &mnemonic))
         .or_else(|| width::convert_scalar_shape(insn, &mnemonic))
+        .or_else(|| width::convert_to_gpr_shape(insn, &mnemonic))
         .or_else(|| permute::bitwise_select_shape(insn, &mnemonic))
         .or_else(|| width::reduce_shape(insn, &mnemonic))
         .or_else(|| multiply::by_element_shape(insn, &mnemonic))

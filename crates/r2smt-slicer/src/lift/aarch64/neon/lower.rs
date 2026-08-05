@@ -99,6 +99,9 @@ impl LiftCtx {
                 fbits,
                 rounding,
             } => self.convert_lanes(insn, shape, kind, upper, fbits, rounding),
+            NeonOp::FloatToGpr { signed, rounding } => {
+                self.float_to_gpr(insn, shape, signed, rounding)
+            }
             NeonOp::RoundToIntegral(rounding) => {
                 self.round_to_integral_lanes(insn, shape, rounding)
             }

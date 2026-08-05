@@ -18,7 +18,7 @@ use r2smt_ir::program::{Instruction, Operand, OperandKind};
 use crate::registers::{is_simd_parent, register_layout};
 
 use super::super::super::{BinOp, parse_immediate};
-use super::geometry::{operand_arrangement, peel_upper, spans_full_register};
+use super::geometry::{is_general_register, operand_arrangement, peel_upper, spans_full_register};
 use super::{NeonOp, NeonShape};
 
 // ===================== widening and narrowing =====================
@@ -476,6 +476,48 @@ pub(super) fn convert_scalar_shape(insn: &Instruction, mnemonic: &str) -> Option
             rounding,
         },
         lane_bits: width,
+        lanes: 1,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+/// The directed float-to-integer conversions writing a **general**
+/// register (`fcvtas w0, s1`, `fcvtas x0, d1`).
+///
+/// The form the other two resolvers cannot express, and the reason is
+/// the one thing that makes it different: the two ends decouple. `w0,
+/// d1` is a legal encoding, so there is no width that describes both,
+/// and the check `convert_scalar_shape` makes — that source and
+/// destination agree — would reject it. `lane_bits` therefore carries
+/// the *source*, exactly as [`super::permute::element_to_gpr_shape`]
+/// already does for `umov`, and the lowering reads the destination's
+/// width off the operand.
+///
+/// All four combinations of `{w, x} × {s, d}` are encodings, so nothing
+/// here relates the two widths beyond each being one the architecture
+/// names.
+pub(super) fn convert_to_gpr_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    if !is_directed_float_to_int(mnemonic) {
+        return None;
+    }
+    let (kind, rounding, _) = convert_kind(mnemonic)?;
+    let ConvertKind::FloatToInt { signed } = kind else {
+        return None;
+    };
+    if insn.operands.len() != 2 {
+        return None;
+    }
+    if !is_general_register(insn.operands.first()?) {
+        return None;
+    }
+    let source_bits = scalar_vector_width(insn.operands.get(1)?)?;
+    if !matches!(source_bits, 16 | 32 | 64) {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::FloatToGpr { signed, rounding },
+        lane_bits: source_bits,
         lanes: 1,
         dest_index: 0,
         source_index: 0,

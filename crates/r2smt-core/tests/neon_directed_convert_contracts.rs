@@ -395,3 +395,105 @@ fn the_scalar_directed_converts_reject_shapes_the_encoding_lacks() {
     assert_declines("fcvtas", &["s0", "d1"]);
     assert_declines("fcvtas", &["b0", "b1"]);
 }
+
+// ===================== the general-register spelling =====================
+//
+// `fcvtas w0, s1` is the form neither other resolver can express,
+// because the two ends decouple: `x0, s1` and `w0, d1` are both legal,
+// so no single width describes the instruction. What these pin is the
+// decoupling itself and the unsigned range, which are the two places a
+// lowering that assumed the widths matched would produce a number rather
+// than a decline.
+
+const GPR_BITS: u16 = 64;
+
+fn solve_gpr_lowering(
+    mnemonic: &str,
+    operands: &[&str],
+    source: u128,
+    expected: u128,
+) -> SmtResult {
+    let insn = instruction(mnemonic, operands);
+    let lifted = lift_per_mnemonic(&insn, Arch::Aarch64);
+    assert!(
+        lifted
+            .iter()
+            .all(|s| !matches!(s, IrStmt::Unsupported { .. })),
+        "{mnemonic} {operands:?} declined: {lifted:?}"
+    );
+    let mut statements = vec![IrStmt::Assign {
+        dst: Var::new("v1", VECTOR_BITS),
+        src: Expr::konst(source, VECTOR_BITS),
+    }];
+    statements.extend(lifted);
+    let slice = LiftedSlice {
+        branch: branch(),
+        statements,
+        condition: Expr::eq(
+            Expr::Var(Var::new("x0", GPR_BITS)),
+            Expr::konst(expected, GPR_BITS),
+        ),
+        status: SliceStatus::Complete,
+        treat_truncation_as_inputs: false,
+        arch: Arch::Aarch64,
+    };
+    solve_branch(
+        &ssa_convert(&slice),
+        SolveOptions {
+            timeout_ms: TEST_SOLVE_TIMEOUT_MS,
+            ..SolveOptions::default()
+        },
+    )
+}
+
+fn assert_gpr_converts(mnemonic: &str, operands: &[&str], source: u128, expected: u128) {
+    assert_eq!(
+        solve_gpr_lowering(mnemonic, operands, source, expected),
+        SmtResult::AlwaysTrue,
+        "{mnemonic} {operands:?} of {source:#x} must give {expected:#x}"
+    );
+}
+
+#[test]
+fn gpr_fcvtas_rounds_ties_away_into_a_word_register() {
+    assert_gpr_converts("fcvtas", &["w0", "s1"], S_2_5, I_3);
+}
+
+#[test]
+fn gpr_fcvtms_and_fcvtps_disagree_on_a_negative_half() {
+    // -1.5 toward `-inf` is -2 and toward `+inf` is -1. A `w` write
+    // zero-extends the parent, so the 64-bit view keeps the 32-bit
+    // pattern rather than sign-extending it — which is the ARM rule and
+    // also the thing a lowering that wrote `x0` directly would get wrong.
+    assert_gpr_converts("fcvtms", &["w0", "s1"], S_NEG_1_5, 0xffff_fffe);
+    assert_gpr_converts("fcvtps", &["w0", "s1"], S_NEG_1_5, 0xffff_ffff);
+}
+
+#[test]
+fn gpr_conversion_widths_decouple_between_source_and_destination() {
+    // A binary32 source into a 64-bit register: 3e9 does not fit a
+    // signed word, and the destination is not the source's width. A
+    // resolver that required the two to agree would decline this, and
+    // one that took the destination's width for the source's would read
+    // the wrong format.
+    const S_3E9: u128 = 0x4f32_d05e;
+    assert_gpr_converts("fcvtns", &["x0", "s1"], S_3E9, 0xb2d0_5e00);
+}
+
+#[test]
+fn gpr_fcvtnu_covers_the_upper_half_of_the_unsigned_range() {
+    // 2^63 as a double. The unsigned conversion must reach it; the
+    // signed one saturates at 2^63 - 1, so a lowering that dropped the
+    // extra bit of range answers 0x7fffffffffffffff here.
+    const D_TWO_POW_63: u128 = 0x43e0_0000_0000_0000;
+    assert_gpr_converts("fcvtnu", &["x0", "d1"], D_TWO_POW_63, 0x8000_0000_0000_0000);
+}
+
+#[test]
+fn gpr_fcvtas_reads_a_double_source_as_binary64() {
+    // The mirror of the decoupling test: a `d` source into a `w`
+    // destination. Reading it as binary32 would give a different number
+    // entirely rather than a decline.
+    const D_NEG_1_5: u128 = 0xbff8_0000_0000_0000;
+    assert_gpr_converts("fcvtas", &["w0", "d1"], D_NEG_1_5, 0xffff_fffe);
+}
