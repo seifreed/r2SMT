@@ -24,10 +24,11 @@ pub(super) fn analyze_aarch32(insn: &Instruction) -> InstructionEffect {
     // (`ls`/`cs`), so peeling first mis-dispatches them as a predicated
     // base. Mirrors the guard in `lift_instruction_aarch32`.
     let (dispatch_mnemonic, is_predicated) = if !crate::lift::is_aarch32_base_supported(&mnemonic)
+        && crate::lift::vfp_scalar(&mnemonic).is_none()
         && let Some((base, _)) = crate::lift::strip_aarch32_cond_suffix(&mnemonic)
-        && crate::lift::is_aarch32_base_supported(base)
+        && crate::lift::aarch32_predicable_base(&base)
     {
-        (base.to_string(), true)
+        (base, true)
     } else {
         (mnemonic.clone(), false)
     };

@@ -17,9 +17,10 @@ pub(super) mod neon;
 
 use super::{
     BinOp, FpArithOp, LiftCtx, MemAccess, PackedIntOp, PackedOp, VectorShape, Writeback,
-    aarch64_cond_suffix_to_predicate, constant_delta, fp_lane_result, fp_propagating_max_min,
-    fp_sort_bits_checked, is_aarch32_arith_short_form, is_aarch32_base_supported, nonzero_width,
-    strip_aarch32_cond_suffix, strip_thumb_width_suffix, vector_shape, width_mask,
+    aarch32_predicable_base, aarch64_cond_suffix_to_predicate, constant_delta, fp_lane_result,
+    fp_propagating_max_min, fp_sort_bits_checked, is_aarch32_arith_short_form,
+    is_aarch32_base_supported, nonzero_width, strip_aarch32_cond_suffix, strip_thumb_width_suffix,
+    vector_shape, width_mask,
 };
 
 impl LiftCtx {
@@ -94,11 +95,12 @@ impl LiftCtx {
         // — so peeling first would mis-lift `lsls` as a conditional
         // `lsl` and shadow its own exact match arm.
         if !is_aarch32_base_supported(mnem.as_str())
+            && vfp_scalar(mnem.as_str()).is_none()
             && let Some((base, cond_suffix)) = strip_aarch32_cond_suffix(&mnem)
-            && is_aarch32_base_supported(base)
+            && aarch32_predicable_base(base.as_str())
             && let Some(cond_expr) = aarch64_cond_suffix_to_predicate(cond_suffix)
         {
-            self.lift_aarch32_predicated(insn, base, &cond_expr);
+            self.lift_aarch32_predicated(insn, base.as_str(), &cond_expr);
             return;
         }
         self.lift_aarch32_by_mnemonic(insn, &mnem);

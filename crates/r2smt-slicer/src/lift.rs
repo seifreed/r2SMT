@@ -1153,12 +1153,45 @@ pub(crate) fn is_aarch32_arith_short_form(base: &str) -> bool {
     )
 }
 
-/// If `mnem` ends with a recognised condition-code suffix and the
-/// remaining prefix is non-empty, return `(base, cond_suffix)`.
-/// Otherwise return `None` so the caller dispatches the mnem as-is.
-pub(crate) fn strip_aarch32_cond_suffix(mnem: &str) -> Option<(&str, &str)> {
+/// If `mnem` carries a recognised condition-code suffix, return
+/// `(base, cond_suffix)` with the suffix removed. Otherwise return
+/// `None` so the caller dispatches the mnem as-is.
+///
+/// The suffix is not always at the end of the string. A VFP or NEON
+/// mnemonic spells its element type after a dot and the condition
+/// *before* it — `vaddeq.f32`, not `vadd.f32eq` — so stripping from the
+/// end of the whole mnemonic never peels one. That was a silent
+/// coverage hole across the entire predicated floating-point family,
+/// not just one instruction: the base was never recovered, so the
+/// dispatcher saw an unknown mnemonic and declined.
+pub(crate) fn strip_aarch32_cond_suffix(mnem: &str) -> Option<(String, &str)> {
+    match mnem.split_once('.') {
+        Some((head, ty)) => {
+            let (base, cond) = peel_cond_suffix(head)?;
+            Some((format!("{base}.{ty}"), cond))
+        }
+        None => peel_cond_suffix(mnem).map(|(base, cond)| (base.to_string(), cond)),
+    }
+}
+
+/// Whether a cond-suffix-stripped `AArch32` mnemonic names something a
+/// handler models, so the peel was real and not a coincidence of
+/// spelling.
+///
+/// Consults the vector and VFP parsers as well as the integer table:
+/// `vaddeq.f32` peels to `vadd.f32`, which no integer mnemonic list
+/// contains and `vfp_scalar` does.
+pub(crate) fn aarch32_predicable_base(base: &str) -> bool {
+    is_aarch32_base_supported(base)
+        || vfp_scalar(base).is_some()
+        || aarch32::neon_packed_op(base).is_some()
+}
+
+/// Peel a condition suffix from the end of `head`, which carries no
+/// element type.
+fn peel_cond_suffix(head: &str) -> Option<(&str, &str)> {
     for cond in AARCH_COND_SUFFIXES {
-        let Some(base) = mnem.strip_suffix(cond) else {
+        let Some(base) = head.strip_suffix(cond) else {
             continue;
         };
         if base.is_empty() {

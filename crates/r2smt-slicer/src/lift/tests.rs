@@ -1389,6 +1389,52 @@ fn aarch32_rotated_register_offset_lifts() {
 }
 
 #[test]
+fn aarch32_predicated_vfp_peels_its_condition_suffix() {
+    // The condition sits *before* the element type — `vaddeq.f32`, not
+    // `vadd.f32eq` — so stripping from the end of the whole mnemonic
+    // never peeled one. The base was never recovered, the dispatcher
+    // saw an unknown mnemonic, and the whole predicated floating-point
+    // family declined silently.
+    let stmts = lift_aarch32("vaddeq.f32", vec![reg("s0"), reg("s1"), reg("s2")]);
+    assert!(
+        !stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_predicated_vfp_reads_its_destination_on_the_false_path() {
+    // Predication is lowered as an `Ite` whose else-arm is the prior
+    // value, so the destination is a use. Dropping it would let the
+    // slicer treat whatever produced `s0` as dead.
+    let i = insn(
+        0x1000,
+        4,
+        "vaddeq.f32",
+        vec![reg("s0"), reg("s1"), reg("s2")],
+    );
+    let e = crate::effect::analyze(&i, Arch::Arm);
+    assert!(e.uses.contains(&"v0") && e.reads_flags, "{e:?}");
+}
+
+#[test]
+fn aarch32_unpredicated_vfp_is_not_mistaken_for_a_peeled_form() {
+    // `vmls.f32` ends in `ls` before the dot, which is a condition
+    // spelling. Peeling it would leave `vm`, which no handler models —
+    // the guard is that the peeled base has to be supported.
+    assert!(crate::lift::vfp_scalar("vmul.f32").is_some());
+    let stmts = lift_aarch32("vmul.f32", vec![reg("s0"), reg("s1"), reg("s2")]);
+    assert!(
+        !stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::Unsupported { .. })),
+        "{stmts:?}"
+    );
+}
+
+#[test]
 fn aarch32_rrx_register_offset_still_declines() {
     // `rrx` rotates *through the carry flag* by one, so it is a 33-bit
     // operation and not a rotate of the register at all. Lowering it as
