@@ -1533,7 +1533,9 @@ impl LiftCtx {
 
 #[cfg(test)]
 mod tests {
-    use super::{FP_DOUBLE_BITS, FP_HALF_BITS, FP_SINGLE_BITS, FusedStep, fused_multiply_lane};
+    use super::{
+        FP_DOUBLE_BITS, FP_HALF_BITS, FP_SINGLE_BITS, FusedStep, fused_formats, fused_multiply_lane,
+    };
     use r2smt_ir::expr::Expr;
 
     fn lane(bits: u16) -> Expr {
@@ -1565,6 +1567,25 @@ mod tests {
                 FP_DOUBLE_BITS,
             )
             .is_some()
+        );
+    }
+
+    #[test]
+    fn a_binary64_lane_widens_to_binary128_and_not_to_something_narrower() {
+        // Accepting the lane is not the property that matters — *which*
+        // intermediate it widens to is. A binary64 intermediate would
+        // still lift, still be accepted by the test above, and round
+        // twice: a wrong value, silently. The exactness argument needs
+        // `q >= 2p + 2`, and only binary128 gives it for `p = 53`.
+        let formats = fused_formats(FP_DOUBLE_BITS).expect("binary64 lanes are modelled");
+        assert_eq!(
+            formats.wide,
+            (15, 113),
+            "a binary64 fused step must widen to binary128"
+        );
+        assert!(
+            u32::from(formats.wide.1) >= 2 * u32::from(formats.lane.1) + 2,
+            "the intermediate must be wide enough for a single rounding"
         );
     }
 
