@@ -80,6 +80,16 @@ pub(crate) enum PackedOp {
     Int(PackedIntOp),
     /// IEEE floating-point lanes.
     Fp(FpArithOp),
+    /// `fmulx` — a float multiply whose `inf * 0` answer is `±2.0`
+    /// instead of a NaN, the sign being the exclusive or of the
+    /// operands'.
+    ///
+    /// Not an [`FpArithOp`] member, because that enum is shared with the
+    /// x86 handlers and its `Max` / `Min` already carry Intel's
+    /// semantics; adding an `AArch64`-only operation there would force
+    /// an arm in every `matches!` that enumerates it, on paths where it
+    /// can never occur.
+    MultiplyExtended,
     /// Multiply-accumulate: `dst := dst ± a * b`, lane-wise.
     ///
     /// A variant of its own rather than a [`PackedIntOp`] or an
@@ -460,13 +470,17 @@ pub(crate) fn fused_multiply_lane(
     let narrowed = Expr::fp_to_ieee_bv(Expr::fp_to_fp(value, rm, lane_e, lane_s));
     Some(match step {
         FusedStep::MulAdd | FusedStep::MulSub => narrowed,
-        FusedStep::RecipStep => {
-            zero_times_infinity_result(a_bits, b_bits, formats.lane_two, narrowed, &formats)
-        }
+        FusedStep::RecipStep => zero_times_infinity_result(
+            a_bits,
+            b_bits,
+            Expr::konst(formats.lane_two, formats.lane_bits),
+            narrowed,
+            &formats,
+        ),
         FusedStep::RsqrtStep => zero_times_infinity_result(
             a_bits,
             b_bits,
-            formats.lane_one_and_a_half,
+            Expr::konst(formats.lane_one_and_a_half, formats.lane_bits),
             narrowed,
             &formats,
         ),
@@ -480,7 +494,7 @@ pub(crate) fn fused_multiply_lane(
 fn zero_times_infinity_result(
     a_bits: &Expr,
     b_bits: &Expr,
-    result_bits: u128,
+    result: Expr,
     otherwise: Expr,
     formats: &FusedFormats,
 ) -> Expr {
@@ -496,9 +510,43 @@ fn zero_times_infinity_result(
     );
     Expr::Ite {
         cond: Box::new(special),
-        then_expr: Box::new(Expr::konst(result_bits, width)),
+        then_expr: Box::new(result),
         else_expr: Box::new(otherwise),
     }
+}
+
+/// One lane of `fmulx` — a float multiply whose only difference from
+/// `fmul` is the `inf * 0` answer.
+///
+/// `FPMulX` gives `±2.0` there, where the arithmetic alone gives a NaN,
+/// and the sign is the **exclusive or** of the two operands' signs. That
+/// sign is why this cannot go through
+/// [`zero_times_infinity_result`]'s original constant-valued shape the
+/// way `frecps` / `frsqrts` do: their special-case answers are fixed
+/// positives, and this one is not.
+///
+/// One rounding, so no wide intermediate — [`fused_formats`] is consulted
+/// only for the lane's constants, which is also what bounds the widths to
+/// the three that name an IEEE sort.
+pub(crate) fn fp_multiply_extended_lane(
+    a_bits: &Expr,
+    b_bits: &Expr,
+    lane_bits: u16,
+) -> Option<Expr> {
+    let formats = fused_formats(lane_bits)?;
+    let product = fp_lane_result(FpArithOp::Mul, a_bits.clone(), b_bits.clone(), lane_bits)?;
+    let sign_mask = Expr::konst(
+        formats.lane_abs_mask ^ ((1u128 << lane_bits) - 1),
+        lane_bits,
+    );
+    let sign_of = |bits: &Expr| Expr::bv_and(bits.clone(), sign_mask.clone());
+    let signed_two = Expr::bv_or(
+        Expr::konst(formats.lane_two, lane_bits),
+        Expr::bv_xor(sign_of(a_bits), sign_of(b_bits)),
+    );
+    Some(zero_times_infinity_result(
+        a_bits, b_bits, signed_two, product, &formats,
+    ))
 }
 
 /// Lane result of a floating-point max / min that **propagates** NaN
@@ -1250,6 +1298,7 @@ impl LiftCtx {
         b_op: &Operand,
         op: FpArithOp,
         lane_bits: u16,
+        extended: bool,
     ) -> Option<Expr> {
         let view = self.simd_instruction_view_bits(&[dst, a_op, b_op])?;
         let count = Self::packed_lane_count(view, lane_bits)?;
@@ -1261,7 +1310,9 @@ impl LiftCtx {
         for index in 0..count {
             let a = Self::extract_lane(a_val.clone(), lane_bits, index)?;
             let b = Self::extract_lane(b_val.clone(), lane_bits, index)?;
-            let lane = if propagating {
+            let lane = if extended {
+                fp_multiply_extended_lane(&a, &b, lane_bits)?
+            } else if propagating {
                 fp_propagating_max_min(a, b, lane_bits, matches!(op, FpArithOp::Max), false)?
             } else {
                 fp_lane_result(op, a, b, lane_bits)?
@@ -1476,7 +1527,11 @@ impl LiftCtx {
         let b_op = ops.get(2);
         let result = match op {
             PackedOp::Fp(fp) => match b_op {
-                Some(b) => self.packed_fp_result(dst, a_op, b, fp, lane_bits),
+                Some(b) => self.packed_fp_result(dst, a_op, b, fp, lane_bits, false),
+                None => None,
+            },
+            PackedOp::MultiplyExtended => match b_op {
+                Some(b) => self.packed_fp_result(dst, a_op, b, FpArithOp::Mul, lane_bits, true),
                 None => None,
             },
             PackedOp::Int(int) => self.packed_int_result(dst, a_op, b_op, int, lane_bits),

@@ -1165,3 +1165,87 @@ fn frsqrts_over_half_lanes_returns_one_point_five_for_zero_times_infinity() {
         packed(16, &[H_ONE_POINT_FIVE; 8]),
     );
 }
+
+// ===================== fmulx =====================
+//
+// `FPMulX` is `fmul` on every input but one: `inf * 0` gives `±2.0`
+// where the arithmetic gives a NaN, and the sign is the exclusive or of
+// the two operands'. That sign is the whole reason it cannot reuse the
+// `frecps` / `frsqrts` guard, whose special-case answers are fixed
+// positives.
+
+const S_TWO: u128 = 0x4000_0000;
+const S_MINUS_TWO: u128 = 0xc000_0000;
+const S_MINUS_INFINITY: u128 = 0xff80_0000;
+const S_MINUS_ZERO: u128 = 0x8000_0000;
+const S_FOUR: u128 = 0x4080_0000;
+const S_TWELVE: u128 = 0x4140_0000;
+
+#[test]
+fn fmulx_is_an_ordinary_product_away_from_the_special_case() {
+    // 3 * 4 = 12. If it were anything but `fmul` here, every use would
+    // be wrong rather than just the guarded one.
+    assert_computes(
+        "fmulx",
+        &["v0.4s", "v1.4s", "v2.4s"],
+        &[
+            ("v1", packed(32, &[F32_THREE; 4])),
+            ("v2", packed(32, &[S_FOUR; 4])),
+        ],
+        packed(32, &[S_TWELVE; 4]),
+    );
+}
+
+#[test]
+fn fmulx_gives_two_for_infinity_times_zero() {
+    // Both operands positive, so the sign is positive. `fmul` would
+    // give a NaN here — a value no verdict can use.
+    assert_computes(
+        "fmulx",
+        &["v0.4s", "v1.4s", "v2.4s"],
+        &[
+            ("v1", packed(32, &[F32_INFINITY; 4])),
+            ("v2", packed(32, &[0; 4])),
+        ],
+        packed(32, &[S_TWO; 4]),
+    );
+}
+
+#[test]
+fn fmulx_takes_the_sign_from_the_exclusive_or_of_the_operands() {
+    // The property that separates this from a constant `+2.0`: one
+    // negative operand flips the answer's sign, and two do not. Four
+    // lanes cover all four sign combinations at once.
+    assert_computes(
+        "fmulx",
+        &["v0.4s", "v1.4s", "v2.4s"],
+        &[
+            (
+                "v1",
+                packed(
+                    32,
+                    &[
+                        F32_INFINITY,
+                        S_MINUS_INFINITY,
+                        F32_INFINITY,
+                        S_MINUS_INFINITY,
+                    ],
+                ),
+            ),
+            ("v2", packed(32, &[0, 0, S_MINUS_ZERO, S_MINUS_ZERO])),
+        ],
+        packed(32, &[S_TWO, S_MINUS_TWO, S_MINUS_TWO, S_TWO]),
+    );
+}
+
+#[test]
+fn fmulx_lifts_in_its_scalar_spelling_too() {
+    // The scalar form shares the lane helper, so the special case and
+    // its sign cannot differ between spellings of one instruction.
+    assert_computes(
+        "fmulx",
+        &["s0", "s1", "s2"],
+        &[("v1", S_MINUS_INFINITY), ("v2", 0)],
+        S_MINUS_TWO,
+    );
+}

@@ -74,6 +74,7 @@ fn packed_op(mnemonic: &str) -> Option<PackedOp> {
         "fadd" => PackedOp::Fp(FpArithOp::Add),
         "fsub" => PackedOp::Fp(FpArithOp::Sub),
         "fmul" => PackedOp::Fp(FpArithOp::Mul),
+        "fmulx" => PackedOp::MultiplyExtended,
         "fdiv" => PackedOp::Fp(FpArithOp::Div),
         _ => return None,
     })
@@ -107,7 +108,7 @@ pub(super) fn packed_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonSha
     // that cannot occur.
     let names_float_lane = matches!(
         op,
-        PackedOp::Fp(_) | PackedOp::Int(PackedIntOp::SignBit { .. })
+        PackedOp::Fp(_) | PackedOp::MultiplyExtended | PackedOp::Int(PackedIntOp::SignBit { .. })
     );
     if names_float_lane && !is_float_lane(arrangement.lane_bits) {
         return None;

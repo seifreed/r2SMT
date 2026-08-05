@@ -132,6 +132,10 @@ impl LiftCtx {
             "fadd" => self.lift_aarch64_fp_arith3(insn, FpArithOp::Add),
             "fsub" => self.lift_aarch64_fp_arith3(insn, FpArithOp::Sub),
             "fmul" => self.lift_aarch64_fp_arith3(insn, FpArithOp::Mul),
+            // `fmulx` differs from `fmul` on one input class, so it goes
+            // through the packed core's lane helper rather than the
+            // scalar arithmetic one.
+            "fmulx" => self.lift_aarch64_fmulx(insn),
             "fdiv" => self.lift_aarch64_fp_arith3(insn, FpArithOp::Div),
             "fmax" => self.lift_aarch64_fp_arith3(insn, FpArithOp::Max),
             "fmin" => self.lift_aarch64_fp_arith3(insn, FpArithOp::Min),
@@ -1049,6 +1053,42 @@ impl LiftCtx {
             return;
         };
         if !self.write_simd_dst(dst, rounded, true) {
+            self.push_aarch64_fp_unsupported(insn);
+        }
+    }
+
+    /// `fmulx Rd, Rn, Rm` — the scalar spelling of the extended
+    /// multiply.
+    ///
+    /// Shares [`crate::lift::simd::fp_multiply_extended_lane`] with the
+    /// packed and by-element forms, so the `inf * 0` answer and its sign
+    /// cannot differ between spellings of one instruction.
+    fn lift_aarch64_fmulx(&mut self, insn: &Instruction) {
+        let (Some(dst), Some(a), Some(b)) = (
+            insn.operands.first(),
+            insn.operands.get(1),
+            insn.operands.get(2),
+        ) else {
+            self.push_aarch64_fp_unsupported(insn);
+            return;
+        };
+        let Some(lane) = self.simd_view_bits(dst) else {
+            self.push_aarch64_fp_unsupported(insn);
+            return;
+        };
+        let (Some(a_bits), Some(b_bits)) = (
+            self.read_simd_lane_bits(a, lane, 0),
+            self.read_simd_lane_bits(b, lane, 0),
+        ) else {
+            self.push_aarch64_fp_unsupported(insn);
+            return;
+        };
+        let Some(result) = crate::lift::simd::fp_multiply_extended_lane(&a_bits, &b_bits, lane)
+        else {
+            self.push_aarch64_fp_unsupported(insn);
+            return;
+        };
+        if !self.write_simd_dst(dst, result, true) {
             self.push_aarch64_fp_unsupported(insn);
         }
     }

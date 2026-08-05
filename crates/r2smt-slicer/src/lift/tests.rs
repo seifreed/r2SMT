@@ -4069,15 +4069,15 @@ fn aarch64_half_width_arrangement_write_zeroes_the_upper_half() {
 
 #[test]
 fn aarch64_unmodelled_vector_mnemonic_declines() {
-    // `fmulx` is the canary now that `fmla` lifts: it is a float
-    // multiply extended (`0 * inf` gives 2.0, not NaN), which no family
-    // claims. A mnemonic no family claims must decline rather than fall
-    // into a same-width handler.
+    // `bfdot` is the canary now that `fmulx` lifts: a `FEAT_BF16` dot
+    // product, whose bfloat16 lanes are not an IEEE interchange format
+    // this pipeline names at all. A mnemonic no family claims must
+    // decline rather than fall into a same-width handler.
     let i = insn(
         0x1000,
         4,
-        "fmulx",
-        vec![reg("v0.4s"), reg("v1.4s"), reg("v2.4s")],
+        "bfdot",
+        vec![reg("v0.4s"), reg("v1.8h"), reg("v2.8h")],
     );
     let stmts = crate::lift::lift_per_mnemonic(&i, Arch::Aarch64);
     assert!(

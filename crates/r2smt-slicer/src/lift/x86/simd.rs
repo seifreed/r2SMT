@@ -999,7 +999,7 @@ impl LiftCtx {
                 return;
             }
         };
-        let Some(result) = self.packed_fp_result(dst, a_op, b_op, op, lane_bits) else {
+        let Some(result) = self.packed_fp_result(dst, a_op, b_op, op, lane_bits, false) else {
             self.push_simd_unsupported(insn);
             return;
         };
