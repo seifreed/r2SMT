@@ -42,7 +42,8 @@ pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
         // family is shared with the rest of the vector file and the
         // slicer sees the aliasing.
         "fadd" | "fsub" | "fmul" | "fdiv" | "fmax" | "fmin" | "fsqrt" | "fabs" | "fneg"
-        | "fmov" | "fcvt" | "scvtf" | "ucvtf" | "fcvtzs" | "fcvtzu" => {
+        | "fmov" | "fcvt" | "scvtf" | "ucvtf" | "fcvtzs" | "fcvtzu" | "frinta" | "frintn"
+        | "frintp" | "frintm" | "frintz" | "frinti" | "frintx" => {
             aarch64_arith3_effect(insn, InstructionKind::Simd, false)
         }
         // `fcmp` writes NZCV and defines no register — `cmp`'s shape.

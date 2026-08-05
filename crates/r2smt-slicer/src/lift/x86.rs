@@ -1077,6 +1077,13 @@ pub(crate) fn pins_rounding_mode(insn: &Instruction) -> bool {
             | "fdivr"
             | "fdivrp"
             | "fsqrt"
+            // `frndint` is the sharpest case for pinning: its whole
+            // result *is* the rounding mode's choice, so the control
+            // word's RC field selects between four different answers
+            // for the same input. Precision control applies on top,
+            // and `fldcw` writes both — which is what makes the
+            // truncation this entry arms the load-bearing half.
+            | "frndint"
             // The integer-operand arithmetic converts its operand
             // exactly and then rounds the result, exactly as the
             // float-operand forms do.
