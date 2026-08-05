@@ -1095,15 +1095,39 @@ enum MemOffset {
     Register {
         name: String,
         subtract: bool,
-        shift: Option<(BinOp, u32)>,
+        shift: Option<Aarch32Shift>,
     },
 }
 
-/// The shift applied to an index register, or `None` for a spelling
-/// this model does not carry.
+/// The shift an index register carries.
 ///
-/// `rrx` is still declined: it rotates *through the carry flag* by one,
-/// so it is a 33-bit operation and not a rotate of the register at all.
+/// A type of its own rather than the `(BinOp, u32)` pair it used to be,
+/// because `rrx` fits neither half: it takes no amount, and it is not a
+/// function of the register alone — it reads the carry flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Aarch32Shift {
+    /// `lsl` / `lsr` / `asr` / `ror` by an immediate.
+    ByAmount(BinOp, u32),
+    /// `rrx` — rotate right **through the carry flag** by one.
+    ///
+    /// A 33-bit operation, not a rotate of the register: the carry
+    /// enters at the top and the register's low bit falls out into it.
+    /// `Ror(x, 1)` would drop the carry and shift the wrong bit in from
+    /// above, which is a wrong *address* rather than a decline — the
+    /// reason this declined for as long as it did.
+    ///
+    /// It needs no new `Expr` node, which is what the previous note here
+    /// got wrong: `Concat` and `Extract` express a 33-bit intermediate
+    /// exactly, and `CF` is already a one-bit `Var` this file reads.
+    ThroughCarry,
+}
+
+/// The two-operand shift applied to an index register, or `None` for a
+/// spelling this model does not carry.
+///
+/// `rrx` is absent on purpose and handled by its caller: it takes no
+/// amount, so it is not a `BinOp` over a register and a constant. See
+/// [`Aarch32Shift::ThroughCarry`].
 fn aarch32_shift_op(name: &str) -> Option<BinOp> {
     match name {
         "lsl" => Some(BinOp::Shl),
@@ -1127,8 +1151,18 @@ fn aarch32_offset_expr(offset: &MemOffset, ptr_bits: u16) -> Option<Expr> {
         } => {
             let parent = register_layout(name, Arch::Arm).map(|l| l.parent)?;
             let mut value = Expr::Var(Var::new(parent, ptr_bits));
-            if let Some((op, amount)) = shift {
-                value = op.apply(value, Expr::konst(u128::from(*amount), ptr_bits));
+            match shift {
+                None => {}
+                Some(Aarch32Shift::ByAmount(op, amount)) => {
+                    value = op.apply(value, Expr::konst(u128::from(*amount), ptr_bits));
+                }
+                // The carry becomes the new top bit and every other bit
+                // moves down one, which is exactly bits `[ptr_bits:1]`
+                // of the 33-bit concatenation.
+                Some(Aarch32Shift::ThroughCarry) => {
+                    let through = Expr::concat(Expr::Var(Var::new("CF", 1)), value.clone());
+                    value = Expr::extract(through, ptr_bits, 1);
+                }
             }
             if *subtract {
                 value = Expr::sub(Expr::konst(0, ptr_bits), value);
@@ -1196,13 +1230,23 @@ fn parse_aarch32_offset_parts(parts: &[&str]) -> Option<MemOffset> {
         None => None,
         Some(spec) => {
             let mut words = spec.split_whitespace();
-            let op = aarch32_shift_op(&words.next()?.to_ascii_lowercase())?;
-            let amount = words.next()?;
-            let amount = parse_aarch32_immediate(amount.strip_prefix('#').unwrap_or(amount))?;
-            if words.next().is_some() {
-                return None;
+            let name = words.next()?.to_ascii_lowercase();
+            // `rrx` rotates by exactly one and says so by taking no
+            // amount, so a spelling that carries one is not the form.
+            if name == "rrx" {
+                if words.next().is_some() {
+                    return None;
+                }
+                Some(Aarch32Shift::ThroughCarry)
+            } else {
+                let op = aarch32_shift_op(&name)?;
+                let amount = words.next()?;
+                let amount = parse_aarch32_immediate(amount.strip_prefix('#').unwrap_or(amount))?;
+                if words.next().is_some() {
+                    return None;
+                }
+                Some(Aarch32Shift::ByAmount(op, u32::try_from(amount).ok()?))
             }
-            Some((op, u32::try_from(amount).ok()?))
         }
     };
     Some(MemOffset::Register {
@@ -1534,6 +1578,39 @@ pub(crate) fn aarch32_vmrs_transfers_flags(insn: &Instruction) -> bool {
     let dst = dst.raw.trim().to_ascii_lowercase();
     let src = src.raw.trim().to_ascii_lowercase();
     dst.starts_with("apsr") && src == "fpscr"
+}
+
+/// Whether any memory operand of `insn` uses an `rrx` index shift, and
+/// so reads the carry flag.
+///
+/// Exists for the effect table, which otherwise hardcodes
+/// `reads_flags: false` on every memory instruction. That would be a
+/// **fabricated verdict** and not lost precision: the backward walk
+/// would drop whatever defined `CF`, and SSA would bind the address's
+/// carry to a stale free input — the same failure mode this file's
+/// predication wrapper documents.
+///
+/// It answers through the real parser rather than by sniffing text, so
+/// the effect table and the lowering cannot disagree about which
+/// instructions carry one.
+pub(crate) fn aarch32_memory_reads_carry(insn: &Instruction) -> bool {
+    insn.operands.iter().any(|operand| {
+        if operand.kind != OperandKind::Memory {
+            return false;
+        }
+        // The pre-index `!` sits outside the brackets the parser wants.
+        let raw = operand.raw.trim();
+        let body = raw.strip_suffix('!').map_or(raw, str::trim);
+        parse_aarch32_memory(body).is_some_and(|(_, offset)| {
+            matches!(
+                offset,
+                MemOffset::Register {
+                    shift: Some(Aarch32Shift::ThroughCarry),
+                    ..
+                }
+            )
+        })
+    })
 }
 
 /// Whether `insn` is a NEON form that writes both of its named

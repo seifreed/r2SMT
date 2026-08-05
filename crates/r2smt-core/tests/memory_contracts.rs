@@ -977,3 +977,77 @@ fn test_wide_const_high_bits_survive_encoding() {
     let verdict = solve_branch(&slice, solve_opts());
     assert_eq!(verdict, SmtResult::AlwaysTrue);
 }
+
+// --- `rrx`, whose address depends on the carry flag ------------------
+
+/// Solve `ldr r0, [r1, r2, rrx]` with `r1 = 0`, `r2 = 2` and `CF` bound
+/// to `carry`, and report whether the loaded address is necessarily
+/// `expected`.
+fn aarch32_rrx_address_is(carry: u128, expected: u128) -> SmtResult {
+    use r2smt_ir::expr::Var;
+    let lifted = lift_per_mnemonic(
+        &insn(
+            0x1000,
+            "ldr",
+            vec![
+                op("r0", OperandKind::Register),
+                op("[r1, r2, rrx]", OperandKind::Memory),
+            ],
+        ),
+        Arch::Arm,
+    );
+    let address = lifted
+        .iter()
+        .find_map(|s| match s {
+            IrStmt::LoadMem { address, .. } => Some(address.clone()),
+            _ => None,
+        })
+        .expect("an rrx-indexed ldr must produce a LoadMem");
+    // The address reads `r1`, `r2` and `CF` unversioned, so binding
+    // them as SSA inputs of the same names is what the solver needs.
+    let statements = vec![IrStmt::Assign {
+        dst: Var::new("t_bind", 1),
+        src: Expr::bool_and(
+            Expr::eq(Expr::var("r1", 32), Expr::konst(0, 32)),
+            Expr::bool_and(
+                Expr::eq(Expr::var("r2", 32), Expr::konst(2, 32)),
+                Expr::eq(Expr::var("CF", 1), Expr::konst(carry, 1)),
+            ),
+        ),
+    }];
+    let slice = SsaLiftedSlice {
+        branch: synthetic_branch(),
+        statements,
+        condition: Expr::bool_or(
+            Expr::eq(Expr::var("t_bind", 1), Expr::konst(0, 1)),
+            Expr::eq(address, Expr::konst(expected, 32)),
+        ),
+        status: SliceStatus::Complete,
+        treat_truncation_as_inputs: false,
+        inputs: vec![Var::new("r1", 32), Var::new("r2", 32), Var::new("CF", 1)],
+        defs: vec![Var::new("t_bind", 1)],
+        arch: Arch::Arm,
+    };
+    solve_branch(&slice, solve_opts())
+}
+
+#[test]
+fn aarch32_rrx_shifts_the_index_right_and_brings_the_carry_in_at_the_top() {
+    // 2 >> 1 is 1, and with `CF` clear nothing enters the top.
+    assert_eq!(aarch32_rrx_address_is(0, 1), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn aarch32_rrx_puts_a_set_carry_into_the_index_sign_bit() {
+    // The whole point of the family, and what makes it a 33-bit
+    // operation rather than a rotate of the register: with `CF` set the
+    // same index gives `0x8000_0001`, not `1`. A lowering as
+    // `Ror(x, 1)` would answer `1` here — the register's own low bit
+    // would come back round instead of the carry — so this is the pair
+    // that separates the two, and it is a wrong *address* rather than a
+    // decline.
+    assert_eq!(
+        aarch32_rrx_address_is(1, 0x8000_0001),
+        SmtResult::AlwaysTrue
+    );
+}

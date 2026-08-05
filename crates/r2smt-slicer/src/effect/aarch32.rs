@@ -4,6 +4,7 @@ use super::{
     InstructionEffect, InstructionKind, any_memory_operand, canonical_register, other_effect,
     registers_in_operand,
 };
+use crate::lift::aarch32_memory_reads_carry;
 use r2smt_common::Arch;
 use r2smt_ir::program::{Instruction, Operand};
 
@@ -319,7 +320,12 @@ fn aarch32_push_pop_effect(insn: &Instruction, is_pop: bool) -> InstructionEffec
         defines_flags: false,
         has_memory_access: true,
         is_call: false,
-        reads_flags: false,
+        // An `rrx` index shift rotates *through* the carry, so the
+        // address depends on `CF`. Reporting `false` here would drop
+        // whatever defined it from the slice and let SSA bind the
+        // address's carry to a stale free input — the same fabrication
+        // this file's predication wrapper documents at the top.
+        reads_flags: aarch32_memory_reads_carry(insn),
     }
 }
 
@@ -353,7 +359,12 @@ fn aarch32_ldm_stm_effect(insn: &Instruction, is_load: bool) -> InstructionEffec
         defines_flags: false,
         has_memory_access: true,
         is_call: false,
-        reads_flags: false,
+        // An `rrx` index shift rotates *through* the carry, so the
+        // address depends on `CF`. Reporting `false` here would drop
+        // whatever defined it from the slice and let SSA bind the
+        // address's carry to a stale free input — the same fabrication
+        // this file's predication wrapper documents at the top.
+        reads_flags: aarch32_memory_reads_carry(insn),
     }
 }
 
@@ -421,7 +432,12 @@ fn aarch32_pair_effect(insn: &Instruction, is_load: bool) -> InstructionEffect {
         defines_flags: false,
         has_memory_access: true,
         is_call: false,
-        reads_flags: false,
+        // An `rrx` index shift rotates *through* the carry, so the
+        // address depends on `CF`. Reporting `false` here would drop
+        // whatever defined it from the slice and let SSA bind the
+        // address's carry to a stale free input — the same fabrication
+        // this file's predication wrapper documents at the top.
+        reads_flags: aarch32_memory_reads_carry(insn),
     }
 }
 
@@ -468,7 +484,12 @@ fn aarch32_ldr_effect(insn: &Instruction) -> InstructionEffect {
         defines_flags: false,
         has_memory_access: true,
         is_call: false,
-        reads_flags: false,
+        // An `rrx` index shift rotates *through* the carry, so the
+        // address depends on `CF`. Reporting `false` here would drop
+        // whatever defined it from the slice and let SSA bind the
+        // address's carry to a stale free input — the same fabrication
+        // this file's predication wrapper documents at the top.
+        reads_flags: aarch32_memory_reads_carry(insn),
     }
 }
 

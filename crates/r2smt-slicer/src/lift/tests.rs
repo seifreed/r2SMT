@@ -1435,16 +1435,41 @@ fn aarch32_unpredicated_vfp_is_not_mistaken_for_a_peeled_form() {
 }
 
 #[test]
-fn aarch32_rrx_register_offset_still_declines() {
+fn aarch32_rrx_register_offset_lifts_and_reads_the_carry() {
     // `rrx` rotates *through the carry flag* by one, so it is a 33-bit
-    // operation and not a rotate of the register at all. Lowering it as
-    // `Ror(x, 1)` would drop the carry bit and shift the wrong value
-    // into the top — a wrong address, not a decline.
-    let stmts = lift_aarch32(
+    // operation and not a rotate of the register. That is why
+    // `Ror(x, 1)` would be a wrong address rather than a decline — but
+    // it is **not** why it declined, and the note that said it needed a
+    // new IR node was wrong: `Concat` and `Extract` express the 33-bit
+    // intermediate exactly.
+    let insn = insn(
+        0x1000,
+        4,
         "ldr",
         vec![reg("r0"), op("[r1, r2, rrx]", OperandKind::Memory)],
     );
-    assert!(!aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    let stmts = crate::lift::lift_per_mnemonic(&insn, Arch::Arm);
+    assert!(aarch32_lifts_cleanly(&stmts), "{stmts:?}");
+    // The load's address depends on `CF`, so the effect table has to say
+    // so. Without this the backward walk drops whatever defined the
+    // carry and SSA binds it to a stale free input — a fabricated
+    // verdict, which is the real reason this family was blocked.
+    assert!(
+        crate::effect::analyze(&insn, Arch::Arm).reads_flags,
+        "an rrx-indexed load reads CF"
+    );
+    // And the plain index shifts still do not.
+    let plain = insn_at_1000_ldr_shifted("[r1, r2, lsl 2]");
+    assert!(!crate::effect::analyze(&plain, Arch::Arm).reads_flags);
+}
+
+fn insn_at_1000_ldr_shifted(mem: &str) -> Instruction {
+    insn(
+        0x1000,
+        4,
+        "ldr",
+        vec![reg("r0"), op(mem, OperandKind::Memory)],
+    )
 }
 
 #[test]
