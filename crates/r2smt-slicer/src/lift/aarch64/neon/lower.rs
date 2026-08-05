@@ -81,6 +81,9 @@ impl LiftCtx {
                 upper,
             } => self.saturating_lanes(insn, shape, kind, signed_sources, upper),
             NeonOp::Shift { kind, signed } => self.shift_lanes(insn, shape, kind, signed),
+            NeonOp::ShiftInsert { left, shift } => {
+                self.shift_insert_lanes(insn, shape, left, shift)
+            }
             NeonOp::Compare { kind, zero } => self.compare_lanes(insn, shape, kind, zero),
             NeonOp::Convert { kind, upper, fbits } => {
                 self.convert_lanes(insn, shape, kind, upper, fbits)

@@ -77,6 +77,13 @@ enum NeonOp {
     },
     /// A same-width shift, by an immediate or by a per-lane amount.
     Shift { kind: ShiftKind, signed: bool },
+    /// `sri` / `sli` — shift one source lane and insert it over the
+    /// destination lane, keeping the destination bits the shift vacated.
+    ///
+    /// Its own variant rather than a member of [`NeonOp::Shift`] because
+    /// the destination is an *input* here and a plain shift's is not:
+    /// the bits the shift moves out of the way are the ones that survive.
+    ShiftInsert { left: bool, shift: u16 },
     /// A lane-wise compare, writing an all-ones or all-zeros mask per
     /// lane rather than a flag.
     Compare { kind: CompareKind, zero: bool },
@@ -213,7 +220,8 @@ impl NeonShape {
             | NeonOp::PairwiseLong {
                 accumulate: true, ..
             }
-            | NeonOp::HighNarrow { upper: true, .. } => true,
+            | NeonOp::HighNarrow { upper: true, .. }
+            | NeonOp::ShiftInsert { .. } => true,
             NeonOp::ByElement { kind, .. } => kind.combines(),
             NeonOp::FusedStep(step) => step.reads_accumulator(),
             // `tbx` preserves the destination byte for an out-of-range
@@ -256,6 +264,7 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| multiply::multiply_accumulate_shape(insn, &mnemonic))
         .or_else(|| arith::saturating_shape(insn, &mnemonic))
         .or_else(|| arith::shift_shape(insn, &mnemonic))
+        .or_else(|| arith::shift_insert_shape(insn, &mnemonic))
         .or_else(|| arith::compare_shape(insn, &mnemonic))
         .or_else(|| width::convert_shape(insn, &mnemonic))
         .or_else(|| permute::bitwise_select_shape(insn, &mnemonic))

@@ -424,6 +424,45 @@ pub(super) fn shift_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShap
     })
 }
 
+/// `sri` / `sli` — the shift-and-insert pair.
+///
+/// The two directions carry different immediate ranges, and both bounds
+/// are the encoding's rather than a convenience: `sli` shifts left by
+/// `0..n-1` and `sri` right by `1..n`, so each spells exactly the
+/// amounts that leave at least one source bit in the destination. A
+/// `sri` by the full element width is therefore legal and copies
+/// nothing, which the lowering reproduces rather than special-cases.
+pub(super) fn shift_insert_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let left = match mnemonic {
+        "sli" => true,
+        "sri" => false,
+        _ => return None,
+    };
+    if insn.operands.len() != 3 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    if operand_arrangement(insn.operands.get(1)?)? != destination {
+        return None;
+    }
+    let shift = u16::try_from(parse_immediate(&insn.operands.get(2)?.raw)?).ok()?;
+    let bounded = if left {
+        shift < destination.lane_bits
+    } else {
+        shift > 0 && shift <= destination.lane_bits
+    };
+    if !bounded {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::ShiftInsert { left, shift },
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
 // ===================== lane-wise compares =====================
 
 /// The lane-wise compare family.
@@ -536,6 +575,15 @@ pub(super) enum SaturatingKind {
     /// `sqdmulh` / `sqrdmulh` — double the product and keep its high
     /// half.
     DoublingMultiplyHigh { rounding: bool },
+    /// `sqabs` / `sqneg` — the magnitude or the negation of one element,
+    /// clamped into the signed range.
+    ///
+    /// The clamp is the whole reason these are not members of the
+    /// lane-wise family, where `abs` and `neg` already sit: both wrap at
+    /// `INT_MIN`, whose magnitude is one past the top of the range, so
+    /// resolving `sqabs` through `abs` would answer `INT_MIN` where the
+    /// architecture answers `INT_MAX`. A wrong value, not a decline.
+    Unary { negate: bool },
 }
 
 /// The same-width saturating and halving mnemonics.
@@ -561,6 +609,8 @@ fn saturating_same_width(base: &str) -> Option<(SaturatingKind, bool)> {
             SaturatingKind::DoublingMultiplyHigh { rounding: true },
             true,
         ),
+        "sqabs" => (SaturatingKind::Unary { negate: false }, true),
+        "sqneg" => (SaturatingKind::Unary { negate: true }, true),
         _ => return None,
     })
 }
@@ -610,7 +660,7 @@ pub(super) fn saturating_shape(insn: &Instruction, mnemonic: &str) -> Option<Neo
         SaturatingKind::Narrow { .. } | SaturatingKind::ShiftNarrow { .. }
     );
     let expected_operands = match kind {
-        SaturatingKind::Narrow { .. } => 2,
+        SaturatingKind::Narrow { .. } | SaturatingKind::Unary { .. } => 2,
         _ => 3,
     };
     if insn.operands.len() != expected_operands {
@@ -681,8 +731,8 @@ pub(super) fn saturating_shape(insn: &Instruction, mnemonic: &str) -> Option<Neo
 
 // ===================== estimates =====================
 
-/// `frecpe` / `frsqrte`, the reciprocal and reciprocal-square-root
-/// estimates.
+/// `frecpe` / `frsqrte` / `urecpe` / `ursqrte`, the reciprocal and
+/// reciprocal-square-root estimates.
 ///
 /// Their *refinement* steps `frecps` / `frsqrts` are deliberately not
 /// here. `2.0 - x*y` and `(3.0 - x*y) / 2.0` describe them arithmetically,
@@ -696,12 +746,29 @@ pub(super) fn saturating_shape(insn: &Instruction, mnemonic: &str) -> Option<Neo
 /// which would need binary128, so that is its own piece of work rather
 /// than a half-covered special case.)
 pub(super) fn estimate_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
-    if !matches!(mnemonic, "frecpe" | "frsqrte") || insn.operands.len() != 2 {
+    // The unsigned pair shares the lowering because it shares the
+    // objection: `urecpe` / `ursqrte` normalise the element, look the
+    // reciprocal up in a table the architecture specifies to eight
+    // fraction bits, and renormalise. That is a divide the IR cannot
+    // spell, so the choice is a free value or a decline, and a decline
+    // would truncate the slice. Unlike the float pair they encode only
+    // a 32-bit element.
+    let float = match mnemonic {
+        "frecpe" | "frsqrte" => true,
+        "urecpe" | "ursqrte" => false,
+        _ => return None,
+    };
+    if insn.operands.len() != 2 {
         return None;
     }
     let destination = operand_arrangement(insn.operands.first()?)?;
-    // An estimate of an IEEE lane; `.16b` names no float format.
-    if !matches!(destination.lane_bits, 16 | 32 | 64) {
+    let encodable = if float {
+        // An estimate of an IEEE lane; `.16b` names no float format.
+        is_float_lane(destination.lane_bits)
+    } else {
+        destination.lane_bits == 32
+    };
+    if !encodable {
         return None;
     }
     if operand_arrangement(insn.operands.get(1)?)? != destination {

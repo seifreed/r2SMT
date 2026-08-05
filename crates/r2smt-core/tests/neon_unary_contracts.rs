@@ -595,16 +595,12 @@ fn addhn2_writes_the_upper_half_and_preserves_the_lower_one() {
 // ===================== the boundary =====================
 
 #[test]
-fn the_saturating_unary_forms_still_decline() {
-    // `sqabs` / `sqneg` clamp where `abs` / `neg` wrap, so resolving
-    // them through the wrapping family would be a wrong value. They
-    // stay outside it until they get a lowering of their own.
-    assert_declines("sqabs", &["v0.8b", "v1.8b"]);
-    assert_declines("sqneg", &["v0.8b", "v1.8b"]);
-}
-
-#[test]
-fn the_shift_insert_forms_still_decline() {
-    assert_declines("sri", &["v0.8b", "v1.8b", "#1"]);
-    assert_declines("sli", &["v0.8b", "v1.8b", "#1"]);
+fn the_saturating_unary_forms_are_not_resolved_through_the_wrapping_ones() {
+    // `sqabs` / `sqneg` now lift, with the clamp `abs` / `neg` do not
+    // have — their values live in `neon_saturating_family_contracts`.
+    // What this file still owns is the boundary between the two: the
+    // *scalar* spelling carries no arrangement, and the wrapping family
+    // must not claim it.
+    assert_declines("sqabs", &["b0", "b1"]);
+    assert_declines("sqneg", &["h0", "h1"]);
 }

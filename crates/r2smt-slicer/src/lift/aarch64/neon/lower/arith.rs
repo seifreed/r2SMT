@@ -102,6 +102,51 @@ impl LiftCtx {
         Self::concat_lanes(lanes)
     }
 
+    /// `sri` / `sli` — the shifted source laid over the destination,
+    /// with the destination's own bits kept where the shift left a hole.
+    ///
+    /// The mask is built from the shift alone and is therefore a
+    /// constant, so nothing here depends on the lane's value. A `sri` by
+    /// the whole element width falls out of the same expression rather
+    /// than needing a case: the shift clears every source bit and the
+    /// mask keeps every destination one, which is the identity the
+    /// architecture defines.
+    pub(super) fn shift_insert_lanes(
+        &mut self,
+        insn: &Instruction,
+        shape: NeonShape,
+        left: bool,
+        shift: u16,
+    ) -> Option<Expr> {
+        let lane_bits = shape.lane_bits;
+        let source = self.widen_source(insn, 1)?;
+        let destination = self.destination_value(insn, shape)?;
+        let amount = Expr::konst(u128::from(shift), lane_bits);
+        // The bits the shift vacates, and so the ones the destination
+        // keeps: the low `shift` for a left shift, the high `shift` for
+        // a right one.
+        let kept = if left {
+            low_bits(shift)?
+        } else {
+            unsigned_max(lane_bits)? ^ low_bits(lane_bits.checked_sub(shift)?)?
+        };
+        let mut lanes = Vec::with_capacity(usize::from(shape.lanes));
+        for index in 0..shape.lanes {
+            let a = LiftCtx::extract_lane(source.clone(), lane_bits, index)?;
+            let previous = LiftCtx::extract_lane(destination.clone(), lane_bits, index)?;
+            let shifted = if left {
+                Expr::shl(a, amount.clone())
+            } else {
+                Expr::lshr(a, amount.clone())
+            };
+            lanes.push(Expr::bv_or(
+                shifted,
+                Expr::bv_and(previous, Expr::konst(kept, lane_bits)),
+            ));
+        }
+        Self::concat_lanes(lanes)
+    }
+
     /// The saturating, halving and rounding-narrow family.
     ///
     /// Every member computes its lane at a width where the result cannot
@@ -385,6 +430,21 @@ fn leading_zeros(value: &Expr, bits: u16) -> Expr {
     count
 }
 
+/// A mask of the `bits` low-order bits, and zero when `bits` is zero.
+///
+/// [`unsigned_max`] declines a zero width rather than answering zero,
+/// which is right where it is asked for a *range*: a zero-bit vector has
+/// none. The shift inserts ask for a *mask* instead, and both ends of
+/// their immediate range are legal encodings — `sli #0` keeps no
+/// destination bit, `sri #n` keeps every one — so zero is an answer here
+/// and not a decline.
+fn low_bits(bits: u16) -> Option<u128> {
+    if bits == 0 {
+        return Some(0);
+    }
+    unsigned_max(bits)
+}
+
 /// Clamp `value`, computed at `wide` bits, into the `narrow`-bit range
 /// `to` names, returning a `narrow`-bit result.
 ///
@@ -510,6 +570,27 @@ fn saturating_lane(
                 // is a real bit of the source rather than fill.
                 None => Some(Expr::extract(shifted, lane_bits - 1, 0)),
             }
+        }
+        SaturatingKind::Unary { negate } => {
+            // One extra bit is exactly what the corner needs: `-INT_MIN`
+            // is `2^(n-1)`, one past the top of the `n`-bit signed range
+            // but the smallest value the `n+1`-bit one still holds. At
+            // the element's own width the negation would wrap back onto
+            // `INT_MIN` and the clamp would see a value already inside
+            // the range, so nothing would saturate.
+            let wide = lane_bits.checked_add(1)?;
+            let value = extend(a, wide, true);
+            let negated = Expr::sub(Expr::konst(0, wide), value.clone());
+            let result = if negate {
+                negated
+            } else {
+                Expr::Ite {
+                    cond: Box::new(Expr::slt(value.clone(), Expr::konst(0, wide))),
+                    then_expr: Box::new(negated),
+                    else_expr: Box::new(value),
+                }
+            };
+            clamp(result, wide, lane_bits, SaturateTo::Signed)
         }
         SaturatingKind::DoublingMultiplyHigh { rounding } => {
             // The product needs `2 * lane_bits`, and doubling it needs
