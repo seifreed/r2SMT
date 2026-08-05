@@ -266,10 +266,9 @@ fn names_scalar_neon_family(insn: &Instruction, arch: Arch) -> bool {
     if arch != Arch::Aarch64 {
         return false;
     }
-    matches!(
-        insn.mnemonic.trim().to_ascii_lowercase().as_str(),
-        "sqabs" | "sqneg"
-    )
+    let mnemonic = insn.mnemonic.trim().to_ascii_lowercase();
+    matches!(mnemonic.as_str(), "sqabs" | "sqneg")
+        || aarch64::neon::width::is_directed_float_to_int(&mnemonic)
 }
 
 /// Classify `insn` against the vector shapes the lifter models.

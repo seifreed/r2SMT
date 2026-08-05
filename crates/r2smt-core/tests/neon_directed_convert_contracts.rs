@@ -285,3 +285,113 @@ fn the_directed_conversions_decline_the_upper_half_spelling() {
     // it resolve as one.
     assert_declines("fcvtns2", &["v0.4s", "v1.4s"]);
 }
+
+// ===================== the scalar spelling =====================
+//
+// `fcvtas s0, s1` carries no arrangement on either operand, so it
+// reaches the resolvers only through the scalar-family allowlist in
+// `vector_shape`. Before that it fell out of the dispatch's unknown-
+// mnemonic arm — and, unlike `sqabs`, with no decline contract naming it
+// in either direction. These pin the mode, because getting the mode
+// wrong here is a wrong integer rather than a decline.
+
+/// One scalar convert of `1.5`, whose result separates all four modes:
+/// ties-to-even gives 2, ties-away 2, toward `+inf` 2, toward `-inf` 1
+/// and truncation 1. Paired with `-1.5` below to split the first two.
+fn assert_scalar_converts(mnemonic: &str, source: u128, expected: u128) {
+    assert_eq!(
+        solve_lowering(mnemonic, &["s0", "s1"], &[("v1", source)], expected),
+        SmtResult::AlwaysTrue,
+        "{mnemonic} of {source:#x} must give {expected:#x}"
+    );
+}
+
+#[test]
+fn scalar_fcvtns_breaks_a_tie_to_even() {
+    // 2.5 -> 2, which is what separates ties-to-even from ties-away.
+    assert_scalar_converts("fcvtns", S_2_5, I_2);
+}
+
+#[test]
+fn scalar_fcvtas_breaks_the_same_tie_away_from_zero() {
+    assert_scalar_converts("fcvtas", S_2_5, I_3);
+}
+
+#[test]
+fn scalar_fcvtps_rounds_toward_positive_infinity() {
+    // -1.5 toward `+inf` is -1; toward `-inf` it is -2. Using a negative
+    // input is what makes this fail for a lowering that truncates.
+    assert_scalar_converts("fcvtps", S_NEG_1_5, I_NEG_1);
+}
+
+#[test]
+fn scalar_fcvtms_rounds_toward_negative_infinity() {
+    assert_scalar_converts("fcvtms", S_NEG_1_5, I_NEG_2);
+}
+
+#[test]
+fn scalar_fcvtnu_covers_the_unsigned_range_rather_than_the_signed_one() {
+    // 3e9 is above `INT_MAX` and below `UINT_MAX`. The IR has no
+    // unsigned conversion node, so the lowering goes through the signed
+    // one with an extra bit of range; dropping that would saturate at
+    // 0x7fffffff, a wrong value rather than a lost one.
+    const S_3E9: u128 = 0x4f32_d05e;
+    assert_scalar_converts("fcvtnu", S_3E9, 0xb2d0_5e00);
+}
+
+#[test]
+fn a_scalar_convert_zeroes_the_rest_of_the_vector_register() {
+    // The write is not a merge. `v0` is preset to all ones, so a
+    // lowering that preserved the upper bits fails here.
+    assert_eq!(
+        solve_lowering(
+            "fcvtas",
+            &["s0", "s1"],
+            &[("v0", PARENT_PRESET), ("v1", S_2_5)],
+            I_3,
+        ),
+        SmtResult::AlwaysTrue,
+    );
+}
+
+#[test]
+fn the_scalar_converts_that_already_had_a_handler_still_lift() {
+    // `fcvtzs` / `fcvtzu` and `scvtf` / `ucvtf` lift through the
+    // scalar-FP arm of the dispatch, so they are deliberately outside
+    // the allowlist: claiming them here would give one instruction two
+    // lowerings. This is the cheap guard against the allowlist growing
+    // to swallow them.
+    //
+    // Only that they lift, not what they compute, and the reason is a
+    // seam worth knowing about. The scalar-FP handlers write through
+    // `build_parent_write`, which sizes the parent at `LiftCtx::bits`
+    // — 64 on `AArch64` — while every NEON lowering writes `v0` at 128.
+    // So the two paths name the same register at two widths, and the
+    // 128-bit binding this file's harness uses cannot express what the
+    // scalar-FP path produces. Pinning a value here would be asserting
+    // on the harness rather than on the lowering. See
+    // `.planning/2026-08-05-parent-width-scalar-fp.md`.
+    for (mnemonic, operands) in [
+        ("fcvtzs", ["s0", "s1"]),
+        ("fcvtzu", ["s0", "s1"]),
+        ("scvtf", ["s0", "s1"]),
+        ("ucvtf", ["s0", "s1"]),
+    ] {
+        let lifted = lift_per_mnemonic(&instruction(mnemonic, &operands), Arch::Aarch64);
+        assert!(
+            lifted
+                .iter()
+                .all(|s| !matches!(s, IrStmt::Unsupported { .. })),
+            "{mnemonic} {operands:?} should still lift: {lifted:?}"
+        );
+    }
+}
+
+#[test]
+fn the_scalar_directed_converts_reject_shapes_the_encoding_lacks() {
+    // No fixed-point form for the directed spellings, mismatched views
+    // are not an encoding, and a byte view names no IEEE format.
+    assert_declines("fcvtas", &["s0", "s1", "#1"]);
+    assert_declines("fcvtas", &["s0", "d1"]);
+    assert_declines("fcvtas", &["b0", "b1"]);
+}

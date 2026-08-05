@@ -425,6 +425,63 @@ pub(super) fn convert_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonSh
     })
 }
 
+/// Whether `base` is one of the four directed float-to-integer
+/// spellings, which are the conversions with no scalar handler of their
+/// own.
+///
+/// `fcvtzs` / `fcvtzu` and `scvtf` / `ucvtf` are deliberately excluded:
+/// their scalar forms already lift through the scalar-FP arm of
+/// `lift_instruction_aarch64`, and claiming them here would give one
+/// instruction two lowerings.
+pub(in crate::lift) fn is_directed_float_to_int(base: &str) -> bool {
+    matches!(
+        base,
+        "fcvtas" | "fcvtau" | "fcvtns" | "fcvtnu" | "fcvtps" | "fcvtpu" | "fcvtms" | "fcvtmu"
+    )
+}
+
+/// The directed float-to-integer conversions in their scalar spelling
+/// (`fcvtas s0, s1`), where neither operand carries an arrangement.
+///
+/// Same seam as [`super::arith::saturating_scalar_shape`] and the same
+/// reason for being its own resolver: [`convert_shape`] reads geometry
+/// from `operand_arrangement`, which answers `None` for a bare `s0`.
+///
+/// The architecture keeps both sides the same width in this form, so
+/// unlike the vector family there is no source/destination relation to
+/// work out — only a check that the two agree. Fixed-point is excluded
+/// with the same argument the vector resolver already makes: the four
+/// directed spellings have register forms only.
+pub(super) fn convert_scalar_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    if !is_directed_float_to_int(mnemonic) {
+        return None;
+    }
+    let (kind, rounding, _) = convert_kind(mnemonic)?;
+    if insn.operands.len() != 2 {
+        return None;
+    }
+    let width = scalar_vector_width(insn.operands.first()?)?;
+    if scalar_vector_width(insn.operands.get(1)?)? != width {
+        return None;
+    }
+    // The source is the IEEE side, so its width has to name a format.
+    if !matches!(width, 16 | 32 | 64) {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::Convert {
+            kind,
+            upper: false,
+            fbits: 0,
+            rounding,
+        },
+        lane_bits: width,
+        lanes: 1,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
 // ===================== across-lane reductions =====================
 
 /// The integer across-lane reductions.

@@ -322,6 +322,7 @@ pub(crate) fn shape(insn: &Instruction) -> Option<NeonShape> {
         .or_else(|| arith::shift_insert_shape(insn, &mnemonic))
         .or_else(|| arith::compare_shape(insn, &mnemonic))
         .or_else(|| width::convert_shape(insn, &mnemonic))
+        .or_else(|| width::convert_scalar_shape(insn, &mnemonic))
         .or_else(|| permute::bitwise_select_shape(insn, &mnemonic))
         .or_else(|| width::reduce_shape(insn, &mnemonic))
         .or_else(|| multiply::by_element_shape(insn, &mnemonic))
