@@ -343,15 +343,40 @@ fn uniform_shape(insn: &Instruction, operands: usize) -> Option<Arrangement> {
 /// time.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ShiftKind {
-    /// `shl` — shift left by an immediate.
-    LeftImmediate { shift: u16 },
+    /// `shl` / `sqshl` / `uqshl` — shift left by an immediate,
+    /// discarding the bits that leave the element or clamping instead.
+    LeftImmediate { shift: u16, saturate: bool },
     /// `ushr` / `sshr` / `urshr` / `srshr` — shift right by an
     /// immediate, optionally rounding.
     RightImmediate { shift: u16, rounding: bool },
-    /// `ushl` / `sshl` / `urshl` / `srshl` — shift by the second
-    /// source's per-lane amount, left when positive and right when
-    /// negative.
-    Register { rounding: bool },
+    /// `ushl` / `sshl` / `urshl` / `srshl` / `sqshl` / `uqshl` /
+    /// `sqrshl` / `uqrshl` — shift by the second source's per-lane
+    /// amount, left when positive and right when negative.
+    ///
+    /// `saturate` applies to the left direction only, which is not an
+    /// approximation: a right shift of an `n`-bit element always fits
+    /// `n` bits, so there is nothing for it to clamp.
+    Register { rounding: bool, saturate: bool },
+}
+
+/// The saturating left shifts, whose one mnemonic spells two shapes.
+///
+/// `sqshl v0.8b, v1.8b, #3` and `sqshl v0.8b, v1.8b, v2.8b` are
+/// genuinely different instructions — a fixed left shift and a per-lane
+/// signed amount that can go either way — and the only thing telling
+/// them apart is whether the amount operand carries an arrangement.
+fn saturating_left_shift(insn: &Instruction) -> Option<ShiftKind> {
+    let amount = insn.operands.get(2)?;
+    if operand_arrangement(amount).is_some() {
+        return Some(ShiftKind::Register {
+            rounding: false,
+            saturate: true,
+        });
+    }
+    Some(ShiftKind::LeftImmediate {
+        shift: u16::try_from(parse_immediate(&amount.raw)?).ok()?,
+        saturate: true,
+    })
 }
 
 /// The same-width shift family.
@@ -370,10 +395,12 @@ pub(super) fn shift_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShap
             rounding,
         })
     };
+    let register = |rounding, saturate| ShiftKind::Register { rounding, saturate };
     let (kind, signed) = match mnemonic {
         "shl" => (
             ShiftKind::LeftImmediate {
                 shift: immediate_shift()?,
+                saturate: false,
             },
             false,
         ),
@@ -381,10 +408,14 @@ pub(super) fn shift_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShap
         "sshr" => (right(false)?, true),
         "urshr" => (right(true)?, false),
         "srshr" => (right(true)?, true),
-        "ushl" => (ShiftKind::Register { rounding: false }, false),
-        "sshl" => (ShiftKind::Register { rounding: false }, true),
-        "urshl" => (ShiftKind::Register { rounding: true }, false),
-        "srshl" => (ShiftKind::Register { rounding: true }, true),
+        "ushl" => (register(false, false), false),
+        "sshl" => (register(false, false), true),
+        "urshl" => (register(true, false), false),
+        "srshl" => (register(true, false), true),
+        "sqshl" => (saturating_left_shift(insn)?, true),
+        "uqshl" => (saturating_left_shift(insn)?, false),
+        "sqrshl" => (register(true, true), true),
+        "uqrshl" => (register(true, true), false),
         _ => return None,
     };
     let register_form = matches!(kind, ShiftKind::Register { .. });
@@ -408,7 +439,7 @@ pub(super) fn shift_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShap
     // A left shift by the element width, or a right shift past it, is
     // outside the immediate encodings' range.
     let bounded = match kind {
-        ShiftKind::LeftImmediate { shift } => shift < destination.lane_bits,
+        ShiftKind::LeftImmediate { shift, .. } => shift < destination.lane_bits,
         ShiftKind::RightImmediate { shift, .. } => shift > 0 && shift <= destination.lane_bits,
         ShiftKind::Register { .. } => true,
     };
@@ -417,6 +448,45 @@ pub(super) fn shift_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShap
     }
     Some(NeonShape {
         op: NeonOp::Shift { kind, signed },
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+/// `sri` / `sli` — the shift-and-insert pair.
+///
+/// The two directions carry different immediate ranges, and both bounds
+/// are the encoding's rather than a convenience: `sli` shifts left by
+/// `0..n-1` and `sri` right by `1..n`, so each spells exactly the
+/// amounts that leave at least one source bit in the destination. A
+/// `sri` by the full element width is therefore legal and copies
+/// nothing, which the lowering reproduces rather than special-cases.
+pub(super) fn shift_insert_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let left = match mnemonic {
+        "sli" => true,
+        "sri" => false,
+        _ => return None,
+    };
+    if insn.operands.len() != 3 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    if operand_arrangement(insn.operands.get(1)?)? != destination {
+        return None;
+    }
+    let shift = u16::try_from(parse_immediate(&insn.operands.get(2)?.raw)?).ok()?;
+    let bounded = if left {
+        shift < destination.lane_bits
+    } else {
+        shift > 0 && shift <= destination.lane_bits
+    };
+    if !bounded {
+        return None;
+    }
+    Some(NeonShape {
+        op: NeonOp::ShiftInsert { left, shift },
         lane_bits: destination.lane_bits,
         lanes: destination.lanes,
         dest_index: 0,
@@ -536,6 +606,15 @@ pub(super) enum SaturatingKind {
     /// `sqdmulh` / `sqrdmulh` — double the product and keep its high
     /// half.
     DoublingMultiplyHigh { rounding: bool },
+    /// `sqabs` / `sqneg` — the magnitude or the negation of one element,
+    /// clamped into the signed range.
+    ///
+    /// The clamp is the whole reason these are not members of the
+    /// lane-wise family, where `abs` and `neg` already sit: both wrap at
+    /// `INT_MIN`, whose magnitude is one past the top of the range, so
+    /// resolving `sqabs` through `abs` would answer `INT_MIN` where the
+    /// architecture answers `INT_MAX`. A wrong value, not a decline.
+    Unary { negate: bool },
 }
 
 /// The same-width saturating and halving mnemonics.
@@ -561,6 +640,8 @@ fn saturating_same_width(base: &str) -> Option<(SaturatingKind, bool)> {
             SaturatingKind::DoublingMultiplyHigh { rounding: true },
             true,
         ),
+        "sqabs" => (SaturatingKind::Unary { negate: false }, true),
+        "sqneg" => (SaturatingKind::Unary { negate: true }, true),
         _ => return None,
     })
 }
@@ -610,7 +691,7 @@ pub(super) fn saturating_shape(insn: &Instruction, mnemonic: &str) -> Option<Neo
         SaturatingKind::Narrow { .. } | SaturatingKind::ShiftNarrow { .. }
     );
     let expected_operands = match kind {
-        SaturatingKind::Narrow { .. } => 2,
+        SaturatingKind::Narrow { .. } | SaturatingKind::Unary { .. } => 2,
         _ => 3,
     };
     if insn.operands.len() != expected_operands {
@@ -679,10 +760,82 @@ pub(super) fn saturating_shape(insn: &Instruction, mnemonic: &str) -> Option<Neo
     })
 }
 
+/// `suqadd` / `usqadd` — the mixed-signedness accumulate.
+///
+/// Two operands, both the destination's arrangement, and the
+/// destination is an input: it is the accumulator. What separates this
+/// from the ordinary saturating add is that the two addends are read
+/// with *different* signednesses and the clamp is into the range of the
+/// destination, which is neither addend's.
+pub(super) fn mixed_sign_add_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let destination_signed = match mnemonic {
+        "suqadd" => true,
+        "usqadd" => false,
+        _ => return None,
+    };
+    let destination = uniform_shape(insn, 2)?;
+    Some(NeonShape {
+        op: NeonOp::MixedSignAdd { destination_signed },
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
+/// `sqdmull` / `sqdmlal` / `sqdmlsl` — the doubling long multiplies.
+///
+/// A product, and yet resolved here rather than beside the other
+/// multiplies, for the reason the module header gives: what defines the
+/// family is the clamp. `2 * INT_MIN * INT_MIN` is `2^(2n-1)`, one past
+/// the top of the doubled element's signed range, and it is the only
+/// input pair at which these saturate at all.
+pub(super) fn doubling_long_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
+    let (base, upper) = peel_upper(mnemonic);
+    let combine = match base {
+        "sqdmull" => None,
+        "sqdmlal" => Some(BinOp::Add),
+        "sqdmlsl" => Some(BinOp::Sub),
+        _ => return None,
+    };
+    if insn.operands.len() != 3 {
+        return None;
+    }
+    let destination = operand_arrangement(insn.operands.first()?)?;
+    // The architecture encodes a 16- or 32-bit source element only, so
+    // the destination is 32 or 64. Without this a `.8h` destination
+    // would resolve against byte sources the encoding does not spell.
+    if !matches!(destination.lane_bits, 32 | 64) {
+        return None;
+    }
+    let source_bits = destination.lane_bits / 2;
+    let expected_lanes = if upper {
+        destination.lanes.checked_mul(2)?
+    } else {
+        destination.lanes
+    };
+    for operand in insn.operands.iter().skip(1) {
+        let arrangement = operand_arrangement(operand)?;
+        if arrangement.lane_bits != source_bits || arrangement.lanes != expected_lanes {
+            return None;
+        }
+        if upper && !spans_full_register(arrangement) {
+            return None;
+        }
+    }
+    Some(NeonShape {
+        op: NeonOp::DoublingLong { combine, upper },
+        lane_bits: destination.lane_bits,
+        lanes: destination.lanes,
+        dest_index: 0,
+        source_index: 0,
+    })
+}
+
 // ===================== estimates =====================
 
-/// `frecpe` / `frsqrte`, the reciprocal and reciprocal-square-root
-/// estimates.
+/// `frecpe` / `frsqrte` / `urecpe` / `ursqrte`, the reciprocal and
+/// reciprocal-square-root estimates.
 ///
 /// Their *refinement* steps `frecps` / `frsqrts` are deliberately not
 /// here. `2.0 - x*y` and `(3.0 - x*y) / 2.0` describe them arithmetically,
@@ -696,12 +849,29 @@ pub(super) fn saturating_shape(insn: &Instruction, mnemonic: &str) -> Option<Neo
 /// which would need binary128, so that is its own piece of work rather
 /// than a half-covered special case.)
 pub(super) fn estimate_shape(insn: &Instruction, mnemonic: &str) -> Option<NeonShape> {
-    if !matches!(mnemonic, "frecpe" | "frsqrte") || insn.operands.len() != 2 {
+    // The unsigned pair shares the lowering because it shares the
+    // objection: `urecpe` / `ursqrte` normalise the element, look the
+    // reciprocal up in a table the architecture specifies to eight
+    // fraction bits, and renormalise. That is a divide the IR cannot
+    // spell, so the choice is a free value or a decline, and a decline
+    // would truncate the slice. Unlike the float pair they encode only
+    // a 32-bit element.
+    let float = match mnemonic {
+        "frecpe" | "frsqrte" => true,
+        "urecpe" | "ursqrte" => false,
+        _ => return None,
+    };
+    if insn.operands.len() != 2 {
         return None;
     }
     let destination = operand_arrangement(insn.operands.first()?)?;
-    // An estimate of an IEEE lane; `.16b` names no float format.
-    if !matches!(destination.lane_bits, 16 | 32 | 64) {
+    let encodable = if float {
+        // An estimate of an IEEE lane; `.16b` names no float format.
+        is_float_lane(destination.lane_bits)
+    } else {
+        destination.lane_bits == 32
+    };
+    if !encodable {
         return None;
     }
     if operand_arrangement(insn.operands.get(1)?)? != destination {
