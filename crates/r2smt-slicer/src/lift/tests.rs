@@ -5526,3 +5526,35 @@ fn ptest_is_claimed_by_the_x86_simd_gate_so_esil_does_not_win() {
         "ptest should define ZF, got {stmts:?}"
     );
 }
+
+#[test]
+fn the_scalar_write_path_refuses_a_simd_parent() {
+    // The structural half of the `fcvtzs s0, s1` fix. That handler now
+    // branches on the destination's class, but the reason the branch is
+    // *needed* lives here: this path sizes the parent at `LiftCtx::bits`
+    // — 64 on `AArch64`, 32 on `AArch32` — where a vector register is
+    // 128, and its partial-write branch preserves bits a scalar SIMD
+    // write clears.
+    //
+    // Refusing is strictly better than being careful, because there is
+    // no correct use of it on a vector register. Without this, the next
+    // handler written can arrive at the same silent wrong value.
+    for (arch, simd, general) in [
+        (Arch::Aarch64, "s0", "w0"),
+        (Arch::Aarch64, "d0", "x0"),
+        (Arch::Arm, "s0", "r0"),
+    ] {
+        let ctx = LiftCtx::new(arch);
+        let value = Expr::konst(0, 32);
+        assert!(
+            ctx.build_parent_write(&reg(simd), value.clone()).is_none(),
+            "{arch:?}: {simd} is a vector view and must not take the scalar path"
+        );
+        // And the same call on a general register still works, so the
+        // guard is about the register file rather than about width.
+        assert!(
+            ctx.build_parent_write(&reg(general), value).is_some(),
+            "{arch:?}: {general} must still take it"
+        );
+    }
+}

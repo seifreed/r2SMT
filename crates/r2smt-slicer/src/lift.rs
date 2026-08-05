@@ -32,7 +32,7 @@ use tracing::debug;
 use crate::collector::BranchCandidate;
 use crate::condition::BranchCondition;
 use crate::effect::{memory_operand_width, stack_slot};
-use crate::registers::{has_vector_arrangement, register_layout};
+use crate::registers::{has_vector_arrangement, is_simd_parent, register_layout};
 use crate::slice::{Slice, SliceMerge, SliceStatus};
 
 mod aarch32;
@@ -842,8 +842,29 @@ impl LiftCtx {
     /// Build the right-hand-side expression that, when assigned to the
     /// parent register, captures writing `value` (already at the
     /// destination's natural width) to the operand `op`.
+    ///
+    /// **General registers only.** A SIMD parent declines here and must
+    /// go through [`LiftCtx::write_simd_dst`] instead, because this path
+    /// gets two things wrong for one and neither loudly. It sizes the
+    /// parent at [`LiftCtx::bits`] — the *pointer* width, 64 on
+    /// `AArch64` and 32 on `AArch32`, where the vector register is 128 —
+    /// and since the SSA pass versions by name alone, a vector read of
+    /// the same register binds to that narrower definition rather than
+    /// becoming a free input. And its partial-write branch preserves the
+    /// bits outside the view, which is right for a sub-register write
+    /// and wrong for a scalar SIMD one that clears them.
+    ///
+    /// That combination reached the solver once (`fcvtzs s0, s1`, fixed
+    /// alongside this guard) and produced a wrong verdict below bit 63
+    /// and an out-of-range `Z3_mk_extract` above it. The guard is here
+    /// so the next handler cannot arrive at it the same way: there is no
+    /// correct use of this function on a vector register, so refusing is
+    /// strictly better than being careful.
     fn build_parent_write(&self, op: &Operand, value: Expr) -> Option<(Var, Expr)> {
         let layout = register_layout(&op.raw, self.arch)?;
+        if is_simd_parent(layout.parent, self.arch) {
+            return None;
+        }
         let parent_bits = self.bits;
         if layout.hi >= parent_bits {
             return None;
