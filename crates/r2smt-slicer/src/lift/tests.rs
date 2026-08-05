@@ -1978,6 +1978,52 @@ fn movsd_reg_reg_effect_reads_its_destination() {
 }
 
 #[test]
+fn palignr_effect_reads_its_destination_despite_having_three_operands() {
+    // `palignr` is the first modelled family that is both
+    // read-modify-write and 3-operand: the destination is the *high*
+    // half of the pair the window slides over. An operand-count proxy
+    // for "VEX form" would drop it from `uses`, and the backward walk
+    // would then discard whatever produced it — a fabricated verdict,
+    // the `pandn` class.
+    //
+    // The derived parity guard cannot catch this: it checks membership,
+    // kind, def-parity and the absence of `Unsupported`, and never
+    // inspects `uses`.
+    let i = insn(
+        0x1000,
+        4,
+        "palignr",
+        vec![
+            op("xmm0", OperandKind::Register),
+            op("xmm1", OperandKind::Register),
+            op("0x5", OperandKind::Immediate),
+        ],
+    );
+    let e = crate::effect::analyze(&i, Arch::X86_64);
+    assert!(e.uses.contains(&"zmm0"), "{:?}", e.uses);
+}
+
+#[test]
+fn vpalignr_effect_does_not_read_its_destination() {
+    // The companion direction, so the rule is genuinely keyed on the
+    // encoding and not on the operand count: the VEX form names both
+    // halves of the pair explicitly and never reads the destination.
+    let i = insn(
+        0x1000,
+        4,
+        "vpalignr",
+        vec![
+            op("xmm0", OperandKind::Register),
+            op("xmm1", OperandKind::Register),
+            op("xmm2", OperandKind::Register),
+            op("0x5", OperandKind::Immediate),
+        ],
+    );
+    let e = crate::effect::analyze(&i, Arch::X86_64);
+    assert_eq!(e.uses, vec!["zmm1", "zmm2"]);
+}
+
+#[test]
 fn movsd_string_form_is_not_claimed_by_the_scalar_move_handler() {
     // `movsd` also names the string instruction (opcode `A5`), which
     // radare2 spells `movsd dword [rdi], dword [rsi]`. It shares nothing
@@ -3118,6 +3164,7 @@ const SIMD_IMMEDIATE_COUNT: &[&str] = &[
 /// selector from a *register*, and giving it an immediate would build
 /// an instruction that does not exist.
 const SIMD_IMMEDIATE_SELECTOR: &[&str] = &[
+    "palignr",
     "pshufd",
     "pshuflw",
     "pshufhw",
@@ -3160,6 +3207,11 @@ fn simd_parity_operands(mnemonic: &str) -> Vec<Vec<Operand>> {
         }
         "movq" | "vmovq" => {
             return vec![vec![reg("rax"), reg("xmm1")], vec![reg("xmm0"), reg("rax")]];
+        }
+        // The only 4-operand form modelled: two explicit sources plus
+        // the byte offset.
+        "vpalignr" => {
+            return vec![vec![reg("xmm0"), reg("xmm1"), reg("xmm2"), imm("0x5")]];
         }
         _ => {}
     }
@@ -3207,7 +3259,7 @@ fn the_simd_membership_table_covers_every_modelled_mnemonic() {
     // table is a deliberate act.
     assert_eq!(
         x86::X86_SIMD_MOVES.len() + x86::X86_SIMD_READ_MODIFY_WRITES.len(),
-        216,
+        218,
         "the x86 SIMD membership table changed size"
     );
 }

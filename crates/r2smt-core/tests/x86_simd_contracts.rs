@@ -946,3 +946,104 @@ fn ptest_clears_the_flags_it_does_not_compute() {
         );
     }
 }
+
+/// Byte `i` of `zmm0` (the `palignr` destination, and the *high* half of
+/// the pair) is `0x10 + i`; byte `i` of `zmm1` is `i`. The concatenation
+/// `zmm0 : zmm1` therefore reads `0x00, 0x01, … 0x1f` from the bottom,
+/// so an expected window is legible by inspection.
+const ALIGN_LOW: u128 = 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100;
+const ALIGN_HIGH: u128 = 0x1f1e_1d1c_1b1a_1918_1716_1514_1312_1110;
+
+#[test]
+fn palignr_slides_a_window_over_the_concatenated_pair() {
+    // The destination is the high half and the source the low one, so a
+    // byte offset of 4 lands on `0x04`. Concatenating the other way
+    // round would start at `0x14`.
+    assert_computes(
+        "palignr",
+        &["xmm0", "xmm1", "0x4"],
+        &[("zmm0", ALIGN_HIGH), ("zmm1", ALIGN_LOW)],
+        0x1312_1110_0f0e_0d0c_0b0a_0908_0706_0504,
+    );
+}
+
+#[test]
+fn palignr_of_zero_returns_the_source_untouched() {
+    // The degenerate offset, which pins the direction of the pair: a
+    // window starting at byte zero is the *source*, never the
+    // destination.
+    assert_computes(
+        "palignr",
+        &["xmm0", "xmm1", "0x0"],
+        &[("zmm0", ALIGN_HIGH), ("zmm1", ALIGN_LOW)],
+        ALIGN_LOW,
+    );
+}
+
+#[test]
+fn palignr_fills_with_zero_past_the_end_of_the_pair() {
+    // With an offset of 20 the window runs off the top of the 32-byte
+    // pair after twelve bytes, and the architecture defines the rest as
+    // zero. This is the case a pick table of plain indices cannot
+    // express: an out-of-range index makes `extract_lane` decline, so
+    // the instruction would be dropped where the answer is a constant.
+    assert_computes(
+        "palignr",
+        &["xmm0", "xmm1", "0x14"],
+        &[("zmm0", ALIGN_HIGH), ("zmm1", ALIGN_LOW)],
+        0x0000_0000_1f1e_1d1c_1b1a_1918_1716_1514,
+    );
+}
+
+#[test]
+fn palignr_past_the_whole_pair_is_all_zero() {
+    assert_computes(
+        "palignr",
+        &["xmm0", "xmm1", "0x20"],
+        &[("zmm0", ALIGN_HIGH), ("zmm1", ALIGN_LOW)],
+        0,
+    );
+}
+
+#[test]
+fn vpalignr_takes_its_pair_from_the_two_explicit_sources() {
+    // The VEX form does not read its destination at all, so binding
+    // `zmm0` to a distinctive value must not change the result.
+    assert_computes(
+        "vpalignr",
+        &["xmm0", "xmm1", "xmm2", "0x4"],
+        &[
+            ("zmm0", 0xdead_beef_dead_beef_dead_beef_dead_beef),
+            ("zmm1", ALIGN_HIGH),
+            ("zmm2", ALIGN_LOW),
+        ],
+        0x1312_1110_0f0e_0d0c_0b0a_0908_0706_0504,
+    );
+}
+
+#[test]
+fn vpalignr_aligns_each_128_bit_block_against_its_own_half() {
+    // AVX widened this by running the same 128-bit alignment in each
+    // half rather than by widening the window, so the upper block never
+    // reads a byte from the lower one. Reading a `ymm` as one flat
+    // 32-byte vector would move data across the halfway line — a wrong
+    // value, not a decline.
+    //
+    // Both sources carry `ALIGN_HIGH` in their upper block and
+    // `ALIGN_LOW` in their lower, so a window that crossed blocks would
+    // be visibly different from one that did not.
+    assert_eq!(
+        solve_with_bindings(
+            "vpalignr",
+            &["ymm0", "ymm1", "ymm2", "0x4"],
+            &[
+                ("zmm1", two_blocks(ALIGN_LOW, ALIGN_HIGH)),
+                ("zmm2", two_blocks(ALIGN_HIGH, ALIGN_LOW)),
+            ],
+            0x1312_1110_0f0e_0d0c_0b0a_0908_0706_0504,
+            128,
+        ),
+        SmtResult::AlwaysTrue,
+        "the upper block of vpalignr should align within its own half"
+    );
+}

@@ -261,7 +261,6 @@ fn simd_effect(insn: &Instruction, shape: X86SimdShape) -> InstructionEffect {
         return other_effect(insn);
     }
     let mnem = insn.mnemonic.trim().to_ascii_lowercase();
-    let three_op = insn.operands.len() == 3;
     let is_xor = mnem == "pxor" || mnem == "vpxor";
     let zero_idiom = is_xor && xor_zero_idiom(insn);
 
@@ -270,10 +269,23 @@ fn simd_effect(insn: &Instruction, shape: X86SimdShape) -> InstructionEffect {
     if let Some(dst) = insn.operands.first() {
         if let Some(reg) = canonical_register(&dst.raw, Arch::X86_64) {
             defs.push(reg);
-            // A 2-operand bitwise op reads its destination (RMW).
-            // Moves, 3-operand VEX forms, and the zero idiom write the
-            // destination without depending on its prior value.
-            if matches!(shape, X86SimdShape::ReadModifyWrite) && !three_op && !zero_idiom {
+            // A legacy read-modify-write reads its destination; the VEX
+            // form names its two sources explicitly and does not, and
+            // the zero idiom depends on nothing.
+            //
+            // Keyed on the encoding rather than on the operand count.
+            // The two agree for every mnemonic modelled when this was
+            // written, and diverge for the first family that is both
+            // read-modify-write and 3-operand: `palignr xmm0, xmm1, 5`
+            // reads `xmm0` as the high half of its source pair, so an
+            // operand-count proxy would drop it from `uses` and the
+            // backward walk would discard whatever produced it. The
+            // 4-operand VEX form breaks the proxy the other way, adding
+            // a use it does not have.
+            if matches!(shape, X86SimdShape::ReadModifyWrite)
+                && !crate::lift::is_vex(insn)
+                && !zero_idiom
+            {
                 uses.push(reg);
             }
         } else {

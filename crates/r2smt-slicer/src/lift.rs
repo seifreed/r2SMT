@@ -53,7 +53,7 @@ pub(crate) use simd::{
     fp_sort_bits_checked, fused_multiply_lane,
 };
 pub(crate) use x86::{
-    X86SimdShape, is_fp_compare_mnemonic, is_x86_vector_flag_compare, sse_scalar_move_lane,
+    X86SimdShape, is_fp_compare_mnemonic, is_vex, is_x86_vector_flag_compare, sse_scalar_move_lane,
     x86_simd_shape,
 };
 use x87::X87Stack;

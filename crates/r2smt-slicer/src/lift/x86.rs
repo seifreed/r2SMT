@@ -951,6 +951,12 @@ pub(crate) const X86_SIMD_READ_MODIFY_WRITES: &[&str] = &[
     "vpunpckhwd",
     "vpunpckhdq",
     "vpunpckhqdq",
+    // `palignr` is the one family whose legacy form is 3-operand and
+    // still reads its destination — it is the *high* half of the pair
+    // the window slides over. That is what the destination-use rule
+    // keys off `is_vex` rather than the operand count for.
+    "palignr",
+    "vpalignr",
     // `pshufb` shuffles the destination itself, indexed by the source,
     // so the destination is a use as well; the packs fill their
     // destination from both operands.
@@ -969,7 +975,7 @@ pub(crate) const X86_SIMD_READ_MODIFY_WRITES: &[&str] = &[
 /// Whether `insn` is a VEX/EVEX-encoded (`v`-prefixed) SIMD form, whose
 /// destination write zeroes the vector-register bits above the view.
 /// Legacy SSE forms preserve those bits.
-fn is_vex(insn: &Instruction) -> bool {
+pub(crate) fn is_vex(insn: &Instruction) -> bool {
     insn.mnemonic.trim().to_ascii_lowercase().starts_with('v')
 }
 

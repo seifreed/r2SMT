@@ -232,6 +232,7 @@ impl LiftCtx {
             "pabsw" | "vpabsw" => self.lift_simd_packed_int_unary(insn, ABSOLUTE, 16),
             "pabsd" | "vpabsd" => self.lift_simd_packed_int_unary(insn, ABSOLUTE, 32),
             // Constant permutations selected by an immediate.
+            "palignr" | "vpalignr" => self.lift_simd_align_right(insn),
             "pshufd" | "vpshufd" => self.lift_simd_shuffle(insn, ShuffleForm::Doubleword),
             "pshuflw" | "vpshuflw" => self.lift_simd_shuffle(insn, ShuffleForm::LowWords),
             "pshufhw" | "vpshufhw" => self.lift_simd_shuffle(insn, ShuffleForm::HighWords),
@@ -337,6 +338,60 @@ impl LiftCtx {
             return;
         };
         let Some(result) = self.permuted_value(&a_op, Some(&b_op), view, lane_bits, &picks) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        if !self.write_simd_dst(&dst, result, is_vex(insn)) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
+    /// `palignr` — concatenate the destination above the source and
+    /// take the 16-byte window starting `imm8` bytes up.
+    ///
+    /// The first family here whose legacy form is 3-operand and still
+    /// reads its destination: it is the *high* half of the pair. The
+    /// VEX form takes four operands and the pair from its two explicit
+    /// sources instead.
+    ///
+    /// Per 128-bit block like every other x86 permutation, so a `ymm`
+    /// form aligns each half against its own half and never across.
+    fn lift_simd_align_right(&mut self, insn: &Instruction) {
+        let ops = &insn.operands;
+        let Some(dst) = ops.first() else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        // The pair is (high, low) = (first source, second source), and
+        // the immediate is always last.
+        let (high_op, low_op, selector) = match ops.len() {
+            3 => (dst, &ops[1], &ops[2]),
+            4 => (&ops[1], &ops[2], &ops[3]),
+            _ => {
+                self.push_simd_unsupported(insn);
+                return;
+            }
+        };
+        if selector.kind != OperandKind::Immediate {
+            self.push_simd_unsupported(insn);
+            return;
+        }
+        let Some(offset) = parse_immediate(&selector.raw) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let (dst, high_op, low_op) = (dst.clone(), high_op.clone(), low_op.clone());
+        let Some(view) = self.simd_instruction_view_bits(&[&dst, &high_op, &low_op]) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let Some(picks) = align_right_picks(offset, view) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let Some(result) =
+            self.permuted_value(&low_op, Some(&high_op), view, BITS_PER_BYTE, &picks)
+        else {
             self.push_simd_unsupported(insn);
             return;
         };
@@ -535,8 +590,15 @@ impl LiftCtx {
             None => None,
         };
         let mut lanes = Vec::with_capacity(picks.len());
-        for &(from_second, index) in picks {
-            let source = if from_second { b.clone()? } else { a.clone() };
+        for pick in picks {
+            let (source, index) = match *pick {
+                LanePick::First(index) => (a.clone(), index),
+                LanePick::Second(index) => (b.clone()?, index),
+                LanePick::Zero => {
+                    lanes.push(Expr::konst(0, lane_bits));
+                    continue;
+                }
+            };
             lanes.push(Self::extract_lane(source, lane_bits, index)?);
         }
         Self::concat_lanes(lanes)
@@ -1264,9 +1326,24 @@ impl LiftCtx {
     }
 }
 
-/// Where one destination lane comes from: `true` selects the second
-/// source operand, and the index is absolute within the whole view.
-type LanePick = (bool, u16);
+/// Where one destination lane comes from. Indices are absolute within
+/// the whole view, not within the 128-bit block.
+///
+/// [`LanePick::Zero`] is not a source at all, and exists because
+/// `palignr` fills with architectural zeros once its byte offset passes
+/// the width of the source pair. Spelling that as an out-of-range index
+/// would not work: [`LiftCtx::extract_lane`] answers `None` past the
+/// view, so the whole instruction would decline where the correct
+/// answer is a known constant.
+#[derive(Clone, Copy)]
+enum LanePick {
+    /// Lane `index` of the first source.
+    First(u16),
+    /// Lane `index` of the second source.
+    Second(u16),
+    /// A lane the architecture defines as zero.
+    Zero,
+}
 
 /// Bits in the 128-bit block every x86 lane permutation is confined to.
 ///
@@ -1354,7 +1431,38 @@ fn shuffle_picks(form: ShuffleForm, selector: u64, view: u16) -> Option<Vec<Lane
                 // Outside the immediate's reach, so copied verbatim.
                 _ => lane,
             };
-            picks.push((false, base.checked_add(within)?));
+            picks.push(LanePick::First(base.checked_add(within)?));
+        }
+    }
+    Some(picks)
+}
+
+/// The destination byte table of a `palignr`, per 128-bit block.
+///
+/// Destination byte `i` takes byte `i + offset` of the concatenation
+/// `high : low`, so indices below 16 come from the low source and
+/// 16..31 from the high one. Past 31 the architecture defines the byte
+/// as zero, which is why [`LanePick`] carries a variant for it: the
+/// whole result is zero once `offset >= 32`, and the top bytes are zero
+/// for any `offset` above 16.
+fn align_right_picks(offset: u64, view: u16) -> Option<Vec<LanePick>> {
+    let blocks = permute_blocks(view)?;
+    let per_block = PERMUTE_BLOCK_BITS / BITS_PER_BYTE;
+    let pair = per_block.checked_mul(2)?;
+    // The immediate is a byte; a wider value is not an encoding.
+    let offset = u16::from(u8::try_from(offset).ok()?);
+    let mut picks = Vec::with_capacity(usize::from(blocks) * usize::from(per_block));
+    for block in 0..blocks {
+        let base = block.checked_mul(per_block)?;
+        for byte in 0..per_block {
+            let Some(index) = byte.checked_add(offset).filter(|i| *i < pair) else {
+                picks.push(LanePick::Zero);
+                continue;
+            };
+            picks.push(match index.checked_sub(per_block) {
+                Some(high) => LanePick::Second(base.checked_add(high)?),
+                None => LanePick::First(base.checked_add(index)?),
+            });
         }
     }
     Some(picks)
@@ -1377,8 +1485,8 @@ fn unpack_picks(high: bool, lane_bits: u16, view: u16) -> Option<Vec<LanePick>> 
         let base = block.checked_mul(per_block)?;
         for pair in 0..half {
             let index = base.checked_add(source_base)?.checked_add(pair)?;
-            picks.push((false, index));
-            picks.push((true, index));
+            picks.push(LanePick::First(index));
+            picks.push(LanePick::Second(index));
         }
     }
     Some(picks)
