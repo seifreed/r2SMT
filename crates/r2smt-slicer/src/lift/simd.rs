@@ -71,6 +71,13 @@ pub(crate) enum PackedIntOp {
         signed: bool,
         rounding: bool,
     },
+    /// x86 `pmulhw` / `pmulhuw` — the **high** half of the lane product.
+    ///
+    /// Its signedness is the whole operation rather than a detail of it:
+    /// the low half of a product is the same bits either way, and only
+    /// the half this keeps tells the two apart. `0xffff * 2` is `0xffff`
+    /// signed (it is `-1 * 2`) and `0x0001` unsigned.
+    MultiplyHigh { signed: bool },
 }
 
 /// What a packed ARM vector data-processing instruction computes.
@@ -1024,6 +1031,14 @@ fn packed_int_lane(op: PackedIntOp, a: Expr, b: Option<Expr>, bits: u16) -> Opti
         PackedIntOp::BitClear => Expr::bv_and(a, Expr::bv_xor(b?, all_ones(bits))),
         PackedIntOp::Not => Expr::bv_xor(a, all_ones(bits)),
         PackedIntOp::Copy => a,
+        PackedIntOp::MultiplyHigh { signed } => {
+            // Multiply where the product fits, then keep the top half.
+            // Doing it at the lane width would discard exactly the bits
+            // this instruction returns.
+            let wide = bits.checked_mul(2)?;
+            let product = Expr::mul(extend_lane(a, wide, signed), extend_lane(b?, wide, signed));
+            Expr::extract(product, wide - 1, bits)
+        }
         PackedIntOp::MinMax { max, signed } => {
             let other = b?;
             // `max` keeps the first operand when the second is smaller;

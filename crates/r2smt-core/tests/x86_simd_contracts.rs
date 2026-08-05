@@ -22,6 +22,7 @@ use r2smt_smt::solve_branch;
 use r2smt_ssa::ssa_convert;
 
 const TEST_SOLVE_TIMEOUT_MS: u32 = 10_000;
+
 const VECTOR_BITS: u16 = 512;
 
 fn operand(raw: &str) -> Operand {
@@ -1045,5 +1046,85 @@ fn vpalignr_aligns_each_128_bit_block_against_its_own_half() {
         ),
         SmtResult::AlwaysTrue,
         "the upper block of vpalignr should align within its own half"
+    );
+}
+
+// --- the multiply forms that keep the high half ----------------------
+
+#[test]
+fn pmulhw_keeps_the_signed_high_half_of_the_product() {
+    // `0xffff` is `-1` signed, so `-1 * 2` is `-2` and its high word is
+    // `0xffff`. The low half would be `0xfffe` either way — only the
+    // half this instruction keeps tells the signed form from the
+    // unsigned one, which is why the pair below is the contract.
+    assert_computes(
+        "pmulhw",
+        &["xmm0", "xmm1"],
+        &[
+            ("zmm0", packed(16, &[0xffff])),
+            ("zmm1", packed(16, &[0x0002])),
+        ],
+        packed(16, &[0xffff]),
+    );
+}
+
+#[test]
+fn pmulhuw_keeps_the_unsigned_high_half_of_the_same_product() {
+    // The same lanes read unsigned: `65535 * 2` is `0x1_fffe`, whose
+    // high word is `0x0001`. A lowering that extended the wrong way
+    // answers `0xffff` here.
+    assert_computes(
+        "pmulhuw",
+        &["xmm0", "xmm1"],
+        &[
+            ("zmm0", packed(16, &[0xffff])),
+            ("zmm1", packed(16, &[0x0002])),
+        ],
+        packed(16, &[0x0001]),
+    );
+}
+
+#[test]
+fn pmaddwd_adds_the_adjacent_products_into_one_dword() {
+    // Two word lanes in, one dword lane out: `2*3 + 4*5` is 26. A
+    // lowering that treated this as lane-in/lane-out would produce two
+    // words rather than one dword.
+    assert_computes(
+        "pmaddwd",
+        &["xmm0", "xmm1"],
+        &[("zmm0", packed(16, &[2, 4])), ("zmm1", packed(16, &[3, 5]))],
+        packed(32, &[26]),
+    );
+}
+
+#[test]
+fn pmaddwd_does_not_saturate_the_one_pair_that_overflows() {
+    // `0x8000 * 0x8000` is `0x4000_0000` signed, twice, and the sum is
+    // exactly `0x8000_0000`. It is the only input pair that reaches the
+    // edge, and the architecture does **not** saturate it — a lowering
+    // that clamped would answer `0x7fff_ffff`.
+    assert_computes(
+        "pmaddwd",
+        &["xmm0", "xmm1"],
+        &[
+            ("zmm0", packed(16, &[0x8000, 0x8000])),
+            ("zmm1", packed(16, &[0x8000, 0x8000])),
+        ],
+        packed(32, &[0x8000_0000]),
+    );
+}
+
+#[test]
+fn pmaddwd_reads_its_words_signed() {
+    // `(-1) * 1 + 0 * 0` is `-1`, sign-extended across the dword. Read
+    // unsigned the same lanes would give `0x0000_ffff`.
+    assert_computes(
+        "pmaddwd",
+        &["xmm0", "xmm1"],
+        &[
+            ("zmm0", packed(16, &[0xffff, 0])),
+            ("zmm1", packed(16, &[0x0001, 0])),
+        ],
+        packed(32, &[0xffff_ffff]),
     );
 }

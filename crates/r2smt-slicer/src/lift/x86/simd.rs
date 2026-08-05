@@ -24,9 +24,9 @@ use crate::lift::{
 
 use super::{
     ABSOLUTE, ADD, AVERAGE, BITS_PER_BYTE, F16C_HALF_BITS, F16C_IMM_USE_MXCSR, F16C_SINGLE_BITS,
-    FpCompare, MAX_SIGNED, MAX_UNSIGNED, MIN_SIGNED, MIN_UNSIGNED, MUL, SAT_ADD_SIGNED,
-    SAT_ADD_UNSIGNED, SAT_SUB_SIGNED, SAT_SUB_UNSIGNED, SUB, SimdBitOp, VECTOR_TEST_CLEARED_FLAGS,
-    fp_mask_lane, is_vex, parse_immediate, same_xmm_register,
+    FpCompare, MAX_SIGNED, MAX_UNSIGNED, MIN_SIGNED, MIN_UNSIGNED, MUL, MUL_HIGH_SIGNED,
+    MUL_HIGH_UNSIGNED, SAT_ADD_SIGNED, SAT_ADD_UNSIGNED, SAT_SUB_SIGNED, SAT_SUB_UNSIGNED, SUB,
+    SimdBitOp, VECTOR_TEST_CLEARED_FLAGS, fp_mask_lane, is_vex, parse_immediate, same_xmm_register,
 };
 
 impl LiftCtx {
@@ -200,6 +200,11 @@ impl LiftCtx {
             "psubq" | "vpsubq" => self.lift_simd_packed_int(insn, SUB, 64),
             "pmullw" | "vpmullw" => self.lift_simd_packed_int(insn, MUL, 16),
             "pmulld" | "vpmulld" => self.lift_simd_packed_int(insn, MUL, 32),
+            // The high half of the word product. Word lanes only — x86
+            // spells no byte or dword form.
+            "pmulhw" | "vpmulhw" => self.lift_simd_packed_int(insn, MUL_HIGH_SIGNED, 16),
+            "pmulhuw" | "vpmulhuw" => self.lift_simd_packed_int(insn, MUL_HIGH_UNSIGNED, 16),
+            "pmaddwd" | "vpmaddwd" => self.lift_pmaddwd(insn),
             // The saturating forms. Only byte and word lanes exist —
             // x86 spells no saturating dword add.
             "paddsb" | "vpaddsb" => self.lift_simd_packed_int(insn, SAT_ADD_SIGNED, 8),
@@ -625,6 +630,78 @@ impl LiftCtx {
         };
         let (dst_c, a_c, b_c) = (dst.clone(), a_op.clone(), b_op.clone());
         let Some(result) = self.packed_int_result(&dst_c, &a_c, Some(&b_c), op, lane_bits) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        if !self.write_simd_dst(&dst_c, result, is_vex(insn)) {
+            self.push_simd_unsupported(insn);
+        }
+    }
+
+    /// `pmaddwd` — multiply signed word lanes pairwise and add each
+    /// adjacent pair into one dword lane.
+    ///
+    /// Not a lane operation, which is why it gets a handler of its own
+    /// rather than a [`PackedIntOp`]: the destination has **half** the
+    /// lanes at **twice** the width, so nothing in the lane-in/lane-out
+    /// vocabulary describes it.
+    ///
+    /// The sum is exact at 32 bits and the architecture does not
+    /// saturate it — the one input pair that overflows,
+    /// `0x8000 * 0x8000` twice, gives exactly `0x8000_0000` — so the
+    /// products are widened first and added at the destination width.
+    fn lift_pmaddwd(&mut self, insn: &Instruction) {
+        const SOURCE_BITS: u16 = 16;
+        const RESULT_BITS: u16 = 32;
+        let ops = &insn.operands;
+        let Some(dst) = ops.first() else {
+            return;
+        };
+        let (a_op, b_op) = match ops.len() {
+            2 => (dst.clone(), ops[1].clone()),
+            3 => (ops[1].clone(), ops[2].clone()),
+            _ => {
+                self.push_simd_unsupported(insn);
+                return;
+            }
+        };
+        let dst_c = dst.clone();
+        let Some(view) = self.simd_instruction_view_bits(&[&dst_c, &a_op, &b_op]) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let Some(pairs) = Self::packed_lane_count(view, RESULT_BITS) else {
+            self.push_simd_unsupported(insn);
+            return;
+        };
+        let mut lanes = Vec::new();
+        for pair in 0..pairs {
+            let mut sum = None;
+            for half in 0..2 {
+                let index = pair * 2 + half;
+                let (Some(a), Some(b)) = (
+                    self.read_simd_lane_bits(&a_op, SOURCE_BITS, index),
+                    self.read_simd_lane_bits(&b_op, SOURCE_BITS, index),
+                ) else {
+                    self.push_simd_unsupported(insn);
+                    return;
+                };
+                let product = Expr::mul(
+                    Expr::sign_ext(a, RESULT_BITS),
+                    Expr::sign_ext(b, RESULT_BITS),
+                );
+                sum = Some(match sum {
+                    Some(acc) => Expr::add(acc, product),
+                    None => product,
+                });
+            }
+            let Some(lane) = sum else {
+                self.push_simd_unsupported(insn);
+                return;
+            };
+            lanes.push(lane);
+        }
+        let Some(result) = Self::concat_lanes(lanes) else {
             self.push_simd_unsupported(insn);
             return;
         };

@@ -609,6 +609,12 @@ pub(crate) const X86_VECTOR_FLAG_COMPARES: &[&str] =
 const ADD: PackedIntOp = PackedIntOp::Bin(BinOp::Add);
 const SUB: PackedIntOp = PackedIntOp::Bin(BinOp::Sub);
 const MUL: PackedIntOp = PackedIntOp::Bin(BinOp::Mul);
+/// `pmulhw` / `pmulhuw` — the high half of the word product. The two
+/// differ only in the extension, and that difference is the whole
+/// instruction: `0xffff * 2` gives `0xffff` signed and `0x0001`
+/// unsigned.
+const MUL_HIGH_SIGNED: PackedIntOp = PackedIntOp::MultiplyHigh { signed: true };
+const MUL_HIGH_UNSIGNED: PackedIntOp = PackedIntOp::MultiplyHigh { signed: false };
 
 /// `padds*` / `paddus*` / `psubs*` / `psubus*` — the saturating forms.
 /// The `signed` flag picks both the extension of the operands and the
@@ -856,6 +862,12 @@ pub(crate) const X86_SIMD_READ_MODIFY_WRITES: &[&str] = &[
     "psubq",
     "pmullw",
     "pmulld",
+    "pmulhw",
+    "pmulhuw",
+    "pmaddwd",
+    "vpmulhw",
+    "vpmulhuw",
+    "vpmaddwd",
     "pslldq",
     "psrldq",
     "psllw",

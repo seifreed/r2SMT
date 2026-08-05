@@ -3442,7 +3442,7 @@ fn the_simd_membership_table_covers_every_modelled_mnemonic() {
     // table is a deliberate act.
     assert_eq!(
         x86::X86_SIMD_MOVES.len() + x86::X86_SIMD_READ_MODIFY_WRITES.len(),
-        218,
+        224,
         "the x86 SIMD membership table changed size"
     );
 }
