@@ -630,6 +630,11 @@ fn aarch64_branch_var(candidate: &BranchCandidate, arch: Arch) -> (Expr, u16) {
 #[must_use]
 pub fn lift_per_mnemonic(insn: &Instruction, arch: Arch) -> Vec<IrStmt> {
     let mut ctx = LiftCtx::new(arch);
+    // The same per-instruction state `lift_instruction` sets. It used
+    // to be skipped here, which only showed up in temp *names* (`t_0_N`)
+    // until `pc` became a value read off the address — after which the
+    // harness compared a lowering production never produces.
+    ctx.begin_instruction(insn);
     // Closed structural dispatch over the supported ISAs (the
     // documented exhaustive-dispatch-table exception). Mirrors the
     // tail of `LiftCtx::lift_instruction` *without* the ESIL / P-code
@@ -663,6 +668,9 @@ struct LiftCtx {
     /// Whether an x86 instruction whose ESIL writes flags may take the
     /// ESIL rung. See [`SliceLimits::esil_flags`].
     esil_flags: bool,
+    /// Whether the instruction being lifted is Thumb-encoded, which is
+    /// what decides how far ahead `pc` reads.
+    cur_is_thumb: bool,
 }
 
 impl LiftCtx {
@@ -675,6 +683,7 @@ impl LiftCtx {
             cur_addr: Address::new(0),
             x87: X87Stack::new(),
             esil_flags: false,
+            cur_is_thumb: false,
         }
     }
 
@@ -682,6 +691,14 @@ impl LiftCtx {
     ///
     /// Never on ARM, whatever the caller asked for — see the gate's
     /// comment for the two measured reasons.
+    /// The value an `AArch32` `pc` read answers at the current
+    /// instruction: its own address plus 8 (ARM) or 4 (Thumb), aligned
+    /// down to a word. ARM ARM Vol. C §A2.3.
+    fn cur_pc_value(&self) -> u64 {
+        let ahead = if self.cur_is_thumb { 4 } else { 8 };
+        self.cur_addr.0.wrapping_add(ahead) & !3
+    }
+
     fn allows_esil_flags(&self) -> bool {
         self.esil_flags && matches!(self.arch, Arch::X86 | Arch::X86_64)
     }
@@ -696,8 +713,16 @@ impl LiftCtx {
         Var::new(name, width)
     }
 
-    fn lift_instruction(&mut self, insn: &Instruction) {
+    /// Per-instruction state every entry point must set before
+    /// dispatching, so [`lift_per_mnemonic`] and [`lift_slice`] cannot
+    /// disagree about what the handlers see.
+    fn begin_instruction(&mut self, insn: &Instruction) {
         self.cur_addr = insn.address;
+        self.cur_is_thumb = insn.is_thumb;
+    }
+
+    fn lift_instruction(&mut self, insn: &Instruction) {
+        self.begin_instruction(insn);
         // Integer-SIMD override: the ESIL / P-code lowerings model an
         // `xmm` register at the pointer width (64 bits) and do not
         // canonicalise it to its vector parent, so they produce a
@@ -861,6 +886,20 @@ impl LiftCtx {
         // `AlwaysTrue` instead of getting stuck on a free input.
         if layout.parent == "xzr" {
             return Some(Expr::konst(0, layout.width()));
+        }
+        // `AArch32` reads `pc` as this instruction's own address plus a
+        // fixed distance — 8 in ARM state, 4 in Thumb, word-aligned —
+        // so it is a constant and never an input. The addressing model
+        // has modelled it that way since literal pools landed; a `pc`
+        // read as a *data* operand went through here instead and
+        // surfaced as a free `r15`, which is the whole of
+        // `add rX, pc, rY`, the ARM32 position-independent idiom.
+        //
+        // Correct even when the slice also writes `r15`: a `pc` read
+        // always answers the *reading* instruction's address, whatever
+        // ran before it.
+        if matches!(self.arch, Arch::Arm) && layout.parent == "r15" {
+            return Some(Expr::konst(u128::from(self.cur_pc_value()), layout.width()));
         }
         let parent_bits = self.bits;
         if layout.hi >= parent_bits {

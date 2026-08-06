@@ -273,3 +273,94 @@ fn aarch32_cbz_on_a_nonzero_register_is_never_taken() {
     let program = compare_and_branch_program("5", "cbz");
     assert_eq!(solve_first_branch(&program), SmtResult::AlwaysFalse);
 }
+
+/// `pc` read as a **data** operand is a constant, not an input.
+///
+/// `add rX, pc, rY` is the ARM32 position-independent idiom and it is
+/// everywhere. The addressing model has read `pc` as `address + 8`
+/// (ARM) / `+ 4` (Thumb), word-aligned, since literal pools landed, but
+/// a `pc` reaching an *arithmetic* handler went through the generic
+/// register read and surfaced as a free `r15` — sound, and blind on the
+/// idiom that computes every global address.
+///
+/// Found by the differential harness: radare2's ESIL substitutes the
+/// concrete value (`r0,0x58c,+,0xffffffff,&,r0,=` for `add r0, pc, r0`
+/// at `0x584`), so the two lifters disagreed on 12 of one sample's 31
+/// remaining disagreements.
+///
+/// `mov r0, 4; add r0, pc, r0; cmp r0, expected; beq` — the branch is
+/// necessarily taken only if `pc` answers what the ISA says.
+fn pc_arithmetic_program(is_thumb: bool, expected: &str) -> Program {
+    let build = |addr: u64, mnemonic: &str, operands: Vec<Operand>| Instruction {
+        address: Address(addr),
+        size: 4,
+        bytes: Vec::new(),
+        mnemonic: mnemonic.to_string(),
+        operands,
+        esil: None,
+        pcode: None,
+        is_thumb,
+    };
+    Program {
+        arch: Arch::Arm,
+        bits: 32,
+        entry: Some(Address(0x580)),
+        functions: vec![Function {
+            address: Address(0x580),
+            name: Some("sym.pic".into()),
+            blocks: vec![BasicBlock {
+                address: Address(0x580),
+                instructions: vec![
+                    build(
+                        0x580,
+                        "mov",
+                        vec![
+                            op("r0", OperandKind::Register),
+                            op("4", OperandKind::Immediate),
+                        ],
+                    ),
+                    build(
+                        0x584,
+                        "add",
+                        vec![
+                            op("r0", OperandKind::Register),
+                            op("pc", OperandKind::Register),
+                            op("r0", OperandKind::Register),
+                        ],
+                    ),
+                    build(
+                        0x588,
+                        "cmp",
+                        vec![
+                            op("r0", OperandKind::Register),
+                            op(expected, OperandKind::Immediate),
+                        ],
+                    ),
+                    build(0x58c, "beq", vec![op("0x600", OperandKind::Immediate)]),
+                ],
+                successors: vec![],
+            }],
+            is_thumb,
+        }],
+    }
+}
+
+#[test]
+fn test_a_pc_data_read_in_arm_state_is_the_address_plus_eight() {
+    // 0x584 + 8 = 0x58c, plus the 4 in `r0`.
+    assert_eq!(
+        solve_first_branch(&pc_arithmetic_program(false, "0x590")),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_a_pc_data_read_in_thumb_state_is_the_address_plus_four() {
+    // The twin, and what makes the pair have teeth: a model that used
+    // one distance for both passes one of these and fails the other.
+    // 0x584 + 4 = 0x588, plus the 4 in `r0`.
+    assert_eq!(
+        solve_first_branch(&pc_arithmetic_program(true, "0x58c")),
+        SmtResult::AlwaysTrue
+    );
+}
