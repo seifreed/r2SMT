@@ -375,6 +375,63 @@ fn compound_shift_shifts_the_target_by_the_value() {
 }
 
 #[test]
+fn the_stack_pointer_is_not_sixteen_bits_on_arm() {
+    // `sp` used to fall into x86's 16-bit sub-register arm, because the
+    // width table was consulted without an architecture. So on ARM every
+    // stack-relative computation radare2 spells with a bare `sp` modelled
+    // `(sp & 0xffff)`: `add x2, sp, 8` became `(sp & 0xffff) + 8`, a
+    // wrong address rather than a lost one.
+    //
+    // It reaches production. These instructions set no flags, so their
+    // ESIL carries no `:=` and the ladder takes it; and 1 557 of one
+    // sample's 6 155 liftable ESIL strings carry a bare `sp` — 410
+    // `stp`, 285 `ldp`, 281 `str`, 188 `ldr`. Found by the differential
+    // harness, which reported it as 112 of its 114 disagreements.
+    // Assert the *variable*, not a rendered substring: `ZeroExtend`
+    // spells its target `to_bits`, which contains `bits: 64` and made an
+    // earlier version of this test pass on the broken table too.
+    for (arch, dst, want) in [(Arch::Aarch64, "x6", 64_u16), (Arch::Arm, "r6", 32)] {
+        let lift = lift_esil(&format!("sp,{dst},="), arch).expect("lift ok");
+        match &lift.statements[0] {
+            IrStmt::Assign { src, .. } => {
+                assert_eq!(
+                    *src,
+                    Expr::Var(Var::new("sp", want)),
+                    "{arch:?}: sp must be a bare {want}-bit read, not a widened narrow one"
+                );
+            }
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn the_x86_stack_pointer_keeps_its_own_width() {
+    // The other side of the dispatch: `sp` really is 16 bits on x86, so
+    // the fix must not be "sp is always the pointer width".
+    let lift = lift_esil("sp,ax,=", Arch::X86_64).expect("lift ok");
+    match &lift.statements[0] {
+        IrStmt::Assign { src, .. } => {
+            assert_eq!(*src, Expr::Var(Var::new("sp", 16)), "x86 sp stays 16 bits");
+        }
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_low_numbered_arm_registers_are_not_x86_64_wide() {
+    // `r8`–`r15` matched x86-64's arm before the `AArch32` guard could
+    // see them, so an ARM32 `r8` came back 64 bits wide.
+    let lift = lift_esil("r8,r0,=", Arch::Arm).expect("lift ok");
+    match &lift.statements[0] {
+        IrStmt::Assign { src, .. } => {
+            assert_eq!(*src, Expr::Var(Var::new("r8", 32)), "AArch32 r8 is 32 bits");
+        }
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}
+
+#[test]
 fn the_negate_all_bits_operator_is_not_modelled_as_a_comparison() {
     // radare2's `ae???` spells `!=` as `(1 -- 0)` tagged `math+regw`:
     // it pops **one** operand and writes a register with its bitwise

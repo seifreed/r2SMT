@@ -88,6 +88,11 @@ struct Machine {
     /// for unknown registers default to this, matching the slicer's
     /// canonical register layout.
     default_bits: u16,
+    /// The architecture whose register names this ESIL describes.
+    /// Load-bearing: several names collide across ISAs (`sp`, `lr`,
+    /// `fp`, `r8`–`r15`) and answering with the wrong family's width is
+    /// a wrong *value*, not a lost one.
+    arch: Arch,
     stack: Vec<StackValue>,
     statements: Vec<IrStmt>,
     /// Last arithmetic / logical result. ESIL's `$z`, `$s`, `$cN`,
@@ -183,6 +188,7 @@ impl Machine {
     fn new(arch: Arch) -> Self {
         Self {
             default_bits: arch.pointer_bits(),
+            arch,
             stack: Vec::new(),
             statements: Vec::new(),
             last_arith: None,
@@ -223,7 +229,7 @@ impl Machine {
                     _ => name.as_str(),
                 }
                 .to_string();
-                let bits = register_width(&canonical).unwrap_or(self.default_bits);
+                let bits = register_width(&canonical, self.arch).unwrap_or(self.default_bits);
                 self.stack
                     .push(StackValue::Register(Var::new(canonical, bits)));
                 Ok(())
@@ -510,38 +516,66 @@ impl Machine {
 /// canonical-name resolution still owns the parent-register mapping;
 /// here we only care about width so the lifter does not zero-extend
 /// flag bits to the pointer width by accident.
-fn register_width(name: &str) -> Option<u16> {
+fn register_width(name: &str, arch: Arch) -> Option<u16> {
     let lower = name.to_ascii_lowercase();
-    match lower.as_str() {
-        // x86 / x86_64 flags. Both `zf` (ESIL convention) and `ZF`
-        // (lifter canonical form) resolve here.
-        "zf" | "cf" | "sf" | "of" | "pf" | "af" | "df" | "if" | "tf" => Some(1),
-        // x86 8-bit sub-registers.
+    // Flags are one bit on every ISA, and both spellings reach here —
+    // `zf` from radare2 and `ZF` from this crate's canonicalisation.
+    if matches!(
+        lower.as_str(),
+        "zf" | "cf" | "sf" | "of" | "pf" | "af" | "df" | "if" | "tf"
+    ) {
+        return Some(1);
+    }
+    match arch {
+        Arch::X86 | Arch::X86_64 => x86_register_width(&lower),
+        Arch::Aarch64 => aarch64_register_width(&lower),
+        Arch::Arm => aarch32_register_width(&lower),
+        _ => None,
+    }
+}
+
+fn x86_register_width(lower: &str) -> Option<u16> {
+    match lower {
         "al" | "ah" | "bl" | "bh" | "cl" | "ch" | "dl" | "dh" | "sil" | "dil" | "bpl" | "spl"
         | "r8b" | "r9b" | "r10b" | "r11b" | "r12b" | "r13b" | "r14b" | "r15b" => Some(8),
-        // x86 16-bit sub-registers.
         "ax" | "bx" | "cx" | "dx" | "si" | "di" | "bp" | "sp" | "r8w" | "r9w" | "r10w" | "r11w"
         | "r12w" | "r13w" | "r14w" | "r15w" => Some(16),
-        // x86 32-bit sub-registers.
         "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" | "esp" | "r8d" | "r9d" | "r10d"
         | "r11d" | "r12d" | "r13d" | "r14d" | "r15d" | "eip" => Some(32),
-        // x86 64-bit registers.
         "rax" | "rbx" | "rcx" | "rdx" | "rsi" | "rdi" | "rbp" | "rsp" | "r8" | "r9" | "r10"
         | "r11" | "r12" | "r13" | "r14" | "r15" | "rip" => Some(64),
-        // AArch64 32-bit `w` views (general purpose r0..r30 + wsp/wzr).
+        _ => None,
+    }
+}
+
+fn aarch64_register_width(lower: &str) -> Option<u16> {
+    match lower {
         n if n.starts_with('w') && parse_arm_reg_index(&n[1..]).is_some_and(|i| i <= 30) => {
             Some(32)
         }
         "wsp" | "wzr" => Some(32),
-        // AArch64 64-bit `x` views.
         n if n.starts_with('x') && parse_arm_reg_index(&n[1..]).is_some_and(|i| i <= 30) => {
             Some(64)
         }
-        "xzr" | "lr" | "fp" => Some(64),
-        // AArch32 general purpose r0..r15.
+        // `sp` is the whole reason this table is dispatched on the
+        // architecture. It used to fall into x86's 16-bit arm, so every
+        // stack-relative computation radare2 spells with a bare `sp`
+        // modelled `(sp & 0xffff)` — `add x2, sp, 8` became
+        // `(sp & 0xffff) + 8`, a wrong address rather than a lost one.
+        // 1 557 instructions of one sample carry a bare `sp`.
+        "sp" | "xzr" | "lr" | "fp" => Some(64),
+        _ => None,
+    }
+}
+
+fn aarch32_register_width(lower: &str) -> Option<u16> {
+    match lower {
+        // `r8`–`r15` matched x86-64's arm first and came back 64-bit,
+        // and `lr` / `fp` were hardcoded to `AArch64`'s width.
         n if n.starts_with('r') && parse_arm_reg_index(&n[1..]).is_some_and(|i| i <= 15) => {
             Some(32)
         }
+        "sp" | "lr" | "fp" | "ip" | "pc" => Some(32),
         _ => None,
     }
 }
