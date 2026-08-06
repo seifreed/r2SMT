@@ -108,6 +108,21 @@ pub struct SliceLimits {
     /// historical hard-truncate-at-join behavior byte-identical.
     #[serde(default)]
     pub allow_join_merge: bool,
+    /// When set, an x86 instruction whose ESIL writes flags (any string
+    /// carrying `:=`) may take the ESIL rung instead of being sent to
+    /// its per-mnemonic handler.
+    ///
+    /// **x86 only, by construction.** On both ARM ISAs the rung is
+    /// skipped whatever this says, because radare2 emits ARM's
+    /// architectural carry where this pipeline stores its inverse — a
+    /// faithful lift there resolves every unsigned ARM branch to the
+    /// other arm. See the gate in [`crate::lift`].
+    ///
+    /// Off by default, which is byte-identical to the behaviour before
+    /// `:=` was lexed at all. It exists so the change of default can be
+    /// *measured* against a corpus before it is made.
+    #[serde(default)]
+    pub esil_flags: bool,
 }
 
 impl Default for SliceLimits {
@@ -119,6 +134,7 @@ impl Default for SliceLimits {
             allow_calls: false,
             unknowns_on_truncation: false,
             allow_join_merge: false,
+            esil_flags: false,
         }
     }
 }

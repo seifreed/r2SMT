@@ -16,7 +16,9 @@ pub mod slice;
 pub use collector::{BranchCandidate, collect_branches, collect_function_branches};
 pub use condition::{BranchCondition, BranchKind};
 pub use effect::{InstructionEffect, InstructionKind, analyze, canonical_register};
-pub use lift::{LiftedSlice, lift_branch_condition, lift_per_mnemonic, lift_slice};
+pub use lift::{
+    LiftedSlice, lift_branch_condition, lift_per_mnemonic, lift_slice, lift_slice_with,
+};
 // The register-layout table moved down to the foundation layer so both
 // lifters can reach it: `r2smt-slicer` depends on `r2smt-esil`, so a
 // table living here is invisible to the ESIL machine. Re-exported whole

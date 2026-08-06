@@ -21,7 +21,7 @@
 use r2smt_common::Arch;
 use r2smt_ir::program::Function;
 use r2smt_slicer::slice::SliceStatus;
-use r2smt_slicer::{BranchCandidate, SliceLimits, lift_slice, slice_branch};
+use r2smt_slicer::{BranchCandidate, SliceLimits, lift_slice_with, slice_branch};
 use r2smt_ssa::{SsaLiftedSlice, optimize_slice, ssa_convert};
 use tracing::debug;
 
@@ -84,7 +84,7 @@ fn build(
     arch: Arch,
 ) -> SsaLiftedSlice {
     let slice = slice_branch(candidate, function, limits, arch);
-    let lifted = lift_slice(&slice, arch);
+    let lifted = lift_slice_with(&slice, arch, limits.esil_flags);
     optimize_slice(&ssa_convert(&lifted))
 }
 

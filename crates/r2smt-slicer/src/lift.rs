@@ -455,7 +455,18 @@ pub(crate) fn pins_rounding_mode(insn: &Instruction, arch: Arch) -> bool {
 /// future caller hand-builds non-x86 IR.
 #[must_use]
 pub fn lift_slice(slice: &Slice, arch: Arch) -> LiftedSlice {
+    lift_slice_with(slice, arch, false)
+}
+
+/// [`lift_slice`], with the ESIL flag-setting rung opened on x86.
+///
+/// A separate entry point rather than a parameter on `lift_slice` so the
+/// 30-odd existing call sites — nearly all of them tests — stay
+/// untouched; `esil_flags = false` is what every one of them means.
+#[must_use]
+pub fn lift_slice_with(slice: &Slice, arch: Arch, esil_flags: bool) -> LiftedSlice {
     let mut ctx = LiftCtx::new(arch);
+    ctx.esil_flags = esil_flags;
     // Lower Φ-merges interleaved with the kept-instruction stream in
     // execution order. Each merge's `tail_instructions` is the number
     // of kept instructions that execute *after* it, so its execution
@@ -649,6 +660,9 @@ struct LiftCtx {
     /// slice. A slice is a linear instruction sequence, so pushes and
     /// pops compose exactly; see `lift/x87.rs`.
     x87: X87Stack,
+    /// Whether an x86 instruction whose ESIL writes flags may take the
+    /// ESIL rung. See [`SliceLimits::esil_flags`].
+    esil_flags: bool,
 }
 
 impl LiftCtx {
@@ -660,7 +674,16 @@ impl LiftCtx {
             temp_counter: 0,
             cur_addr: Address::new(0),
             x87: X87Stack::new(),
+            esil_flags: false,
         }
+    }
+
+    /// Whether a flag-setting ESIL string may lift here.
+    ///
+    /// Never on ARM, whatever the caller asked for — see the gate's
+    /// comment for the two measured reasons.
+    fn allows_esil_flags(&self) -> bool {
+        self.esil_flags && matches!(self.arch, Arch::X86 | Arch::X86_64)
     }
 
     fn new_temp(&mut self, address: Address, width: u16) -> Var {
@@ -762,7 +785,7 @@ impl LiftCtx {
         // destination held before the instruction — a radare2 bug that a
         // faithful implementation would import.
         if let Some(esil) = insn.esil.as_deref()
-            && !r2smt_esil::assigns_without_flags(esil)
+            && (self.allows_esil_flags() || !r2smt_esil::assigns_without_flags(esil))
             && let Ok(lift) = r2smt_esil::lift_esil(esil, self.arch)
             && !lift.statements.is_empty()
         {

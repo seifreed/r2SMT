@@ -10,7 +10,7 @@ use r2smt_common::Address;
 use r2smt_core::{dump_program, prepare_ssa};
 use r2smt_ir::program::{Function, Program};
 use r2smt_slicer::{
-    LiftedSlice, Slice, SliceLimits, collect_branches, collect_function_branches, lift_slice,
+    LiftedSlice, Slice, SliceLimits, collect_branches, collect_function_branches, lift_slice_with,
     slice_branch,
 };
 use r2smt_ssa::SsaLiftedSlice;
@@ -153,7 +153,7 @@ pub(crate) fn lift(
             continue;
         };
         let slice = slice_branch(cand, function, limits, ctx.program.arch);
-        lifts.push(lift_slice(&slice, arch));
+        lifts.push(lift_slice_with(&slice, arch, limits.esil_flags));
     }
 
     if let Some(path) = json_out {

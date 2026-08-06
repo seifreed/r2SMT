@@ -81,6 +81,7 @@ fn init_tracing(verbosity: u8) -> Result<()> {
 fn run(cli: Cli) -> Result<()> {
     let deep = cli.deep_analysis;
     let ir_pcode = cli.ir.wants_pcode();
+    let esil_flags = cli.esil_flags;
     match cli.command {
         Command::Version => {
             println!("r2smt {}", env!("CARGO_PKG_VERSION"));
@@ -103,7 +104,10 @@ fn run(cli: Cli) -> Result<()> {
             timeout_ms,
             max_paths,
         } => {
-            let mut limits = SliceLimits::default();
+            let mut limits = SliceLimits {
+                esil_flags,
+                ..SliceLimits::default()
+            };
             if let Some(n) = max_instructions {
                 limits.max_instructions = n;
             }
@@ -145,7 +149,10 @@ fn run(cli: Cli) -> Result<()> {
             max_blocks,
             json,
         } => {
-            let mut limits = SliceLimits::default();
+            let mut limits = SliceLimits {
+                esil_flags,
+                ..SliceLimits::default()
+            };
             if let Some(n) = max_instructions {
                 limits.max_instructions = n;
             }
@@ -176,7 +183,10 @@ fn run(cli: Cli) -> Result<()> {
             max_blocks,
             json,
         } => {
-            let mut limits = SliceLimits::default();
+            let mut limits = SliceLimits {
+                esil_flags,
+                ..SliceLimits::default()
+            };
             if let Some(n) = max_instructions {
                 limits.max_instructions = n;
             }
@@ -211,7 +221,10 @@ fn run(cli: Cli) -> Result<()> {
             dry_run,
             save_project,
         } => {
-            let mut limits = SliceLimits::default();
+            let mut limits = SliceLimits {
+                esil_flags,
+                ..SliceLimits::default()
+            };
             if let Some(n) = max_instructions {
                 limits.max_instructions = n;
             }
@@ -260,7 +273,10 @@ fn run(cli: Cli) -> Result<()> {
             manifest,
             rollback,
         } => {
-            let mut limits = SliceLimits::default();
+            let mut limits = SliceLimits {
+                esil_flags,
+                ..SliceLimits::default()
+            };
             if let Some(n) = max_instructions {
                 limits.max_instructions = n;
             }
@@ -316,7 +332,10 @@ fn run(cli: Cli) -> Result<()> {
             allow_join_merge,
             differential_lift,
         } => {
-            let mut limits = SliceLimits::default();
+            let mut limits = SliceLimits {
+                esil_flags,
+                ..SliceLimits::default()
+            };
             if let Some(n) = max_instructions {
                 limits.max_instructions = n;
             }
@@ -373,7 +392,10 @@ fn run(cli: Cli) -> Result<()> {
             with_decompiler,
             allow_join_merge,
         } => {
-            let mut limits = SliceLimits::default();
+            let mut limits = SliceLimits {
+                esil_flags,
+                ..SliceLimits::default()
+            };
             if let Some(n) = max_instructions {
                 limits.max_instructions = n;
             }
@@ -417,7 +439,10 @@ fn run(cli: Cli) -> Result<()> {
             explain,
             allow_join_merge,
         } => {
-            let mut limits = SliceLimits::default();
+            let mut limits = SliceLimits {
+                esil_flags,
+                ..SliceLimits::default()
+            };
             if let Some(n) = max_instructions {
                 limits.max_instructions = n;
             }
@@ -463,7 +488,10 @@ fn run(cli: Cli) -> Result<()> {
             max_blocks,
             json,
         } => {
-            let mut limits = SliceLimits::default();
+            let mut limits = SliceLimits {
+                esil_flags,
+                ..SliceLimits::default()
+            };
             if let Some(n) = max_instructions {
                 limits.max_instructions = n;
             }

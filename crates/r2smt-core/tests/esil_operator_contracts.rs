@@ -453,3 +453,93 @@ fn test_an_unseeding_assignment_still_writes_its_destination() {
         SmtResult::AlwaysTrue
     );
 }
+
+// ---------------------------------------------------------------------
+// The gate itself. `lift_slice_with`'s third argument opens the ESIL
+// rung for flag-setting instructions — on x86 only.
+// ---------------------------------------------------------------------
+
+/// One `cmp eax, 1` carrying the ESIL string radare2 6.1.8 emits for it,
+/// lifted as a whole slice so the ladder's decision is what is observed.
+fn cmp_slice(esil: &str, mnemonic: &str, ops: &[&str]) -> r2smt_slicer::Slice {
+    use r2smt_ir::program::{Instruction, Operand, OperandKind};
+    r2smt_slicer::Slice {
+        branch: branch(),
+        instructions: vec![Instruction {
+            address: Address::new(0x1000),
+            size: 4,
+            bytes: vec![],
+            mnemonic: mnemonic.into(),
+            operands: ops
+                .iter()
+                .map(|raw| Operand {
+                    raw: (*raw).into(),
+                    kind: OperandKind::Register,
+                })
+                .collect(),
+            esil: Some(esil.into()),
+            pcode: None,
+            is_thumb: false,
+        }],
+        status: SliceStatus::Complete,
+        roots: Vec::new(),
+        merges: Vec::new(),
+        treat_truncation_as_inputs: false,
+    }
+}
+
+/// Which rung lifted this `cmp`, told apart by a difference that is
+/// itself the point: the per-mnemonic x86 handler leaves `PF` (and `OF`)
+/// as `Expr::Unknown`, while radare2's ESIL spells `$p` out and the
+/// machine models it exactly. So an `Unknown` in the result means the
+/// per-mnemonic handler ran.
+fn took_the_esil_rung(lifted: &r2smt_slicer::LiftedSlice) -> bool {
+    !format!("{:?}", lifted.statements).contains("Unknown")
+}
+
+#[test]
+fn test_the_gate_off_sends_a_flag_setting_x86_instruction_to_its_handler() {
+    let slice = cmp_slice(
+        "1,eax,==,$z,zf,:=,32,$b,cf,:=,$p,pf,:=,31,$s,sf,:=",
+        "cmp",
+        &["eax", "1"],
+    );
+    assert!(!took_the_esil_rung(&r2smt_slicer::lift_slice_with(
+        &slice,
+        Arch::X86_64,
+        false
+    )));
+}
+
+#[test]
+fn test_the_gate_on_lets_a_flag_setting_x86_instruction_take_the_esil_rung() {
+    let slice = cmp_slice(
+        "1,eax,==,$z,zf,:=,32,$b,cf,:=,$p,pf,:=,31,$s,sf,:=",
+        "cmp",
+        &["eax", "1"],
+    );
+    assert!(took_the_esil_rung(&r2smt_slicer::lift_slice_with(
+        &slice,
+        Arch::X86_64,
+        true
+    )));
+}
+
+#[test]
+fn test_the_gate_on_still_refuses_arm() {
+    // The one contract that cannot be relaxed. radare2 emits ARM's
+    // architectural carry (`64,$b,!,cf,:=`) where this pipeline stores
+    // its inverse, so lifting this faithfully sends every unsigned ARM
+    // branch to the opposite arm — a wrong verdict with full confidence,
+    // not a lost one.
+    let slice = cmp_slice(
+        "x1,x0,==,$z,zf,:=,63,$s,nf,:=,64,$b,!,cf,:=,63,$o,vf,:=",
+        "cmp",
+        &["x0", "x1"],
+    );
+    assert!(!took_the_esil_rung(&r2smt_slicer::lift_slice_with(
+        &slice,
+        Arch::Aarch64,
+        true
+    )));
+}
