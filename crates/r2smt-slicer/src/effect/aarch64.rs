@@ -41,6 +41,14 @@ pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
         "lsl" => aarch64_arith3_effect(insn, InstructionKind::Shl, false),
         "lsr" => aarch64_arith3_effect(insn, InstructionKind::Shr, false),
         "asr" => aarch64_arith3_effect(insn, InstructionKind::Sar, false),
+        // The carry-in family. It shares `arith3`'s def/use shape but
+        // **reads** the flags, and that is the load-bearing difference:
+        // without it the backward walk drops whatever defined `CF` and
+        // SSA binds the carry to a stale free input — a fabricated
+        // verdict, the same failure `aarch32_memory_reads_carry` exists
+        // to prevent on the addressing side.
+        "adc" | "sbc" | "ngc" => aarch64_carry_arith_effect(insn, false),
+        "adcs" | "sbcs" | "ngcs" => aarch64_carry_arith_effect(insn, true),
         // 2-operand compare / test: flags only, no destination.
         // Scalar floating point. The destination is written whole (a
         // scalar write zeroes the rest of the vector register), so it
@@ -440,6 +448,15 @@ fn aarch64_mov_effect(insn: &Instruction) -> InstructionEffect {
         has_memory_access: any_memory_operand(&insn.operands),
         is_call: false,
         reads_flags: false,
+    }
+}
+
+/// `adc` / `sbc` / `ngc` and their flag-setting forms: `arith3`'s
+/// registers, plus a read of the flags for the carry-in.
+fn aarch64_carry_arith_effect(insn: &Instruction, sets_flags: bool) -> InstructionEffect {
+    InstructionEffect {
+        reads_flags: true,
+        ..aarch64_arith3_effect(insn, InstructionKind::Add, sets_flags)
     }
 }
 

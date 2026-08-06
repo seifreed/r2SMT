@@ -660,28 +660,10 @@ impl LiftCtx {
         };
         let lhs = self.read_operand_at(src1, width);
         let rhs = self.read_source_with_shift(insn, 2, width);
-        // `CF` is stored in x86 borrow polarity, the inverse of ARM's
-        // `C` (see `shift::arm_carry`). `adc` adds ARM's `C` and `sbc`
-        // subtracts its complement, so the two operations want the two
-        // sides of that inversion — and reading the stored bit as if it
-        // were ARM's `C` was a definite wrong value, not a lost one.
-        let stored = Expr::Var(Var::new("CF", 1));
-        let term = match op {
-            BinOp::Sub => Expr::zero_ext(stored, width),
-            _ => Expr::zero_ext(shift::arm_carry(stored), width),
-        };
-        let tmp = self.new_temp(insn.address, width);
-        self.assign(tmp.clone(), op.apply(op.apply(lhs, rhs), term));
-        let result = Expr::Var(tmp);
-        if sets_flags {
-            self.set_flag("ZF", Expr::eq(result.clone(), Expr::konst(0, width)));
-            self.set_flag("SF", Expr::slt(result.clone(), Expr::konst(0, width)));
-            self.set_flag("CF", Expr::Unknown(String::new()));
-            self.set_flag("OF", Expr::Unknown(String::new()));
-        }
-        if !self.write_register_to(dst, result) {
-            self.unsupported_aarch32(insn, "adc/sbc destination not a supported register");
-        }
+        // The tail — including the carry-in's trip across the polarity
+        // inversion — is shared with `AArch64`, whose `adc` / `sbc` are
+        // the same operation. See [`LiftCtx::emit_carry_arith`].
+        self.emit_carry_arith(insn, op, &lhs, &rhs, width, sets_flags);
     }
 
     /// `sxtb`/`sxth`/`uxtb`/`uxth Rd, Rm` — take the low `bits` of the

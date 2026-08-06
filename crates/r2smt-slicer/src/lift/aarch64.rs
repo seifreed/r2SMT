@@ -7,7 +7,7 @@ use r2smt_ir::stmt::IrStmt;
 
 use crate::registers::register_layout;
 
-use super::aarch32::shift::stored_carry;
+use super::aarch32::shift::{self, stored_carry};
 use super::shifted_operand::{OPERAND2_INDEX_ARITH3, OPERAND2_INDEX_COMPARE};
 use super::{
     BinOp, CsArithOp, FpArithOp, LiftCtx, MemAccess, VectorShape, Writeback,
@@ -93,6 +93,14 @@ impl LiftCtx {
             "mvn" => self.lift_aarch64_mvn(insn),
             "neg" => self.lift_aarch64_neg(insn, false),
             "negs" => self.lift_aarch64_neg(insn, true),
+            // The carry-in family. `ngc Rd, Op` is `sbc Rd, xzr, Op`,
+            // the same two-operand-for-three shape as `neg`.
+            "adc" => self.lift_aarch64_carry_arith(insn, BinOp::Add, false),
+            "adcs" => self.lift_aarch64_carry_arith(insn, BinOp::Add, true),
+            "sbc" => self.lift_aarch64_carry_arith(insn, BinOp::Sub, false),
+            "sbcs" => self.lift_aarch64_carry_arith(insn, BinOp::Sub, true),
+            "ngc" => self.lift_aarch64_ngc(insn, false),
+            "ngcs" => self.lift_aarch64_ngc(insn, true),
             // Compare / test: 2-operand, no destination.
             "cmp" => self.lift_aarch64_cmp(insn),
             // `cmn Rn, Operand` is `adds xzr, Rn, Operand`.
@@ -142,10 +150,28 @@ impl LiftCtx {
             // pair forms still decline.
             "ldp" => self.lift_aarch64_ldp(insn),
             "stp" => self.lift_aarch64_stp(insn),
-            // Scalar floating point. The lane width comes from the
-            // register letter (`s0` → 32, `d0` → 64, `h0` → 16), which
-            // `simd_view_bits` already reports, so one handler covers
-            // every precision.
+            // The scalar floating-point family is a dispatch of its own,
+            // split out when this one crossed clippy's length limit.
+            // It answers whether it claimed the mnemonic, mirroring
+            // `lift_aarch32_by_mnemonic`, and is the first step of the
+            // documented `lift/aarch64/fp.rs` extraction.
+            mnemonic if self.lift_aarch64_fp_by_mnemonic(insn, mnemonic) => {}
+            _ => self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: format!("at {addr} (aarch64)", addr = insn.address),
+            }),
+        }
+    }
+
+    /// The scalar floating-point arm of the `AArch64` dispatch. Returns
+    /// whether the mnemonic was claimed, so the caller can fall through
+    /// to its `Unsupported` arm.
+    ///
+    /// The lane width comes from the register letter (`s0` → 32,
+    /// `d0` → 64, `h0` → 16), which `simd_view_bits` already reports, so
+    /// one handler covers every precision.
+    fn lift_aarch64_fp_by_mnemonic(&mut self, insn: &Instruction, mnem: &str) -> bool {
+        match mnem {
             "fadd" => self.lift_aarch64_fp_arith3(insn, FpArithOp::Add),
             "fsub" => self.lift_aarch64_fp_arith3(insn, FpArithOp::Sub),
             "fmul" => self.lift_aarch64_fp_arith3(insn, FpArithOp::Mul),
@@ -182,11 +208,9 @@ impl LiftCtx {
                 self.lift_aarch64_fp_round(insn, rounding, saturate);
             }
             "frecpx" => self.lift_aarch64_frecpx(insn),
-            _ => self.stmts.push(IrStmt::Unsupported {
-                mnemonic: insn.mnemonic.clone(),
-                comment: format!("at {addr} (aarch64)", addr = insn.address),
-            }),
+            _ => return false,
         }
+        true
     }
 
     pub(super) fn lift_aarch64_mov(&mut self, insn: &Instruction) {
@@ -372,6 +396,92 @@ impl LiftCtx {
         // the shift and computes a wrong value.
         let rhs = self.read_source_with_shift(insn, 2, dst_width);
         self.emit_arith3(insn, op, &lhs, &rhs, dst_width, sets_flags);
+    }
+
+    /// `adc` / `adcs` / `sbc` / `sbcs` / `ngc` / `ngcs`, shared by both
+    /// ARM ISAs — the semantics are identical and so is the hazard.
+    ///
+    /// The carry-in crosses the polarity inversion, which is the whole
+    /// reason this is not an arm of [`Self::emit_arith3`]. `CF` holds
+    /// ARM's `C` **inverted** (x86 borrow polarity, see
+    /// [`shift::arm_carry`]); `adc` adds ARM's `C` while `sbc` subtracts
+    /// its complement — the borrow — so the two operations want the two
+    /// sides of that inversion and the stored bit is already the right
+    /// one for `sbc`. Reading it raw for `adc` is a definite wrong
+    /// value, and the `AArch32` side shipped that bug once already.
+    ///
+    /// C and V are left Unknown rather than fabricated: a carry-out
+    /// needs an extension bit this helper does not plumb.
+    pub(super) fn emit_carry_arith(
+        &mut self,
+        insn: &Instruction,
+        op: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        width: u16,
+        sets_flags: bool,
+    ) {
+        let Some(dst) = insn.operands.first() else {
+            return;
+        };
+        let stored = Expr::Var(Var::new("CF", 1));
+        let term = match op {
+            BinOp::Sub => Expr::zero_ext(stored, width),
+            _ => Expr::zero_ext(shift::arm_carry(stored), width),
+        };
+        let tmp = self.new_temp(insn.address, width);
+        self.assign(
+            tmp.clone(),
+            op.apply(op.apply(lhs.clone(), rhs.clone()), term),
+        );
+        let result = Expr::Var(tmp);
+        if sets_flags {
+            self.set_flag("ZF", Expr::eq(result.clone(), Expr::konst(0, width)));
+            self.set_flag("SF", Expr::slt(result.clone(), Expr::konst(0, width)));
+            self.set_flag("CF", Expr::Unknown(String::new()));
+            self.set_flag("OF", Expr::Unknown(String::new()));
+        }
+        if !self.write_register_to(dst, result) {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "non-register destination (carry arithmetic)".into(),
+            });
+        }
+    }
+
+    /// `adc` / `adcs` / `sbc` / `sbcs Rd, Rn, Op` on `AArch64`.
+    fn lift_aarch64_carry_arith(&mut self, insn: &Instruction, op: BinOp, sets_flags: bool) {
+        let (Some(dst), Some(src1), Some(_)) = (
+            insn.operands.first(),
+            insn.operands.get(1),
+            insn.operands.get(2),
+        ) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "adc/sbc expect Rd, Rn, Op (aarch64)".into(),
+            });
+            return;
+        };
+        let Some(width) = self.aarch64_destination_width(insn, dst) else {
+            return;
+        };
+        let lhs = self.read_operand_at(src1, width);
+        let rhs = self.read_source_with_shift(insn, OPERAND2_INDEX_ARITH3, width);
+        self.emit_carry_arith(insn, op, &lhs, &rhs, width, sets_flags);
+    }
+
+    /// `ngc` / `ngcs Rd, Op` — `sbc` / `sbcs Rd, xzr, Op`, the
+    /// two-operand spelling with the zero register on the left.
+    fn lift_aarch64_ngc(&mut self, insn: &Instruction, sets_flags: bool) {
+        let Some(dst) = insn.operands.first() else {
+            return;
+        };
+        let Some(width) = self.aarch64_destination_width(insn, dst) else {
+            return;
+        };
+        let rhs = self.read_source_with_shift(insn, OPERAND2_INDEX_COMPARE, width);
+        let lhs = Expr::konst(0, width);
+        self.emit_carry_arith(insn, BinOp::Sub, &lhs, &rhs, width, sets_flags);
     }
 
     /// Commit a three-operand arithmetic result: temp, flags, then the

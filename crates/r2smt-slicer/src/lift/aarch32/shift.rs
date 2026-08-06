@@ -83,7 +83,7 @@ fn shift_carry_out(op: BinOp, src: &Expr, amount: u16, width: u16) -> CarryOut {
 /// Reading a raw `CF` as if it were ARM's `C` is a wrong *value*, and
 /// writing ARM's `C` raw is a wrong *branch* — neither shows up in a
 /// contract that pins a flag's value, which is how both survived.
-pub(super) fn arm_carry(stored: Expr) -> Expr {
+pub(in crate::lift) fn arm_carry(stored: Expr) -> Expr {
     Expr::bv_xor(stored, Expr::konst(1, 1))
 }
 
