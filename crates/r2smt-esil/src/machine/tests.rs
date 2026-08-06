@@ -476,7 +476,10 @@ fn the_x86_stack_pointer_keeps_its_own_width() {
             let read_sp = Expr::extract(Expr::Var(Var::new("rsp", 64)), 15, 0);
             assert_eq!(
                 *src,
-                Expr::concat(Expr::extract(Expr::Var(Var::new("rax", 64)), 63, 16), read_sp),
+                Expr::concat(
+                    Expr::extract(Expr::Var(Var::new("rax", 64)), 63, 16),
+                    read_sp
+                ),
                 "x86 sp stays 16 bits"
             );
         }

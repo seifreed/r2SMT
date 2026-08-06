@@ -43,36 +43,12 @@
 //! | `$o(N)` | `$c(N-1) ⊕ $c(N)` |
 //! | `$p` | even parity of the low 8 bits of `cur` |
 
-use r2smt_ir::expr::{Expr, Var};
+use r2smt_ir::expr::Expr;
 
 use crate::machine::FlagCtx;
 
 /// Bits of the low byte `$p` folds over.
 const PARITY_BITS: u16 = 8;
-
-/// Canonical `Var` for a named flag token (`$z` → `ZF`, …).
-///
-/// Kept because these are the names the rest of the pipeline stores
-/// flags under; the *values* now come from the context helpers below.
-#[must_use]
-pub fn flag_token_to_var(suffix: &str) -> Option<Var> {
-    let name = match suffix {
-        "z" => "ZF",
-        "c" => "CF",
-        "s" => "SF",
-        "o" => "OF",
-        "p" => "PF",
-        _ => return None,
-    };
-    Some(Var::new(name, 1))
-}
-
-/// [`flag_token_to_var`] as a free expression, for callers with no flag
-/// context to derive from.
-#[must_use]
-pub fn flag_token_to_expr(suffix: &str) -> Option<Expr> {
-    flag_token_to_var(suffix).map(Expr::Var)
-}
 
 /// A condition as a 1-bit value, which is what the ESIL stack carries.
 fn as_bit(cond: Expr) -> Expr {
@@ -179,31 +155,25 @@ mod tests {
     }
 
     #[test]
-    fn canonical_flag_names_round_trip() {
-        for (suffix, name) in [
-            ("z", "ZF"),
-            ("c", "CF"),
-            ("s", "SF"),
-            ("o", "OF"),
-            ("p", "PF"),
-        ] {
-            assert_eq!(flag_token_to_var(suffix).map(|v| v.name), Some(name.into()));
-        }
-    }
-
-    #[test]
-    fn unknown_suffix_returns_none() {
-        assert!(flag_token_to_var("q").is_none());
-    }
-
-    #[test]
     fn the_bit_index_is_not_read_from_the_token_text() {
-        // `$s7` / `$b4` are not radare2 tokens: `ae 0x80,rax,=,$s7`
-        // leaves the literal `$s7` on the stack unresolved. Parsing them
-        // modelled a syntax that is never emitted.
-        assert!(flag_token_to_var("s7").is_none());
-        assert!(flag_token_to_var("b4").is_none());
-        assert!(flag_token_to_var("c5").is_none());
+        // `$s7` / `$b4` / `$c5` are not radare2 tokens: `ae 0x80,rax,=,$s7`
+        // leaves the literal `$s7` on the stack unresolved, so parsing
+        // them modelled a syntax that is never emitted. The index rides
+        // on the *stack* — `0x80,rax,=,7,$s`.
+        //
+        // Asserted against the production entry point rather than a name
+        // table, because that is the path a future parser change would
+        // travel: this used to live on a `flag_token_to_var` helper that
+        // nothing outside its own tests ever called.
+        for suffix in ["s7", "b4", "c5"] {
+            let err =
+                crate::lift_esil(&format!("0x80,rax,=,${suffix}"), r2smt_common::Arch::X86_64)
+                    .expect_err("a parametric suffix is not a token");
+            assert!(
+                matches!(err, crate::EsilError::UnsupportedFlag(ref s) if s == suffix),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]

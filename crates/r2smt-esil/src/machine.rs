@@ -314,7 +314,8 @@ impl Machine {
                     _ => name.as_str(),
                 }
                 .to_string();
-                self.stack.push(StackValue::Register(self.register_ref(&canonical)));
+                self.stack
+                    .push(StackValue::Register(self.register_ref(&canonical)));
                 Ok(())
             }
             EsilToken::Flag(suffix) => self.apply_flag(&suffix),
