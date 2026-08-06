@@ -31,12 +31,23 @@
 //!    value. Without this, distinct input spellings (`eax` vs the
 //!    parent `rax`) would let the solver pick them independently and
 //!    fabricate a difference.
-//! 3. Only jointly-defined, identically-named, modelled outputs are
-//!    compared (the `ZF`/`CF`/`SF` flags — `OF`/`PF` are excluded for
-//!    the same reason `r2smt_core` treats them as unmodelled — plus
-//!    registers defined under the same name and width on both sides).
-//!    Comparing fewer things can only *miss* a disagreement (a recall
-//!    gap, acceptable for a corroboration harness), never invent one.
+//! 3. Only jointly-defined, modelled outputs are compared (the
+//!    `ZF`/`CF`/`SF` flags — `OF`/`PF` are excluded for the same reason
+//!    `r2smt_core` treats them as unmodelled — plus registers, projected
+//!    into their *parent's* coordinates by `canonical_finals` so `fp` and
+//!    `x29` pair instead of both dropping out). Comparing fewer things
+//!    can only *miss* a disagreement (a recall gap, acceptable for a
+//!    corroboration harness), never invent one.
+//!
+//! Two consequences of that projection are worth stating, because both
+//! used to be silent recall gaps rather than deliberate policy. A
+//! definition whose width disagrees with its architectural view is
+//! **compared, not skipped** — that is the shape a width defect takes in
+//! a destination, so the old equal-widths guard suppressed exactly the
+//! bug it should have caught. And the one exception is the vector files,
+//! where such a mismatch means the side has no SIMD model at all; that is
+//! modelling depth, like `OF`/`PF`, and reporting it would bury every
+//! real finding under one entry per vector instruction.
 //!
 //! Anything indecisive (solver timeout / unknown / unsound, or nothing
 //! comparable) is `Inconclusive`, never `Agree`.
@@ -46,8 +57,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use r2smt_common::{Address, Arch, SmtResult};
 use r2smt_ir::expr::{Expr, Var};
 use r2smt_ir::stmt::IrStmt;
+use r2smt_slicer::registers::{is_simd_parent, simd_parent_bits};
 use r2smt_slicer::{
-    BranchCandidate, BranchCondition, BranchKind, LiftedSlice, SliceStatus, register_layout,
+    BranchCandidate, BranchCondition, BranchKind, LiftedSlice, RegisterLayout, SliceStatus,
+    register_layout,
 };
 use r2smt_ssa::{SsaLiftedSlice, ssa_convert};
 
@@ -153,11 +166,11 @@ pub fn build_equivalence_query(a: &[IrStmt], b: &[IrStmt], arch: Arch) -> Option
 
     let (parents, none_inputs) = tie_inputs(&ssa_a, &ssa_b, arch)?;
 
-    let finals_a = final_defs(&ssa_a);
-    let finals_b = final_defs(&ssa_b);
     let tainted_a = tainted_defs(&ssa_a)?;
     let tainted_b = tainted_defs(&ssa_b)?;
-    let condition = differ_condition(&finals_a, &finals_b, &tainted_a, &tainted_b, arch)?;
+    let finals_a = canonical_finals(&ssa_a, "A·", &tainted_a, arch);
+    let finals_b = canonical_finals(&ssa_b, "B·", &tainted_b, arch);
+    let condition = differ_condition(&finals_a, &finals_b)?;
 
     let mut statements: Vec<IrStmt> = Vec::new();
     statements.extend(tie_statements(&ssa_a, &ssa_b, &parents, arch)?);
@@ -466,6 +479,128 @@ fn namespace_expr(expr: &Expr, pfx: &str, depth: u32) -> Option<Expr> {
     Some(out)
 }
 
+/// Architectural width of a register parent under `arch`.
+///
+/// A vector parent is **not** the pointer width, and assuming it is was
+/// the same class of defect as the `sp`-at-16-bits bug this harness was
+/// built to find: `register_layout("xmm0", X86_64)` resolves to the
+/// synthetic `zmm0` parent at 512 bits and both ARM ISAs carry `v<n>` at
+/// 128, so sizing either at 64 declares a name at a width nothing else
+/// uses and slices it out of range.
+fn parent_width(parent: &str, arch: Arch) -> u16 {
+    if is_simd_parent(parent, arch) {
+        simd_parent_bits(arch).unwrap_or_else(|| arch.pointer_bits())
+    } else {
+        arch.pointer_bits()
+    }
+}
+
+/// Rebuild what a definition of one register *view* says about the whole
+/// parent, so two lowerings that name the same physical register through
+/// different spellings are compared instead of dropped.
+///
+/// Reading the def in its own coordinates and matching on the base name
+/// is what lost 181 instances of the `sp` bug: a side defining `fp` and a
+/// side defining `x29` never paired, because `differ_condition` matched
+/// base names exactly while `tie_inputs` had been canonicalising the
+/// *input* side through [`register_layout`] all along.
+///
+/// `parent_in` is the shared free input for the parent, so the bits this
+/// write does not touch come from the one machine state both sides read.
+/// A 32-bit alias write zero-extends its parent on both `x86_64` and
+/// `AArch64`, so that form is the whole parent and reads nothing.
+fn parent_space_value(
+    def: &Var,
+    prefix: &str,
+    layout: RegisterLayout,
+    parent_bits: u16,
+) -> Option<Expr> {
+    let piece = Expr::Var(namespace_var(def, prefix));
+    if layout.zero_extends_parent_64 || (layout.lo == 0 && layout.hi.checked_add(1)? >= parent_bits)
+    {
+        return Some(coerce(piece, def.bits, parent_bits));
+    }
+    // Deliberately *not* guarded on `def.bits == layout.width()`: a
+    // definition whose width disagrees with the architectural view is
+    // precisely the bug shape this harness must report, so it is coerced
+    // and compared rather than skipped.
+    let mut value = coerce(piece, def.bits, layout.width());
+    let parent_in = Expr::var(layout.parent, parent_bits);
+    if layout.lo > 0 {
+        value = Expr::concat(
+            value,
+            Expr::extract(parent_in.clone(), layout.lo.checked_sub(1)?, 0),
+        );
+    }
+    if layout.hi.checked_add(1)? < parent_bits {
+        value = Expr::concat(
+            Expr::extract(
+                parent_in,
+                parent_bits.checked_sub(1)?,
+                layout.hi.checked_add(1)?,
+            ),
+            value,
+        );
+    }
+    Some(value)
+}
+
+/// Project one side's final definitions into parent coordinates, keyed
+/// by parent name (registers) or flag name.
+///
+/// Two definitions landing on one parent — a lowering that writes both
+/// `w0` and `x0` — drop that parent entirely: [`final_defs`] keys by base
+/// name and so does not order them against each other, and the narrower
+/// reconstruction would splice against a `parent_in` that the wider write
+/// has already replaced. Fails toward missing a disagreement.
+fn canonical_finals(
+    ssa: &SsaLiftedSlice,
+    prefix: &str,
+    tainted: &BTreeSet<String>,
+    arch: Arch,
+) -> BTreeMap<String, Expr> {
+    let mut out: BTreeMap<String, Expr> = BTreeMap::new();
+    let mut collided: BTreeSet<String> = BTreeSet::new();
+    for (base, def) in final_defs(ssa) {
+        if tainted.contains(&def.name) {
+            continue;
+        }
+        if COMPARABLE_FLAGS.contains(&base.as_str()) {
+            out.insert(base, Expr::Var(namespace_var(&def, prefix)));
+            continue;
+        }
+        let Some(layout) = register_layout(&base, arch) else {
+            continue;
+        };
+        // A definition whose width contradicts its own architectural
+        // view means the side has no model of that register file at all,
+        // which is modelling depth rather than a lifter defect — the same
+        // reason `OF` / `PF` sit outside [`COMPARABLE_FLAGS`]. This is
+        // scoped to the **vector** files on purpose: r2's ESIL carries no
+        // SIMD model and names `xmm0` at the pointer width, so comparing
+        // it against a real 128-bit merge reports every vector
+        // instruction and buries the findings that matter. The same
+        // mismatch on a general register is the `sp`-at-16-bits shape and
+        // must still be reported, so it deliberately falls through.
+        if def.bits != layout.width() && is_simd_parent(layout.parent, arch) {
+            continue;
+        }
+        let parent = layout.parent.to_string();
+        let bits = parent_width(layout.parent, arch);
+        let Some(value) = parent_space_value(&def, prefix, layout, bits) else {
+            collided.insert(parent);
+            continue;
+        };
+        if out.insert(parent.clone(), value).is_some() {
+            collided.insert(parent);
+        }
+    }
+    for parent in &collided {
+        out.remove(parent);
+    }
+    out
+}
+
 /// Collect the final SSA version of every defined base name (the last
 /// `base#N` in definition order maps `base → Var{"base#N", bits}`).
 fn final_defs(ssa: &SsaLiftedSlice) -> BTreeMap<String, Var> {
@@ -480,34 +615,23 @@ fn final_defs(ssa: &SsaLiftedSlice) -> BTreeMap<String, Var> {
 
 /// Build the disjunction "some jointly-defined modelled output
 /// differs". `None` when nothing is comparable.
+///
+/// Both sides arrive already projected into parent coordinates by
+/// [`canonical_finals`], which is what removed the old
+/// `var_a.bits != var_b.bits` guard. That guard skipped exactly the shape
+/// a width bug produces in a destination — `sub sp, sp, #N` defining `sp`
+/// at 16 bits on one side and 64 on the other — so a width defect landing
+/// on the destination suppressed its own detection.
 fn differ_condition(
-    finals_a: &BTreeMap<String, Var>,
-    finals_b: &BTreeMap<String, Var>,
-    tainted_a: &BTreeSet<String>,
-    tainted_b: &BTreeSet<String>,
-    arch: Arch,
+    finals_a: &BTreeMap<String, Expr>,
+    finals_b: &BTreeMap<String, Expr>,
 ) -> Option<Expr> {
     let mut terms: Vec<Expr> = Vec::new();
-    for (base, var_a) in finals_a {
-        let Some(var_b) = finals_b.get(base) else {
+    for (key, value_a) in finals_a {
+        let Some(value_b) = finals_b.get(key) else {
             continue;
         };
-        let is_flag = COMPARABLE_FLAGS.contains(&base.as_str());
-        let is_reg = register_layout(base, arch).is_some();
-        if !(is_flag || is_reg) || var_a.bits != var_b.bits {
-            continue;
-        }
-        // Only compare outputs that are fully modelled on *both*
-        // sides. An output fed by an `Expr::Unknown` would otherwise
-        // become an independent free value per side and fabricate a
-        // disagreement — forbidden by the mission invariant.
-        if tainted_a.contains(&var_a.name) || tainted_b.contains(&var_b.name) {
-            continue;
-        }
-        terms.push(Expr::ne(
-            Expr::Var(namespace_var(var_a, "A·")),
-            Expr::Var(namespace_var(var_b, "B·")),
-        ));
+        terms.push(Expr::ne(value_a.clone(), value_b.clone()));
     }
     let mut iter = terms.into_iter();
     let first = iter.next()?;
@@ -525,7 +649,6 @@ fn tie_inputs(
     ssa_b: &SsaLiftedSlice,
     arch: Arch,
 ) -> Option<(BTreeMap<String, Var>, Vec<Var>)> {
-    let ptr = arch.pointer_bits();
     let mut parents: BTreeMap<String, Var> = BTreeMap::new();
     let mut none_a: BTreeMap<String, u16> = BTreeMap::new();
     let mut none_b: BTreeMap<String, u16> = BTreeMap::new();
@@ -535,7 +658,7 @@ fn tie_inputs(
             if let Some(parent) = register_layout(&input.name, arch).map(|l| l.parent) {
                 parents
                     .entry(parent.to_string())
-                    .or_insert_with(|| Var::new(parent, ptr));
+                    .or_insert_with(|| Var::new(parent, parent_width(parent, arch)));
             } else {
                 let bucket = if store { &mut none_a } else { &mut none_b };
                 bucket.insert(input.name.clone(), input.bits);
@@ -561,13 +684,13 @@ fn tie_statements(
     parents: &BTreeMap<String, Var>,
     arch: Arch,
 ) -> Option<Vec<IrStmt>> {
-    let ptr = arch.pointer_bits();
     let mut ties: Vec<IrStmt> = Vec::new();
     let mut bound: BTreeSet<String> = BTreeSet::new();
     for input in ssa_a.inputs.iter().chain(ssa_b.inputs.iter()) {
         let Some(layout) = register_layout(&input.name, arch) else {
             continue;
         };
+        let ptr = parent_width(layout.parent, arch);
         if input.name == layout.parent && input.bits == ptr {
             continue;
         }

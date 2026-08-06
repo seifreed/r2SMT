@@ -38,7 +38,11 @@ fn insn(addr: u64, mnemonic: &str, operands: Vec<Operand>) -> Instruction {
 }
 
 fn diff(a: &[IrStmt], b: &[IrStmt]) -> DiffVerdict {
-    match build_equivalence_query(a, b, Arch::X86_64) {
+    diff_arch(a, b, Arch::X86_64)
+}
+
+fn diff_arch(a: &[IrStmt], b: &[IrStmt], arch: Arch) -> DiffVerdict {
+    match build_equivalence_query(a, b, arch) {
         None => DiffVerdict::Inconclusive,
         Some(query) => classify_equivalence(solve_branch(
             &query,
@@ -230,6 +234,93 @@ fn test_scalar_move_against_the_esil_xmm_model_is_not_a_disagreement() {
         "the ESIL lowering is the point of the test"
     );
     assert_ne!(diff(&lowerings.mnemonic, &esil), DiffVerdict::Disagree);
+}
+
+/// `dst := x0 + delta`, the one shape the alias contracts need.
+fn define_from_x0(dst: &str, dst_bits: u16, delta: u128) -> Vec<IrStmt> {
+    vec![IrStmt::Assign {
+        dst: Var::new(dst, dst_bits),
+        src: Expr::add(Expr::var("x0", 64), Expr::konst(delta, 64)),
+    }]
+}
+
+#[test]
+fn test_alias_named_outputs_are_compared_through_the_parent() {
+    // `fp` and `x29` are two spellings of one register. Matching outputs
+    // by base name never paired them, which is how 181 further instances
+    // of the `sp` bug went unreported while `tie_inputs` had been
+    // canonicalising the input side all along.
+    let a = define_from_x0("fp", 64, 8);
+    let b = define_from_x0("x29", 64, 16);
+    assert_eq!(diff_arch(&a, &b, Arch::Aarch64), DiffVerdict::Disagree);
+}
+
+#[test]
+fn test_alias_named_outputs_agree_when_the_values_match() {
+    let a = define_from_x0("fp", 64, 8);
+    let b = define_from_x0("x29", 64, 8);
+    assert_eq!(diff_arch(&a, &b, Arch::Aarch64), DiffVerdict::Agree);
+}
+
+#[test]
+fn test_mismatched_output_widths_are_compared_not_skipped() {
+    // The measured `sp`-at-16-bits shape, in a *destination*: one side
+    // models the stack pointer at its architectural 64 bits, the other at
+    // x86's 16. The old `var_a.bits != var_b.bits` guard skipped exactly
+    // this, so a width defect landing on the destination suppressed its
+    // own detection.
+    let wide = vec![IrStmt::Assign {
+        dst: Var::new("sp", 64),
+        src: Expr::sub(Expr::var("sp", 64), Expr::konst(16, 64)),
+    }];
+    let narrow = vec![IrStmt::Assign {
+        dst: Var::new("sp", 16),
+        src: Expr::sub(Expr::var("sp", 16), Expr::konst(16, 16)),
+    }];
+    assert_eq!(
+        diff_arch(&wide, &narrow, Arch::Aarch64),
+        DiffVerdict::Disagree
+    );
+}
+
+#[test]
+fn test_partial_register_write_agrees_with_a_full_parent_write() {
+    // Anti-fabrication counterpart: reconstructing a narrow write against
+    // the shared parent input must reproduce what the explicit
+    // full-parent write says, or every sub-register lowering pair becomes
+    // a disagreement.
+    let partial = vec![IrStmt::Assign {
+        dst: Var::new("ax", 16),
+        src: Expr::konst(5, 16),
+    }];
+    let full = vec![IrStmt::Assign {
+        dst: Var::new("rax", 64),
+        src: Expr::concat(
+            Expr::extract(Expr::var("rax", 64), 63, 16),
+            Expr::konst(5, 16),
+        ),
+    }];
+    assert_eq!(diff(&partial, &full), DiffVerdict::Agree);
+}
+
+#[test]
+fn test_vector_width_mismatch_is_not_comparable_rather_than_a_disagreement() {
+    // The guard that keeps the alias canonicalisation from reporting
+    // every SIMD instruction: r2's ESIL carries no vector model and names
+    // `xmm0` at the pointer width, which contradicts the 128-bit
+    // architectural view. That is modelling depth, not a lifter defect.
+    // The same mismatch on a general register is the `sp` shape above and
+    // must still be reported — which is why the guard tests the parent's
+    // register file and not merely the widths.
+    let narrow = vec![IrStmt::Assign {
+        dst: Var::new("xmm0", 64),
+        src: Expr::konst(1, 64),
+    }];
+    let wide = vec![IrStmt::Assign {
+        dst: Var::new("xmm0", 128),
+        src: Expr::konst(2, 128),
+    }];
+    assert_eq!(diff(&narrow, &wide), DiffVerdict::Inconclusive);
 }
 
 #[test]
