@@ -634,6 +634,7 @@ name = "r2smt-core"
 version = "0.1.0"
 dependencies = [
  "r2smt-common",
+ "r2smt-esil",
  "r2smt-ir",
  "r2smt-r2pipe",
  "r2smt-slicer",
