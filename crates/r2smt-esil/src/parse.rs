@@ -34,8 +34,17 @@ pub enum EsilToken {
     /// case).
     Unary(&'static str),
     /// `=` token: pops `value`, then `target`. The slicer assigns
-    /// `target = value`.
+    /// `target = value`, and the write seeds the flag context.
     Assign,
+    /// `:=` — the same assignment **without** seeding the flag context.
+    /// A distinct variant rather than a payload on [`EsilToken::Assign`]
+    /// so the machine's dispatch stays a flat match.
+    AssignNoFlags,
+    /// `==` — pops both operands, seeds the flag context, pushes
+    /// nothing.
+    Compare,
+    /// `!=` — pops one register and writes its logical NOT back.
+    NegAssign,
     /// Compound assignment such as `+=`, `-=`, `&=`, etc. The
     /// payload is the operator part (`"+"`, `"-"`, …).
     CompoundAssign(&'static str),
@@ -97,20 +106,42 @@ fn classify(tok: &str) -> EsilToken {
         "<=" => EsilToken::Binary("<="),
         ">" => EsilToken::Binary(">"),
         ">=" => EsilToken::Binary(">="),
-        "==" => EsilToken::Binary("=="),
-        // `!=` is deliberately absent. radare2 spells it `(1 -- 0)`
-        // tagged `math+regw` in `ae???` — it pops **one** operand and
-        // writes a register with its bitwise complement ("negate all
-        // bits"), pushing nothing. It is not a comparison. Modelling it
-        // as `Expr::ne` was wrong in kind, not just in stack effect, so
-        // it falls to `Unknown` and the lift fails into the
-        // per-mnemonic handler rather than computing a different
-        // instruction. Measured unreachable today (0 occurrences in
-        // liftable ESIL across three ISAs, because every real use sits
-        // in a string that also carries `:=`), which is why this is a
-        // decline and not an implementation.
+        // Not a binary operator: `ae 5,3,==` leaves the stack **empty**,
+        // so it pops two and pushes nothing, seeding the flag context
+        // instead. Modelling it as one left a boolean the next token
+        // would consume as an operand.
+        "==" => EsilToken::Compare,
+        // radare2's own help calls this "negate all bits" and that is
+        // wrong: `ar rax=0x0f; ae rax,!=` leaves **0**, not
+        // `0xfffffffffffffff0`. It is a logical NOT written back to the
+        // popped register, `(1 -- 0)` tagged `math+regw`. The operator
+        // was withdrawn from the model in `f45b3cdd` rather than fixed,
+        // because two tests pinned the complement reading; this is the
+        // measured one.
+        "!=" => EsilToken::NegAssign,
         "!" => EsilToken::Unary("!"),
         "=" => EsilToken::Assign,
+        // `:=` is **deliberately** still unlexed, so it stays an
+        // `Unknown` and the whole lift fails into the per-mnemonic
+        // handler. The machine models it already
+        // ([`EsilToken::AssignNoFlags`], `apply_assign(_, false)`) — what
+        // is missing is the *gate*, not the semantics.
+        //
+        // radare2 writes every flag of every ISA with `:=`, so lexing it
+        // moves the entire flag-setting population off the per-mnemonic
+        // handlers, which carry ~750 solver-backed contracts, and onto
+        // this machine, which has ~50 unit tests. Two measured facts make
+        // that unsafe on ARM specifically: r2's `a64 cmp` emits
+        // `64,$b,!,cf,:=`, i.e. ARM's architectural C, where this
+        // pipeline stores the *inverse* borrow polarity so one
+        // `lift_branch_condition` can serve both ISAs — every unsigned
+        // ARM branch would resolve to the other arm. And r2's own a64
+        // `subs` seeds through `x0,=`, so its carry is a function of
+        // whatever the destination held *before* the instruction; that
+        // is a bug in radare2 that a faithful implementation imports.
+        //
+        // The unblock therefore needs the override seam in
+        // `r2smt_slicer::lift::lift_instruction` first.
         "+=" => EsilToken::CompoundAssign("+"),
         "-=" => EsilToken::CompoundAssign("-"),
         "*=" => EsilToken::CompoundAssign("*"),
@@ -228,7 +259,7 @@ mod tests {
 
     #[test]
     fn binary_operators() {
-        for op in ["+", "-", "*", "&", "|", "^", "<<", ">>", "=="] {
+        for op in ["+", "-", "*", "&", "|", "^", "<<", ">>"] {
             let toks = tokenize(op);
             assert_eq!(toks, vec![EsilToken::Binary(op)], "for {op}");
         }
@@ -257,7 +288,7 @@ mod tests {
         assert!(matches!(toks[0], EsilToken::Integer(1)));
         assert!(matches!(toks[1], EsilToken::Register(_)));
         assert!(matches!(toks[2], EsilToken::Assign));
-        assert!(matches!(toks[5], EsilToken::Binary("==")));
+        assert!(matches!(toks[5], EsilToken::Compare));
         assert!(matches!(toks[6], EsilToken::Flag(_)));
         assert!(matches!(toks[7], EsilToken::Register(_)));
         assert!(matches!(toks[8], EsilToken::Assign));

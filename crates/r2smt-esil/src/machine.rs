@@ -26,7 +26,7 @@ use r2smt_common::Arch;
 use r2smt_ir::expr::{Expr, Var};
 use r2smt_ir::stmt::IrStmt;
 
-use crate::flags::flag_token_to_expr_in_ctx;
+use crate::flags;
 use crate::parse::{EsilToken, tokenize};
 
 /// Why an ESIL parse / evaluation failed.
@@ -99,7 +99,7 @@ struct Machine {
     /// `$bN`, … flag tokens derive their value from this — they
     /// describe "the flag the latest math operation would have set"
     /// rather than the content of a register named ZF/SF/...
-    last_arith: Option<LastArith>,
+    flag_ctx: Option<FlagCtx>,
     /// Active predicated-block frames. A `?{` token pushes a frame
     /// holding the condition and the index where the block body
     /// started; the matching `}` token pops the frame and wraps every
@@ -108,38 +108,35 @@ struct Machine {
     /// a block flip `contains_mem_op` so the close errors out — the
     /// IR has no conditional memory effect we can model soundly.
     block_stack: Vec<BlockFrame>,
+    /// A seeded `old` value named but not yet emitted. See
+    /// [`Machine::materialise_old`].
+    pending_old: Option<PendingOld>,
 }
 
-/// Family the last arithmetic / logical operation belonged to.
-/// Carries enough information for the parametric flag tokens
-/// (`$cN`, `$bN`) to know which operand-aware formula to emit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ArithKind {
-    /// `+` — `lhs + rhs`. Drives `$cN` (carry into bit N+1).
-    Add,
-    /// `-` — `lhs - rhs`. Drives `$bN` (borrow into bit N+1).
-    Sub,
-    /// `*`. Flags are not modelled for multiplication.
-    Mul,
-    /// `/` (unsigned divide).
-    Div,
-    /// `%` (unsigned remainder).
-    Rem,
-    /// `&`, `|`, `^`.
-    Logic,
-    /// `<<`, `>>` — logical shifts.
-    Shift,
-}
-
-/// Snapshot of an arithmetic / logical operation kept around so the
-/// flag-token evaluator can derive `$z` / `$s` / `$c` / `$o` / `$p`
-/// and the parametric `$cN` / `$bN` bit-precise carry/borrow tokens.
+/// The `old` half of a flag context, deferred until a flag reads it.
 #[derive(Debug, Clone)]
-pub(crate) struct LastArith {
-    pub(crate) kind: ArithKind,
-    pub(crate) lhs: Expr,
-    pub(crate) rhs: Expr,
-    pub(crate) result: Expr,
+struct PendingOld {
+    temp: Var,
+    target: Var,
+    at: usize,
+}
+
+/// The flag context radare2 keeps: the value a destination held before
+/// the seeding operation and the value it holds after, at that
+/// destination's width.
+///
+/// Measured, not inferred — see the module doc of [`crate::flags`]. Two
+/// things about it replaced an entire `ArithKind` enum. The context is
+/// seeded by **writes and compares**, never by bare arithmetic; and every
+/// flag is a function of this pair alone, so whether the seeding
+/// operation added or subtracted is a distinction radare2 does not make.
+#[derive(Debug, Clone)]
+pub(crate) struct FlagCtx {
+    /// The destination's value before the operation.
+    pub(crate) old: Expr,
+    /// Its value after.
+    pub(crate) cur: Expr,
+    /// The destination's width, which is what `$z` masks to.
     pub(crate) bits: u16,
 }
 
@@ -191,8 +188,9 @@ impl Machine {
             arch,
             stack: Vec::new(),
             statements: Vec::new(),
-            last_arith: None,
+            flag_ctx: None,
             block_stack: Vec::new(),
+            pending_old: None,
         }
     }
 
@@ -234,30 +232,14 @@ impl Machine {
                     .push(StackValue::Register(Var::new(canonical, bits)));
                 Ok(())
             }
-            EsilToken::Flag(suffix) => {
-                // ESIL `$z` / `$s` are derived from the *latest math
-                // operation*, not from a register named ZF / SF. When
-                // the machine has seen an arithmetic op recently, we
-                // synthesise the bit from that result. The parametric
-                // `$cN` / `$bN` tokens emit a bit-precise carry/borrow
-                // expression over the operands of the same snapshot;
-                // see `flag_token_to_expr_in_ctx` for the formula.
-                // Anything we cannot model surfaces as
-                // `UnsupportedFlag` so the slicer falls back to the
-                // per-mnemonic handler.
-                let expr = match suffix.as_str() {
-                    "z" => self.derive_zero_flag(),
-                    "s" => self.derive_sign_flag(),
-                    other => flag_token_to_expr_in_ctx(other, self.last_arith.as_ref())
-                        .ok_or_else(|| EsilError::UnsupportedFlag(suffix.clone()))?,
-                };
-                self.stack.push(StackValue::Expression { expr, bits: 1 });
-                Ok(())
-            }
+            EsilToken::Flag(suffix) => self.apply_flag(&suffix),
             EsilToken::Binary(op) => self.apply_binary(op),
+            EsilToken::Compare => self.apply_compare(),
+            EsilToken::NegAssign => self.apply_neg_assign(),
             EsilToken::Unary(op) => self.apply_unary(op),
-            EsilToken::Assign => self.apply_assign(None),
-            EsilToken::CompoundAssign(op) => self.apply_assign(Some(op)),
+            EsilToken::Assign => self.apply_assign(None, true),
+            EsilToken::AssignNoFlags => self.apply_assign(None, false),
+            EsilToken::CompoundAssign(op) => self.apply_assign(Some(op), true),
             EsilToken::Load(size) => self.apply_load(size),
             EsilToken::Store(size) => self.apply_store(size),
             EsilToken::BlockOpen => self.open_block(),
@@ -343,36 +325,12 @@ impl Machine {
             ">=" => Expr::ule(rhs_e, lhs_e),
             _ => return Err(EsilError::UnknownToken(op.to_string())),
         };
-        // Snapshot arithmetic / logical results — the comparison
-        // operators do not seed flag-token derivation because their
-        // 1-bit output is not the "math result" ESIL's `$z` /
-        // `$s` reference. The lhs/rhs operands are retained so the
-        // parametric `$cN` / `$bN` tokens can emit a bit-precise
-        // carry/borrow formula over the same pre-widened pair.
-        let arith_kind = match op {
-            "+" => Some(ArithKind::Add),
-            "-" => Some(ArithKind::Sub),
-            "*" => Some(ArithKind::Mul),
-            "/" => Some(ArithKind::Div),
-            "%" => Some(ArithKind::Rem),
-            "&" | "|" | "^" => Some(ArithKind::Logic),
-            "<<" | ">>" => Some(ArithKind::Shift),
-            _ => None,
-        };
-        if let Some(kind) = arith_kind {
-            // Recover the pre-widened operands from the IR — `expr`
-            // already carries them as its direct children for the
-            // arith ops listed above, so we re-extract instead of
-            // double-cloning the stack values.
-            let (lhs_snap, rhs_snap) = arith_operands(&expr);
-            self.last_arith = Some(LastArith {
-                kind,
-                lhs: lhs_snap,
-                rhs: rhs_snap,
-                result: expr.clone(),
-                bits: result_bits,
-            });
-        }
+        // Deliberately seeds nothing. `ae 0x81,1,-,7,$s` leaves the
+        // difference on the stack and still answers `$s(7) = 0`, and
+        // `ae 5,3,+,$z` answers the *unseeded* default — bare arithmetic
+        // does not touch the flag context. The model used to seed here
+        // and nowhere else, which is the exact inverse of what radare2
+        // does; the seeding sites are `apply_assign` and `apply_compare`.
         self.stack.push(StackValue::Expression {
             expr,
             bits: result_bits,
@@ -380,27 +338,57 @@ impl Machine {
         Ok(())
     }
 
-    fn derive_zero_flag(&self) -> Expr {
-        match &self.last_arith {
-            Some(arith) => Expr::Ite {
-                cond: Box::new(Expr::eq(arith.result.clone(), Expr::konst(0, arith.bits))),
-                then_expr: Box::new(Expr::konst(1, 1)),
-                else_expr: Box::new(Expr::konst(0, 1)),
-            },
-            None => Expr::Var(Var::new("ZF", 1)),
-        }
-    }
-
-    fn derive_sign_flag(&self) -> Expr {
-        match &self.last_arith {
-            Some(arith) if arith.bits > 0 => {
-                let hi = arith.bits - 1;
-                Expr::extract(arith.result.clone(), hi, hi)
+    /// Evaluate one `$<flag>` token against the current context.
+    ///
+    /// The split is by **measured stack effect**: `$z` and `$p` pop
+    /// nothing, while `$s` / `$c` / `$b` / `$o` pop their bit index —
+    /// `ae 5,0x80,rax,=,7,$s` leaves `[5, 1]`, taking exactly one. The
+    /// index must be a literal, since a mask cannot be built from a
+    /// symbolic width.
+    ///
+    /// With no context there is no sound answer, and this declines
+    /// rather than handing back a free `ZF`. radare2's context survives
+    /// across instructions and ours cannot, so a free variable would let
+    /// a branch predicate silently take an input; declining sends the
+    /// instruction to a per-mnemonic handler that has contracts.
+    fn apply_flag(&mut self, suffix: &str) -> Result<(), EsilError> {
+        let unsupported = || EsilError::UnsupportedFlag(suffix.to_string());
+        let ctx = self.flag_ctx.clone().ok_or_else(unsupported)?;
+        let expr = match suffix {
+            "z" => flags::zero_flag(&ctx),
+            "p" => flags::parity_flag(&ctx).ok_or_else(unsupported)?,
+            "s" | "c" | "b" | "o" => {
+                let index = self.pop_flag_index()?;
+                // Only the carry family reads `old`; the sign bit is a
+                // function of the result alone.
+                if matches!(suffix, "c" | "b" | "o") {
+                    self.materialise_old();
+                }
+                match suffix {
+                    "s" => flags::sign_flag(&ctx, index),
+                    "c" => flags::carry_flag(&ctx, index),
+                    "b" => flags::borrow_flag(&ctx, index),
+                    _ => flags::overflow_flag(&ctx, index),
+                }
+                .ok_or_else(unsupported)?
             }
-            _ => Expr::Var(Var::new("SF", 1)),
-        }
+            _ => return Err(unsupported()),
+        };
+        self.stack.push(StackValue::Expression { expr, bits: 1 });
+        Ok(())
     }
 
+    /// Pop the bit index a parametric flag token consumes, requiring a
+    /// literal.
+    fn pop_flag_index(&mut self) -> Result<u16, EsilError> {
+        match self.pop("flag bit index")? {
+            StackValue::Expression {
+                expr: Expr::Const { value, .. },
+                ..
+            } => u16::try_from(value).map_err(|_| EsilError::UnsupportedFlag(value.to_string())),
+            _ => Err(EsilError::UnsupportedFlag("non-literal bit index".into())),
+        }
+    }
     fn apply_unary(&mut self, op: &'static str) -> Result<(), EsilError> {
         let operand = self.pop("unary operand")?;
         let bits = operand.bits();
@@ -421,7 +409,19 @@ impl Machine {
         Ok(())
     }
 
-    fn apply_assign(&mut self, compound: Option<&'static str>) -> Result<(), EsilError> {
+    /// `seeds_flags` is what separates `=` from `:=`. radare2's own help
+    /// spells the difference — "assign updating internal flags" versus
+    /// "assign without updating internal flags" — and a probe confirms
+    /// it: after a `==`, a following `:=` leaves `$z` reading the
+    /// compare's context while `=` overwrites it with the assigned
+    /// value. Every flag write inside a flag-setting instruction has to
+    /// be `:=`, or it would clobber the context the next flag token
+    /// still needs to read.
+    fn apply_assign(
+        &mut self,
+        compound: Option<&'static str>,
+        seeds_flags: bool,
+    ) -> Result<(), EsilError> {
         // ESIL is postfix: for `value,target,=` the stack at this
         // point is `[value, target]`, so the *target* is popped first
         // and the *value* second. Same convention for the compound
@@ -450,9 +450,107 @@ impl Machine {
                 }
             }
         };
+        if seeds_flags {
+            self.seed_flag_ctx(&target_var, &final_expr);
+        }
         self.statements.push(IrStmt::Assign {
             dst: target_var,
             src: final_expr,
+        });
+        Ok(())
+    }
+
+    /// Record the flag context a write leaves behind.
+    ///
+    /// The `old` value is captured into a temp **before** the
+    /// destination is written. Embedding `Expr::Var(target)` directly
+    /// would not work: `ssa_convert` renames reads by statement
+    /// position, so a flag expression emitted after the write would have
+    /// its reference to the destination rewritten to the *new* version
+    /// and the flag would read its own result. Same hazard, and the same
+    /// remedy, as the lifter's flag-ordering invariant.
+    fn seed_flag_ctx(&mut self, target: &Var, value: &Expr) {
+        let snapshot = Var::new(self.fresh_tmp_name("old"), target.bits);
+        // Named now, emitted only if something reads it. `$z`, `$s` and
+        // `$p` are functions of the *result* alone, so the common case
+        // costs no statement at all and every ESIL lift that reads no
+        // carry stays byte-identical to before this model landed.
+        self.pending_old = Some(PendingOld {
+            temp: snapshot.clone(),
+            target: target.clone(),
+            at: self.statements.len(),
+        });
+        self.flag_ctx = Some(FlagCtx {
+            old: Expr::Var(snapshot),
+            cur: value.clone(),
+            bits: target.bits,
+        });
+    }
+
+    /// Emit the deferred `old` snapshot, ahead of the write it precedes.
+    fn materialise_old(&mut self) {
+        let Some(pending) = self.pending_old.take() else {
+            return;
+        };
+        self.statements.insert(
+            pending.at,
+            IrStmt::Assign {
+                dst: pending.temp,
+                src: Expr::Var(pending.target),
+            },
+        );
+        for frame in &mut self.block_stack {
+            if frame.stmt_start > pending.at {
+                frame.stmt_start += 1;
+            }
+        }
+    }
+
+    /// `==` — pop both operands, seed the context with the subtraction,
+    /// and push **nothing**.
+    ///
+    /// `ae 5,3,==` leaves the stack empty and `ae 5,5,==,$z` answers 1,
+    /// so the comparison is a pure seeding operation. Modelling it as a
+    /// binary operator that pushes a boolean left a residue the next
+    /// token would consume as an operand — a wrong value, not a decline.
+    fn apply_compare(&mut self) -> Result<(), EsilError> {
+        let lhs = self.pop("compare lhs")?;
+        let rhs = self.pop("compare rhs")?;
+        let bits = lhs.bits().max(rhs.bits());
+        let lhs_e = widen(lhs, bits);
+        let rhs_e = widen(rhs, bits);
+        self.flag_ctx = Some(FlagCtx {
+            old: lhs_e.clone(),
+            cur: Expr::sub(lhs_e, rhs_e),
+            bits,
+        });
+        Ok(())
+    }
+
+    /// `!=` — logical NOT, written back to the popped register.
+    ///
+    /// radare2's help calls this "negate all bits" and that is wrong:
+    /// `ar rax=0x0f; ae rax,!=` leaves `0`, not `0xfffffffffffffff0`.
+    /// Measured across 0, 2, 0x0f and all-ones, it is
+    /// `dst = (dst == 0) ? 1 : 0`, stored rather than pushed, and it
+    /// does not seed. The operator was withdrawn from the model in
+    /// `f45b3cdd` rather than fixed, because two tests pinned the wrong
+    /// reading; this is the measured one.
+    fn apply_neg_assign(&mut self) -> Result<(), EsilError> {
+        let target = self.pop("negate target")?;
+        let StackValue::Register(target_var) = target else {
+            return Err(EsilError::InvalidAssignmentTarget);
+        };
+        let bits = target_var.bits;
+        let is_zero = Expr::eq(Expr::Var(target_var.clone()), Expr::konst(0, bits));
+        let src = Expr::Ite {
+            cond: Box::new(is_zero),
+            then_expr: Box::new(Expr::konst(1, bits)),
+            else_expr: Box::new(Expr::konst(0, bits)),
+        };
+        self.statements.push(IrStmt::Assign {
+            dst: target_var,
+            src,
         });
         Ok(())
     }
@@ -611,28 +709,6 @@ fn cast_to_1bit(value: StackValue) -> Expr {
         cond: Box::new(Expr::eq(expr, Expr::konst(0, bits))),
         then_expr: Box::new(Expr::konst(0, 1)),
         else_expr: Box::new(Expr::konst(1, 1)),
-    }
-}
-
-/// Recover the immediate operands of a binary arith expression as
-/// owned clones. Used to snapshot the operands behind the latest math
-/// operation for the parametric `$cN` / `$bN` flag tokens. The caller
-/// guarantees `expr` is one of the supported arith / logic / shift
-/// kinds — anything else returns conservative `Unknown` placeholders
-/// rather than panicking.
-fn arith_operands(expr: &Expr) -> (Expr, Expr) {
-    match expr {
-        Expr::Add(a, b)
-        | Expr::Sub(a, b)
-        | Expr::Mul(a, b)
-        | Expr::UDiv(a, b)
-        | Expr::URem(a, b)
-        | Expr::And(a, b)
-        | Expr::Or(a, b)
-        | Expr::Xor(a, b)
-        | Expr::Shl(a, b)
-        | Expr::LShr(a, b) => ((**a).clone(), (**b).clone()),
-        _ => (Expr::unknown(), Expr::unknown()),
     }
 }
 

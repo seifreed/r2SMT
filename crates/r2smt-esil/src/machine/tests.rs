@@ -124,39 +124,58 @@ fn test_esil_lnot_width_is_1bit() {
 }
 
 #[test]
-fn flag_token_falls_back_to_free_var_without_arith_context() {
-    // ESIL: "$z,zf,=" — copies the `$z` synthetic flag into the
-    // 1-bit zf register. With no prior arithmetic operation the
-    // machine has nothing to derive `$z` from and falls back to
-    // the canonical `Var("ZF", 1)`. The lowercase `zf` target
-    // also normalises to the uppercase canonical form.
-    let lift = lift_esil("$z,zf,=", Arch::X86_64).expect("lift ok");
-    match &lift.statements[0] {
+fn a_flag_without_a_seeded_context_declines() {
+    // radare2's flag context survives across instructions and ours
+    // cannot, so with nothing seeded there is no sound answer. This used
+    // to hand back a free `Var("ZF")`, which lets a branch predicate
+    // silently take an input; declining sends the instruction to a
+    // per-mnemonic handler that has contracts.
+    let err = lift_esil("$z,zf,=", Arch::X86_64).expect_err("must decline");
+    assert!(matches!(err, EsilError::UnsupportedFlag(_)), "{err:?}");
+}
+
+#[test]
+fn bare_arithmetic_does_not_seed_the_flag_context() {
+    // Measured: `ae 0x81,1,-,7,$s` leaves the difference on the stack and
+    // still answers `$s(7) = 0`, and `ae 5,3,+,$z` answers the unseeded
+    // default. The model used to seed here and *only* here, which is the
+    // exact inverse of radare2.
+    let err = lift_esil("1,eax,-,$z,zf,=", Arch::X86_64).expect_err("must decline");
+    assert!(matches!(err, EsilError::UnsupportedFlag(_)), "{err:?}");
+}
+
+#[test]
+fn a_write_seeds_the_flag_context() {
+    // The other half: `ae 0x80,rax,=,7,$s` answers 1, so an assignment
+    // does seed. `$z` is a function of the result alone, so no `old`
+    // snapshot is emitted and the lift stays two statements.
+    let lift = lift_esil("0x80,rax,=,$z,zf,=", Arch::X86_64).expect("lift ok");
+    assert_eq!(lift.statements.len(), 2);
+    match &lift.statements[1] {
         IrStmt::Assign { dst, src } => {
             assert_eq!(dst.name, "ZF");
-            assert_eq!(dst.bits, 1);
-            assert_eq!(*src, Expr::Var(Var::new("ZF", 1)));
+            assert!(matches!(src, Expr::Ite { .. }), "{src:?}");
         }
         _ => panic!("expected Assign"),
     }
 }
 
 #[test]
-fn flag_token_derives_zero_bit_from_last_arith() {
-    // After `1,eax,-` the machine remembers `eax_widened - 1` as
-    // the latest arithmetic result — ESIL reads `a,b,OP` as
-    // `b OP a` — so `$z` becomes
-    // `Ite(result == 0, 1, 0)` rather than a free flag variable.
-    let lift = lift_esil("1,eax,-,$z,zf,=", Arch::X86_64).expect("lift ok");
-    assert_eq!(lift.statements.len(), 1);
-    match &lift.statements[0] {
-        IrStmt::Assign { dst, src } => {
-            assert_eq!(dst.name, "ZF");
-            // The src must be an Ite collapsing the last
-            // arithmetic delta to a 1-bit flag.
-            assert!(matches!(src, Expr::Ite { .. }));
+fn a_carry_flag_reads_the_value_the_destination_held_before() {
+    // `$c` is `(cur & m) <u (old & m)`, so it needs the pre-write value.
+    // That snapshot is emitted *ahead* of the write: `ssa_convert`
+    // renames reads by statement position, so a reference placed after
+    // the write would be rewritten to the new version and the flag would
+    // read its own result.
+    let lift = lift_esil("1,rax,+=,64,$c,cf,=", Arch::X86_64).expect("lift ok");
+    assert_eq!(lift.statements.len(), 3);
+    match (&lift.statements[0], &lift.statements[1]) {
+        (IrStmt::Assign { dst: snap, src }, IrStmt::Assign { dst: written, .. }) => {
+            assert_eq!(*src, Expr::Var(Var::new("rax", 64)));
+            assert_eq!(written.name, "rax");
+            assert!(snap.name.starts_with("__esil_old"), "{}", snap.name);
         }
-        _ => panic!("expected Assign"),
+        other => panic!("expected snapshot then write, got {other:?}"),
     }
 }
 
@@ -166,16 +185,18 @@ fn unclosed_block_returns_unsupported_control_flow() {
     // the slicer falls back to the per-mnemonic handler. Without
     // this check the unwrapped statements would be committed as
     // if they were unconditional.
-    let err = lift_esil("rax,0,==,?{", Arch::X86_64).expect_err("must reject");
+    let err = lift_esil("zf,?{", Arch::X86_64).expect_err("must reject");
     assert_eq!(err, EsilError::UnsupportedControlFlow);
 }
 
 #[test]
 fn block_simple_predicated_assign_wraps_with_ite() {
-    // ESIL `0,rax,==,?{,2,rax,=,}`: "if rax == 0 then rax := 2".
+    // ESIL `zf,?{,2,rax,=,}`: "if ZF then rax := 2". The condition is
+    // a register because that is what radare2 emits — `==` seeds the
+    // flag context and pushes nothing.
     // The block close must turn the inner `rax := 2` into
     // `rax := Ite(rax == 0, 2, rax)`.
-    let lift = lift_esil("0,rax,==,?{,2,rax,=,}", Arch::X86_64).expect("lift ok");
+    let lift = lift_esil("zf,?{,2,rax,=,}", Arch::X86_64).expect("lift ok");
     assert_eq!(lift.statements.len(), 1);
     match &lift.statements[0] {
         IrStmt::Assign { dst, src } => {
@@ -187,7 +208,11 @@ fn block_simple_predicated_assign_wraps_with_ite() {
                     else_expr,
                 } => {
                     // Condition is a 1-bit equality predicate.
-                    assert!(matches!(cond.as_ref(), Expr::Eq(_, _)));
+                    // The condition is the ZF register narrowed to one bit.
+                    assert!(
+                        matches!(cond.as_ref(), Expr::Var(_) | Expr::Extract { .. }),
+                        "{cond:?}"
+                    );
                     // Then-branch is the constant write.
                     assert_eq!(then_expr.as_ref().clone(), Expr::konst(2, 64));
                     // Else-branch preserves the prior value of rax.
@@ -202,10 +227,10 @@ fn block_simple_predicated_assign_wraps_with_ite() {
 
 #[test]
 fn block_nested_wraps_with_outer_then_inner_ite() {
-    // ESIL `0,rax,==,?{,1,rbx,==,?{,2,rax,=,},}`: outer cond
+    // ESIL `zf,?{,cf,?{,2,rax,=,},}`: outer cond
     // wraps over the inner block; the inner block already
     // wrapped the assignment once. Result: nested Ite.
-    let lift = lift_esil("0,rax,==,?{,1,rbx,==,?{,2,rax,=,},}", Arch::X86_64).expect("lift ok");
+    let lift = lift_esil("zf,?{,cf,?{,2,rax,=,},}", Arch::X86_64).expect("lift ok");
     assert_eq!(lift.statements.len(), 1);
     match &lift.statements[0] {
         IrStmt::Assign { src, .. } => match src {
@@ -214,7 +239,10 @@ fn block_nested_wraps_with_outer_then_inner_ite() {
                 then_expr: outer_then,
                 ..
             } => {
-                assert!(matches!(outer_cond.as_ref(), Expr::Eq(_, _)));
+                assert!(
+                    matches!(outer_cond.as_ref(), Expr::Var(_) | Expr::Extract { .. }),
+                    "{outer_cond:?}"
+                );
                 // Inner is itself an Ite.
                 assert!(matches!(outer_then.as_ref(), Expr::Ite { .. }));
             }
@@ -228,7 +256,7 @@ fn block_nested_wraps_with_outer_then_inner_ite() {
 fn block_with_store_returns_unsupported() {
     // Stores cannot be made conditional in the IR — the close
     // handler aborts the lift.
-    let err = lift_esil("0,rax,==,?{,rax,rbx,=[8],}", Arch::X86_64).expect_err("must reject");
+    let err = lift_esil("zf,?{,rax,rbx,=[8],}", Arch::X86_64).expect_err("must reject");
     assert_eq!(err, EsilError::UnsupportedControlFlow);
 }
 
@@ -236,7 +264,7 @@ fn block_with_store_returns_unsupported() {
 fn block_with_load_returns_unsupported() {
     // Loads have an unconditional side effect; the block close
     // refuses to wrap them.
-    let err = lift_esil("0,rax,==,?{,rsp,[4],}", Arch::X86_64).expect_err("must reject");
+    let err = lift_esil("zf,?{,rsp,[4],}", Arch::X86_64).expect_err("must reject");
     assert_eq!(err, EsilError::UnsupportedControlFlow);
 }
 
@@ -432,21 +460,21 @@ fn the_low_numbered_arm_registers_are_not_x86_64_wide() {
 }
 
 #[test]
-fn the_negate_all_bits_operator_is_not_modelled_as_a_comparison() {
-    // radare2's `ae???` spells `!=` as `(1 -- 0)` tagged `math+regw`:
-    // it pops **one** operand and writes a register with its bitwise
-    // complement, pushing nothing. It was modelled as `Expr::ne` — wrong
-    // in kind, not merely in stack effect — and pinned that way by two
-    // parser tests, which is worse than no test at all.
-    //
-    // It declines rather than being implemented because it is measured
-    // unreachable: zero occurrences in liftable ESIL across three ISAs,
-    // since every real use sits in a string that also carries `:=`.
-    let err = lift_esil("rax,!=", Arch::X86_64).expect_err("`!=` must not lift");
-    assert!(
-        matches!(err, EsilError::UnknownToken(ref t) if t == "!="),
-        "{err:?}"
-    );
+fn the_logical_not_operator_writes_back_rather_than_comparing() {
+    // radare2's help calls `!=` "negate all bits" and that is wrong:
+    // `ar rax=0x0f; ae rax,!=` leaves 0, not 0xfffffffffffffff0. It is a
+    // logical NOT stored into the popped register, pushing nothing. The
+    // operator was withdrawn in `f45b3cdd` rather than fixed because two
+    // tests pinned the complement reading.
+    let lift = lift_esil("rax,!=", Arch::X86_64).expect("`!=` lifts");
+    assert_eq!(lift.statements.len(), 1);
+    match &lift.statements[0] {
+        IrStmt::Assign { dst, src } => {
+            assert_eq!(dst.name, "rax");
+            assert!(matches!(src, Expr::Ite { .. }), "{src:?}");
+        }
+        _ => panic!("expected Assign"),
+    }
 }
 
 // --- ARM, which this file did not cover at all until now -------------
@@ -502,7 +530,7 @@ fn the_arm_flag_writing_operator_is_still_unsupported() {
     // own `C` into `cf`, while this pipeline stores its inverse (see
     // `aarch32_carry_convention_contracts.rs`), so the bridge would
     // need to invert on the ARM path before that family may lift here.
-    let err = lift_esil("$z,zf,:=", Arch::Arm).expect_err("`:=` is unsupported");
+    let err = lift_esil("1,rax,:=", Arch::Arm).expect_err("`:=` is unsupported");
     assert!(
         matches!(err, EsilError::UnknownToken(ref t) if t == ":="),
         "{err:?}"
