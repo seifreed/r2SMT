@@ -1,11 +1,21 @@
 //! Bit-precise register layouts for the supported ISAs.
 //!
-//! [`canonical_register`](crate::canonical_register) reports *which*
-//! parent register a name belongs to (x86 only today). This module
-//! reports *which bits* of that parent the name addresses, so the
-//! lifter can replace its historical "treat every sub-register as the
-//! full parent" shortcut with bit-precise [`Expr::Extract`] /
-//! [`Expr::Concat`] / [`Expr::ZeroExtend`] rewrites.
+//! `r2smt_slicer::canonical_register` reports *which* parent register
+//! a name belongs to. This module reports *which bits* of that parent
+//! the name addresses, so a lifter can replace the historical "treat
+//! every sub-register as the full parent" shortcut with bit-precise
+//! `Expr::Extract` / `Expr::Concat` / `Expr::ZeroExtend` rewrites.
+//!
+//! It lives in the foundation layer, below the IR, because both
+//! lifters need it and they sit on opposite sides of a dependency
+//! edge: `r2smt-slicer` depends on `r2smt-esil`, so the table could
+//! not stay in the slicer and still be reachable from the ESIL
+//! machine. Its only import is [`Arch`], so the move costs no new
+//! dependency edge. One consequence is worth knowing: [`Arch`] is
+//! `#[non_exhaustive]`, which binds only *outside* its defining crate,
+//! so the per-ISA dispatchers here are exhaustive and a new ISA variant
+//! stops the build until its table is written — louder, and better,
+//! than the silent `None` the catch-all arm used to give.
 //!
 //! The table is sample-agnostic, pure ISA. References:
 //! - x86 / `x86_64`: Intel SDM Vol. 1 §3.4.
@@ -72,12 +82,8 @@
 //! `AArch32` `sp` is the alias of `r13`. The same string genuinely
 //! means three different things, so [`register_layout`] takes an
 //! [`Arch`] parameter to pick the right table.
-//!
-//! [`Expr::Extract`]: r2smt_ir::expr::Expr::Extract
-//! [`Expr::Concat`]: r2smt_ir::expr::Expr::Concat
-//! [`Expr::ZeroExtend`]: r2smt_ir::expr::Expr::ZeroExtend
 
-use r2smt_common::Arch;
+use crate::Arch;
 
 // ===================== shared: RegisterLayout + dispatchers + const builders =====================
 
@@ -120,9 +126,6 @@ pub fn register_layout(name: &str, arch: Arch) -> Option<RegisterLayout> {
         Arch::X86 | Arch::X86_64 => x86_layout(&lower),
         Arch::Aarch64 => aarch64_layout(&lower),
         Arch::Arm => arm32_layout(&lower),
-        // `Arch` is `#[non_exhaustive]`; any future ISA falls back to
-        // no-match until its layout table is added.
-        _ => None,
     }
 }
 
@@ -138,7 +141,6 @@ pub const fn simd_parent_bits(arch: Arch) -> Option<u16> {
     match arch {
         Arch::X86 | Arch::X86_64 => Some(512),
         Arch::Aarch64 | Arch::Arm => Some(128),
-        _ => None,
     }
 }
 
@@ -153,7 +155,6 @@ pub fn is_simd_parent(parent: &str, arch: Arch) -> bool {
     let prefix = match arch {
         Arch::X86 | Arch::X86_64 => "zmm",
         Arch::Aarch64 | Arch::Arm => "v",
-        _ => return false,
     };
     parent
         .strip_prefix(prefix)
@@ -247,7 +248,8 @@ impl Arrangement {
 /// which is the only shape a 64-by-64 carry-less product can be written
 /// in. It admits exactly one lane — `2q` would span 256 bits, which
 /// [`parse_arrangement`] rejects on total width.
-pub(crate) const fn element_type_bits(letter: char) -> Option<u16> {
+#[must_use]
+pub const fn element_type_bits(letter: char) -> Option<u16> {
     match letter {
         'b' => Some(8),
         'h' => Some(16),
@@ -306,7 +308,6 @@ pub fn alias_for(parent: &str, hi: u16, lo: u16, arch: Arch) -> Option<&'static 
         Arch::X86 | Arch::X86_64 => x86_alias(parent, hi, lo),
         Arch::Aarch64 => aarch64_alias(parent, hi, lo),
         Arch::Arm => arm32_alias(parent, hi, lo),
-        _ => None,
     }
 }
 

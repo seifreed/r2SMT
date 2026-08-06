@@ -98,7 +98,7 @@ pub(super) fn x86_layout(lower: &str) -> Option<RegisterLayout> {
         // register name: it is the single canonical data-flow node the
         // whole stack collapses onto, reached by tokenising the
         // disassembler spelling `st(0)`..`st(7)` (see
-        // [`crate::effect::registers_in_operand`]). The index is
+        // `r2smt_slicer::effect::registers_in_operand`). The index is
         // deliberately lost — TOP rotates under every push and pop, so
         // an index-keyed node would alias two different physical
         // registers. The lifter models the individual slots with its own

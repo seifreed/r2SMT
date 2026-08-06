@@ -3,9 +3,11 @@
 //! workspace. No `r2smt-*` dependencies are allowed here.
 
 pub mod error;
+pub mod registers;
 pub mod smt;
 pub mod types;
 
 pub use error::{Error, Result};
+pub use registers::{RegisterLayout, alias_for, register_layout};
 pub use smt::{SmtResult, SolveOptions};
 pub use types::{Address, Arch};
