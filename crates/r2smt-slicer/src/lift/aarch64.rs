@@ -7,6 +7,7 @@ use r2smt_ir::stmt::IrStmt;
 
 use crate::registers::register_layout;
 
+use super::aarch32::shift::stored_carry;
 use super::shifted_operand::{OPERAND2_INDEX_ARITH3, OPERAND2_INDEX_COMPARE};
 use super::{
     BinOp, CsArithOp, FpArithOp, LiftCtx, MemAccess, VectorShape, Writeback,
@@ -305,7 +306,11 @@ impl LiftCtx {
     ///
     /// The logical and multiply families are **not** the same on the two
     /// ISAs, and one shared arm would fabricate a flag on whichever ISA
-    /// lost. A64 `ANDS` clears C and V; A32 `ANDS` / `ORRS` / `EORS`
+    /// lost. A64 `ANDS` clears C and V — and *clearing* C means the
+    /// pipeline's `CF`, which holds ARM's `C` inverted, must be written
+    /// **one**; V carries no such inversion and is written zero. Writing
+    /// both zero, as this did, makes `b.hs` after an `ands` resolve to
+    /// the opposite arm. A32 `ANDS` / `ORRS` / `EORS`
     /// takes C from the shifter carry-out of Operand2 and leaves V alone,
     /// and `MULS` from ARM v6 on leaves both alone. A32 has no `ORRS` / `EORS`
     /// counterpart on A64 at all, so those two arms used to be reachable
@@ -331,7 +336,7 @@ impl LiftCtx {
                 self.set_aarch32_logical_carry(insn, OPERAND2_INDEX_ARITH3);
             }
             BinOp::And | BinOp::Or | BinOp::Xor => {
-                self.set_flag("CF", Expr::konst(0, 1));
+                self.set_flag("CF", stored_carry(Expr::konst(0, 1)));
                 self.set_flag("OF", Expr::konst(0, 1));
             }
             BinOp::Mul if arm32 => {}
@@ -561,7 +566,7 @@ impl LiftCtx {
         if self.arch == Arch::Arm {
             self.set_aarch32_logical_carry(insn, OPERAND2_INDEX_COMPARE);
         } else {
-            self.set_flag("CF", Expr::konst(0, 1));
+            self.set_flag("CF", stored_carry(Expr::konst(0, 1)));
             self.set_flag("OF", Expr::konst(0, 1));
         }
         self.set_flag("PF", Expr::Unknown(String::new()));

@@ -89,7 +89,7 @@ pub(super) fn arm_carry(stored: Expr) -> Expr {
 
 /// The pipeline's `CF` from an ARM carry bit. Same inversion, named for
 /// the direction so call sites read as what they mean.
-fn stored_carry(arm: Expr) -> Expr {
+pub(in crate::lift) fn stored_carry(arm: Expr) -> Expr {
     Expr::bv_xor(arm, Expr::konst(1, 1))
 }
 
