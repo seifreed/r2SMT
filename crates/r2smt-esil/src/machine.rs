@@ -307,8 +307,11 @@ impl Machine {
     }
 
     fn apply_binary(&mut self, op: &'static str) -> Result<(), EsilError> {
-        let rhs = self.pop("binary rhs")?;
+        // ESIL is postfix and `a,b,OP` means `b OP a`: the *second*
+        // token is the left-hand side, so it is the one on top of the
+        // stack and therefore the one popped first.
         let lhs = self.pop("binary lhs")?;
+        let rhs = self.pop("binary rhs")?;
         let bits = lhs.bits().max(rhs.bits());
         let lhs_e = widen(lhs, bits);
         let rhs_e = widen(rhs, bits);

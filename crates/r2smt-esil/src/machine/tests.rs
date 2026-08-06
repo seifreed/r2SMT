@@ -143,8 +143,9 @@ fn flag_token_falls_back_to_free_var_without_arith_context() {
 
 #[test]
 fn flag_token_derives_zero_bit_from_last_arith() {
-    // After `1,eax,-` the machine remembers `1 - eax_widened` as
-    // the latest arithmetic result, so `$z` becomes
+    // After `1,eax,-` the machine remembers `eax_widened - 1` as
+    // the latest arithmetic result — ESIL reads `a,b,OP` as
+    // `b OP a` — so `$z` becomes
     // `Ite(result == 0, 1, 0)` rather than a free flag variable.
     let lift = lift_esil("1,eax,-,$z,zf,=", Arch::X86_64).expect("lift ok");
     assert_eq!(lift.statements.len(), 1);
@@ -257,8 +258,11 @@ fn unknown_token_surfaces_with_text() {
 
 #[test]
 fn stack_underflow_reports_context() {
+    // The top of the stack is the *left*-hand side, since ESIL reads
+    // `a,b,OP` as `b OP a`, so it is the operand popped first and the
+    // one an empty stack fails to supply.
     let err = lift_esil("+", Arch::X86_64).expect_err("must reject");
-    assert_eq!(err, EsilError::StackUnderflow("binary rhs"));
+    assert_eq!(err, EsilError::StackUnderflow("binary lhs"));
 }
 
 #[test]
@@ -342,4 +346,56 @@ fn the_arm_flag_writing_operator_is_still_unsupported() {
         matches!(err, EsilError::UnknownToken(ref t) if t == ":="),
         "{err:?}"
     );
+}
+
+/// Fold a constant-only expression, covering exactly the operators the
+/// operand-order table below exercises. Returns `None` for anything
+/// else so a shape change surfaces as a failure rather than a pass.
+fn eval_const(expr: &Expr) -> Option<u128> {
+    let mask = u128::from(u64::MAX);
+    match expr {
+        Expr::Const { value, .. } => Some(*value),
+        Expr::Sub(a, b) => Some(eval_const(a)?.wrapping_sub(eval_const(b)?) & mask),
+        Expr::UDiv(a, b) => eval_const(a)?.checked_div(eval_const(b)?),
+        Expr::URem(a, b) => eval_const(a)?.checked_rem(eval_const(b)?),
+        Expr::Shl(a, b) => Some((eval_const(a)? << eval_const(b)?) & mask),
+        Expr::LShr(a, b) => Some(eval_const(a)? >> eval_const(b)?),
+        Expr::Ult(a, b) => Some(u128::from(eval_const(a)? < eval_const(b)?)),
+        Expr::Ule(a, b) => Some(u128::from(eval_const(a)? <= eval_const(b)?)),
+        _ => None,
+    }
+}
+
+#[test]
+fn non_commutative_operators_match_radare2_operand_order() {
+    // ESIL evaluates `a,b,OP` as `b OP a`: the second token is the
+    // left-hand side. Every expectation below is the value printed by
+    // `r2 -qc '"ae 4,10,<op>"'` on radare2 6.1.8, so each entry is
+    // `10 OP 4` and never `4 OP 10`.
+    const CASES: &[(&str, &str, u128)] = &[
+        ("-", "rax", 6),
+        ("/", "rax", 2),
+        ("%", "rax", 2),
+        ("<<", "rax", 0xa0),
+        (">>", "rax", 0),
+        ("<", "zf", 0),
+        ("<=", "zf", 0),
+        (">", "zf", 1),
+        (">=", "zf", 1),
+    ];
+    let measured: Vec<(&str, Option<u128>)> = CASES
+        .iter()
+        .map(|(op, target, _)| {
+            let lift = lift_esil(&format!("4,10,{op},{target},="), Arch::X86_64).expect("lift ok");
+            match lift.statements.first() {
+                Some(IrStmt::Assign { src, .. }) => (*op, eval_const(src)),
+                _ => (*op, None),
+            }
+        })
+        .collect();
+    let expected: Vec<(&str, Option<u128>)> = CASES
+        .iter()
+        .map(|(op, _, want)| (*op, Some(*want)))
+        .collect();
+    assert_eq!(measured, expected);
 }
