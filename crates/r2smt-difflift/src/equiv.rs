@@ -172,13 +172,15 @@ pub fn build_equivalence_query(a: &[IrStmt], b: &[IrStmt], arch: Arch) -> Option
     let finals_b = canonical_finals(&ssa_b, "B·", &tainted_b, arch);
     let condition = differ_condition(&finals_a, &finals_b)?;
 
+    // No tie statements: `namespace_stmt` substitutes each register-typed
+    // free input with its slice of the shared parent, so the two sides
+    // already read one machine state and no name is ever declared twice.
     let mut statements: Vec<IrStmt> = Vec::new();
-    statements.extend(tie_statements(&ssa_a, &ssa_b, &parents, arch)?);
     for stmt in &ssa_a.statements {
-        statements.push(namespace_stmt(stmt, "A·")?);
+        statements.push(namespace_stmt(stmt, "A·", arch)?);
     }
     for stmt in &ssa_b.statements {
-        statements.push(namespace_stmt(stmt, "B·")?);
+        statements.push(namespace_stmt(stmt, "B·", arch)?);
     }
 
     let mut inputs: Vec<Var> = parents.into_values().collect();
@@ -342,11 +344,11 @@ fn synthetic_branch() -> BranchCandidate {
 /// Namespace every *defined* variable (SSA gives every def a `#N`
 /// suffix; free inputs never carry one) so the two lowering bodies can
 /// coexist in one slice while still *sharing* their free inputs.
-fn namespace_stmt(stmt: &IrStmt, pfx: &str) -> Option<IrStmt> {
+fn namespace_stmt(stmt: &IrStmt, pfx: &str, arch: Arch) -> Option<IrStmt> {
     match stmt {
         IrStmt::Assign { dst, src } => Some(IrStmt::Assign {
             dst: namespace_var(dst, pfx),
-            src: namespace_expr(src, pfx, 0)?,
+            src: namespace_expr(src, pfx, arch, 0)?,
         }),
         IrStmt::Nop => Some(IrStmt::Nop),
         // Rejected upstream by `comparable`; defensively pass through.
@@ -362,21 +364,54 @@ fn namespace_var(var: &Var, pfx: &str) -> Var {
     }
 }
 
+/// Rewrite one variable occurrence: a definition is namespaced, a
+/// register-typed free input is *substituted* by an exact slice of the
+/// shared parent.
+///
+/// Substituting rather than asserting `input == slice_of(parent)` is what
+/// keeps the query single-sorted. The assertion form emitted a second
+/// symbol with the same name at another width — for a 16-bit `sp` it was
+/// even degenerate, `sp[15:0] == sp[15:0]` — and the only reason that
+/// side still modelled a truncation was the Z3 encoder answering a
+/// narrower request with a sub-view. That made a Layer-3 correctness
+/// property depend on a Layer-4 implementation detail, and the text
+/// backends, which have no such behaviour, emitted an ill-sorted script
+/// instead.
+fn substitute_or_namespace(var: &Var, pfx: &str, arch: Arch) -> Expr {
+    if var.name.contains('#') {
+        return Expr::Var(namespace_var(var, pfx));
+    }
+    let Some(layout) = register_layout(&var.name, arch) else {
+        return Expr::Var(var.clone());
+    };
+    let bits = parent_width(layout.parent, arch);
+    if layout.hi >= bits {
+        return Expr::Var(var.clone());
+    }
+    let parent = Expr::var(layout.parent, bits);
+    let (slice, slice_bits) = if layout.lo == 0 && layout.hi.saturating_add(1) == bits {
+        (parent, bits)
+    } else {
+        (Expr::extract(parent, layout.hi, layout.lo), layout.width())
+    };
+    coerce(slice, slice_bits, var.bits)
+}
+
 // Exhaustive `Expr` dispatch: FP arms mirror the BV arms' shape but stay separate for legibility (CLAUDE.md exhaustive-dispatch exception).
 #[allow(clippy::match_same_arms, clippy::too_many_lines)]
-fn namespace_expr(expr: &Expr, pfx: &str, depth: u32) -> Option<Expr> {
+fn namespace_expr(expr: &Expr, pfx: &str, arch: Arch, depth: u32) -> Option<Expr> {
     if depth > EXPR_DEPTH_BUDGET {
         return None;
     }
     let next = depth + 1;
     let bin = |ctor: fn(Box<Expr>, Box<Expr>) -> Expr, a: &Expr, b: &Expr| -> Option<Expr> {
         Some(ctor(
-            Box::new(namespace_expr(a, pfx, next)?),
-            Box::new(namespace_expr(b, pfx, next)?),
+            Box::new(namespace_expr(a, pfx, arch, next)?),
+            Box::new(namespace_expr(b, pfx, arch, next)?),
         ))
     };
     let out = match expr {
-        Expr::Var(v) => Expr::Var(namespace_var(v, pfx)),
+        Expr::Var(v) => substitute_or_namespace(v, pfx, arch),
         Expr::Const { .. } | Expr::Unknown(_) => expr.clone(),
         Expr::Add(a, b) => bin(Expr::Add, a, b)?,
         Expr::Ror(a, b) => bin(Expr::Ror, a, b)?,
@@ -400,81 +435,90 @@ fn namespace_expr(expr: &Expr, pfx: &str, depth: u32) -> Option<Expr> {
         Expr::Sle(a, b) => bin(Expr::Sle, a, b)?,
         Expr::BoolAnd(a, b) => bin(Expr::BoolAnd, a, b)?,
         Expr::BoolOr(a, b) => bin(Expr::BoolOr, a, b)?,
-        Expr::BoolNot(a) => Expr::BoolNot(Box::new(namespace_expr(a, pfx, next)?)),
+        Expr::BoolNot(a) => Expr::BoolNot(Box::new(namespace_expr(a, pfx, arch, next)?)),
         Expr::Ite {
             cond,
             then_expr,
             else_expr,
         } => Expr::Ite {
-            cond: Box::new(namespace_expr(cond, pfx, next)?),
-            then_expr: Box::new(namespace_expr(then_expr, pfx, next)?),
-            else_expr: Box::new(namespace_expr(else_expr, pfx, next)?),
+            cond: Box::new(namespace_expr(cond, pfx, arch, next)?),
+            then_expr: Box::new(namespace_expr(then_expr, pfx, arch, next)?),
+            else_expr: Box::new(namespace_expr(else_expr, pfx, arch, next)?),
         },
         Expr::Extract { src, hi, lo } => Expr::Extract {
-            src: Box::new(namespace_expr(src, pfx, next)?),
+            src: Box::new(namespace_expr(src, pfx, arch, next)?),
             hi: *hi,
             lo: *lo,
         },
         Expr::Concat { high, low } => Expr::Concat {
-            high: Box::new(namespace_expr(high, pfx, next)?),
-            low: Box::new(namespace_expr(low, pfx, next)?),
+            high: Box::new(namespace_expr(high, pfx, arch, next)?),
+            low: Box::new(namespace_expr(low, pfx, arch, next)?),
         },
         Expr::ZeroExtend { src, to_bits } => Expr::ZeroExtend {
-            src: Box::new(namespace_expr(src, pfx, next)?),
+            src: Box::new(namespace_expr(src, pfx, arch, next)?),
             to_bits: *to_bits,
         },
         Expr::SignExtend { src, to_bits } => Expr::SignExtend {
-            src: Box::new(namespace_expr(src, pfx, next)?),
+            src: Box::new(namespace_expr(src, pfx, arch, next)?),
             to_bits: *to_bits,
         },
         Expr::FAdd(a, b, rm) => Expr::fadd(
-            namespace_expr(a, pfx, next)?,
-            namespace_expr(b, pfx, next)?,
+            namespace_expr(a, pfx, arch, next)?,
+            namespace_expr(b, pfx, arch, next)?,
             *rm,
         ),
         Expr::FSub(a, b, rm) => Expr::fsub(
-            namespace_expr(a, pfx, next)?,
-            namespace_expr(b, pfx, next)?,
+            namespace_expr(a, pfx, arch, next)?,
+            namespace_expr(b, pfx, arch, next)?,
             *rm,
         ),
         Expr::FMul(a, b, rm) => Expr::fmul(
-            namespace_expr(a, pfx, next)?,
-            namespace_expr(b, pfx, next)?,
+            namespace_expr(a, pfx, arch, next)?,
+            namespace_expr(b, pfx, arch, next)?,
             *rm,
         ),
         Expr::FDiv(a, b, rm) => Expr::fdiv(
-            namespace_expr(a, pfx, next)?,
-            namespace_expr(b, pfx, next)?,
+            namespace_expr(a, pfx, arch, next)?,
+            namespace_expr(b, pfx, arch, next)?,
             *rm,
         ),
-        Expr::FEq(a, b) => Expr::feq(namespace_expr(a, pfx, next)?, namespace_expr(b, pfx, next)?),
-        Expr::FLt(a, b) => Expr::flt(namespace_expr(a, pfx, next)?, namespace_expr(b, pfx, next)?),
-        Expr::FLe(a, b) => Expr::fle(namespace_expr(a, pfx, next)?, namespace_expr(b, pfx, next)?),
-        Expr::FIsNaN(a) => Expr::fisnan(namespace_expr(a, pfx, next)?),
-        Expr::FSqrt(a, rm) => Expr::fsqrt(namespace_expr(a, pfx, next)?, *rm),
+        Expr::FEq(a, b) => Expr::feq(
+            namespace_expr(a, pfx, arch, next)?,
+            namespace_expr(b, pfx, arch, next)?,
+        ),
+        Expr::FLt(a, b) => Expr::flt(
+            namespace_expr(a, pfx, arch, next)?,
+            namespace_expr(b, pfx, arch, next)?,
+        ),
+        Expr::FLe(a, b) => Expr::fle(
+            namespace_expr(a, pfx, arch, next)?,
+            namespace_expr(b, pfx, arch, next)?,
+        ),
+        Expr::FIsNaN(a) => Expr::fisnan(namespace_expr(a, pfx, arch, next)?),
+        Expr::FSqrt(a, rm) => Expr::fsqrt(namespace_expr(a, pfx, arch, next)?, *rm),
         Expr::FRoundToIntegral(a, rm) => {
-            Expr::fround_to_integral(namespace_expr(a, pfx, next)?, *rm)
+            Expr::fround_to_integral(namespace_expr(a, pfx, arch, next)?, *rm)
         }
         Expr::FpConst { .. } => expr.clone(),
         Expr::BvToFp { src, ebits, sbits } => {
-            Expr::bv_to_fp(namespace_expr(src, pfx, next)?, *ebits, *sbits)
+            Expr::bv_to_fp(namespace_expr(src, pfx, arch, next)?, *ebits, *sbits)
         }
-        Expr::FpToIeeeBv(src) => Expr::fp_to_ieee_bv(namespace_expr(src, pfx, next)?),
+        Expr::FpToIeeeBv(src) => Expr::fp_to_ieee_bv(namespace_expr(src, pfx, arch, next)?),
         Expr::FpToSbv { src, rm, bits } => {
-            Expr::fp_to_sbv(namespace_expr(src, pfx, next)?, *rm, *bits)
+            Expr::fp_to_sbv(namespace_expr(src, pfx, arch, next)?, *rm, *bits)
         }
         Expr::SbvToFp {
             src,
             rm,
             ebits,
             sbits,
-        } => Expr::sbv_to_fp(namespace_expr(src, pfx, next)?, *rm, *ebits, *sbits),
+        } => Expr::sbv_to_fp(namespace_expr(src, pfx, arch, next)?, *rm, *ebits, *sbits),
         Expr::FpToFp {
             src,
             rm,
             ebits,
             sbits,
-        } => Expr::fp_to_fp(namespace_expr(src, pfx, next)?, *rm, *ebits, *sbits),
+        } => Expr::fp_to_fp(namespace_expr(src, pfx, arch, next)?, *rm, *ebits, *sbits),
     };
     Some(out)
 }
@@ -674,45 +718,6 @@ fn tie_inputs(
         .map(|(name, bits)| Var::new(name, bits))
         .collect();
     Some((parents, none_inputs))
-}
-
-/// Emit the binding `side_input == slice_of(parent)` for every
-/// register-typed free input that is not already the shared parent.
-fn tie_statements(
-    ssa_a: &SsaLiftedSlice,
-    ssa_b: &SsaLiftedSlice,
-    parents: &BTreeMap<String, Var>,
-    arch: Arch,
-) -> Option<Vec<IrStmt>> {
-    let mut ties: Vec<IrStmt> = Vec::new();
-    let mut bound: BTreeSet<String> = BTreeSet::new();
-    for input in ssa_a.inputs.iter().chain(ssa_b.inputs.iter()) {
-        let Some(layout) = register_layout(&input.name, arch) else {
-            continue;
-        };
-        let ptr = parent_width(layout.parent, arch);
-        if input.name == layout.parent && input.bits == ptr {
-            continue;
-        }
-        if !bound.insert(input.name.clone()) {
-            continue;
-        }
-        let _ = parents.get(layout.parent)?;
-        let parent_var = Expr::var(layout.parent, ptr);
-        let (slice, slice_bits) = if layout.lo == 0 && layout.hi + 1 == ptr {
-            (parent_var, ptr)
-        } else {
-            (
-                Expr::extract(parent_var, layout.hi, layout.lo),
-                layout.width(),
-            )
-        };
-        ties.push(IrStmt::Assign {
-            dst: input.clone(),
-            src: coerce(slice, slice_bits, input.bits),
-        });
-    }
-    Some(ties)
 }
 
 fn coerce(expr: Expr, from_bits: u16, to_bits: u16) -> Expr {

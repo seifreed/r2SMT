@@ -324,6 +324,30 @@ fn test_vector_width_mismatch_is_not_comparable_rather_than_a_disagreement() {
 }
 
 #[test]
+fn test_query_renders_for_the_text_backends() {
+    // The query a mismatched-width pair produces must be *renderable*,
+    // not merely solvable by Z3. Those are different bars: Z3 answers a
+    // name declared at two sorts by sub-viewing it, so side B's
+    // truncation used to be an accident of the encoder rather than a
+    // property of the query, while the text backends have no such
+    // behaviour and emitted an ill-sorted script the solver rejected as a
+    // parse error. Substituting the ties removed the shape; the strict
+    // emitter is what notices if it ever comes back.
+    let wide = vec![IrStmt::Assign {
+        dst: Var::new("sp", 64),
+        src: Expr::sub(Expr::var("sp", 64), Expr::konst(16, 64)),
+    }];
+    let narrow = vec![IrStmt::Assign {
+        dst: Var::new("sp", 16),
+        src: Expr::sub(Expr::var("sp", 16), Expr::konst(16, 16)),
+    }];
+    let query = build_equivalence_query(&wide, &narrow, Arch::Aarch64);
+    assert!(query.is_some_and(|q| {
+        r2smt_smt::emit_query_strict(&q, &SolveOptions::default(), true).is_ok()
+    }));
+}
+
+#[test]
 fn test_agreement_rate_ignores_inconclusive() {
     let mut stats = r2smt_difflift::AgreementStats::default();
     stats.record(DiffVerdict::Agree);

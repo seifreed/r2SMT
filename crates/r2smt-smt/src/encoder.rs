@@ -38,6 +38,19 @@ struct ByteStore {
 /// solver-bound resources must maintain explicit budgets).
 const MEM_BYTE_STORE_CAP: usize = 4096;
 
+/// Why a name is being declared, which decides what a *narrower* request
+/// for an already-declared name means.
+///
+/// The two are not symmetric: a narrow read is an exact sub-view, a
+/// narrow definition leaves the upper bits of the name unconstrained.
+#[derive(Clone, Copy)]
+enum Declare {
+    /// The name is being read. A narrower width is a sub-view.
+    Read,
+    /// The name is being defined. A narrower width under-constrains it.
+    Define,
+}
+
 /// Encodes IR expressions into Z3 ASTs and feeds the resulting
 /// assertions into a [`Solver`].
 pub struct Encoder {
@@ -109,7 +122,7 @@ impl Encoder {
         match stmt {
             IrStmt::Assign { dst, src } => {
                 let rhs = self.encode_as_bv_with_width(src, dst.bits);
-                let dst_bv = self.declare(&dst.name, dst.bits);
+                let dst_bv = self.declare(&dst.name, dst.bits, Declare::Define);
                 let assertion = dst_bv.eq(&rhs);
                 solver.assert(&assertion);
             }
@@ -135,7 +148,7 @@ impl Encoder {
     /// equal addresses pick the stored byte, unequal addresses fall
     /// through to older stores or the fresh free value.
     fn encode_load_mem(&mut self, dst: &Var, address: &Expr, bits: u16, solver: &Solver) {
-        let dst_bv = self.declare(&dst.name, bits);
+        let dst_bv = self.declare(&dst.name, bits, Declare::Define);
         if bits == 0 {
             return;
         }
@@ -234,7 +247,7 @@ impl Encoder {
     /// the rest of the encoding well-sorted so it can finish without
     /// aborting; its value is irrelevant, since the verdict built on top
     /// of it is discarded.
-    fn declare(&mut self, name: &str, bits: u16) -> BV {
+    fn declare(&mut self, name: &str, bits: u16, purpose: Declare) -> BV {
         if let Some(existing) = self.vars.get(name) {
             let have = existing.get_size();
             let want = u32::from(bits);
@@ -243,12 +256,25 @@ impl Encoder {
             }
             // A *narrower* request is an exact sub-view of the same
             // variable — x86 reaches this legitimately, reading a
-            // vector parent through a shorter view — so answer with the
-            // low bits rather than declaring a conflict. Returning the
-            // full-width variable instead is what used to abort the
-            // process inside the z3 crate.
+            // vector parent through a shorter view — so a *read* answers
+            // with the low bits rather than declaring a conflict.
+            // Returning the full-width variable instead is what used to
+            // abort the process inside the z3 crate.
+            //
+            // A narrower *definition* is a different question with a
+            // different answer. Constraining only the low bits leaves the
+            // rest of the name unrestricted, which in the production
+            // pipeline is a widening but in the differential harness lets
+            // the solver pick those bits per side and fabricate a
+            // disagreement. SSA is what makes this unreachable today —
+            // and that is an argument, not a fact, so the distinction is
+            // carried in the type instead.
             if want < have {
-                return existing.extract(want - 1, 0);
+                if matches!(purpose, Declare::Read) {
+                    return existing.extract(want - 1, 0);
+                }
+                self.width_conflict = true;
+                return BV::fresh_const(name, want);
             }
             // A *wider* request has no sound answer: the extra bits are
             // not described by anything already asserted, and inventing
@@ -540,7 +566,7 @@ impl Encoder {
     }
 
     fn encode_var(&mut self, var: &Var) -> BV {
-        self.declare(&var.name, var.bits)
+        self.declare(&var.name, var.bits, Declare::Read)
     }
 
     fn bv_bin<F>(&mut self, a: &Expr, b: &Expr, sign: Signedness, op: F) -> Encoded

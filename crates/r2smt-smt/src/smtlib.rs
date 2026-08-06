@@ -22,7 +22,7 @@
 //! which fails instead.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
 use r2smt_common::smt::SolveOptions;
@@ -72,6 +72,16 @@ struct RenderCtx {
     aux: Vec<String>,
     fresh_fp_bv: u32,
     unsupported: Option<RenderError>,
+    /// Every symbol declared so far, with the width it was declared at.
+    ///
+    /// The width is the point. This was a bare name list until
+    /// 2026-08-06, so a second `Var` of the same name at a different
+    /// width was silently dropped and every *use* rendered at its own
+    /// `v.bits` — an ill-sorted script the solver rejects with a parse
+    /// error, where the Z3 encoder fails closed to `Unsound`. Two
+    /// backends disagreeing by parse error rather than by verdict is
+    /// exactly what the strict emitter exists to prevent.
+    declared: BTreeMap<String, u16>,
 }
 
 impl RenderCtx {
@@ -146,15 +156,14 @@ fn emit_preamble_with(
     let _ = writeln!(out, "(set-info :status unknown)");
     let _ = writeln!(out, "; r2smt slice @ {addr}", addr = slice.branch.address);
     let _ = writeln!(out, "; timeout-ms: {ms}", ms = options.timeout_ms);
-    let mut declared: Vec<String> = Vec::new();
     let mut mem = TextMemory::new(ptr_bits_for(slice.arch));
     for var in &slice.inputs {
-        declare_bv(&mut out, &var.name, var.bits, &mut declared);
+        declare_bv(&mut out, &var.name, var.bits, ctx);
     }
     for stmt in &slice.statements {
         match stmt {
             IrStmt::Assign { dst, src } => {
-                declare_bv(&mut out, &dst.name, dst.bits, &mut declared);
+                declare_bv(&mut out, &dst.name, dst.bits, ctx);
                 let rhs = render_expr_with_width(src, dst.bits, ctx);
                 ctx.flush_into(&mut out);
                 let _ = writeln!(out, "(assert (= {lhs} {rhs}))", lhs = smt_symbol(&dst.name));
@@ -168,8 +177,8 @@ fn emit_preamble_with(
                 ctx.flush_into(&mut out);
             }
             IrStmt::LoadMem { dst, address, bits } => {
-                declare_bv(&mut out, &dst.name, dst.bits, &mut declared);
-                mem.emit_load(&mut out, &mut declared, dst, address, *bits, ctx);
+                declare_bv(&mut out, &dst.name, dst.bits, ctx);
+                mem.emit_load(&mut out, dst, address, *bits, ctx);
             }
             // Unsupported / Nop emit nothing; the SMT side stays an
             // over-approximation for those (extra freedom can only widen
@@ -308,7 +317,6 @@ impl TextMemory {
     fn emit_load(
         &mut self,
         out: &mut String,
-        declared: &mut Vec<String>,
         dst: &r2smt_ir::expr::Var,
         address: &Expr,
         bits: u16,
@@ -337,7 +345,7 @@ impl TextMemory {
         for i in 0..nbytes {
             let byte_addr = self.byte_addr(&addr, i);
             let fresh = format!("load_{load_id}_{i}");
-            declare_bv(out, &fresh, 8, declared);
+            declare_bv(out, &fresh, 8, ctx);
             let mut byte_val = fresh;
             if !self.havoced {
                 for (store_addr, store_byte) in &self.stores {
@@ -807,16 +815,26 @@ fn smt_symbol(name: &str) -> Cow<'_, str> {
     }
 }
 
-fn declare_bv(out: &mut String, name: &str, bits: u16, declared: &mut Vec<String>) {
-    if declared.iter().any(|n| n == name) {
+/// Declare a bit-vector symbol once, refusing a second declaration at a
+/// different width.
+///
+/// SMT-LIB has no sound answer for one name at two sorts, so the slice is
+/// declined rather than rendered — [`emit_query_strict`] turns the note
+/// into an `Err` and the verdict path falls back to `Inconclusive`,
+/// matching the Z3 encoder's `width_conflict`.
+fn declare_bv(out: &mut String, name: &str, bits: u16, ctx: &mut RenderCtx) {
+    if let Some(&have) = ctx.declared.get(name) {
+        if have != bits {
+            ctx.note_unsupported(format!("symbol {name} declared at {have} and {bits} bits"));
+        }
         return;
     }
+    ctx.declared.insert(name.to_string(), bits);
     let _ = writeln!(
         out,
         "(declare-fun {name} () (_ BitVec {bits}))",
         name = smt_symbol(name)
     );
-    declared.push(name.to_string());
 }
 
 /// Render an expression to SMT-LIB2 text, widening / narrowing to
@@ -835,7 +853,22 @@ fn render_expr_with_width(expr: &Expr, target_bits: u16, ctx: &mut RenderCtx) ->
 #[allow(clippy::too_many_lines, clippy::match_same_arms)]
 fn render_expr(expr: &Expr, ctx: &mut RenderCtx) -> (String, u16) {
     match expr {
-        Expr::Var(v) => (smt_symbol(&v.name).into_owned(), v.bits),
+        // A use at a width other than the declaration's would render the
+        // symbol at `v.bits` while the script declares another sort — the
+        // mismatch the declaration side cannot see, because a use need
+        // not be preceded by its own `declare_bv` call.
+        Expr::Var(v) => {
+            if let Some(&have) = ctx.declared.get(&v.name)
+                && have != v.bits
+            {
+                ctx.note_unsupported(format!(
+                    "symbol {name} declared at {have} bits and read at {read}",
+                    name = v.name,
+                    read = v.bits
+                ));
+            }
+            (smt_symbol(&v.name).into_owned(), v.bits)
+        }
         Expr::Const { value, bits } => (format!("(_ bv{value} {bits})"), *bits),
         Expr::Add(a, b) => bin_op("bvadd", a, b, Signedness::Unsigned, ctx),
         Expr::Sub(a, b) => bin_op("bvsub", a, b, Signedness::Unsigned, ctx),
@@ -1771,6 +1804,57 @@ mod tests {
         // renders once its sorts are ones cvc5 admits, so the refusal is
         // about the sort and not about the widen-multiply-add shape.
         let slice = f64_slice(fused_fixture(IEEE_DOUBLE), F64_ZERO);
+        assert!(emit_query_strict(&slice, &SolveOptions::default(), true).is_ok());
+    }
+
+    /// A slice whose only free input declares `sp` at 64 bits.
+    fn multi_width_slice(statements: Vec<IrStmt>) -> SsaLiftedSlice {
+        let mut slice = mem_slice(statements);
+        slice.inputs = vec![r2smt_ir::expr::Var::new("sp", 64)];
+        slice
+    }
+
+    #[test]
+    fn smtlib_refuses_a_symbol_defined_at_a_second_width() {
+        // SMT-LIB has no sound answer for one name at two sorts. The
+        // renderer used to dedup declarations by name alone and drop the
+        // second silently, emitting an ill-sorted script the solver
+        // rejected as a parse error — so the text backends and Z3
+        // disagreed by *how they failed* rather than by verdict.
+        let slice = multi_width_slice(vec![IrStmt::Assign {
+            dst: r2smt_ir::expr::Var::new("sp", 16),
+            src: Expr::konst(1, 16),
+        }]);
+        assert!(matches!(
+            emit_query_strict(&slice, &SolveOptions::default(), true),
+            Err(RenderError::Unrenderable(_))
+        ));
+    }
+
+    #[test]
+    fn smtlib_refuses_a_symbol_read_at_a_width_other_than_its_declaration() {
+        // The half the declaration site cannot see: a *use* need not be
+        // preceded by its own `declare_bv`, so the mismatch only shows up
+        // when the expression renderer reports the symbol at `v.bits`.
+        let slice = multi_width_slice(vec![IrStmt::Assign {
+            dst: r2smt_ir::expr::Var::new("t", 16),
+            src: Expr::var("sp", 16),
+        }]);
+        assert!(matches!(
+            emit_query_strict(&slice, &SolveOptions::default(), true),
+            Err(RenderError::Unrenderable(_))
+        ));
+    }
+
+    #[test]
+    fn smtlib_renders_a_single_width_symbol_unchanged() {
+        // Teeth for both refusals: the same shapes render once every
+        // occurrence of the name agrees on one width, so the refusal is
+        // about the collision and not about slicing a register at all.
+        let slice = multi_width_slice(vec![IrStmt::Assign {
+            dst: r2smt_ir::expr::Var::new("t", 16),
+            src: Expr::extract(Expr::var("sp", 64), 15, 0),
+        }]);
         assert!(emit_query_strict(&slice, &SolveOptions::default(), true).is_ok());
     }
 }

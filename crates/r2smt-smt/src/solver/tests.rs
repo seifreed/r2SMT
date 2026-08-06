@@ -3411,3 +3411,97 @@ fn aarch64_scalar_convert_and_a_vector_read_agree_on_the_register_width() {
     ]);
     assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
 }
+
+/// A minimal slice whose only job is to drive `Encoder::declare` twice
+/// for one name. The branch condition is a constant, so any verdict
+/// other than `Unsound` means the encoding was accepted.
+fn width_collision_slice(statements: Vec<r2smt_ir::stmt::IrStmt>) -> r2smt_ssa::SsaLiftedSlice {
+    use r2smt_ir::expr::Expr;
+    use r2smt_slicer::{BranchCandidate, BranchCondition, BranchKind, SliceStatus};
+    let z = Address::new(0x1000);
+    r2smt_ssa::SsaLiftedSlice {
+        branch: BranchCandidate {
+            address: z,
+            function: z,
+            block: z,
+            kind: BranchKind::Jcc,
+            mnemonic: "widthtest".into(),
+            condition: BranchCondition::NotEqual,
+            formula: "widthtest".into(),
+            taken_target: None,
+            fallthrough_target: None,
+            compare_register: None,
+            bit_index: None,
+            upstream_resolved: None,
+            operand_raws: Vec::new(),
+            is_thumb: false,
+        },
+        statements,
+        condition: Expr::konst(1, 1),
+        status: SliceStatus::Complete,
+        treat_truncation_as_inputs: false,
+        inputs: Vec::new(),
+        defs: Vec::new(),
+        arch: Arch::Aarch64,
+    }
+}
+
+/// `t := sp` at 64 bits, which declares `sp`, followed by `dst` at
+/// `dst_bits` — a second declaration of the same name.
+fn redeclare_after_reading_sp(
+    dst: &str,
+    dst_bits: u16,
+    read_sp_at: Option<u16>,
+) -> r2smt_ssa::SsaLiftedSlice {
+    use r2smt_ir::expr::{Expr, Var};
+    use r2smt_ir::stmt::IrStmt;
+    let second = IrStmt::Assign {
+        dst: Var::new(dst, dst_bits),
+        src: read_sp_at.map_or_else(|| Expr::konst(1, dst_bits), |bits| Expr::var("sp", bits)),
+    };
+    width_collision_slice(vec![
+        IrStmt::Assign {
+            dst: Var::new("t", 64),
+            src: Expr::var("sp", 64),
+        },
+        second,
+    ])
+}
+
+#[test]
+fn a_narrower_definition_of_an_already_declared_name_fails_closed() {
+    // A narrow *definition* constrains only the low bits and leaves the
+    // rest of the name free. In the production pipeline that is a
+    // widening, but in the differential harness the solver picks those
+    // bits independently per side and fabricates a disagreement — so it
+    // fails closed rather than being answered with a sub-view.
+    let slice = redeclare_after_reading_sp("sp", 16, None);
+    assert_eq!(
+        solve_branch(&slice, SolveOptions::default()),
+        SmtResult::Unsound
+    );
+}
+
+#[test]
+fn a_narrower_read_of_an_already_declared_name_stays_precise() {
+    // The other half of the asymmetry, and the reason this is a
+    // parameter rather than a blanket refusal: a narrow *read* is an
+    // exact sub-view, which x86 reaches legitimately by reading a vector
+    // parent through a shorter view.
+    let slice = redeclare_after_reading_sp("u", 16, Some(16));
+    assert_ne!(
+        solve_branch(&slice, SolveOptions::default()),
+        SmtResult::Unsound
+    );
+}
+
+#[test]
+fn a_definition_at_the_declared_width_is_not_a_conflict() {
+    // Teeth: the refusal is about the width disagreeing, not about
+    // defining a name that was read earlier.
+    let slice = redeclare_after_reading_sp("sp", 64, None);
+    assert_ne!(
+        solve_branch(&slice, SolveOptions::default()),
+        SmtResult::Unsound
+    );
+}
