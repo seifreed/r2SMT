@@ -23,7 +23,7 @@ use r2smt_ir::program::Function;
 use r2smt_report::Report;
 use r2smt_slicer::SliceLimits;
 use r2smt_smt::SolveOptions;
-use tracing::error;
+use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;
 
 mod args;
@@ -838,7 +838,7 @@ fn solve(
     if differential_lift {
         let scope: Vec<Function> = ctx.all_functions().cloned().collect();
         let dl = run_differential_lift(&scope, ctx.program.arch, solver, options);
-        print_lifter_agreement(&dl.stats, dl.compared);
+        print_lifter_agreement(&dl);
         findings.extend(dl.findings);
     }
 
@@ -885,15 +885,22 @@ fn solve(
 /// Bounded scan budget for the opt-in `--differential-lift` pass.
 /// Host-Side Safety: a whole-program run must not issue an unbounded
 /// number of SMT queries.
-const MAX_DIFFLIFT_COMPARISONS: usize = 50_000;
+///
+/// Raised from 50 000 once memory instructions became comparable, which
+/// multiplied the pairs a real binary produces. The number matters less
+/// than the fact that reaching it is now reported: a scan that stopped
+/// early used to be indistinguishable from one that finished.
+const MAX_DIFFLIFT_COMPARISONS: usize = 250_000;
 
 /// Outcome of the differential-lift pass: the engine-integrity
-/// findings, the running agreement tally, and how many pairwise
-/// comparisons were attempted.
+/// findings, the running agreement tally, how many pairwise
+/// comparisons were attempted, and whether the budget cut the scan
+/// short of the program.
 struct DiffLiftRun {
     findings: Vec<Finding>,
     stats: r2smt_difflift::AgreementStats,
     compared: usize,
+    truncated: bool,
 }
 
 /// Cross-check every instruction's independent lowerings. A proven
@@ -910,18 +917,24 @@ fn run_differential_lift(
     let mut stats = r2smt_difflift::AgreementStats::default();
     let mut findings: Vec<Finding> = Vec::new();
     let mut compared = 0usize;
+    let mut truncated = false;
     'outer: for func in functions {
         for block in &func.blocks {
             for insn in &block.instructions {
+                // Checked per *instruction*, not per pair: a mid-pair
+                // break abandoned the disagreements already found for
+                // the instruction in flight, since the finding is only
+                // pushed once every pair has been compared.
+                if compared >= MAX_DIFFLIFT_COMPARISONS {
+                    truncated = true;
+                    break 'outer;
+                }
                 let lowerings = r2smt_difflift::lower_all(insn, arch);
                 let bodies: Vec<(r2smt_difflift::Lowering, &[r2smt_ir::IrStmt])> =
                     lowerings.available().collect();
                 let mut disagreeing: Vec<String> = Vec::new();
                 for (i, (_, sa)) in bodies.iter().enumerate() {
                     for (lb, sb) in &bodies[i + 1..] {
-                        if compared >= MAX_DIFFLIFT_COMPARISONS {
-                            break 'outer;
-                        }
                         compared += 1;
                         let verdict = compare_lowerings(sa, sb, arch, solver, options);
                         stats.record(verdict);
@@ -949,10 +962,19 @@ fn run_differential_lift(
             }
         }
     }
+    if truncated {
+        warn!(
+            target: "r2smt::difflift",
+            compared,
+            cap = MAX_DIFFLIFT_COMPARISONS,
+            "comparison budget exhausted — the rest of the program was not cross-checked"
+        );
+    }
     DiffLiftRun {
         findings,
         stats,
         compared,
+        truncated,
     }
 }
 
@@ -976,15 +998,27 @@ fn compare_lowerings(
 }
 
 /// Print the lifter-agreement metric line (the P22 deliverable).
-fn print_lifter_agreement(stats: &r2smt_difflift::AgreementStats, compared: usize) {
-    let rate = stats
+///
+/// The truncation note is part of the metric, not decoration: without
+/// it a budget-limited scan reports coverage it never had.
+fn print_lifter_agreement(run: &DiffLiftRun) {
+    let rate = run
+        .stats
         .agreement_rate()
         .map_or_else(|| "n/a".to_string(), |r| format!("{:.2}%", r * 100.0));
+    let scope = if run.truncated {
+        format!(
+            " — TRUNCATED at the {MAX_DIFFLIFT_COMPARISONS} budget, the rest of the program was not compared"
+        )
+    } else {
+        String::new()
+    };
     println!(
-        "lifter-agreement: {rate} (agree={a} disagree={d} inconclusive={i}) over {compared} comparisons",
-        a = stats.agree,
-        d = stats.disagree,
-        i = stats.inconclusive,
+        "lifter-agreement: {rate} (agree={a} disagree={d} inconclusive={i}) over {compared} comparisons{scope}",
+        a = run.stats.agree,
+        d = run.stats.disagree,
+        i = run.stats.inconclusive,
+        compared = run.compared,
     );
 }
 
