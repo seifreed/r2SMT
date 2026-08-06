@@ -316,7 +316,7 @@ impl Machine {
         let lhs_e = widen(lhs, bits);
         let rhs_e = widen(rhs, bits);
         let result_bits = match op {
-            "==" | "!=" | "<" | "<=" | ">" | ">=" => 1,
+            "==" | "<" | "<=" | ">" | ">=" => 1,
             _ => bits,
         };
         let expr = match op {
@@ -331,7 +331,6 @@ impl Machine {
             "<<" => Expr::shl(lhs_e.clone(), rhs_e.clone()),
             ">>" => Expr::lshr(lhs_e.clone(), rhs_e.clone()),
             "==" => Expr::eq(lhs_e, rhs_e),
-            "!=" => Expr::ne(lhs_e, rhs_e),
             "<" => Expr::ult(lhs_e, rhs_e),
             "<=" => Expr::ule(lhs_e, rhs_e),
             ">" => Expr::ult(rhs_e, lhs_e),

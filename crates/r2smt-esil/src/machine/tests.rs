@@ -288,6 +288,110 @@ fn memory_store_emits_storemem() {
     ));
 }
 
+#[test]
+fn a_store_takes_its_address_from_the_top_of_the_stack() {
+    // The assertion above only checks the *width*, so an address/value
+    // swap in `apply_store` passes it — the exact shape of the operand
+    // inversion found in `apply_binary`, in the busiest path there is:
+    // stores are ~6 200 of the liftable ESIL strings across three ISAs.
+    //
+    // The ground truth is a real instruction rather than the ESIL VM.
+    // x86 `push 0x14` lowers to `20,4,esp,-,=[4]`, which must write the
+    // value 20 to the address `esp - 4`. So `=[N]` pops the *address*
+    // first and the value second.
+    let lift = lift_esil("20,4,esp,-,=[4]", Arch::X86_64).expect("lift ok");
+    let store = lift
+        .statements
+        .iter()
+        .find(|s| matches!(s, IrStmt::StoreMem { .. }))
+        .expect("a store");
+    match store {
+        IrStmt::StoreMem {
+            address,
+            value,
+            bits,
+        } => {
+            assert_eq!(*bits, 32);
+            // The value is the literal being pushed, not the address.
+            assert_eq!(*value, Expr::extract(Expr::konst(20, 64), 31, 0));
+            // And the address is `esp - 4`, not `4 - esp`. `esp` is
+            // 32-bit while the literal enters at the pointer width, so
+            // the binary widens both to 64 — the operand *order* is what
+            // this pins.
+            assert_eq!(
+                *address,
+                Expr::sub(
+                    Expr::zero_ext(Expr::Var(Var::new("esp", 32)), 64),
+                    Expr::konst(4, 64)
+                )
+            );
+        }
+        other => panic!("expected StoreMem, got {other:?}"),
+    }
+}
+
+#[test]
+fn compound_assignment_subtracts_the_value_from_the_target() {
+    // The only compound-assign test uses `+=`, which is commutative and
+    // therefore passes on an inverted implementation. `-=` is 971 of the
+    // liftable ESIL strings measured and is order-sensitive.
+    //
+    // Measured: `r2 -a x86 -b 64 -qc 'aer rax=10; ae 4,rax,-=; aer rax'`
+    // → 6, so the target is the left-hand side.
+    let lift = lift_esil("4,rax,-=", Arch::X86_64).expect("lift ok");
+    match &lift.statements[0] {
+        IrStmt::Assign { dst, src } => {
+            assert_eq!(dst.name, "rax");
+            assert_eq!(
+                *src,
+                Expr::sub(Expr::Var(Var::new("rax", 64)), Expr::konst(4, 64))
+            );
+        }
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}
+
+#[test]
+fn compound_shift_shifts_the_target_by_the_value() {
+    // Same hazard, same direction. Measured
+    // `aer rax=10; ae 4,rax,<<=; aer rax` → 0xa0, i.e. `10 << 4` and
+    // never `4 << 10`.
+    //
+    // `>>=` is deliberately not pinned here: radare2 6.1.8 leaves the
+    // register untouched for every input tried, so there is no
+    // behaviour to measure against, and it appears zero times in the
+    // liftable corpus anyway.
+    let lift = lift_esil("4,rax,<<=", Arch::X86_64).expect("lift ok");
+    match &lift.statements[0] {
+        IrStmt::Assign { dst, src } => {
+            assert_eq!(dst.name, "rax");
+            assert_eq!(
+                *src,
+                Expr::shl(Expr::Var(Var::new("rax", 64)), Expr::konst(4, 64))
+            );
+        }
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_negate_all_bits_operator_is_not_modelled_as_a_comparison() {
+    // radare2's `ae???` spells `!=` as `(1 -- 0)` tagged `math+regw`:
+    // it pops **one** operand and writes a register with its bitwise
+    // complement, pushing nothing. It was modelled as `Expr::ne` — wrong
+    // in kind, not merely in stack effect — and pinned that way by two
+    // parser tests, which is worse than no test at all.
+    //
+    // It declines rather than being implemented because it is measured
+    // unreachable: zero occurrences in liftable ESIL across three ISAs,
+    // since every real use sits in a string that also carries `:=`.
+    let err = lift_esil("rax,!=", Arch::X86_64).expect_err("`!=` must not lift");
+    assert!(
+        matches!(err, EsilError::UnknownToken(ref t) if t == "!="),
+        "{err:?}"
+    );
+}
+
 // --- ARM, which this file did not cover at all until now -------------
 
 #[test]

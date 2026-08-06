@@ -26,7 +26,7 @@ pub enum EsilToken {
     /// Arithmetic / logical operator that pops two operands and
     /// pushes one. The payload is the canonical operator string
     /// (`"+"`, `"-"`, `"*"`, `"&"`, `"|"`, `"^"`, `"<<"`, `">>"`,
-    /// `">>>>"`, `"<"`, `"<="`, `">"`, `">="`, `"=="`, `"!="`, `"/"`,
+    /// `">>>>"`, `"<"`, `"<="`, `">"`, `">="`, `"=="`, `"/"`,
     /// `"%"`).
     Binary(&'static str),
     /// Unary operator that pops one operand and pushes one. The
@@ -98,7 +98,17 @@ fn classify(tok: &str) -> EsilToken {
         ">" => EsilToken::Binary(">"),
         ">=" => EsilToken::Binary(">="),
         "==" => EsilToken::Binary("=="),
-        "!=" => EsilToken::Binary("!="),
+        // `!=` is deliberately absent. radare2 spells it `(1 -- 0)`
+        // tagged `math+regw` in `ae???` — it pops **one** operand and
+        // writes a register with its bitwise complement ("negate all
+        // bits"), pushing nothing. It is not a comparison. Modelling it
+        // as `Expr::ne` was wrong in kind, not just in stack effect, so
+        // it falls to `Unknown` and the lift fails into the
+        // per-mnemonic handler rather than computing a different
+        // instruction. Measured unreachable today (0 occurrences in
+        // liftable ESIL across three ISAs, because every real use sits
+        // in a string that also carries `:=`), which is why this is a
+        // decline and not an implementation.
         "!" => EsilToken::Unary("!"),
         "=" => EsilToken::Assign,
         "+=" => EsilToken::CompoundAssign("+"),
@@ -218,7 +228,7 @@ mod tests {
 
     #[test]
     fn binary_operators() {
-        for op in ["+", "-", "*", "&", "|", "^", "<<", ">>", "==", "!="] {
+        for op in ["+", "-", "*", "&", "|", "^", "<<", ">>", "=="] {
             let toks = tokenize(op);
             assert_eq!(toks, vec![EsilToken::Binary(op)], "for {op}");
         }
