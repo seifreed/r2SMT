@@ -109,19 +109,24 @@ struct Machine {
     /// a block flip `contains_mem_op` so the close errors out — the
     /// IR has no conditional memory effect we can model soundly.
     block_stack: Vec<BlockFrame>,
-    /// A seeded `old` value named but not yet emitted. See
-    /// [`Machine::materialise_old`].
-    pending_old: Option<PendingOld>,
+    /// A seeded flag context named but not yet emitted. See
+    /// [`Machine::seed_flag_ctx`].
+    pending: Option<PendingCtx>,
 }
 
-/// The `old` half of a flag context, deferred until a flag reads it.
+/// The two halves of a flag context, each deferred until a flag reads
+/// it. Both are spliced in at `at`, which is the position **before** the
+/// destination write — see [`Machine::seed_flag_ctx`] for why that is
+/// load-bearing rather than tidy.
 #[derive(Debug, Clone)]
-struct PendingOld {
-    temp: Var,
-    /// What the snapshot copies — the *slice* the write targets, not
-    /// the whole parent, so a narrow write's flags stay narrow.
-    target: Expr,
+struct PendingCtx {
     at: usize,
+    /// The destination's value before the write. Note it snapshots the
+    /// *slice* the write targets, not the whole parent, so a narrow
+    /// write's flags stay narrow.
+    old: Option<(Var, Expr)>,
+    /// The value written.
+    cur: Option<(Var, Expr)>,
 }
 
 /// The flag context radare2 keeps: the value a destination held before
@@ -277,7 +282,7 @@ impl Machine {
             statements: Vec::new(),
             flag_ctx: None,
             block_stack: Vec::new(),
-            pending_old: None,
+            pending: None,
         }
     }
 
@@ -440,6 +445,9 @@ impl Machine {
     fn apply_flag(&mut self, suffix: &str) -> Result<(), EsilError> {
         let unsupported = || EsilError::UnsupportedFlag(suffix.to_string());
         let ctx = self.flag_ctx.clone().ok_or_else(unsupported)?;
+        // Every flag is a function of `cur`, so the snapshot of it goes
+        // in ahead of the destination write for all of them.
+        self.materialise_cur();
         let expr = match suffix {
             "z" => flags::zero_flag(&ctx),
             "p" => flags::parity_flag(&ctx).ok_or_else(unsupported)?,
@@ -552,45 +560,70 @@ impl Machine {
 
     /// Record the flag context a write leaves behind.
     ///
-    /// The `old` value is captured into a temp **before** the
-    /// destination is written. Embedding `Expr::Var(target)` directly
-    /// would not work: `ssa_convert` renames reads by statement
-    /// position, so a flag expression emitted after the write would have
-    /// its reference to the destination rewritten to the *new* version
-    /// and the flag would read its own result. Same hazard, and the same
-    /// remedy, as the lifter's flag-ordering invariant.
+    /// **Both halves are captured into temps emitted before the
+    /// destination write**, and neither is optional. `ssa_convert`
+    /// renames reads by statement *position*, and every flag statement
+    /// is emitted after the write, so an inlined expression there has
+    /// its references to the destination rewritten to the version the
+    /// write just created. For `sub rsp, 0x20` that made `$z` read
+    /// `((rsp - 32) - 32) == 0` — the destination subtracted twice.
+    ///
+    /// This is the flag-ordering invariant the per-mnemonic handlers
+    /// have carried since Fase C, arriving here. It was found by the
+    /// differential harness and not by a test, because each output is
+    /// individually correct: the rebinding only shows when the flag and
+    /// the destination are compared *together*.
+    ///
+    /// Both temps are named now and emitted only if a flag actually
+    /// reads them, so a lift with no flag token stays byte-identical.
     fn seed_flag_ctx(&mut self, target: &RegRef, value: &Expr) {
-        let snapshot = Var::new(self.fresh_tmp_name("old"), target.bits());
-        // Named now, emitted only if something reads it. `$z`, `$s` and
-        // `$p` are functions of the *result* alone, so the common case
-        // costs no statement at all and every ESIL lift that reads no
-        // carry stays byte-identical to before this model landed.
-        self.pending_old = Some(PendingOld {
-            temp: snapshot.clone(),
-            target: target.read(),
-            at: self.statements.len(),
+        let bits = target.bits();
+        let at = self.statements.len();
+        let old_temp = Var::new(self.fresh_tmp_name("old"), bits);
+        let cur_temp = Var::new(self.fresh_tmp_name("cur"), bits);
+        self.pending = Some(PendingCtx {
+            at,
+            old: Some((old_temp.clone(), target.read())),
+            cur: Some((cur_temp.clone(), value.clone())),
         });
         self.flag_ctx = Some(FlagCtx {
-            old: Expr::Var(snapshot),
-            cur: value.clone(),
-            bits: target.bits(),
+            old: Expr::Var(old_temp),
+            cur: Expr::Var(cur_temp),
+            bits,
         });
     }
 
-    /// Emit the deferred `old` snapshot, ahead of the write it precedes.
-    fn materialise_old(&mut self) {
-        let Some(pending) = self.pending_old.take() else {
+    /// Emit the deferred `cur` snapshot — every flag reads it.
+    fn materialise_cur(&mut self) {
+        let Some(pending) = self.pending.as_mut() else {
             return;
         };
-        self.statements.insert(
-            pending.at,
-            IrStmt::Assign {
-                dst: pending.temp,
-                src: pending.target,
-            },
-        );
+        let at = pending.at;
+        let Some((temp, src)) = pending.cur.take() else {
+            return;
+        };
+        self.insert_snapshot(at, temp, src);
+    }
+
+    /// Emit the deferred `old` snapshot — only `$c`, `$b` and `$o` read it.
+    fn materialise_old(&mut self) {
+        let Some(pending) = self.pending.as_mut() else {
+            return;
+        };
+        let at = pending.at;
+        let Some((temp, src)) = pending.old.take() else {
+            return;
+        };
+        self.insert_snapshot(at, temp, src);
+    }
+
+    /// Splice a snapshot in ahead of the write it precedes, keeping the
+    /// open predicated-block frames pointing at the same statements.
+    fn insert_snapshot(&mut self, at: usize, temp: Var, src: Expr) {
+        self.statements
+            .insert(at, IrStmt::Assign { dst: temp, src });
         for frame in &mut self.block_stack {
-            if frame.stmt_start > pending.at {
+            if frame.stmt_start > at {
                 frame.stmt_start += 1;
             }
         }

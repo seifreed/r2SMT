@@ -171,11 +171,12 @@ fn bare_arithmetic_does_not_seed_the_flag_context() {
 #[test]
 fn a_write_seeds_the_flag_context() {
     // The other half: `ae 0x80,rax,=,7,$s` answers 1, so an assignment
-    // does seed. `$z` is a function of the result alone, so no `old`
-    // snapshot is emitted and the lift stays two statements.
+    // does seed. Three statements: the `cur` snapshot spliced in ahead
+    // of the write, the write, and the flag. `$z` reads no `old`, so
+    // that half stays unmaterialised.
     let lift = lift_esil("0x80,rax,=,$z,zf,=", Arch::X86_64).expect("lift ok");
-    assert_eq!(lift.statements.len(), 2);
-    match &lift.statements[1] {
+    assert_eq!(lift.statements.len(), 3);
+    match &lift.statements[2] {
         IrStmt::Assign { dst, src } => {
             assert_eq!(dst.name, "ZF");
             assert!(matches!(src, Expr::Ite { .. }), "{src:?}");
@@ -192,15 +193,27 @@ fn a_carry_flag_reads_the_value_the_destination_held_before() {
     // the write would be rewritten to the new version and the flag would
     // read its own result.
     let lift = lift_esil("1,rax,+=,64,$c,cf,=", Arch::X86_64).expect("lift ok");
-    assert_eq!(lift.statements.len(), 3);
-    match (&lift.statements[0], &lift.statements[1]) {
-        (IrStmt::Assign { dst: snap, src }, IrStmt::Assign { dst: written, .. }) => {
-            assert_eq!(*src, Expr::Var(Var::new("rax", 64)));
-            assert_eq!(written.name, "rax");
-            assert!(snap.name.starts_with("__esil_old"), "{}", snap.name);
-        }
-        other => panic!("expected snapshot then write, got {other:?}"),
-    }
+    assert_eq!(lift.statements.len(), 4);
+    // Both snapshots precede the write, in either order — what matters
+    // is that the write is not between a snapshot and the flag that
+    // reads it. `$c` reads both halves, so both are materialised.
+    let names: Vec<&str> = lift
+        .statements
+        .iter()
+        .filter_map(|s| match s {
+            IrStmt::Assign { dst, .. } => Some(dst.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let write_at = names.iter().position(|n| *n == "rax").expect("a write");
+    assert!(
+        names[..write_at]
+            .iter()
+            .filter(|n| n.starts_with("__esil_"))
+            .count()
+            == 2,
+        "{names:?}"
+    );
 }
 
 #[test]

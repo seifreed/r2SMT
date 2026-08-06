@@ -543,3 +543,52 @@ fn test_the_gate_on_still_refuses_arm() {
         true
     )));
 }
+
+// ---------------------------------------------------------------------
+// The flag-ordering invariant, arriving in the ESIL machine.
+//
+// `ssa_convert` renames reads by statement *position*, and every flag
+// statement is emitted after the destination write, so a flag whose
+// expression is inlined has its references to the destination rewritten
+// to the version that write just created.
+//
+// Found by the differential harness rather than by a test, and the
+// reason is worth keeping: each output is individually correct. The
+// destination alone agrees with the per-mnemonic handler, and the flag
+// alone agrees. Only comparing the two *together* exposes it, which no
+// single-output contract can do. It was 399 of 540 disagreements on one
+// x86-64 sample.
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_a_flag_reads_the_value_written_and_not_the_value_written_twice() {
+    // The real `sub rsp, 0x20` string. With `rsp` bound to 32 the
+    // result is 0, so `ZF` is 1. Reading the post-write `rsp` instead
+    // computes `(32 - 32) - 32`, which is not zero — the destination
+    // subtracted twice.
+    assert_eq!(
+        solve_esil(
+            "32,rsp,-=,63,$s,sf,:=,$z,zf,=",
+            &[("rsp", 32, QWORD)],
+            ("ZF", 1),
+            1
+        ),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_the_destination_itself_is_written_once() {
+    // The other half of the pair, and the reason the bug survived: this
+    // side was always right. A contract on the destination alone passes
+    // on the broken ordering.
+    assert_eq!(
+        solve_esil(
+            "32,rsp,-=,$z,zf,=",
+            &[("rsp", 96, QWORD)],
+            ("rsp", QWORD),
+            64
+        ),
+        SmtResult::AlwaysTrue
+    );
+}
