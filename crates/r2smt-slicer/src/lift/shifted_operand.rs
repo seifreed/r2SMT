@@ -52,6 +52,24 @@ enum ShiftSpec<'a> {
     },
 }
 
+/// Whether any operand of `insn` is a trailing shift / extend
+/// specifier, so the per-mnemonic handler must claim the instruction
+/// ahead of the ESIL ladder.
+///
+/// radare2 6.1.8 drops the specifier from its ESIL: `add x9, x9, w7,
+/// uxth` comes back as `w7,x9,+,x9,=`, using the whole 32-bit `w7`
+/// instead of its low halfword. That is a wrong *value*, and since the
+/// instruction sets no flags its ESIL carries no `:=` and therefore wins
+/// the ladder — so without this override the wrong value is the one that
+/// ships. Found by `--differential-lift`, which is the case it was built
+/// for: our handler folds the extend and radare2's does not.
+pub(in crate::lift) fn has_shift_specifier(insn: &Instruction) -> bool {
+    insn.operands
+        .iter()
+        .skip(1)
+        .any(|op| parse_shift_spec(&op.raw).is_some())
+}
+
 /// Parse a specifier, or `None` when the operand is an ordinary one.
 ///
 /// Deliberately text-driven: the operand *kind* cannot tell these apart

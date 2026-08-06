@@ -681,6 +681,19 @@ impl LiftCtx {
         // disconnected, wrong-width value. Our per-mnemonic handlers
         // model these precisely at 128 bits — prefer them, bypassing
         // the ESIL/P-code ladder for this closed mnemonic set.
+        // Same override, different reason: an ARM instruction carrying a
+        // trailing shift / extend specifier is modelled here and *not*
+        // by radare2's ESIL, which drops the specifier and so computes a
+        // different value. See `shifted_operand::has_shift_specifier`.
+        if matches!(self.arch, Arch::Aarch64 | Arch::Arm)
+            && shifted_operand::has_shift_specifier(insn)
+        {
+            match self.arch {
+                Arch::Aarch64 => self.lift_instruction_aarch64(insn),
+                _ => self.lift_instruction_aarch32(insn),
+            }
+            return;
+        }
         if is_simd_instruction(insn, self.arch) {
             match self.arch {
                 Arch::Aarch64 => self.lift_instruction_aarch64(insn),

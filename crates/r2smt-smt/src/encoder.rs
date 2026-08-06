@@ -66,6 +66,9 @@ pub struct Encoder {
     /// cleared on every store and on havoc so a stale value can never
     /// be reused across a write.
     load_memo: HashMap<(String, u16), BV>,
+    /// Set when a name was declared at two different widths; the
+    /// verdict built on this encoding is then unusable.
+    width_conflict: bool,
 }
 
 impl Default for Encoder {
@@ -86,6 +89,7 @@ impl Encoder {
             ptr_bits: 64,
             load_counter: 0,
             load_memo: HashMap::new(),
+            width_conflict: false,
         }
     }
 
@@ -213,13 +217,56 @@ impl Encoder {
         self.encode_as_bv_with_width(address, self.ptr_bits)
     }
 
+    /// Declare a free bit-vector, memoised by name.
+    ///
+    /// Two `Var`s that share a name but not a width are a contract
+    /// violation upstream, and this used to answer with the *first*
+    /// width regardless — which either builds a silently wrong formula
+    /// or, where Z3 checks sorts, aborts the process. It really aborted:
+    /// `solve --differential-lift` panicked on a stock `AArch64` sample
+    /// with `SortDiffers { left: (_ BitVec 64), right: (_ BitVec 16) }`,
+    /// because the differential harness namespaces two lowerings into
+    /// one query and can pair a 64-bit definition with a 16-bit one.
+    ///
+    /// Neither answer is acceptable, so the collision is recorded and
+    /// the verdict fails closed (see [`Encoder::had_width_conflict`]). The
+    /// returned bit-vector has the width the caller asked for, keeping
+    /// the rest of the encoding well-sorted so it can finish without
+    /// aborting; its value is irrelevant, since the verdict built on top
+    /// of it is discarded.
     fn declare(&mut self, name: &str, bits: u16) -> BV {
         if let Some(existing) = self.vars.get(name) {
-            return existing.clone();
+            let have = existing.get_size();
+            let want = u32::from(bits);
+            if have == want {
+                return existing.clone();
+            }
+            // A *narrower* request is an exact sub-view of the same
+            // variable — x86 reaches this legitimately, reading a
+            // vector parent through a shorter view — so answer with the
+            // low bits rather than declaring a conflict. Returning the
+            // full-width variable instead is what used to abort the
+            // process inside the z3 crate.
+            if want < have {
+                return existing.extract(want - 1, 0);
+            }
+            // A *wider* request has no sound answer: the extra bits are
+            // not described by anything already asserted, and inventing
+            // them (zero-extension) would be a definite wrong value.
+            self.width_conflict = true;
+            return BV::fresh_const(name, want);
         }
         let bv = BV::new_const(name, u32::from(bits));
         self.vars.insert(name.to_string(), bv.clone());
         bv
+    }
+
+    /// Whether any name was declared at two different widths while
+    /// encoding. A caller that gets `true` must discard the verdict —
+    /// the formula does not describe the slice.
+    #[must_use]
+    pub fn had_width_conflict(&self) -> bool {
+        self.width_conflict
     }
 
     fn encode_as_bv(&mut self, expr: &Expr) -> BV {
@@ -338,6 +385,20 @@ impl Encoder {
             }
             Expr::Extract { src, hi, lo } => {
                 let bv = self.encode_as_bv(src);
+                // An out-of-range slice aborts the process inside the z3
+                // crate (`Option::unwrap` on `extract`). It is reachable:
+                // the differential harness pairs two lowerings of one
+                // instruction that need not agree about a value's width,
+                // so a 64-bit slice can land on a 16-bit operand. Treat
+                // it as the same contract violation a width collision is
+                // — record it, return a well-sorted placeholder so the
+                // encoding can finish, and let the verdict fail closed.
+                let width = bv.get_size();
+                if u32::from(*hi) >= width || lo > hi {
+                    self.width_conflict = true;
+                    let bits = u32::from(hi.saturating_sub(*lo)) + 1;
+                    return Encoded::Bv(BV::fresh_const("oob_extract", bits));
+                }
                 Encoded::Bv(bv.extract(u32::from(*hi), u32::from(*lo)))
             }
             Expr::Concat { high, low } => {

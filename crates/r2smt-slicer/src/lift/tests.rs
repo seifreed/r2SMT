@@ -5888,6 +5888,81 @@ fn reg_x86(name: &str) -> Operand {
 }
 
 #[test]
+fn an_aarch64_variable_shift_masks_its_amount_to_the_datasize() {
+    // `lsr x1, x1, x0` shifts by `x0 mod 64`; radare2's own ESIL spells
+    // it `64,x0,%,x1,>>,x1,=`. Without the mask a bit-vector shift by
+    // the full width is defined as zero while the machine leaves the
+    // register untouched — a wrong value, not a lost one. The
+    // differential harness found this on 11 instructions of one sample.
+    let stmts = lift_per_mnemonic(
+        &insn(0x1000, 4, "lsr", vec![reg("x1"), reg("x1"), reg("x0")]),
+        Arch::Aarch64,
+    );
+    let has_mask = stmts.iter().any(|s| {
+        matches!(s, IrStmt::Assign { src, .. }
+            if format!("{src:?}").contains("And") && format!("{src:?}").contains("63"))
+    });
+    assert!(has_mask, "shift amount must be masked mod 64: {stmts:?}");
+}
+
+#[test]
+fn an_extended_register_operand_keeps_the_per_mnemonic_handler() {
+    // `add x9, x9, w7, uxth` takes the low *halfword* of `w7`. radare2
+    // 6.1.8 drops the `uxth` from its ESIL (`w7,x9,+,x9,=`), and since
+    // the instruction sets no flags that ESIL carries no `:=` and would
+    // otherwise win the ladder — shipping the wrong value. The override
+    // is what keeps our handler, which folds the extend.
+    let mut add = insn(
+        0x1000,
+        4,
+        "add",
+        vec![
+            reg("x9"),
+            reg("x9"),
+            reg("w7"),
+            op("uxth", OperandKind::Register),
+        ],
+    );
+    add.esil = Some("w7,x9,+,x9,=".into());
+    let program = Program {
+        arch: Arch::Aarch64,
+        bits: 64,
+        entry: Some(Address(0x1000)),
+        functions: vec![Function {
+            address: Address(0x1000),
+            name: Some("f".into()),
+            blocks: vec![BasicBlock {
+                address: Address(0x1000),
+                instructions: vec![
+                    add,
+                    insn(0x1004, 4, "cmp", vec![reg("x9"), reg("x3")]),
+                    insn(
+                        0x1008,
+                        4,
+                        "b.ne",
+                        vec![op("0x1000", OperandKind::Immediate)],
+                    ),
+                ],
+                successors: vec![],
+            }],
+            is_thumb: false,
+        }],
+    };
+    let lifted = lift_first(&program, Arch::Aarch64);
+    // The extend narrows to 16 bits, so the folded operand must carry an
+    // Extract; the raw ESIL lowering would not.
+    let folded = lifted
+        .statements
+        .iter()
+        .any(|s| format!("{s:?}").contains("Extract"));
+    assert!(
+        folded,
+        "the extend must be folded, not dropped: {:?}",
+        lifted.statements
+    );
+}
+
+#[test]
 fn an_esil_lowering_that_produced_nothing_does_not_win_the_ladder() {
     // The ladder used to accept any `Ok` from the ESIL machine, and a
     // stack-only ESIL string evaluates to `Ok` with **zero** statements.

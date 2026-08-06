@@ -96,7 +96,15 @@ pub fn solve_branch_with_pretty(slice: &SsaLiftedSlice, options: SolveOptions) -
     let sat_false = solver.check();
     solver.pop(1);
 
-    let verdict = combine(sat_true, sat_false);
+    // A name declared at two widths means the formula does not describe
+    // the slice, so the verdict is discarded rather than reported. Fails
+    // closed to `Unsound`, which the confidence ladder already treats as
+    // "do not act on this".
+    let verdict = if encoder.had_width_conflict() {
+        SmtResult::Unsound
+    } else {
+        combine(sat_true, sat_false)
+    };
     debug!(
         target: "r2smt::smt",
         at = %slice.branch.address,

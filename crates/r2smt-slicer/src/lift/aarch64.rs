@@ -77,9 +77,9 @@ impl LiftCtx {
             // `bvudiv` / `bvsdiv`.
             "udiv" => self.lift_aarch64_arith3(insn, BinOp::UDiv, false),
             "sdiv" => self.lift_aarch64_arith3(insn, BinOp::SDiv, false),
-            "lsl" => self.lift_aarch64_arith3(insn, BinOp::Shl, false),
-            "lsr" => self.lift_aarch64_arith3(insn, BinOp::Shr, false),
-            "asr" => self.lift_aarch64_arith3(insn, BinOp::Sar, false),
+            "lsl" => self.lift_aarch64_shift(insn, BinOp::Shl),
+            "lsr" => self.lift_aarch64_shift(insn, BinOp::Shr),
+            "asr" => self.lift_aarch64_shift(insn, BinOp::Sar),
             // The complemented-Operand2 logicals. A64 spells them as
             // their own mnemonics where A32 has only `bic`; the shape is
             // the plain 3-operand one with `Rm` inverted first.
@@ -447,6 +447,46 @@ impl LiftCtx {
                 comment: "non-register destination (carry arithmetic)".into(),
             });
         }
+    }
+
+    /// `lsl` / `lsr` / `asr Rd, Rn, Rm` — the variable-amount shifts.
+    ///
+    /// The amount is taken **modulo the datasize**: 64 for an `X`
+    /// destination, 32 for a `W` one. Dropping the mask is a wrong
+    /// *value* and not a lost one, because a bit-vector shift by the
+    /// full width is defined as zero while the machine leaves the
+    /// register untouched — `lsr x1, x1, x0` with `x0 == 64` answers 0
+    /// instead of `x1`.
+    ///
+    /// The `AArch32` side already models this (`Rs[7:0]`, see
+    /// `lift/aarch32/shift.rs`); `AArch64` did not, and the differential
+    /// harness is what surfaced it: radare2's own ESIL for the same
+    /// instruction is `64,x0,%,x1,>>,x1,=`, so the two lowerings
+    /// disagreed on 11 instructions of one sample.
+    ///
+    /// Masking unconditionally is safe for the immediate forms too,
+    /// since the encoding already bounds those below the datasize.
+    fn lift_aarch64_shift(&mut self, insn: &Instruction, op: BinOp) {
+        let (Some(dst), Some(src1), Some(_)) = (
+            insn.operands.first(),
+            insn.operands.get(1),
+            insn.operands.get(2),
+        ) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "fewer than 3 operands (aarch64 shift)".into(),
+            });
+            return;
+        };
+        let Some(width) = self.aarch64_destination_width(insn, dst) else {
+            return;
+        };
+        let lhs = self.read_operand_at(src1, width);
+        let rhs = self.read_source_with_shift(insn, OPERAND2_INDEX_ARITH3, width);
+        // The datasize is a power of two, so "modulo width" is a mask of
+        // the low `log2(width)` bits.
+        let amount = Expr::bv_and(rhs, Expr::konst(u128::from(width - 1), width));
+        self.emit_arith3(insn, op, &lhs, &amount, width, false);
     }
 
     /// `adc` / `adcs` / `sbc` / `sbcs Rd, Rn, Op` on `AArch64`.
