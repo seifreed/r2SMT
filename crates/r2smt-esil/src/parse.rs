@@ -126,11 +126,41 @@ fn parse_memory_or_register(tok: &str) -> EsilToken {
     {
         return EsilToken::Store(n);
     }
-    if is_identifier(tok) {
+    if is_identifier(tok) && !is_esil_keyword(tok) {
         EsilToken::Register(tok.to_ascii_lowercase())
     } else {
         EsilToken::Unknown(tok.to_string())
     }
+}
+
+/// Whether an otherwise register-shaped token is really one of ESIL's
+/// alphabetic operators.
+///
+/// Without this every one of them — `DUP`, `SWAP`, `POP`, `ASR`, `ROR`,
+/// `GOTO`, `BREAK`, `TODO`, `NAN`, … — parses as a *register*, and the
+/// damage is silent and in the unsound direction: `lift_esil` returns
+/// `Ok` holding a free variable (or, for the zero-effect ones like
+/// `TODO`, no statements at all), so [`crate::lift_esil`]'s caller takes
+/// the result and never falls through to the per-mnemonic handler. An
+/// ARM `r2,r1,ROR,r0,=` became `r0 = <free>`: a fabricated value, not a
+/// lost one. Measured in real output from one `AArch64` sample: `DUP`
+/// 1 121, `ROR` 641, `ASR` 130, `SWAP` 57.
+///
+/// The test is *case*, not a name list, and that is deliberate. Every
+/// alphabetic operator radare2 lists in `ae???` is upper-case, while
+/// register names arrive lower-case — an assumption this module already
+/// relies on, since it lower-cases them on the way in. So the rule
+/// covers operators added by later radare2 versions, which a fixed list
+/// would silently start misparsing again. Measured across `AArch64`,
+/// x86-64 and `AArch32` samples, the only upper-case ESIL tokens in real
+/// output are operators and hex literals, and the literals never reach
+/// here — [`classify`] claims them first.
+///
+/// A token wrongly rejected costs precision: the lift fails and the
+/// per-mnemonic handler runs instead. A token wrongly accepted costs
+/// soundness. The rule errs toward the first.
+fn is_esil_keyword(tok: &str) -> bool {
+    tok.chars().any(|c| c.is_ascii_uppercase())
 }
 
 fn is_identifier(tok: &str) -> bool {
@@ -155,9 +185,16 @@ mod tests {
     }
 
     #[test]
-    fn register_name_lowercases() {
+    fn an_upper_case_token_is_an_operator_and_not_a_register() {
+        // This used to assert `RAX` lowercases into `Register("rax")`,
+        // which read as harmless normalisation and was the whole bug:
+        // radare2 spells register names lower-case and its alphabetic
+        // *operators* upper-case, so accepting an upper-case identifier
+        // as a register is what turned `DUP` / `ROR` / `ASR` into free
+        // variables. Nothing measured emits an upper-case register.
+        assert_eq!(tokenize("DUP"), vec![EsilToken::Unknown("DUP".to_string())]);
         assert_eq!(
-            tokenize("RAX"),
+            tokenize("rax"),
             vec![EsilToken::Register("rax".to_string())]
         );
     }

@@ -5886,3 +5886,72 @@ fn x86_a_shift_by_a_literal_zero_leaves_every_flag_alone() {
 fn reg_x86(name: &str) -> Operand {
     op(name, OperandKind::Register)
 }
+
+#[test]
+fn an_esil_lowering_that_produced_nothing_does_not_win_the_ladder() {
+    // The ladder used to accept any `Ok` from the ESIL machine, and a
+    // stack-only ESIL string evaluates to `Ok` with **zero** statements.
+    // The instruction was then modelled as a no-op and the per-mnemonic
+    // handler never ran — a fabricated verdict rather than a lost one,
+    // because the slice stayed `Complete` while an instruction that
+    // really does write `eax` contributed nothing.
+    //
+    // Here `sub eax, ebx` carries an ESIL that pushes and pops without
+    // assigning. The per-mnemonic handler must still define `eax`.
+    let mut sub = insn(0x40_1000, 2, "sub", vec![reg_x86("eax"), reg_x86("ebx")]);
+    sub.esil = Some("eax,ebx".into());
+    let program = one_block_program(vec![
+        sub,
+        insn(
+            0x40_1002,
+            2,
+            "jne",
+            vec![op("0x401000", OperandKind::Immediate)],
+        ),
+    ]);
+    let lifted = lift_first(&program, Arch::X86_64);
+    assert!(
+        find_assign(&lifted.statements, "rax").is_some(),
+        "the per-mnemonic handler must run when ESIL emitted nothing: {:?}",
+        lifted.statements
+    );
+}
+
+#[test]
+fn an_esil_operator_parsed_as_a_register_no_longer_shadows_the_handler() {
+    // The other half of the same hole, at the seam where it did damage.
+    // `ROR` was tokenised as a register, so an ARM `ror` lifted to
+    // `r0 = <free value named "ror">` and the ladder returned before the
+    // per-mnemonic handler could compute the rotate. One AArch64 sample
+    // emits `ROR` 641 times.
+    let mut ror = insn(0x1000, 4, "ror", vec![reg("r0"), reg("r1"), reg("r2")]);
+    ror.esil = Some("r2,r1,ROR,r0,=".into());
+    let program = Program {
+        arch: Arch::Arm,
+        bits: 32,
+        entry: Some(Address(0x1000)),
+        functions: vec![Function {
+            address: Address(0x1000),
+            name: Some("f".into()),
+            blocks: vec![BasicBlock {
+                address: Address(0x1000),
+                instructions: vec![
+                    ror,
+                    insn(0x1004, 4, "cmp", vec![reg("r0"), reg("r3")]),
+                    insn(0x1008, 4, "bne", vec![op("0x1000", OperandKind::Immediate)]),
+                ],
+                successors: vec![],
+            }],
+            is_thumb: false,
+        }],
+    };
+    let lifted = lift_first(&program, Arch::Arm);
+    let has_free_ror = lifted.statements.iter().any(|s| {
+        matches!(s, IrStmt::Assign { src, .. } if matches!(src, Expr::Var(v) if v.name == "ror"))
+    });
+    assert!(
+        !has_free_ror,
+        "`ROR` must not survive as a free variable: {:?}",
+        lifted.statements
+    );
+}

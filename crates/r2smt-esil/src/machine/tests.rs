@@ -399,3 +399,41 @@ fn non_commutative_operators_match_radare2_operand_order() {
         .collect();
     assert_eq!(measured, expected);
 }
+
+#[test]
+fn the_alphabetic_esil_operators_are_not_registers() {
+    // Every one of these is an operator in radare2's own `ae???` table,
+    // and each used to parse as a *register* — so `r2,r1,ROR,r0,=` lifted
+    // to `r0 = <free value named "ror">`. A fabricated value, not a lost
+    // one, and invisible because the lift still returned `Ok`.
+    //
+    // Prevalence is why this matters: one AArch64 sample emits `DUP`
+    // 1 121 times, `ROR` 641, `ASR` 130, `SWAP` 57.
+    for op in [
+        "DUP", "SWAP", "POP", "ASR", "LSL", "LSR", "ROR", "ROL", "GOTO", "BREAK", "TODO", "TRAP",
+        "NAN", "SQRT", "NUM", "CLEAR", "STACK", "BITS", "SETD", "SETJT", "I2D", "U2D", "D2I",
+        "D2F", "F2D", "CEIL", "FLOOR", "ROUND",
+    ] {
+        let err = lift_esil(&format!("r1,r2,{op},r0,="), Arch::Arm)
+            .expect_err("an ESIL operator must not lift as a register");
+        assert!(
+            matches!(err, EsilError::UnknownToken(ref t) if t == op),
+            "{op}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn a_lower_case_register_is_still_a_register() {
+    // The other direction of the same rule, so the fix cannot be
+    // "reject everything alphabetic". radare2 spells register names
+    // lower-case, which is what makes the case test safe.
+    let lift = lift_esil("rbx,rax,=", Arch::X86_64).expect("lift ok");
+    match lift.statements.first() {
+        Some(IrStmt::Assign { dst, src }) => {
+            assert_eq!(dst.name, "rax");
+            assert!(matches!(src, Expr::Var(v) if v.name == "rbx"), "{src:?}");
+        }
+        other => panic!("expected Assign, got {other:?}"),
+    }
+}

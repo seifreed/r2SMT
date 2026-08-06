@@ -719,8 +719,17 @@ impl LiftCtx {
             return;
         }
 
+        // A lowering that produced nothing is not a lowering. ESIL can
+        // evaluate to zero statements — a stack-only sequence, or an
+        // instruction radare2 has not esilized — and taking it would
+        // model the instruction as a **no-op** and skip the
+        // per-mnemonic handler entirely, which is a fabricated verdict
+        // rather than a lost one. Falling through costs nothing where
+        // the emptiness is genuine: `nop` has an empty ESIL string and
+        // the per-mnemonic dispatch already steps over it.
         if let Some(esil) = insn.esil.as_deref()
             && let Ok(lift) = r2smt_esil::lift_esil(esil, self.arch)
+            && !lift.statements.is_empty()
         {
             debug!(
                 target: "r2smt::lift",
