@@ -23,6 +23,7 @@
 //! on success.
 
 use r2smt_common::Arch;
+use r2smt_common::registers::{is_simd_parent, register_layout};
 use r2smt_ir::expr::{Expr, Var};
 use r2smt_ir::stmt::IrStmt;
 
@@ -117,7 +118,9 @@ struct Machine {
 #[derive(Debug, Clone)]
 struct PendingOld {
     temp: Var,
-    target: Var,
+    /// What the snapshot copies — the *slice* the write targets, not
+    /// the whole parent, so a narrow write's flags stay narrow.
+    target: Expr,
     at: usize,
 }
 
@@ -159,8 +162,8 @@ struct BlockFrame {
 enum StackValue {
     /// A register / variable reference. Kept distinct from
     /// `Expression` so the `=` operator can recover the destination
-    /// name without re-parsing the expression.
-    Register(Var),
+    /// without re-parsing the expression.
+    Register(RegRef),
     /// A computed value.
     Expression { expr: Expr, bits: u16 },
 }
@@ -168,16 +171,100 @@ enum StackValue {
 impl StackValue {
     fn bits(&self) -> u16 {
         match self {
-            StackValue::Register(var) => var.bits,
+            StackValue::Register(reg) => reg.bits(),
             StackValue::Expression { bits, .. } => *bits,
         }
     }
 
     fn into_expr(self) -> Expr {
         match self {
-            StackValue::Register(var) => Expr::Var(var),
+            StackValue::Register(reg) => reg.read(),
             StackValue::Expression { expr, .. } => expr,
         }
+    }
+}
+
+/// A register operand: the variable a read and a write actually touch,
+/// plus the bit range of it this name addresses.
+///
+/// The indirection exists because `eax` is not a variable — it is bits
+/// 31..0 of `rax`. Spelling it as its own `Var("eax", 32)`, which this
+/// machine did until 2026-08-06, makes it a *different* data-flow node
+/// from the `Extract(Var("rax", 64), 31, 0)` the per-mnemonic handlers
+/// read, so a slice that mixes the two lifters — which the ladder in
+/// `r2smt_slicer::lift` produces every time one instruction declines and
+/// the next does not — silently loses the flow between them.
+#[derive(Debug, Clone)]
+struct RegRef {
+    /// The variable read and written: the architectural parent when
+    /// [`register_layout`] places the name, the name itself when it
+    /// does not.
+    var: Var,
+    /// Inclusive bit range of `var` this name addresses.
+    lo: u16,
+    hi: u16,
+    /// Whether a write through this name zero-extends the whole parent
+    /// (the `x86_64` / `AArch64` 32-bit-alias rule) rather than
+    /// preserving the bits around the slice.
+    zero_extends: bool,
+}
+
+impl RegRef {
+    /// The degenerate case: the name *is* the variable.
+    fn whole(var: Var) -> Self {
+        let hi = var.bits.saturating_sub(1);
+        Self {
+            var,
+            lo: 0,
+            hi,
+            zero_extends: false,
+        }
+    }
+
+    fn bits(&self) -> u16 {
+        self.hi.saturating_sub(self.lo).saturating_add(1)
+    }
+
+    fn covers_whole_var(&self) -> bool {
+        self.lo == 0 && self.hi.saturating_add(1) == self.var.bits
+    }
+
+    fn read(&self) -> Expr {
+        let parent = Expr::Var(self.var.clone());
+        if self.covers_whole_var() {
+            parent
+        } else {
+            Expr::extract(parent, self.hi, self.lo)
+        }
+    }
+
+    /// The whole-variable expression a write of `value` — already at
+    /// [`RegRef::bits`] — leaves behind.
+    fn write(&self, value: Expr) -> Expr {
+        if self.covers_whole_var() {
+            return value;
+        }
+        if self.zero_extends {
+            return Expr::zero_ext(value, self.var.bits);
+        }
+        let mut result = value;
+        if self.lo > 0 {
+            result = Expr::concat(
+                result,
+                Expr::extract(Expr::Var(self.var.clone()), self.lo.saturating_sub(1), 0),
+            );
+        }
+        if self.hi.saturating_add(1) < self.var.bits {
+            result = Expr::concat(
+                Expr::extract(
+                    Expr::Var(self.var.clone()),
+                    self.var.bits.saturating_sub(1),
+                    self.hi.saturating_add(1),
+                ),
+                result,
+            );
+        }
+        result
     }
 }
 
@@ -227,9 +314,7 @@ impl Machine {
                     _ => name.as_str(),
                 }
                 .to_string();
-                let bits = register_width(&canonical, self.arch).unwrap_or(self.default_bits);
-                self.stack
-                    .push(StackValue::Register(Var::new(canonical, bits)));
+                self.stack.push(StackValue::Register(self.register_ref(&canonical)));
                 Ok(())
             }
             EsilToken::Flag(suffix) => self.apply_flag(&suffix),
@@ -428,15 +513,15 @@ impl Machine {
         // forms (`value,target,+=`).
         let target = self.pop("assign target")?;
         let value = self.pop("assign value")?;
-        let StackValue::Register(target_var) = target else {
+        let StackValue::Register(target_reg) = target else {
             return Err(EsilError::InvalidAssignmentTarget);
         };
-        let dst_bits = target_var.bits;
+        let dst_bits = target_reg.bits();
         let value_expr = widen(value, dst_bits);
         let final_expr = match compound {
             None => value_expr,
             Some(op) => {
-                let lhs = Expr::Var(target_var.clone());
+                let lhs = target_reg.read();
                 match op {
                     "+" => Expr::add(lhs, value_expr),
                     "-" => Expr::sub(lhs, value_expr),
@@ -450,12 +535,16 @@ impl Machine {
                 }
             }
         };
+        // The flag context is the *slice*'s before / after pair, not the
+        // parent's: `$z` masks to the width of the register written, so
+        // `0x100,al,=,$z` is 1 where `0x100,rax,=,$z` is 0. Seeding with
+        // the parent-width write would answer the second for both.
         if seeds_flags {
-            self.seed_flag_ctx(&target_var, &final_expr);
+            self.seed_flag_ctx(&target_reg, &final_expr);
         }
         self.statements.push(IrStmt::Assign {
-            dst: target_var,
-            src: final_expr,
+            dst: target_reg.var.clone(),
+            src: target_reg.write(final_expr),
         });
         Ok(())
     }
@@ -469,21 +558,21 @@ impl Machine {
     /// its reference to the destination rewritten to the *new* version
     /// and the flag would read its own result. Same hazard, and the same
     /// remedy, as the lifter's flag-ordering invariant.
-    fn seed_flag_ctx(&mut self, target: &Var, value: &Expr) {
-        let snapshot = Var::new(self.fresh_tmp_name("old"), target.bits);
+    fn seed_flag_ctx(&mut self, target: &RegRef, value: &Expr) {
+        let snapshot = Var::new(self.fresh_tmp_name("old"), target.bits());
         // Named now, emitted only if something reads it. `$z`, `$s` and
         // `$p` are functions of the *result* alone, so the common case
         // costs no statement at all and every ESIL lift that reads no
         // carry stays byte-identical to before this model landed.
         self.pending_old = Some(PendingOld {
             temp: snapshot.clone(),
-            target: target.clone(),
+            target: target.read(),
             at: self.statements.len(),
         });
         self.flag_ctx = Some(FlagCtx {
             old: Expr::Var(snapshot),
             cur: value.clone(),
-            bits: target.bits,
+            bits: target.bits(),
         });
     }
 
@@ -496,7 +585,7 @@ impl Machine {
             pending.at,
             IrStmt::Assign {
                 dst: pending.temp,
-                src: Expr::Var(pending.target),
+                src: pending.target,
             },
         );
         for frame in &mut self.block_stack {
@@ -538,19 +627,19 @@ impl Machine {
     /// reading; this is the measured one.
     fn apply_neg_assign(&mut self) -> Result<(), EsilError> {
         let target = self.pop("negate target")?;
-        let StackValue::Register(target_var) = target else {
+        let StackValue::Register(target_reg) = target else {
             return Err(EsilError::InvalidAssignmentTarget);
         };
-        let bits = target_var.bits;
-        let is_zero = Expr::eq(Expr::Var(target_var.clone()), Expr::konst(0, bits));
+        let bits = target_reg.bits();
+        let is_zero = Expr::eq(target_reg.read(), Expr::konst(0, bits));
         let src = Expr::Ite {
             cond: Box::new(is_zero),
             then_expr: Box::new(Expr::konst(1, bits)),
             else_expr: Box::new(Expr::konst(0, bits)),
         };
         self.statements.push(IrStmt::Assign {
-            dst: target_var,
-            src,
+            dst: target_reg.var.clone(),
+            src: target_reg.write(src),
         });
         Ok(())
     }
@@ -565,7 +654,7 @@ impl Machine {
             bits,
         });
         self.mark_active_block_mem_op();
-        self.stack.push(StackValue::Register(dst));
+        self.stack.push(StackValue::Register(RegRef::whole(dst)));
         Ok(())
     }
 
@@ -601,6 +690,33 @@ impl Machine {
 
     fn fresh_tmp_name(&self, prefix: &str) -> String {
         format!("__esil_{prefix}_{idx}", idx = self.statements.len())
+    }
+
+    /// Place `name` against its architectural parent.
+    ///
+    /// Two shapes decline to the historical narrow spelling, and both
+    /// have to: a **SIMD** name, whose parent is 128 bits wide where
+    /// this machine sizes variables at the pointer width — two `Var`s of
+    /// one name and different widths do not collide loudly, since SSA
+    /// versions by name and the encoder keeps the first width it sees —
+    /// and a slice reaching **past the pointer width**, which is `rax`
+    /// read under a 32-bit `Arch`. Same two guards, for the same
+    /// reasons, as `r2smt_slicer::lift::LiftCtx::read_register`.
+    fn register_ref(&self, name: &str) -> RegRef {
+        let parent_bits = self.default_bits;
+        if let Some(layout) = register_layout(name, self.arch)
+            && !is_simd_parent(layout.parent, self.arch)
+            && layout.hi < parent_bits
+        {
+            return RegRef {
+                var: Var::new(layout.parent, parent_bits),
+                lo: layout.lo,
+                hi: layout.hi,
+                zero_extends: layout.zero_extends_parent_64 && parent_bits == 64,
+            };
+        }
+        let bits = register_width(name, self.arch).unwrap_or(parent_bits);
+        RegRef::whole(Var::new(name, bits))
     }
 }
 

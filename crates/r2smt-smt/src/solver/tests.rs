@@ -1485,7 +1485,7 @@ fn unknowns_on_truncation_leaves_real_branch_as_both_possible() {
 }
 
 #[test]
-fn esil_first_path_mixed_with_the_mnemonic_handler_loses_the_subregister_link() {
+fn esil_first_path_mixed_with_the_mnemonic_handler_keeps_the_subregister_link() {
     // Same shape as `constant_propagation_je_is_always_true`, but
     // every instruction now carries the ESIL string radare2 would
     // emit. The slicer's lift loop must consume the ESIL first
@@ -1556,19 +1556,18 @@ fn esil_first_path_mixed_with_the_mnemonic_handler_loses_the_subregister_link() 
     //
     // With the real string, `:=` is unlexed and the whole `cmp` falls
     // back to the per-mnemonic handler, while `mov` still lifts through
-    // ESIL. That mix is what this now pins, and the verdict is
-    // `BothPossible` rather than `AlwaysTrue` for a reason worth naming:
-    // **the two lifters spell sub-registers differently.** The ESIL
-    // machine assigns a `Var("eax", 32)`, the per-mnemonic handler reads
-    // `eax` as `Extract(Var("rax", 64), 31, 0)` — two different
-    // variables, so the constant does not reach the compare.
+    // ESIL. **That mix is the point of this test**, because it is what
+    // the ladder produces on every real function, and until 2026-08-06
+    // it resolved to `BothPossible`: the ESIL machine assigned a
+    // `Var("eax", 32)` while the per-mnemonic handler read `eax` as
+    // `Extract(Var("rax", 64), 31, 0)`, two different variables, so the
+    // constant never reached the compare.
     //
-    // The direction is the safe one (precision lost, never a fabricated
-    // verdict), and the pure per-mnemonic path still resolves this shape
-    // exactly — see `constant_propagation_je_is_always_true`. Unifying
-    // the two spellings is the follow-up; it is also what would let the
-    // differential harness compare far more instruction pairs.
-    assert_eq!(solve_first(&program), SmtResult::BothPossible);
+    // Both lifters now place a sub-register against its architectural
+    // parent through the one `r2smt_common::registers` table, so the
+    // flow survives the seam and this resolves as exactly as the pure
+    // per-mnemonic path does — see `constant_propagation_je_is_always_true`.
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
 }
 
 #[test]

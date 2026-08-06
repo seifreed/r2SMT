@@ -20,14 +20,25 @@ fn assign_constant_to_register_64bit() {
 
 #[test]
 fn assign_constant_to_subregister_narrows_value() {
-    // ESIL `mov eax, 1`: target is 32-bit, immediate enters as
-    // 64-bit so the widen step extracts the low 32 bits.
+    // ESIL `mov eax, 1`: the slice written is 32-bit, the immediate
+    // enters as 64-bit so the widen step extracts the low 32 bits, and
+    // the write lands on the **parent** — zero-extended, per the
+    // `x86_64` 32-bit-alias rule.
+    //
+    // The parent spelling is what makes this machine's output the same
+    // data-flow node as the per-mnemonic handler's. It used to write
+    // `Var("eax", 32)`, which is a different variable from the
+    // `Extract(Var("rax", 64), 31, 0)` those handlers read, so a slice
+    // mixing the two lifters lost the flow between them.
     let lift = lift_esil("1,eax,=", Arch::X86_64).expect("lift ok");
     match &lift.statements[0] {
         IrStmt::Assign { dst, src } => {
-            assert_eq!(dst.name, "eax");
-            assert_eq!(dst.bits, 32);
-            assert_eq!(*src, Expr::extract(Expr::konst(1, 64), 31, 0));
+            assert_eq!(dst.name, "rax");
+            assert_eq!(dst.bits, 64);
+            assert_eq!(
+                *src,
+                Expr::zero_ext(Expr::extract(Expr::konst(1, 64), 31, 0), 64)
+            );
         }
         _ => panic!("expected Assign"),
     }
@@ -86,7 +97,10 @@ fn test_esil_lnot_nonzero_yields_zero() {
             assert_eq!(dst.name, "rax");
             let expected = Expr::zero_ext(
                 Expr::Ite {
-                    cond: Box::new(Expr::eq(Expr::Var(Var::new("eax", 32)), Expr::konst(0, 32))),
+                    cond: Box::new(Expr::eq(
+                        Expr::extract(Expr::Var(Var::new("rax", 64)), 31, 0),
+                        Expr::konst(0, 32),
+                    )),
                     then_expr: Box::new(Expr::konst(1, 1)),
                     else_expr: Box::new(Expr::konst(0, 1)),
                 },
@@ -104,18 +118,28 @@ fn test_esil_lnot_width_is_1bit() {
     // the 8-bit `al` must zero-extend a 1-bit core to 8 bits — the
     // `ZeroExtend { to_bits: 8 }` over an `Ite` whose branches are
     // `konst(_, 1)` proves the pushed value was exactly 1 bit wide.
+    //
+    // And `al` is the case that separates the two write rules: it is
+    // **not** a 32-bit alias, so the parent write *preserves* bits 63..8
+    // rather than zero-extending, which is what `1,eax,=` does.
     let lift = lift_esil("eax,!,al,=", Arch::X86_64).expect("lift ok");
     assert_eq!(lift.statements.len(), 1);
     match &lift.statements[0] {
         IrStmt::Assign { dst, src } => {
-            assert_eq!(dst.bits, 8);
-            let expected = Expr::zero_ext(
-                Expr::Ite {
-                    cond: Box::new(Expr::eq(Expr::Var(Var::new("eax", 32)), Expr::konst(0, 32))),
-                    then_expr: Box::new(Expr::konst(1, 1)),
-                    else_expr: Box::new(Expr::konst(0, 1)),
-                },
-                8,
+            assert_eq!(dst.bits, 64);
+            let expected = Expr::concat(
+                Expr::extract(Expr::Var(Var::new("rax", 64)), 63, 8),
+                Expr::zero_ext(
+                    Expr::Ite {
+                        cond: Box::new(Expr::eq(
+                            Expr::extract(Expr::Var(Var::new("rax", 64)), 31, 0),
+                            Expr::konst(0, 32),
+                        )),
+                        then_expr: Box::new(Expr::konst(1, 1)),
+                        else_expr: Box::new(Expr::konst(0, 1)),
+                    },
+                    8,
+                ),
             );
             assert_eq!(*src, expected);
         }
@@ -349,7 +373,7 @@ fn a_store_takes_its_address_from_the_top_of_the_stack() {
             assert_eq!(
                 *address,
                 Expr::sub(
-                    Expr::zero_ext(Expr::Var(Var::new("esp", 32)), 64),
+                    Expr::zero_ext(Expr::extract(Expr::Var(Var::new("rsp", 64)), 31, 0), 64),
                     Expr::konst(4, 64)
                 )
             );
@@ -418,13 +442,20 @@ fn the_stack_pointer_is_not_sixteen_bits_on_arm() {
     // Assert the *variable*, not a rendered substring: `ZeroExtend`
     // spells its target `to_bits`, which contains `bits: 64` and made an
     // earlier version of this test pass on the broken table too.
-    for (arch, dst, want) in [(Arch::Aarch64, "x6", 64_u16), (Arch::Arm, "r6", 32)] {
+    // `AArch32` spells `sp` as an ABI alias, so the layout table
+    // collapses it onto `r13` — which is the point of routing through
+    // that table rather than a width-only one: the per-mnemonic handlers
+    // read the same `r13`.
+    for (arch, dst, parent, want) in [
+        (Arch::Aarch64, "x6", "sp", 64_u16),
+        (Arch::Arm, "r6", "r13", 32),
+    ] {
         let lift = lift_esil(&format!("sp,{dst},="), arch).expect("lift ok");
         match &lift.statements[0] {
             IrStmt::Assign { src, .. } => {
                 assert_eq!(
                     *src,
-                    Expr::Var(Var::new("sp", want)),
+                    Expr::Var(Var::new(parent, want)),
                     "{arch:?}: sp must be a bare {want}-bit read, not a widened narrow one"
                 );
             }
@@ -436,11 +467,18 @@ fn the_stack_pointer_is_not_sixteen_bits_on_arm() {
 #[test]
 fn the_x86_stack_pointer_keeps_its_own_width() {
     // The other side of the dispatch: `sp` really is 16 bits on x86, so
-    // the fix must not be "sp is always the pointer width".
+    // the fix must not be "sp is always the pointer width". Read as bits
+    // 15..0 of `rsp`, which is the same 16 bits and the same node the
+    // per-mnemonic handlers use.
     let lift = lift_esil("sp,ax,=", Arch::X86_64).expect("lift ok");
     match &lift.statements[0] {
         IrStmt::Assign { src, .. } => {
-            assert_eq!(*src, Expr::Var(Var::new("sp", 16)), "x86 sp stays 16 bits");
+            let read_sp = Expr::extract(Expr::Var(Var::new("rsp", 64)), 15, 0);
+            assert_eq!(
+                *src,
+                Expr::concat(Expr::extract(Expr::Var(Var::new("rax", 64)), 63, 16), read_sp),
+                "x86 sp stays 16 bits"
+            );
         }
         other => panic!("expected Assign, got {other:?}"),
     }
