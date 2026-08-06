@@ -17,14 +17,22 @@ pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
         "mov" | "movz" => aarch64_mov_effect(insn),
         // 3-operand arithmetic / logical: dst, src1, src2. The
         // flag-setting `s` suffix flips `defines_flags`.
+        // The complemented-Operand2 logicals (`bic` / `bics` / `orn` /
+        // `eon`) and the two-operand spellings of a three-operand
+        // instruction (`mvn` = `orn Rd, xzr, Op`, `neg` = `sub Rd, xzr,
+        // Op`) share their siblings' arms: what they complement is a
+        // value the lifter computes, and none of it changes which
+        // registers are read or written. `aarch64_arith3_effect` covers
+        // both arities — it reads every operand past the first — so a
+        // trailing shift specifier lands in `uses` either way.
         "add" => aarch64_arith3_effect(insn, InstructionKind::Add, false),
         "adds" => aarch64_arith3_effect(insn, InstructionKind::Add, true),
-        "sub" => aarch64_arith3_effect(insn, InstructionKind::Sub, false),
-        "subs" => aarch64_arith3_effect(insn, InstructionKind::Sub, true),
-        "and" => aarch64_arith3_effect(insn, InstructionKind::And, false),
-        "ands" => aarch64_arith3_effect(insn, InstructionKind::And, true),
-        "orr" => aarch64_arith3_effect(insn, InstructionKind::Or, false),
-        "eor" => aarch64_arith3_effect(insn, InstructionKind::Xor, false),
+        "sub" | "neg" => aarch64_arith3_effect(insn, InstructionKind::Sub, false),
+        "subs" | "negs" => aarch64_arith3_effect(insn, InstructionKind::Sub, true),
+        "and" | "bic" => aarch64_arith3_effect(insn, InstructionKind::And, false),
+        "ands" | "bics" => aarch64_arith3_effect(insn, InstructionKind::And, true),
+        "orr" | "orn" | "mvn" => aarch64_arith3_effect(insn, InstructionKind::Or, false),
+        "eor" | "eon" => aarch64_arith3_effect(insn, InstructionKind::Xor, false),
         // `mul`, `udiv`, `sdiv` share the 3-operand shape and never
         // set NZCV on AArch64 (no `s`-suffixed sibling). The lifter
         // tells them apart semantically via `Expr::udiv` / `sdiv`.
@@ -48,7 +56,7 @@ pub(super) fn analyze_aarch64(insn: &Instruction) -> InstructionEffect {
             aarch64_arith3_effect(insn, InstructionKind::Simd, false)
         }
         // `fcmp` writes NZCV and defines no register — `cmp`'s shape.
-        "cmp" | "fcmp" | "fcmpe" => aarch64_cmp_test_effect(insn, InstructionKind::Cmp),
+        "cmp" | "cmn" | "fcmp" | "fcmpe" => aarch64_cmp_test_effect(insn, InstructionKind::Cmp),
         "tst" => aarch64_cmp_test_effect(insn, InstructionKind::Test),
         // Control flow.
         "b" => InstructionEffect {
@@ -157,9 +165,12 @@ fn aarch64_vector_effect(insn: &Instruction) -> Option<InstructionEffect> {
         // zeroes the vector register above it, so the destination is a
         // pure def — the 3-operand shape, not x86's read-modify-write
         // one. Handled here rather than by falling through to the
-        // integer arms so that the mnemonics with no scalar `AArch64`
-        // form (`mvn`, `bic`) are classified too, without those arms
-        // newly claiming the scalar spellings the lifter does not model.
+        // integer arms, which is what keeps the packed spelling of a
+        // mnemonic off the scalar arm regardless of what that arm does.
+        // The reason recorded here used to be that `mvn` and `bic` have
+        // no scalar `AArch64` form; they do — `bic x0, x1, x2` and
+        // `mvn x0, x1` are both real A64 — and both are now dispatched
+        // below.
         //
         // An element insert is the exception: it preserves every lane it
         // does not write, so its destination is a use as well, and the

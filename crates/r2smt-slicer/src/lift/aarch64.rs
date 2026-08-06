@@ -80,8 +80,23 @@ impl LiftCtx {
             "lsl" => self.lift_aarch64_arith3(insn, BinOp::Shl, false),
             "lsr" => self.lift_aarch64_arith3(insn, BinOp::Shr, false),
             "asr" => self.lift_aarch64_arith3(insn, BinOp::Sar, false),
+            // The complemented-Operand2 logicals. A64 spells them as
+            // their own mnemonics where A32 has only `bic`; the shape is
+            // the plain 3-operand one with `Rm` inverted first.
+            "bic" => self.lift_aarch64_logical_not(insn, BinOp::And, false),
+            "bics" => self.lift_aarch64_logical_not(insn, BinOp::And, true),
+            "orn" => self.lift_aarch64_logical_not(insn, BinOp::Or, false),
+            "eon" => self.lift_aarch64_logical_not(insn, BinOp::Xor, false),
+            // `mvn Rd, Rm` is `orn Rd, xzr, Rm`, and `neg Rd, Rm` is
+            // `sub Rd, xzr, Rm` — both the 2-operand spelling of a
+            // 3-operand instruction with the zero register on the left.
+            "mvn" => self.lift_aarch64_mvn(insn),
+            "neg" => self.lift_aarch64_neg(insn, false),
+            "negs" => self.lift_aarch64_neg(insn, true),
             // Compare / test: 2-operand, no destination.
             "cmp" => self.lift_aarch64_cmp(insn),
+            // `cmn Rn, Operand` is `adds xzr, Rn, Operand`.
+            "cmn" => self.lift_aarch64_cmn(insn),
             "tst" => self.lift_aarch64_tst(insn),
             // Conditional select: `csel Rd, Rn, Rm, cond` → Ite.
             "csel" => self.lift_aarch64_csel(insn),
@@ -199,6 +214,117 @@ impl LiftCtx {
                 comment: "non-register destination (aarch64 mov)".into(),
             });
         }
+    }
+
+    /// `bic` / `bics` / `orn` / `eon` — the 3-operand logicals whose
+    /// second source is complemented: `Rd := Rn <op> NOT Op`.
+    ///
+    /// Only the `Rm` read differs from [`Self::lift_aarch64_arith3`], so
+    /// the flag policy, the destination write and the temp that orders
+    /// them all come from `emit_arith3` — which is also what keeps
+    /// `bics` on the same C-and-V answer as `ands` rather than a second
+    /// copy of it.
+    ///
+    /// The complement is applied **after** any trailing shift, which is
+    /// the order the architecture defines: `bic x0, x1, x2, lsl 4`
+    /// clears the shifted bits, not the shifted complement.
+    fn lift_aarch64_logical_not(&mut self, insn: &Instruction, op: BinOp, sets_flags: bool) {
+        let (Some(dst), Some(src1), Some(_)) = (
+            insn.operands.first(),
+            insn.operands.get(1),
+            insn.operands.get(2),
+        ) else {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "fewer than 3 operands (aarch64 complemented logical)".into(),
+            });
+            return;
+        };
+        let Some(width) = self.aarch64_destination_width(insn, dst) else {
+            return;
+        };
+        let lhs = self.read_operand_at(src1, width);
+        let rhs = self.read_source_with_shift(insn, OPERAND2_INDEX_ARITH3, width);
+        let rhs = Expr::bv_xor(rhs, Expr::konst(u128::from(width_mask(width)), width));
+        self.emit_arith3(insn, op, &lhs, &rhs, width, sets_flags);
+    }
+
+    /// `mvn Rd, Op` — `orn Rd, xzr, Op`, i.e. the bitwise complement.
+    /// Never sets flags: A64 spells no `mvns`.
+    fn lift_aarch64_mvn(&mut self, insn: &Instruction) {
+        let Some(dst) = insn.operands.first() else {
+            return;
+        };
+        let Some(width) = self.aarch64_destination_width(insn, dst) else {
+            return;
+        };
+        let src = self.read_source_with_shift(insn, OPERAND2_INDEX_COMPARE, width);
+        let value = Expr::bv_xor(src, Expr::konst(u128::from(width_mask(width)), width));
+        if !self.write_register_to(dst, value) {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "non-register destination (aarch64 mvn)".into(),
+            });
+        }
+    }
+
+    /// `neg` / `negs Rd, Op` — `sub` / `subs Rd, xzr, Op`.
+    ///
+    /// Routed through `emit_arith3` with a literal zero as the left
+    /// source so `negs` gets the `Sub` arm's precise carry rather than
+    /// the catch-all's Unknown.
+    fn lift_aarch64_neg(&mut self, insn: &Instruction, sets_flags: bool) {
+        let Some(dst) = insn.operands.first() else {
+            return;
+        };
+        let Some(width) = self.aarch64_destination_width(insn, dst) else {
+            return;
+        };
+        let rhs = self.read_source_with_shift(insn, OPERAND2_INDEX_COMPARE, width);
+        let lhs = Expr::konst(0, width);
+        self.emit_arith3(insn, BinOp::Sub, &lhs, &rhs, width, sets_flags);
+    }
+
+    /// `cmn Rn, Op` — `adds xzr, Rn, Op`: flags from the sum, no
+    /// register destination.
+    fn lift_aarch64_cmn(&mut self, insn: &Instruction) {
+        let (Some(lhs_op), Some(rhs_op)) = (insn.operands.first(), insn.operands.get(1)) else {
+            return;
+        };
+        let width = self.binop_width(lhs_op, rhs_op);
+        let lhs = self.read_operand_at(lhs_op, width);
+        let rhs = self.read_source_with_shift(insn, OPERAND2_INDEX_COMPARE, width);
+        let tmp = self.new_temp(insn.address, width);
+        self.assign(tmp.clone(), Expr::add(lhs.clone(), rhs.clone()));
+        let tmp_expr = Expr::Var(tmp);
+        // `Add` reaches the catch-all arm, which leaves C and V Unknown
+        // — a carry-out needs an extension bit the flag helper does not
+        // plumb. Sharing the helper is what keeps that answer identical
+        // to `adds`, which is the instruction `cmn` actually is.
+        self.aarch64_set_arith_flags(insn, BinOp::Add, &lhs, &rhs, &tmp_expr, width);
+    }
+
+    /// The destination width every handler above needs, with the two
+    /// shapes that have no answer declined before anything is emitted —
+    /// a decline that has already pushed half an instruction is not a
+    /// decline. Mirrors the guards at the head of
+    /// [`Self::lift_aarch64_arith3`].
+    fn aarch64_destination_width(&mut self, insn: &Instruction, dst: &Operand) -> Option<u16> {
+        if dst.kind != OperandKind::Register || self.is_simd_register(dst) {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "non-GPR destination (aarch64)".into(),
+            });
+            return None;
+        }
+        let width = nonzero_width(self.operand_width(dst));
+        if width.is_none() {
+            self.stmts.push(IrStmt::Unsupported {
+                mnemonic: insn.mnemonic.clone(),
+                comment: "zero-width destination (aarch64)".into(),
+            });
+        }
+        width
     }
 
     pub(super) fn lift_aarch64_arith3(&mut self, insn: &Instruction, op: BinOp, sets_flags: bool) {
