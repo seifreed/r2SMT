@@ -473,3 +473,85 @@ fn test_agreement_rate_ignores_inconclusive() {
     // 2 agree / (2 agree + 1 disagree) — inconclusive excluded.
     assert_eq!(stats.agreement_rate(), Some(2.0 / 3.0));
 }
+
+// ---------------------------------------------------------------------
+// Memory-elimination caps.
+//
+// `mem::eliminate` bounds two things — the distinct byte addresses it
+// tracks across both sides, and the store bytes it tracks per side — and
+// past either it **declines** the whole comparison rather than havocing
+// one side. That direction is not a detail: havocing would leave the
+// havoced side's loads free while the other's stayed determined, so the
+// probe would report a difference the lowerings do not have.
+//
+// The module is private and `eliminate` is `pub(crate)`, so these drive
+// the public entry point, which is the stronger statement anyway: each
+// pair below is identical but for one access, so it pins the *edge* and
+// not merely that some large input declines. A test that only checked
+// the decline would pass with the cap set to zero.
+// ---------------------------------------------------------------------
+
+/// A lowering that loads `count` distinct 64-bit words and then defines
+/// `x0`, so the pair always has one jointly-defined output to compare.
+fn loads_then_define(count: u128) -> Vec<IrStmt> {
+    let mut stmts: Vec<IrStmt> = (0..count)
+        .flat_map(|i| load_from_sp("x9", 64, i * 8, 64))
+        .collect();
+    stmts.push(IrStmt::Assign {
+        dst: Var::new("x0", 64),
+        src: Expr::var("x1", 64),
+    });
+    stmts
+}
+
+/// A lowering that stores `count` distinct 64-bit words and then defines
+/// `x0`. Only one side stores, so no probe pair is built and the store
+/// cap is the only bound in play.
+fn stores_then_define(count: u128) -> Vec<IrStmt> {
+    let mut stmts: Vec<IrStmt> = (0..count).map(|i| store_to_sp(i * 8, i, 64)).collect();
+    stmts.push(IrStmt::Assign {
+        dst: Var::new("x0", 64),
+        src: Expr::var("x1", 64),
+    });
+    stmts
+}
+
+/// The other side of every cap pair: no memory at all, one output.
+fn defines_x0() -> Vec<IrStmt> {
+    vec![IrStmt::Assign {
+        dst: Var::new("x0", 64),
+        src: Expr::var("x1", 64),
+    }]
+}
+
+#[test]
+fn test_a_load_count_at_the_key_cap_still_compares() {
+    // 32 loads × 8 bytes = 256 distinct byte addresses, exactly the cap.
+    assert!(
+        build_equivalence_query(&loads_then_define(32), &defines_x0(), Arch::Aarch64).is_some()
+    );
+}
+
+#[test]
+fn test_a_load_count_over_the_key_cap_declines_rather_than_havocing() {
+    // One more load, 264 addresses, and the comparison is abandoned —
+    // not continued with free bytes on one side.
+    assert!(
+        build_equivalence_query(&loads_then_define(33), &defines_x0(), Arch::Aarch64).is_none()
+    );
+}
+
+#[test]
+fn test_a_store_count_at_the_store_cap_still_compares() {
+    // 16 stores × 8 bytes = 128 tracked bytes on this side, the cap.
+    assert!(
+        build_equivalence_query(&stores_then_define(16), &defines_x0(), Arch::Aarch64).is_some()
+    );
+}
+
+#[test]
+fn test_a_store_count_over_the_store_cap_declines_rather_than_havocing() {
+    assert!(
+        build_equivalence_query(&stores_then_define(17), &defines_x0(), Arch::Aarch64).is_none()
+    );
+}
