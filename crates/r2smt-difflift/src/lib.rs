@@ -18,6 +18,7 @@
 
 pub mod equiv;
 pub mod lower;
+mod mem;
 
 pub use equiv::{AgreementStats, DiffVerdict, build_equivalence_query, classify_equivalence};
 pub use lower::{Lowering, Lowerings, lower_all};

@@ -140,21 +140,137 @@ fn test_equivalent_flag_lowerings_agree() {
     assert_eq!(diff(&test_eax, &cmp_eax_0), DiffVerdict::Agree);
 }
 
+/// `sp`-relative load of `bits` into `dst`, at `offset` bytes.
+fn load_from_sp(dst: &str, bits: u16, offset: u128, sp_bits: u16) -> Vec<IrStmt> {
+    vec![IrStmt::LoadMem {
+        dst: Var::new(dst, bits),
+        address: Expr::add(Expr::var("sp", sp_bits), Expr::konst(offset, sp_bits)),
+        bits,
+    }]
+}
+
+/// `sp`-relative store of `value`, at `offset` bytes.
+fn store_to_sp(offset: u128, value: u128, bits: u16) -> IrStmt {
+    IrStmt::StoreMem {
+        address: Expr::add(Expr::var("sp", 64), Expr::konst(offset, 64)),
+        value: Expr::konst(value, bits),
+        bits,
+    }
+}
+
 #[test]
-fn test_memory_touching_lowering_is_not_comparable() {
-    // A lowering that loads memory cannot be soundly compared (no
-    // memory model) — the query must decline rather than risk a
-    // fabricated verdict.
-    let with_load = vec![IrStmt::LoadMem {
-        dst: Var::new("rax", 64),
-        address: Expr::var("rbx", 64),
+fn test_both_sides_read_the_same_initial_memory() {
+    // The anti-fabrication contract the whole design turns on. The
+    // encoder mints a *fresh* free byte per load, so two loads of one
+    // address read independently free values — which across two
+    // lowerings reports a disagreement on every memory instruction. The
+    // shared initial-memory chain is what forces equal addresses to equal
+    // bytes.
+    let a = load_from_sp("x0", 64, 8, 64);
+    let b = load_from_sp("x0", 64, 8, 64);
+    assert_eq!(diff_arch(&a, &b, Arch::Aarch64), DiffVerdict::Agree);
+}
+
+#[test]
+fn test_semantically_equal_load_addresses_agree() {
+    // Teeth for the chain being *semantic* and not a string memo: the two
+    // addresses are structurally different expressions denoting one
+    // address.
+    let a = load_from_sp("x0", 64, 8, 64);
+    let b = vec![IrStmt::LoadMem {
+        dst: Var::new("x0", 64),
+        address: Expr::sub(
+            Expr::add(Expr::var("sp", 64), Expr::konst(16, 64)),
+            Expr::konst(8, 64),
+        ),
         bits: 64,
     }];
-    let plain = vec![IrStmt::Assign {
-        dst: Var::new("rax", 64),
+    assert_eq!(diff_arch(&a, &b, Arch::Aarch64), DiffVerdict::Agree);
+}
+
+#[test]
+fn test_truncated_load_address_disagrees() {
+    // The `ldr` half of the measured `sp` bug, which the old
+    // `comparable()` could not see at all: 285 `ldp` and 188 `ldr` in one
+    // sample were invisible to the very harness that found the bug.
+    let wide = load_from_sp("x0", 64, 8, 64);
+    let narrow = load_from_sp("x0", 64, 8, 16);
+    assert_eq!(
+        diff_arch(&wide, &narrow, Arch::Aarch64),
+        DiffVerdict::Disagree
+    );
+}
+
+#[test]
+fn test_stores_on_one_side_do_not_feed_loads_on_the_other() {
+    // The encoder keeps one byte-store list per slice, so with both
+    // lowerings in one query side B's load would read side A's store and
+    // the pair would agree falsely. Each side keeps its own history here.
+    let a = vec![
+        store_to_sp(0, 5, 64),
+        IrStmt::LoadMem {
+            dst: Var::new("x0", 64),
+            address: Expr::var("sp", 64),
+            bits: 64,
+        },
+    ];
+    let b = vec![IrStmt::LoadMem {
+        dst: Var::new("x0", 64),
+        address: Expr::var("sp", 64),
+        bits: 64,
+    }];
+    assert_eq!(diff_arch(&a, &b, Arch::Aarch64), DiffVerdict::Disagree);
+}
+
+#[test]
+fn test_byte_decomposition_of_a_store_does_not_matter() {
+    // Probing per byte rather than per store width is what makes "one
+    // 16-bit store" and "two 8-bit stores" the same memory state instead
+    // of a disagreement.
+    let whole = vec![store_to_sp(0, 0x0201, 16)];
+    let split = vec![store_to_sp(0, 0x01, 8), store_to_sp(1, 0x02, 8)];
+    assert_eq!(diff_arch(&whole, &split, Arch::Aarch64), DiffVerdict::Agree);
+}
+
+#[test]
+fn test_a_dropped_store_byte_disagrees() {
+    // Teeth for the probe set covering every written byte.
+    let whole = vec![store_to_sp(0, 0x0201, 16)];
+    let half = vec![store_to_sp(0, 0x01, 8)];
+    assert_eq!(
+        diff_arch(&whole, &half, Arch::Aarch64),
+        DiffVerdict::Disagree
+    );
+}
+
+#[test]
+fn test_a_store_at_an_unknown_address_is_not_a_disagreement() {
+    // Two independent `Expr::Unknown`s encode to two independent free
+    // variables, so an unknown address could alias anything and comparing
+    // the resulting memory would fabricate. The side latches instead.
+    let a = vec![IrStmt::StoreMem {
+        address: Expr::Unknown("addr".into()),
+        value: Expr::konst(1, 64),
+        bits: 64,
+    }];
+    let b = vec![store_to_sp(0, 1, 64)];
+    assert_ne!(diff_arch(&a, &b, Arch::Aarch64), DiffVerdict::Disagree);
+}
+
+#[test]
+fn test_a_side_with_no_memory_effect_is_not_a_disagreement() {
+    // One engine modelling a write and the other staying silent is
+    // modelling depth, not a lifter defect — the same category that keeps
+    // `OF` / `PF` out of the comparison set.
+    let stores = vec![store_to_sp(0, 5, 64)];
+    let silent = vec![IrStmt::Assign {
+        dst: Var::new("x0", 64),
         src: Expr::konst(0, 64),
     }];
-    assert!(build_equivalence_query(&with_load, &plain, Arch::X86_64).is_none());
+    assert_ne!(
+        diff_arch(&stores, &silent, Arch::Aarch64),
+        DiffVerdict::Disagree
+    );
 }
 
 #[test]

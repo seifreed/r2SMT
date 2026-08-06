@@ -15,15 +15,23 @@
 //! This harness may flag a disagreement or stay silent; it must never
 //! *fabricate* one. Three guards enforce that:
 //!
-//! 1. If either lowering touches memory ([`IrStmt::LoadMem`] /
-//!    [`IrStmt::StoreMem`]) or declines an instruction
+//! 1. If either lowering declines an instruction
 //!    ([`IrStmt::Unsupported`]), the lowerings are *not comparable* —
 //!    the query is `None` and the caller reports `Inconclusive`. An
 //!    [`Expr::Unknown`] is *not* disqualifying on its own: it
 //!    forward-taints only the outputs whose value depends on it (see
 //!    `tainted_defs`), and a tainted output is excluded from the
 //!    comparison set so it can never become an independently-free
-//!    value that fabricates a difference.
+//!    value that fabricates a difference. Reaching a store's address or
+//!    value latches the whole side's memory out of the comparison
+//!    instead, since an unknown address could alias anything.
+//!
+//!    Memory used to be disqualifying too, and that hid the larger half
+//!    of the very bug this harness found — 410 `stp`, 285 `ldp`, 281
+//!    `str` and 188 `ldr` in one sample, invisible to the tool. It is
+//!    now compiled away into ordinary assignments by the `mem` module,
+//!    whose module doc carries the argument for why the encoder's own
+//!    model cannot be used here.
 //! 2. Free inputs are tied to one shared machine state through the
 //!    project's own register-layout contract
 //!    ([`r2smt_slicer::register_layout`]), so two lowerings that read
@@ -63,6 +71,8 @@ use r2smt_slicer::{
     register_layout,
 };
 use r2smt_ssa::{SsaLiftedSlice, ssa_convert};
+
+use crate::mem;
 
 /// Flags compared by the equivalence oracle. `OF` / `PF` are
 /// deliberately excluded: `r2smt_core::downgrade_for_unmodeled_flags`
@@ -168,23 +178,37 @@ pub fn build_equivalence_query(a: &[IrStmt], b: &[IrStmt], arch: Arch) -> Option
 
     let tainted_a = tainted_defs(&ssa_a)?;
     let tainted_b = tainted_defs(&ssa_b)?;
-    let finals_a = canonical_finals(&ssa_a, "A·", &tainted_a, arch);
-    let finals_b = canonical_finals(&ssa_b, "B·", &tainted_b, arch);
-    let condition = differ_condition(&finals_a, &finals_b)?;
+    let finals_a = canonical_finals(&ssa_a, "A·", &tainted_a.defs, arch);
+    let finals_b = canonical_finals(&ssa_b, "B·", &tainted_b.defs, arch);
 
     // No tie statements: `namespace_stmt` substitutes each register-typed
     // free input with its slice of the shared parent, so the two sides
     // already read one machine state and no name is ever declared twice.
-    let mut statements: Vec<IrStmt> = Vec::new();
+    let mut side_a: Vec<IrStmt> = Vec::new();
     for stmt in &ssa_a.statements {
-        statements.push(namespace_stmt(stmt, "A·", arch)?);
+        side_a.push(namespace_stmt(stmt, "A·", arch)?);
     }
+    let mut side_b: Vec<IrStmt> = Vec::new();
     for stmt in &ssa_b.statements {
-        statements.push(namespace_stmt(stmt, "B·", arch)?);
+        side_b.push(namespace_stmt(stmt, "B·", arch)?);
     }
+
+    // Memory is compiled away rather than modelled by the encoder, whose
+    // store list is one per slice and whose initial memory is minted per
+    // load — see the `mem` module for why both of those fabricate here.
+    let plan = mem::eliminate(
+        &side_a,
+        &side_b,
+        arch.pointer_bits(),
+        !tainted_a.memory && !tainted_b.memory,
+    )?;
+    let statements = plan.statements;
+
+    let condition = differ_condition(&finals_a, &finals_b, &plan.probes)?;
 
     let mut inputs: Vec<Var> = parents.into_values().collect();
     inputs.extend(none_inputs);
+    inputs.extend(plan.free_bytes);
     let defs: Vec<Var> = statements
         .iter()
         .filter_map(|s| match s {
@@ -212,12 +236,9 @@ pub fn build_equivalence_query(a: &[IrStmt], b: &[IrStmt], arch: Arch) -> Option
 /// disqualifying — it only taints the specific outputs it feeds (see
 /// [`tainted_defs`]); fully-modelled outputs are still compared.
 fn comparable(stmts: &[IrStmt]) -> bool {
-    !stmts.iter().any(|stmt| {
-        matches!(
-            stmt,
-            IrStmt::LoadMem { .. } | IrStmt::StoreMem { .. } | IrStmt::Unsupported { .. }
-        )
-    })
+    !stmts
+        .iter()
+        .any(|stmt| matches!(stmt, IrStmt::Unsupported { .. }))
 }
 
 /// Forward-propagate "this value is not fully modelled" taint over the
@@ -226,16 +247,49 @@ fn comparable(stmts: &[IrStmt]) -> bool {
 /// guarantees defs precede their uses, so a single forward pass
 /// reaches the fixed point. `None` if the recursion budget is
 /// exceeded (pathological IR — caller treats it as not comparable).
-fn tainted_defs(ssa: &SsaLiftedSlice) -> Option<BTreeSet<String>> {
-    let mut tainted: BTreeSet<String> = BTreeSet::new();
+fn tainted_defs(ssa: &SsaLiftedSlice) -> Option<Taint> {
+    let mut taint = Taint::default();
     for stmt in &ssa.statements {
-        if let IrStmt::Assign { dst, src } = stmt
-            && expr_is_tainted(src, &tainted, 0)?
-        {
-            tainted.insert(dst.name.clone());
+        match stmt {
+            IrStmt::Assign { dst, src } => {
+                if expr_is_tainted(src, &taint.defs, 0)? {
+                    taint.defs.insert(dst.name.clone());
+                }
+            }
+            // A load off an unknown address, or off a memory some
+            // unknown store already polluted, is not a modelled output.
+            IrStmt::LoadMem { dst, address, .. } => {
+                if taint.memory || expr_is_tainted(address, &taint.defs, 0)? {
+                    taint.defs.insert(dst.name.clone());
+                }
+            }
+            // Latching on the *side* rather than on a name: an unknown
+            // address could alias anything, so nothing this side stores
+            // afterwards is placed where the other side can be compared
+            // against it. Two independent `Expr::Unknown`s encode to two
+            // independent free variables, so comparing across that would
+            // fabricate.
+            IrStmt::StoreMem { address, value, .. } => {
+                if expr_is_tainted(address, &taint.defs, 0)?
+                    || expr_is_tainted(value, &taint.defs, 0)?
+                {
+                    taint.memory = true;
+                }
+            }
+            IrStmt::Unsupported { .. } | IrStmt::Nop => {}
         }
     }
-    Some(tainted)
+    Some(taint)
+}
+
+/// What one side's `Expr::Unknown`s have reached.
+#[derive(Debug, Default)]
+struct Taint {
+    /// Definitions whose value depends on an `Unknown`.
+    defs: BTreeSet<String>,
+    /// Set once an `Unknown` reached a store's address or value, after
+    /// which this side's memory state is not comparable at all.
+    memory: bool,
 }
 
 // Exhaustive `Expr` dispatch: FP arms mirror the BV arms' shape but stay separate for legibility (CLAUDE.md exhaustive-dispatch exception).
@@ -351,8 +405,27 @@ fn namespace_stmt(stmt: &IrStmt, pfx: &str, arch: Arch) -> Option<IrStmt> {
             src: namespace_expr(src, pfx, arch, 0)?,
         }),
         IrStmt::Nop => Some(IrStmt::Nop),
+        // Memory statements carry expressions too, and passing them
+        // through unchanged — as the old catch-all did, on the premise
+        // that `comparable` rejected them upstream — would leave both
+        // sides' load destinations sharing one name the moment memory
+        // became comparable.
+        IrStmt::LoadMem { dst, address, bits } => Some(IrStmt::LoadMem {
+            dst: namespace_var(dst, pfx),
+            address: namespace_expr(address, pfx, arch, 0)?,
+            bits: *bits,
+        }),
+        IrStmt::StoreMem {
+            address,
+            value,
+            bits,
+        } => Some(IrStmt::StoreMem {
+            address: namespace_expr(address, pfx, arch, 0)?,
+            value: namespace_expr(value, pfx, arch, 0)?,
+            bits: *bits,
+        }),
         // Rejected upstream by `comparable`; defensively pass through.
-        other => Some(other.clone()),
+        other @ IrStmt::Unsupported { .. } => Some(other.clone()),
     }
 }
 
@@ -669,6 +742,7 @@ fn final_defs(ssa: &SsaLiftedSlice) -> BTreeMap<String, Var> {
 fn differ_condition(
     finals_a: &BTreeMap<String, Expr>,
     finals_b: &BTreeMap<String, Expr>,
+    probes: &[(Var, Var)],
 ) -> Option<Expr> {
     let mut terms: Vec<Expr> = Vec::new();
     for (key, value_a) in finals_a {
@@ -676,6 +750,14 @@ fn differ_condition(
             continue;
         };
         terms.push(Expr::ne(value_a.clone(), value_b.clone()));
+    }
+    // Appended after the register / flag terms so their order — and so
+    // the rendered script for a memory-free slice — is unchanged.
+    for (probe_a, probe_b) in probes {
+        terms.push(Expr::ne(
+            Expr::Var(probe_a.clone()),
+            Expr::Var(probe_b.clone()),
+        ));
     }
     let mut iter = terms.into_iter();
     let first = iter.next()?;
@@ -720,7 +802,7 @@ fn tie_inputs(
     Some((parents, none_inputs))
 }
 
-fn coerce(expr: Expr, from_bits: u16, to_bits: u16) -> Expr {
+pub(crate) fn coerce(expr: Expr, from_bits: u16, to_bits: u16) -> Expr {
     use std::cmp::Ordering::{Equal, Greater, Less};
     match to_bits.cmp(&from_bits) {
         Equal => expr,
