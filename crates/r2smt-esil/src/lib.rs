@@ -24,3 +24,4 @@ pub mod machine;
 pub mod parse;
 
 pub use machine::{EsilError, EsilLift, lift_esil};
+pub use parse::assigns_without_flags;

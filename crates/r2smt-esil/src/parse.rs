@@ -77,6 +77,19 @@ pub fn tokenize(esil: &str) -> Vec<EsilToken> {
         .collect()
 }
 
+/// Whether `esil` writes a register **without** seeding the flag
+/// context — that is, whether it carries a `:=` token.
+///
+/// The one signal the ladder in `r2smt_slicer::lift` gates on. Keyed on
+/// the *text* rather than on a list of mnemonics deliberately: a closed
+/// mnemonic set is one a newer radare2 escapes, and the failure would be
+/// silent. Compared token by token rather than as a substring, because
+/// `,` is the only separator ESIL has.
+#[must_use]
+pub fn assigns_without_flags(esil: &str) -> bool {
+    esil.split(',').map(str::trim).any(|t| t == ":=")
+}
+
 fn classify(tok: &str) -> EsilToken {
     if let Some(rest) = tok.strip_prefix('$') {
         return EsilToken::Flag(rest.to_string());
@@ -121,27 +134,16 @@ fn classify(tok: &str) -> EsilToken {
         "!=" => EsilToken::NegAssign,
         "!" => EsilToken::Unary("!"),
         "=" => EsilToken::Assign,
-        // `:=` is **deliberately** still unlexed, so it stays an
-        // `Unknown` and the whole lift fails into the per-mnemonic
-        // handler. The machine models it already
-        // ([`EsilToken::AssignNoFlags`], `apply_assign(_, false)`) — what
-        // is missing is the *gate*, not the semantics.
+        // `:=` is `=` minus the seeding, and radare2 emits it for every
+        // flag write of every ISA — a plain `=` there would clobber the
+        // context the *next* flag token still has to read.
         //
-        // radare2 writes every flag of every ISA with `:=`, so lexing it
-        // moves the entire flag-setting population off the per-mnemonic
-        // handlers, which carry ~750 solver-backed contracts, and onto
-        // this machine, which has ~50 unit tests. Two measured facts make
-        // that unsafe on ARM specifically: r2's `a64 cmp` emits
-        // `64,$b,!,cf,:=`, i.e. ARM's architectural C, where this
-        // pipeline stores the *inverse* borrow polarity so one
-        // `lift_branch_condition` can serve both ISAs — every unsigned
-        // ARM branch would resolve to the other arm. And r2's own a64
-        // `subs` seeds through `x0,=`, so its carry is a function of
-        // whatever the destination held *before* the instruction; that
-        // is a bug in radare2 that a faithful implementation imports.
-        //
-        // The unblock therefore needs the override seam in
-        // `r2smt_slicer::lift::lift_instruction` first.
+        // Lexing it here does not put those instructions on this machine:
+        // [`assigns_without_flags`] is what
+        // `r2smt_slicer::lift::lift_instruction` consults to send them to
+        // the per-mnemonic handlers instead. That gate is where the
+        // decision lives, and this is only the vocabulary it needs.
+        ":=" => EsilToken::AssignNoFlags,
         "+=" => EsilToken::CompoundAssign("+"),
         "-=" => EsilToken::CompoundAssign("-"),
         "*=" => EsilToken::CompoundAssign("*"),

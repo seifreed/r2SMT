@@ -403,3 +403,53 @@ fn test_a_load_of_an_untouched_address_is_free_rather_than_zero() {
         SmtResult::BothPossible
     );
 }
+
+// ---------------------------------------------------------------------
+// `:=` — assignment without seeding.
+//
+// The operator radare2 writes every flag of every ISA with, and the one
+// the ladder in `r2smt_slicer::lift` gates on. What it *is* belongs
+// here; whether a flag-setting instruction may take the ESIL rung is a
+// separate decision one layer up.
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_an_unseeding_assignment_preserves_the_compare_context() {
+    // `==(equal) ; 1,rcx,:= ; $z` → 1. The write to `rcx` passes over
+    // the context untouched, so `$z` still describes the compare.
+    assert_eq!(
+        solve_esil(
+            "5,rax,==,1,rcx,:=,$z,zf,=",
+            &[("rax", 5, QWORD)],
+            ("ZF", 1),
+            1
+        ),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_a_seeding_assignment_overwrites_the_compare_context() {
+    // The same string with `=` instead answers 0, because the write of
+    // a non-zero value re-seeds. This pair is the entire difference
+    // between the two operators, and either one alone passes on an
+    // implementation that treats them as synonyms.
+    assert_eq!(
+        solve_esil(
+            "5,rax,==,1,rcx,=,$z,zf,=",
+            &[("rax", 5, QWORD)],
+            ("ZF", 1),
+            0
+        ),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_an_unseeding_assignment_still_writes_its_destination() {
+    // It is an assignment, not a no-op: only the seeding differs.
+    assert_eq!(
+        solve_esil("0x33,rcx,:=", &[("rcx", 0x11, QWORD)], ("rcx", QWORD), 0x33),
+        SmtResult::AlwaysTrue
+    );
+}

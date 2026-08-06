@@ -740,7 +740,29 @@ impl LiftCtx {
         // rather than a lost one. Falling through costs nothing where
         // the emptiness is genuine: `nop` has an empty ESIL string and
         // the per-mnemonic dispatch already steps over it.
+        // Flag-setting gate. radare2 writes every flag of every ISA with
+        // `:=`, which the ESIL machine now lexes — so without this the
+        // whole flag-setting population of the corpus would move off the
+        // per-mnemonic handlers, which carry ~750 solver-backed
+        // contracts, and onto that machine, which has ~26.
+        //
+        // It gates *this rung only*, deliberately: the P-code rung above
+        // has nothing to do with the ESIL machine and keeps its
+        // precedence. And it is keyed on the ESIL **text** rather than on
+        // a list of mnemonics, because a closed set is one a newer
+        // radare2 escapes without a sound.
+        //
+        // On ARM this is permanent, for two measured reasons. `a64 cmp`
+        // emits `64,$b,!,cf,:=` — ARM's architectural `C` — where this
+        // pipeline stores the *inverse*, borrow polarity, so that one
+        // `lift_branch_condition` can serve both ISAs; a faithful `:=`
+        // would write the raw carry and **every unsigned ARM branch would
+        // resolve to the other arm**. And r2's own a64 `subs` seeds its
+        // carry through `x0,=`, so the value depends on whatever the
+        // destination held before the instruction — a radare2 bug that a
+        // faithful implementation would import.
         if let Some(esil) = insn.esil.as_deref()
+            && !r2smt_esil::assigns_without_flags(esil)
             && let Ok(lift) = r2smt_esil::lift_esil(esil, self.arch)
             && !lift.statements.is_empty()
         {

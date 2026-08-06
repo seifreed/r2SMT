@@ -559,23 +559,36 @@ fn the_arm_flag_names_do_not_disturb_x86() {
 }
 
 #[test]
-fn the_arm_flag_writing_operator_is_still_unsupported() {
-    // What the mapping above does *not* buy, stated so nobody reads its
-    // presence as coverage. radare2 writes ARM flags with `:=` — the
-    // whole tail of `ands r0, r1, r2` is
-    // `…,$z,zf,:=,31,$s,nf,:=` — and this machine has no such token, so
-    // the lift fails and the ladder falls through to the per-mnemonic
-    // handler for **every flag-setting ARM instruction**.
+fn the_flag_writing_operator_assigns_without_seeding() {
+    // `:=` is `=` minus the seeding, which is exactly why radare2 uses
+    // it for flag writes: a plain `=` would clobber the context the next
+    // flag token still has to read.
     //
-    // Supporting it is not just a parser entry: ARM's ESIL writes ARM's
-    // own `C` into `cf`, while this pipeline stores its inverse (see
-    // `aarch32_carry_convention_contracts.rs`), so the bridge would
-    // need to invert on the ARM path before that family may lift here.
-    let err = lift_esil("1,rax,:=", Arch::Arm).expect_err("`:=` is unsupported");
-    assert!(
-        matches!(err, EsilError::UnknownToken(ref t) if t == ":="),
-        "{err:?}"
-    );
+    // The `$z` here reads the context the `==` left, *through* an
+    // intervening `:=`. A `:=` that seeded would leave `$z` describing
+    // the write to `rcx` instead; a `:=` that did not lift at all would
+    // decline the whole string. The value difference between the two is
+    // pinned with a solver in `esil_operator_contracts.rs`.
+    let lift = lift_esil("5,rax,==,1,rcx,:=,$z,zf,=", Arch::Aarch64).expect("lift ok");
+    match lift.statements.last() {
+        Some(IrStmt::Assign { dst, .. }) => assert_eq!(dst.name, "ZF"),
+        other => panic!("expected a flag Assign, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_flag_writing_string_is_recognised_by_its_text_and_not_its_mnemonic() {
+    // Lexing `:=` is only the vocabulary; the decision of whether a
+    // flag-setting instruction may lift here at all lives one layer up,
+    // in `r2smt_slicer::lift::lift_instruction`, and it gates on this
+    // predicate. Keyed on the text so a newer radare2 emitting `:=` for
+    // some mnemonic nobody listed cannot slip past it.
+    assert!(crate::assigns_without_flags(
+        "x1,x0,==,$z,zf,:=,63,$s,nf,:="
+    ));
+    // A bare `=` is not it, and neither is a register whose name merely
+    // contains the characters.
+    assert!(!crate::assigns_without_flags("x2,x1,-,x0,="));
 }
 
 /// Fold a constant-only expression, covering exactly the operators the
