@@ -24,7 +24,7 @@ use r2smt_ir::program::Function;
 use r2smt_report::Report;
 use r2smt_slicer::SliceLimits;
 use r2smt_smt::SolveOptions;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use tracing_subscriber::EnvFilter;
 
 mod args;
@@ -1074,6 +1074,7 @@ fn run_differential_lift(
                         });
                         stats.record(verdict);
                         if verdict == r2smt_difflift::DiffVerdict::Disagree {
+                            dump_disagreement(insn, bodies[i].0, sa, *lb, sb);
                             disagreeing.push(format!(
                                 "{a} vs {b}",
                                 a = bodies[i].0.as_str(),
@@ -1111,6 +1112,45 @@ fn run_differential_lift(
         compared,
         truncated,
     }
+}
+
+/// Emit both disagreeing lowerings side by side for triage.
+///
+/// The finding carries only which two engines disagreed, which names
+/// the symptom; deciding *whose* bug it is means reading the two IR
+/// trees against the architecture manual, and every attribution of the
+/// four currently-known disagreements was made that way. This is a
+/// `debug!` and not a flag because the observability contract already
+/// owns the question — full content lives at `debug`/`trace` — and
+/// `RUST_LOG=r2smt::difflift=debug` is the switch that already exists.
+fn dump_disagreement(
+    insn: &r2smt_ir::program::Instruction,
+    lowering_a: r2smt_difflift::Lowering,
+    a: &[r2smt_ir::IrStmt],
+    lowering_b: r2smt_difflift::Lowering,
+    b: &[r2smt_ir::IrStmt],
+) {
+    debug!(
+        target: "r2smt::difflift",
+        address = %insn.address,
+        mnemonic = %insn.mnemonic,
+        thumb = insn.is_thumb,
+        esil = insn.esil.as_deref().unwrap_or("<none>"),
+        "{a_name}:\n{a_body}\n{b_name}:\n{b_body}",
+        a_name = lowering_a.as_str(),
+        a_body = render_lowering(a),
+        b_name = lowering_b.as_str(),
+        b_body = render_lowering(b),
+    );
+}
+
+/// One IR statement per line, indented, for the triage dump.
+fn render_lowering(statements: &[r2smt_ir::IrStmt]) -> String {
+    statements
+        .iter()
+        .map(|s| format!("    {s}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Resolve one pairwise lowering comparison. A solver-backend error
