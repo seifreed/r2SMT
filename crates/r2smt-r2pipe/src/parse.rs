@@ -148,8 +148,9 @@ pub fn parse_function_blocks_opt(json: &str) -> Result<Option<Function>> {
         });
     }
 
-    it_block::fold_it_blocks(&mut blocks);
-
+    // The IT-block fold is deliberately *not* here: it only acts on
+    // instructions already known to be Thumb, and nothing on this path
+    // knows that yet. It runs from [`mark_thumb`].
     Ok(Some(Function {
         address: Address(func.addr),
         name: func.name,
@@ -178,6 +179,18 @@ pub fn parse_function_blocks_opt(json: &str) -> Result<Option<Function>> {
 /// **mixed** file and was measured to be: marking every function Thumb
 /// because `ij` says 16 fixes the Thumb functions and breaks the ARM
 /// ones, trading one set of disagreements for another.
+///
+/// **The IT-block fold runs from here, and that ordering is the whole
+/// point.** `it_block_conditions` answers `None` for an instruction that
+/// is not Thumb, so folding before Thumb state is known is a no-op that
+/// looks like a pass. It sat inside [`parse_function_blocks_opt`] — i.e.
+/// strictly before this function — and the contract covering it only
+/// went green because its fixture fabricated the `bits` field the
+/// parser no longer reads. An unfolded `it` leaves radare2's
+/// last-covered instruction spelled without its condition suffix, which
+/// lifts as an *unconditional* assignment and can carry a slice to
+/// `Complete` without ever visiting the `it` that should have truncated
+/// it: a fabricated verdict, which is why the fold exists at all.
 pub fn mark_thumb(func: &mut Function) {
     func.is_thumb = true;
     for block in &mut func.blocks {
@@ -185,6 +198,7 @@ pub fn mark_thumb(func: &mut Function) {
             insn.is_thumb = true;
         }
     }
+    it_block::fold_it_blocks(&mut func.blocks);
 }
 
 /// Strict variant of [`parse_function_blocks_opt`] for callers that

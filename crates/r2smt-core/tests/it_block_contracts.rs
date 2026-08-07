@@ -19,7 +19,7 @@ use r2smt_common::{Address, Arch};
 use r2smt_core::prepare_ssa;
 use r2smt_ir::program::Function;
 use r2smt_ir::stmt::IrStmt;
-use r2smt_r2pipe::parse::parse_function_blocks;
+use r2smt_r2pipe::parse::{mark_thumb, parse_function_blocks};
 use r2smt_slicer::{SliceLimits, SliceStatus, collect_function_branches};
 use r2smt_smt::solve_branch;
 
@@ -66,7 +66,13 @@ fn solve_opts() -> SolveOptions {
 }
 
 fn function() -> Function {
-    parse_function_blocks(ITE_AGFJ).unwrap()
+    // Thumb arrives from `aflj` via `mark_thumb`, never from `agfj` —
+    // which emits no width hint at all. This fixture used to carry a
+    // fabricated `"bits": 16` and rely on the parser honouring it, so it
+    // exercised a path production never takes.
+    let mut function = parse_function_blocks(ITE_AGFJ).unwrap();
+    mark_thumb(&mut function);
+    function
 }
 
 /// Slice, lift, SSA-rename and solve the sole conditional branch.
