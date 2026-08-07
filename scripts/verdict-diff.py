@@ -18,6 +18,12 @@ Two rules make the measurement mean anything, both learned the hard way:
   eliminating it: a branch sitting exactly on the resource boundary has
   been observed moving between two runs of an unchanged binary.
 
+  Since 2026-08-07 `--rlimit 2000000` is the *default*, so passing it is
+  now redundant rather than essential. It stays spelled out in the recipe
+  above anyway: a diff that only works when the default happens to agree
+  with it is a diff waiting to be wrong. `--rlimit 0` restores the old
+  wall-clock-only behaviour.
+
   Read that rule precisely, because the obvious reading is wrong:
   `--rlimit` does **not** replace the wall clock. `batch` applies both
   budgets, and omitting `--timeout-ms` leaves it at its 500 ms default

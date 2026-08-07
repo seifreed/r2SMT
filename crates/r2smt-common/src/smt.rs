@@ -48,22 +48,35 @@ pub struct SolveOptions {
     /// the determinism intent and guards against upstream drift).
     pub random_seed: u32,
     /// Z3 deterministic resource limit (the `rlimit` parameter): a
-    /// load-independent unit-of-work bound. `0` (default) leaves it
-    /// unset, so the wall-clock `timeout_ms` path is byte-identical to
-    /// before unless a caller opts in. When `> 0` the budget no longer
-    /// depends on host load, so the `Unknown → Timeout` classification
-    /// stops flickering between runs under contention.
+    /// load-independent unit-of-work bound. `0` leaves it unset, so the
+    /// only budget is the wall clock and the verdict then depends on
+    /// host load — the same branch classifies `real_branch` on an idle
+    /// machine and `suspicious_but_unknown` on a busy one.
+    ///
+    /// Defaults to [`DEFAULT_RLIMIT`] rather than to `0` since
+    /// 2026-08-07. Read the trade precisely, because it is not a
+    /// widening: this is a *second* budget applied alongside
+    /// `timeout_ms`, so it can only ever make fewer branches decide, not
+    /// more. What it buys is that which ones stop deciding no longer
+    /// depends on what else the host was doing.
     pub rlimit: u32,
 }
 
+/// Deterministic solver budget applied by default, in Z3 resource
+/// units.
+///
+/// The value every measurement on this branch already used, so a run
+/// with no flags and a diff taken per the `CLAUDE.md` recipe now agree
+/// instead of silently measuring two different things.
+pub const DEFAULT_RLIMIT: u32 = 2_000_000;
+
 impl Default for SolveOptions {
     fn default() -> Self {
-        // `timeout_ms` matches SPEC.md §5.6; `random_seed` / `rlimit`
-        // defaults preserve the pre-P24 observable behaviour.
+        // `timeout_ms` matches SPEC.md §5.6.
         Self {
             timeout_ms: 500,
             random_seed: 0,
-            rlimit: 0,
+            rlimit: DEFAULT_RLIMIT,
         }
     }
 }
