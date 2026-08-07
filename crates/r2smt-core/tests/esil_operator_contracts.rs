@@ -694,3 +694,109 @@ fn test_the_arm_carry_is_stored_as_its_complement() {
         SmtResult::AlwaysTrue
     );
 }
+
+// ---------------------------------------------------------------------
+// The comparators. `machine.rs` implements `>` and `>=` by *swapping*
+// operands rather than by a distinct node, and nothing pinned either
+// that swap or the signedness. Every expectation below was measured on
+// r2 6.1.8, with the `"…"` quoting that `>` / `>=` require.
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_the_less_than_takes_the_second_token_as_the_left_hand_side() {
+    // `ae 4,10,<` → 0, i.e. `10 < 4` and never `4 < 10`.
+    assert_eq!(
+        solve_esil("4,10,<,rax,=", &[], ("rax", QWORD), 0),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_the_less_than_is_signed_and_not_unsigned() {
+    // `ae 1,0x8000000000000000,<` → 1. Signed, `INT64_MIN < 1` holds;
+    // read unsigned the same bits are the largest value there is and the
+    // answer flips. A whole half of the number line, silently.
+    assert_eq!(
+        solve_esil("1,0x8000000000000000,<,rax,=", &[], ("rax", QWORD), 1),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_the_less_or_equal_admits_equality_where_less_than_does_not() {
+    // `ae 7,7,<=` → 1 against `ae 7,7,<` → 0. The boundary is the only
+    // thing separating the two arms.
+    assert_eq!(
+        solve_esil("7,7,<=,rax,=", &[], ("rax", QWORD), 1),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_the_less_or_equal_is_signed_and_not_unsigned() {
+    assert_eq!(
+        solve_esil("1,0x8000000000000000,<=,rax,=", &[], ("rax", QWORD), 1),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_the_greater_than_takes_the_second_token_as_the_left_hand_side() {
+    // `ae 4,10,>` → 1. This is the operand swap; inverted it answers 0.
+    assert_eq!(
+        solve_esil("4,10,>,rax,=", &[], ("rax", QWORD), 1),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_the_greater_than_is_signed_and_not_unsigned() {
+    // `ae 1,0x8000000000000000,>` → 0.
+    assert_eq!(
+        solve_esil("1,0x8000000000000000,>,rax,=", &[], ("rax", QWORD), 0),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_the_greater_or_equal_admits_equality_where_greater_than_does_not() {
+    // `ae 7,7,>=` → 1 against `ae 7,7,>` → 0.
+    assert_eq!(
+        solve_esil("7,7,>=,rax,=", &[], ("rax", QWORD), 1),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_the_greater_or_equal_is_signed_and_not_unsigned() {
+    assert_eq!(
+        solve_esil("1,0x8000000000000000,>=,rax,=", &[], ("rax", QWORD), 0),
+        SmtResult::AlwaysTrue
+    );
+}
+
+// ---------------------------------------------------------------------
+// `!=` — the negating assignment. radare2's own help calls it "negate
+// all bits", which is wrong: `ar rax=0x0f; ae rax,!=` leaves 0, not
+// 0xfffffffffffffff0. It is a logical NOT written back to the register.
+// The semantics were corrected against the tool and then had no test.
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_the_negating_assignment_is_a_logical_not_and_not_a_bit_complement() {
+    // A bit complement of 0x0f would be 0xfffffffffffffff0.
+    assert_eq!(
+        solve_esil("rax,!=", &[("rax", 0x0f, QWORD)], ("rax", QWORD), 0),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_the_negating_assignment_turns_zero_into_one() {
+    // The other half: without it a "write zero" implementation passes
+    // the test above and is still wrong.
+    assert_eq!(
+        solve_esil("rax,!=", &[("rax", 0, QWORD)], ("rax", QWORD), 1),
+        SmtResult::AlwaysTrue
+    );
+}

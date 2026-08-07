@@ -465,10 +465,15 @@ impl Machine {
             "<<" => Expr::shl(lhs_e.clone(), rhs_e.clone()),
             ">>" => Expr::lshr(lhs_e.clone(), rhs_e.clone()),
             "==" => Expr::eq(lhs_e, rhs_e),
-            "<" => Expr::ult(lhs_e, rhs_e),
-            "<=" => Expr::ule(lhs_e, rhs_e),
-            ">" => Expr::ult(rhs_e, lhs_e),
-            ">=" => Expr::ule(rhs_e, lhs_e),
+            // Signed, measured against r2 6.1.8 and not assumed:
+            // `ae 1,0x8000000000000000,<` answers 1, so the machine reads
+            // those bits as `INT64_MIN` and not as the largest unsigned
+            // value. Read unsigned, every comparison with the high bit
+            // set flips — half the number line, silently.
+            "<" => Expr::slt(lhs_e, rhs_e),
+            "<=" => Expr::sle(lhs_e, rhs_e),
+            ">" => Expr::slt(rhs_e, lhs_e),
+            ">=" => Expr::sle(rhs_e, lhs_e),
             _ => return Err(EsilError::UnknownToken(op.to_string())),
         };
         // Deliberately seeds nothing. `ae 0x81,1,-,7,$s` leaves the

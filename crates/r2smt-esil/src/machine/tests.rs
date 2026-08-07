@@ -618,8 +618,18 @@ fn eval_const(expr: &Expr) -> Option<u128> {
         Expr::LShr(a, b) => Some(eval_const(a)? >> eval_const(b)?),
         Expr::Ult(a, b) => Some(u128::from(eval_const(a)? < eval_const(b)?)),
         Expr::Ule(a, b) => Some(u128::from(eval_const(a)? <= eval_const(b)?)),
+        Expr::Slt(a, b) => Some(u128::from(as_i64(eval_const(a)?) < as_i64(eval_const(b)?))),
+        Expr::Sle(a, b) => Some(u128::from(as_i64(eval_const(a)?) <= as_i64(eval_const(b)?))),
         _ => None,
     }
+}
+
+/// Read a 64-bit constant's bits as a signed value, for the comparator
+/// arms above. The operands in this file are all small positives, where
+/// signed and unsigned agree — the distinction is pinned by solver
+/// contracts in `r2smt-core`, which can bind the sign bit.
+fn as_i64(value: u128) -> i64 {
+    u64::try_from(value).unwrap_or(u64::MAX).cast_signed()
 }
 
 #[test]
