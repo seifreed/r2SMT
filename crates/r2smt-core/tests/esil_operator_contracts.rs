@@ -592,3 +592,47 @@ fn test_the_destination_itself_is_written_once() {
         SmtResult::AlwaysTrue
     );
 }
+
+// ---------------------------------------------------------------------
+// The width a comparison seeds its context at.
+//
+// radare2 spells every immediate as a `ut64`, so `cmp ecx, 0xffffffff`
+// arrives as `18446744073709551615,ecx,==`. Taking the operation width
+// as the wider of the two operands lets that spelling decide the
+// semantics, and the machine then asked whether a zero-extended `ecx`
+// could equal `2^64 - 1` — unsatisfiable, so `ZF` was a constant zero
+// where the architecture sets it. Found by the differential harness on
+// six real `cmp` sites of one x86-64 sample, five of them against
+// memory.
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_a_comparison_seeds_at_the_destination_width_not_the_immediate_spelling() {
+    // The real string from `cmp ecx, 0xffffffff`. `ecx` holding
+    // `0xffffffff` *is* equal to the immediate at 32 bits, so `ZF` is 1.
+    assert_eq!(
+        solve_esil(
+            "18446744073709551615,ecx,==,$z,zf,:=",
+            &[("rcx", 0xffff_ffff, QWORD)],
+            ("ZF", 1),
+            1
+        ),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_a_comparison_at_the_destination_width_ignores_the_parent_above_it() {
+    // The other direction, so the fix cannot be "answer 1 regardless":
+    // bits 63..32 of the parent are outside a 32-bit compare, and `ecx`
+    // is zero here.
+    assert_eq!(
+        solve_esil(
+            "18446744073709551615,ecx,==,$z,zf,:=",
+            &[("rcx", 0xffff_ffff_0000_0000, QWORD)],
+            ("ZF", 1),
+            0
+        ),
+        SmtResult::AlwaysTrue
+    );
+}

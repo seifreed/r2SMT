@@ -187,6 +187,26 @@ impl StackValue {
             StackValue::Expression { expr, .. } => expr,
         }
     }
+
+    /// The width this operand carries *architecturally*, as opposed to
+    /// the width it happens to be spelled at.
+    ///
+    /// A register read and a memory read carry one; a bare constant does
+    /// not, because radare2 spells every immediate as a `ut64` whatever
+    /// the operand size is — `cmp dword [rbx], 0xffffffff` comes back as
+    /// `18446744073709551615,rbx,[4],==`. Letting that spelling decide
+    /// the operation width is what made `$z` compare a 32-bit value
+    /// against a 64-bit `-1` and answer *never equal*.
+    fn architectural_bits(&self) -> Option<u16> {
+        match self {
+            StackValue::Register(reg) => Some(reg.bits()),
+            StackValue::Expression {
+                expr: Expr::Const { .. },
+                ..
+            } => None,
+            StackValue::Expression { bits, .. } => Some(*bits),
+        }
+    }
 }
 
 /// A register operand: the variable a read and a write actually touch,
@@ -636,10 +656,24 @@ impl Machine {
     /// so the comparison is a pure seeding operation. Modelling it as a
     /// binary operator that pushes a boolean left a residue the next
     /// token would consume as an operand — a wrong value, not a decline.
+    ///
+    /// The context's width is the **destination's**, falling back to the
+    /// source's and only then to the spelled widths. `cmp` compares at
+    /// its destination's width and sign-extends the source into it, and
+    /// radare2 agrees: `esil_cmp` takes `lastsz` from whichever operand
+    /// resolves to a register, preferring the first popped. Taking
+    /// `max(lhs, rhs)` instead let a 64-bit immediate widen a 32-bit
+    /// comparison, so `cmp ecx, 0xffffffff` asked whether a zero-extended
+    /// `ecx` equalled `2^64 - 1` and answered *never* — an unsatisfiable
+    /// `ZF` where the architecture sets it for `ecx == 0xffffffff`, and a
+    /// following `jz` resolving to a branch the machine does take.
     fn apply_compare(&mut self) -> Result<(), EsilError> {
         let lhs = self.pop("compare lhs")?;
         let rhs = self.pop("compare rhs")?;
-        let bits = lhs.bits().max(rhs.bits());
+        let bits = lhs
+            .architectural_bits()
+            .or_else(|| rhs.architectural_bits())
+            .unwrap_or_else(|| lhs.bits().max(rhs.bits()));
         let lhs_e = widen(lhs, bits);
         let rhs_e = widen(rhs, bits);
         self.flag_ctx = Some(FlagCtx {
