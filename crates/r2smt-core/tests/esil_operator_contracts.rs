@@ -76,7 +76,17 @@ fn solve_esil(
     observed: (&str, u16),
     expected: u128,
 ) -> SmtResult {
-    let lifted = lift_esil(esil, Arch::X86_64)
+    solve_esil_arch(esil, Arch::X86_64, bindings, observed, expected)
+}
+
+fn solve_esil_arch(
+    esil: &str,
+    arch: Arch,
+    bindings: &[(&str, u128, u16)],
+    observed: (&str, u16),
+    expected: u128,
+) -> SmtResult {
+    let lifted = lift_esil(esil, arch)
         .unwrap_or_else(|e| panic!("`{esil}` must lift, got {e:?}"))
         .statements;
     assert!(!lifted.is_empty(), "`{esil}` lifted to nothing");
@@ -97,7 +107,7 @@ fn solve_esil(
         ),
         status: SliceStatus::Complete,
         treat_truncation_as_inputs: false,
-        arch: Arch::X86_64,
+        arch,
     };
     solve_branch(&ssa_convert(&slice), solve_opts())
 }
@@ -632,6 +642,54 @@ fn test_a_comparison_at_the_destination_width_ignores_the_parent_above_it() {
             &[("rcx", 0xffff_ffff_0000_0000, QWORD)],
             ("ZF", 1),
             0
+        ),
+        SmtResult::AlwaysTrue
+    );
+}
+
+// ---------------------------------------------------------------------
+// AArch64. Two rules the machine did not have, both found by the
+// differential harness on one sample and both *reachable in production*
+// on this ISA in the first case: `mov x8, xzr` carries no `:=`, so its
+// ESIL wins the ladder over the per-mnemonic handler.
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_the_zero_register_reads_as_zero_rather_than_a_free_value() {
+    // `mov x8, xzr` is how AArch64 spells "zero this register", and its
+    // ESIL is a plain `xzr,x8,=`. Resolving `xzr` as an ordinary
+    // variable left `x8` free, so `mov x0, xzr; cbz x0, …` — the opaque
+    // predicate the per-mnemonic path resolves precisely — came back
+    // `BothPossible`. 142 of 234 disagreements on one sample.
+    assert_eq!(
+        solve_esil_arch(
+            "xzr,x8,=",
+            Arch::Aarch64,
+            &[("x8", u128::from(u64::MAX), QWORD)],
+            ("x8", QWORD),
+            0
+        ),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_the_arm_carry_is_stored_as_its_complement() {
+    // The real `cmp x9, x0` string. radare2 writes ARM's architectural
+    // `C` — here `!borrow` — and this pipeline stores the complement so
+    // one `lift_branch_condition` can serve both ISAs. With `x9 < x0`
+    // unsigned the architecture clears `C`, so the stored bit is 1.
+    //
+    // Getting this wrong inverts the branch rather than losing it: a
+    // `b.hs` after the compare resolves to the arm the machine does not
+    // take. 77 of the 92 remaining disagreements on that sample.
+    assert_eq!(
+        solve_esil_arch(
+            "x0,x9,==,$z,zf,:=,63,$s,nf,:=,64,$b,!,cf,:=",
+            Arch::Aarch64,
+            &[("x9", 1, QWORD), ("x0", 2, QWORD)],
+            ("CF", 1),
+            1
         ),
         SmtResult::AlwaysTrue
     );

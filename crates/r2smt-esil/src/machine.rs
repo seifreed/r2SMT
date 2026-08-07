@@ -23,7 +23,7 @@
 //! on success.
 
 use r2smt_common::Arch;
-use r2smt_common::registers::{is_simd_parent, register_layout};
+use r2smt_common::registers::{is_simd_parent, is_zero_parent, register_layout};
 use r2smt_ir::expr::{Expr, Var};
 use r2smt_ir::stmt::IrStmt;
 
@@ -232,6 +232,12 @@ struct RegRef {
     /// (the `x86_64` / `AArch64` 32-bit-alias rule) rather than
     /// preserving the bits around the slice.
     zero_extends: bool,
+    /// Whether this names the ISA's hardwired zero register, which reads
+    /// as the constant zero and discards its writes.
+    zero: bool,
+    /// Whether the pipeline stores the complement of what radare2 puts in
+    /// this register, so every read and every write flips a bit.
+    invert: bool,
 }
 
 impl RegRef {
@@ -243,6 +249,8 @@ impl RegRef {
             lo: 0,
             hi,
             zero_extends: false,
+            zero: false,
+            invert: false,
         }
     }
 
@@ -255,17 +263,29 @@ impl RegRef {
     }
 
     fn read(&self) -> Expr {
+        if self.zero {
+            return Expr::konst(0, self.bits());
+        }
         let parent = Expr::Var(self.var.clone());
-        if self.covers_whole_var() {
+        let value = if self.covers_whole_var() {
             parent
         } else {
             Expr::extract(parent, self.hi, self.lo)
+        };
+        if self.invert {
+            return Expr::bv_xor(value, Expr::konst(1, self.bits()));
         }
+        value
     }
 
     /// The whole-variable expression a write of `value` — already at
     /// [`RegRef::bits`] — leaves behind.
     fn write(&self, value: Expr) -> Expr {
+        let value = if self.invert {
+            Expr::bv_xor(value, Expr::konst(1, self.bits()))
+        } else {
+            value
+        };
         if self.covers_whole_var() {
             return value;
         }
@@ -339,8 +359,23 @@ impl Machine {
                     _ => name.as_str(),
                 }
                 .to_string();
-                self.stack
-                    .push(StackValue::Register(self.register_ref(&canonical)));
+                let mut reg = self.register_ref(&canonical);
+                // …and `CF` is where it does *not* match directly. This
+                // pipeline deliberately stores the **complement** of
+                // ARM's `C`, so that one `lift_branch_condition` serves
+                // both ISAs (`cs`/`hs` lowers to `CF == 0`), and the
+                // convention binds every producer. radare2 writes the
+                // architectural `C` — `cmp` emits `32,$b,!,cf,:=` and
+                // a64 `ands`/`tst` emit `0,cf,:=` — so this machine has
+                // to flip it on the way in and back on the way out.
+                //
+                // Without the flip a `b.hs` after an ESIL-lifted `cmp`
+                // resolves to the arm the machine does not take: an
+                // inverted branch, not a lost one. It is why the
+                // `--esil-flags` gate excludes ARM, and it is exactly
+                // what the gate has to stop being true of.
+                reg.invert = canonical == "CF" && matches!(self.arch, Arch::Aarch64 | Arch::Arm);
+                self.stack.push(StackValue::Register(reg));
                 Ok(())
             }
             EsilToken::Flag(suffix) => self.apply_flag(&suffix),
@@ -571,10 +606,16 @@ impl Machine {
         if seeds_flags {
             self.seed_flag_ctx(&target_reg, &final_expr);
         }
-        self.statements.push(IrStmt::Assign {
-            dst: target_reg.var.clone(),
-            src: target_reg.write(final_expr),
-        });
+        // A write to the zero register is discarded, and the flags it
+        // seeds are not: `subs xzr, x0, x1` *is* `cmp`, so dropping the
+        // seed would lose the comparison and dropping the discard would
+        // invent a variable the machine does not have.
+        if !target_reg.zero {
+            self.statements.push(IrStmt::Assign {
+                dst: target_reg.var.clone(),
+                src: target_reg.write(final_expr),
+            });
+        }
         Ok(())
     }
 
@@ -781,6 +822,8 @@ impl Machine {
                 lo: layout.lo,
                 hi: layout.hi,
                 zero_extends: layout.zero_extends_parent_64 && parent_bits == 64,
+                zero: is_zero_parent(layout.parent, self.arch),
+                invert: false,
             };
         }
         let bits = register_width(name, self.arch).unwrap_or(parent_bits);

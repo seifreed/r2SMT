@@ -144,6 +144,27 @@ pub const fn simd_parent_bits(arch: Arch) -> Option<u16> {
     }
 }
 
+/// Whether `parent` names the ISA's hardwired zero register, whose read
+/// is the constant zero and whose write is discarded.
+///
+/// Only `AArch64` has one. Like [`is_simd_parent`] this takes the
+/// *resolved* parent, so it answers for `wzr` as well as `xzr` without a
+/// second name table.
+///
+/// It lives here rather than in either lifter because both need it and
+/// they sit on opposite sides of the `slicer → esil` dependency edge —
+/// the same reason the layout tables themselves moved down. Spelling the
+/// rule a second time in the ESIL machine is what left `mov x8, xzr`
+/// lifting to a free value there while the per-mnemonic handlers folded
+/// it to zero.
+#[must_use]
+pub fn is_zero_parent(parent: &str, arch: Arch) -> bool {
+    match arch {
+        Arch::Aarch64 => parent == "xzr",
+        Arch::X86 | Arch::X86_64 | Arch::Arm => false,
+    }
+}
+
 /// Whether `parent` names a vector register parent under `arch`.
 ///
 /// Checked against the *resolved* parent rather than the operand text,
