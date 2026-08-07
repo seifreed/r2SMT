@@ -6030,3 +6030,43 @@ fn an_esil_operator_parsed_as_a_register_no_longer_shadows_the_handler() {
         lifted.statements
     );
 }
+
+#[test]
+fn aarch32_thumb_pc_as_a_data_operand_is_not_word_aligned() {
+    // The architecture splits the two: `Align(PC, 4)` belongs to the
+    // literal forms — `LDR (literal)`, `ADR` — while `ADD Rd, Rn, PC`
+    // reads `R[15]` raw. At 0x5e2 that is 0x5e6 (1510); aligning gives
+    // 0x5e4, a wrong address two bytes off rather than a decline.
+    //
+    // Only visible in Thumb at an address that is not itself
+    // word-aligned, which is why it hid behind the literal case: in ARM
+    // state every instruction sits on a word and the mask is a no-op.
+    let mut thumb = insn(0x5e2, 2, "add", vec![reg("r1"), reg("pc")]);
+    thumb.is_thumb = true;
+    let stmts = lift_per_mnemonic(&thumb, Arch::Arm);
+    assert!(
+        stmts.iter().any(|s| format!("{s:?}").contains("1510")),
+        "{stmts:?}"
+    );
+}
+
+#[test]
+fn aarch32_thumb_pc_in_a_literal_access_stays_word_aligned() {
+    // The other half of the split, at the *same* unaligned address, so
+    // the pair pins the distinction rather than one side of it: the
+    // literal form must still read Align(0x5e6, 4) = 0x5e4 (1508).
+    let mut thumb = insn(
+        0x5e2,
+        2,
+        "ldr",
+        vec![reg("r1"), op("[pc]", OperandKind::Memory)],
+    );
+    thumb.is_thumb = true;
+    let stmts = lift_per_mnemonic(&thumb, Arch::Arm);
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s, IrStmt::LoadMem { address, .. } if format!("{address:?}").contains("1508"))),
+        "{stmts:?}"
+    );
+}

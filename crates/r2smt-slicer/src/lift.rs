@@ -694,9 +694,24 @@ impl LiftCtx {
     /// The value an `AArch32` `pc` read answers at the current
     /// instruction: its own address plus 8 (ARM) or 4 (Thumb), aligned
     /// down to a word. ARM ARM Vol. C §A2.3.
+    /// `AArch32`'s `pc` as read by a **data** operand: this
+    /// instruction's address plus a fixed distance, and *not*
+    /// word-aligned.
+    ///
+    /// That is the whole difference from the addressing model's
+    /// [`crate::lift::aarch32::aarch32_pc_value`], which does align, and
+    /// the architecture makes exactly this split: `Align(PC, 4)` belongs
+    /// to the literal forms — `LDR (literal)`, `ADR`, the PC-relative
+    /// immediates — while `ADD Rd, Rn, PC` reads `R[15]` raw.
+    ///
+    /// It shows only in Thumb, and only at an address that is not itself
+    /// word-aligned, which is why it hid: in ARM state every instruction
+    /// sits on a word so the mask is a no-op. At `0x5e2`, `add r1, pc`
+    /// reads `0x5e6`, and masking answered `0x5e4` — two bytes off, a
+    /// wrong address rather than a lost one.
     fn cur_pc_value(&self) -> u64 {
         let ahead = if self.cur_is_thumb { 4 } else { 8 };
-        self.cur_addr.0.wrapping_add(ahead) & !3
+        self.cur_addr.0.wrapping_add(ahead)
     }
 
     fn allows_esil_flags(&self) -> bool {

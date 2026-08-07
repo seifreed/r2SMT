@@ -736,3 +736,42 @@ fn test_split_disasm_splits_plain_operands_at_top_level() {
     assert_eq!(ops[0].raw, "x0");
     assert_eq!(ops[2].raw, "x2");
 }
+
+#[test]
+fn parse_function_list_reads_thumb_state_from_aflj_bits() {
+    // The only source r2 6.1.8 offers that is both present and right.
+    // `agfj` omits `bits` entirely, so the per-function hint the block
+    // parser reads is always absent, and every ARM32 instruction
+    // arrived claiming ARM state — a `pc` four bytes too high on every
+    // literal-pool load.
+    let json = r#"[
+            {"addr": 1408, "name": "entry0", "bits": 32},
+            {"addr": 1492, "name": "dbg.JNI_OnLoad", "bits": 16}
+        ]"#;
+    let refs = parse_function_list(json).unwrap();
+    assert_eq!(
+        refs.iter().map(|r| r.is_thumb).collect::<Vec<_>>(),
+        vec![false, true]
+    );
+}
+
+#[test]
+fn parse_function_list_defaults_to_arm_when_aflj_omits_bits() {
+    let json = r#"[{"addr": 4096, "name": "sym.main"}]"#;
+    assert!(!parse_function_list(json).unwrap()[0].is_thumb);
+}
+
+#[test]
+fn mark_thumb_reaches_every_instruction_not_just_the_function() {
+    // The lifter reads `Instruction::is_thumb`, not the function's, so
+    // marking only the header would leave the PC rule unchanged.
+    let mut func = parse_function_blocks(AGFJ_FIXTURE).unwrap();
+    assert!(!func.is_thumb);
+    mark_thumb(&mut func);
+    assert!(
+        func.blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .all(|i| i.is_thumb)
+    );
+}

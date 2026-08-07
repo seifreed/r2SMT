@@ -21,6 +21,10 @@ struct AfljEntry {
     #[serde(alias = "offset")]
     addr: u64,
     name: String,
+    /// Per-function instruction width. `Some(16)` is Thumb on
+    /// `Arch::Arm`; see [`FunctionRef::is_thumb`].
+    #[serde(default)]
+    bits: Option<u8>,
 }
 
 /// A reference to a discovered function returned by `aflj`.
@@ -30,6 +34,16 @@ pub struct FunctionRef {
     pub address: Address,
     /// Symbolic name reported by radare2.
     pub name: String,
+    /// Whether this function decodes in Thumb state, from `aflj`'s
+    /// per-function `bits`.
+    ///
+    /// This is the **only** source r2 6.1.8 offers that is both present
+    /// and right. `agfj` omits `bits` entirely, and the binary-level
+    /// `ij` answer is a single value for a file that can mix states —
+    /// measured on a Thumb-entry ELF where `ij` says 16 while `aflj`
+    /// correctly splits 19 ARM functions from 5 Thumb ones, `entry0`
+    /// among the ARM.
+    pub is_thumb: bool,
 }
 
 /// Parse the response of `aflj` into the list of function references.
@@ -45,6 +59,7 @@ pub fn parse_function_list(json: &str) -> Result<Vec<FunctionRef>> {
         .map(|f| FunctionRef {
             address: Address(f.addr),
             name: f.name,
+            is_thumb: f.bits == Some(16),
         })
         .collect())
 }
@@ -144,6 +159,29 @@ pub fn parse_function_blocks_opt(json: &str) -> Result<Option<Function>> {
         blocks,
         is_thumb: func.bits == Some(16),
     }))
+}
+
+/// Mark `func` and every instruction in it as decoding in Thumb state.
+///
+/// Needed because **`agfj` emits no `bits` field at all** — measured
+/// against r2 6.1.8 — so the per-function hint
+/// [`parse_function_blocks_opt`] reads is always absent and every ARM32
+/// instruction arrived claiming ARM state. That is a wrong PC by four
+/// bytes on every literal-pool load and every `add Rd, pc`, since `pc`
+/// reads `address + 8` in ARM and `address + 4` in Thumb.
+///
+/// The answer comes from [`FunctionRef::is_thumb`], which `aflj` does
+/// report. Deriving it from the binary-level `ij` instead is wrong on a
+/// **mixed** file and was measured to be: marking every function Thumb
+/// because `ij` says 16 fixes the Thumb functions and breaks the ARM
+/// ones, trading one set of disagreements for another.
+pub fn mark_thumb(func: &mut Function) {
+    func.is_thumb = true;
+    for block in &mut func.blocks {
+        for insn in &mut block.instructions {
+            insn.is_thumb = true;
+        }
+    }
 }
 
 /// Strict variant of [`parse_function_blocks_opt`] for callers that

@@ -1,5 +1,6 @@
 //! Live radare2 adapter built on top of `r2pipe`.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::thread::sleep;
 use std::time::Duration;
@@ -98,6 +99,10 @@ pub struct R2PipeProvider {
     /// pcode|auto`). Default `false` keeps the ESIL-only path
     /// byte-identical.
     attach_pcode_on_load: bool,
+    /// Start addresses of the functions `aflj` reports as Thumb, read
+    /// once on first use. See [`parse::mark_thumb`] for why neither
+    /// `agfj` nor `ij` can supply this.
+    thumb_functions: Option<BTreeSet<u64>>,
 }
 
 impl R2PipeProvider {
@@ -209,7 +214,37 @@ impl R2PipeProvider {
         Ok(Self {
             r2,
             attach_pcode_on_load: false,
+            thumb_functions: None,
         })
+    }
+
+    /// Whether the function starting at `address` decodes in Thumb
+    /// state, from a single cached `aflj`.
+    ///
+    /// `agfj` carries no per-function `bits`, so without this every
+    /// ARM32 instruction claims ARM state and reads `pc` four bytes too
+    /// high. The binary-level `ij` cannot stand in for it — a file may
+    /// mix the two states, and this one does. An unavailable or
+    /// unparseable `aflj` answers `false`, which is the pre-existing
+    /// behaviour rather than a new failure mode.
+    fn function_is_thumb(&mut self, address: Address) -> bool {
+        if self.thumb_functions.is_none() {
+            let found = self
+                .cmd("aflj")
+                .ok()
+                .and_then(|json| parse::parse_function_list(&json).ok())
+                .map(|refs| {
+                    refs.iter()
+                        .filter(|r| r.is_thumb)
+                        .map(|r| r.address.get())
+                        .collect::<BTreeSet<u64>>()
+                })
+                .unwrap_or_default();
+            self.thumb_functions = Some(found);
+        }
+        self.thumb_functions
+            .as_ref()
+            .is_some_and(|set| set.contains(&address.get()))
     }
 
     /// Opt instruction-level SLEIGH P-code attachment in/out for the
@@ -488,6 +523,9 @@ impl BinaryProvider for R2PipeProvider {
             if func.name.is_none() {
                 func.name = Some(func_ref.name);
             }
+            if !func.is_thumb && func_ref.is_thumb {
+                parse::mark_thumb(&mut func);
+            }
             functions.push(func);
         }
         if skipped_no_cfg > 0 || skipped_all_nonexec > 0 || dropped_nonexec_blocks > 0 {
@@ -516,7 +554,11 @@ impl BinaryProvider for R2PipeProvider {
     fn load_function(&mut self, address: Address) -> Result<Function> {
         let cmd = format!("agfj {addr}", addr = address.get());
         let json = self.cmd(&cmd)?;
-        parse::parse_function_blocks(&json)
+        let mut func = parse::parse_function_blocks(&json)?;
+        if !func.is_thumb && self.function_is_thumb(address) {
+            parse::mark_thumb(&mut func);
+        }
+        Ok(func)
     }
 
     fn load_block_at(&mut self, address: Address) -> Result<Function> {
