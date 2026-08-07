@@ -133,6 +133,39 @@ pub(crate) fn resolve_targets(
     Ok((ctx, filtered))
 }
 
+/// The functions the differential-lift harness should cross-check.
+///
+/// [`resolve_targets`] narrows the *branch candidates* and never touches
+/// `ctx.program.functions`, so the harness used to walk the whole binary
+/// even under `--at` / `--function`. Triaging one disagreement then cost
+/// a full re-run of the program.
+///
+/// `--function` resolves against the program directly rather than
+/// through `candidates`, so a function holding no conditional branch is
+/// still cross-checked. `--at` reads the containing function off the
+/// single candidate [`resolve_targets`] kept, which is also what carries
+/// the synthesised block when the address lies outside any analysed
+/// function.
+pub(crate) fn difflift_scope(
+    ctx: &AnalysisContext,
+    at: Option<&str>,
+    function_filter: Option<&str>,
+    candidates: &[BranchCandidate],
+) -> Vec<Function> {
+    let target = function_filter
+        .and_then(|raw| raw.parse::<Address>().ok())
+        .or_else(|| {
+            candidates
+                .first()
+                .map(|c| c.function)
+                .filter(|_| at.is_some())
+        });
+    match target.and_then(|addr| ctx.find_function(addr)) {
+        Some(function) => vec![function.clone()],
+        None => ctx.all_functions().cloned().collect(),
+    }
+}
+
 /// Per-function pseudocode byte budget. Host-Side Safety: the cache
 /// is keyed by function (a finite set) and every entry is truncated
 /// on a UTF-8 boundary so a pathological decompilation cannot blow
@@ -329,4 +362,89 @@ pub(crate) fn resolve_folded_branch(
         Err(_) => None,
     };
     Ok(reconcile_folded(rederived, classify_lowered_upstream(cand)))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+
+    use super::{AnalysisContext, difflift_scope};
+    use r2smt_common::{Address, Arch};
+    use r2smt_ir::program::{Function, Program};
+    use r2smt_slicer::{BranchCandidate, BranchCondition, BranchKind};
+
+    fn function(address: u64) -> Function {
+        Function {
+            address: Address::new(address),
+            name: None,
+            blocks: Vec::new(),
+            is_thumb: false,
+        }
+    }
+
+    fn ctx() -> AnalysisContext {
+        AnalysisContext::new(Program {
+            arch: Arch::X86_64,
+            bits: 64,
+            entry: None,
+            functions: vec![function(0x1000), function(0x2000)],
+        })
+    }
+
+    fn candidate_in(function: u64) -> BranchCandidate {
+        BranchCandidate {
+            address: Address::new(function + 4),
+            function: Address::new(function),
+            block: Address::new(function),
+            kind: BranchKind::Jcc,
+            mnemonic: "je".into(),
+            condition: BranchCondition::Equal,
+            formula: "ZF".into(),
+            taken_target: None,
+            fallthrough_target: None,
+            compare_register: None,
+            bit_index: None,
+            upstream_resolved: None,
+            operand_raws: Vec::new(),
+            is_thumb: false,
+        }
+    }
+
+    #[test]
+    fn test_difflift_scope_unfiltered_covers_the_whole_program() {
+        let scope = difflift_scope(&ctx(), None, None, &[]);
+        assert_eq!(scope.len(), 2);
+    }
+
+    #[test]
+    fn test_difflift_scope_function_filter_keeps_only_that_function() {
+        let scope = difflift_scope(&ctx(), None, Some("0x2000"), &[]);
+        assert_eq!(
+            scope.iter().map(|f| f.address).collect::<Vec<_>>(),
+            vec![Address::new(0x2000)]
+        );
+    }
+
+    #[test]
+    fn test_difflift_scope_function_filter_holds_without_any_candidate() {
+        // A function with no conditional branch yields no candidate, and
+        // must still be cross-checked rather than widening to the program.
+        let scope = difflift_scope(&ctx(), None, Some("0x1000"), &[]);
+        assert_eq!(scope.len(), 1);
+    }
+
+    #[test]
+    fn test_difflift_scope_at_keeps_the_function_containing_the_address() {
+        let scope = difflift_scope(&ctx(), Some("0x2004"), None, &[candidate_in(0x2000)]);
+        assert_eq!(
+            scope.iter().map(|f| f.address).collect::<Vec<_>>(),
+            vec![Address::new(0x2000)]
+        );
+    }
+
+    #[test]
+    fn test_difflift_scope_falls_back_to_the_program_when_the_function_is_absent() {
+        let scope = difflift_scope(&ctx(), None, Some("0x9999"), &[]);
+        assert_eq!(scope.len(), 2);
+    }
 }

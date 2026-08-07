@@ -32,8 +32,8 @@ mod render;
 use render::{print_annotation_preview, print_findings_summary};
 mod support;
 use support::{
-    attach_pseudocode, compute_findings, dispatch_solver, open_provider, resolve_folded_branch,
-    resolve_targets,
+    attach_pseudocode, compute_findings, difflift_scope, dispatch_solver, open_provider,
+    resolve_folded_branch, resolve_targets,
 };
 mod commands;
 use commands::batch::batch;
@@ -864,7 +864,7 @@ fn solve(
     }
 
     if differential_lift {
-        let scope: Vec<Function> = ctx.all_functions().cloned().collect();
+        let scope = difflift_scope(&ctx, at, function_filter, &filtered);
         let dl = run_differential_lift(&scope, ctx.program.arch, solver, options);
         print_lifter_agreement(&dl);
         findings.extend(dl.findings);
