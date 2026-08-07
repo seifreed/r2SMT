@@ -7,6 +7,7 @@
 
 //! `r2smt` command-line entrypoint.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
@@ -920,6 +921,66 @@ fn solve(
 /// early used to be indistinguishable from one that finished.
 const MAX_DIFFLIFT_COMPARISONS: usize = 250_000;
 
+/// Bounded memo of already-decided lowering pairs. Host-Side Safety:
+/// the map grows with distinct instruction shapes, which a pathological
+/// input could make unbounded, so past the cap it stops inserting
+/// rather than evicting — a memo that stops helping, never one that
+/// stops fitting.
+const MAX_DIFFLIFT_MEMO_ENTRIES: usize = 50_000;
+
+/// Rewrite the per-instruction temporary names out of a rendered
+/// lowering so two appearances of the same instruction share a memo key.
+///
+/// The per-mnemonic lifter mints temporaries as `t_<addr>_<n>`
+/// (`r2smt_slicer`'s `LiftCtx::new_temp`), so without this every
+/// flag-setting instruction — the family the ESIL rung put into
+/// production on x86 — would key uniquely and the memo would never hit.
+/// Dropping the address is a consistent alpha-rename: `<n>` is already
+/// unique within one instruction, and the other lowering's temporaries
+/// carry the `__esil_` prefix, so the two cannot collide. The
+/// replacement is spelled `t_$_<n>` because `$` appears in no register
+/// or variable name either lifter produces, so a canonicalised name can
+/// never alias a real one.
+///
+/// Constants are deliberately untouched: a pc-relative lowering carries
+/// its address as a value, so the same instruction at two addresses
+/// keeps two keys — which is correct, since it is two different
+/// equivalence questions.
+fn canonical_temp_names(rendered: &str) -> String {
+    let bytes = rendered.as_bytes();
+    let mut out = String::with_capacity(rendered.len());
+    let (mut copied, mut i) = (0usize, 0usize);
+    while i + 2 <= bytes.len() {
+        let starts_name = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if !(starts_name && bytes[i] == b't' && bytes[i + 1] == b'_') {
+            i += 1;
+            continue;
+        }
+        let hex_start = i + 2;
+        let hex_end = hex_start
+            + bytes[hex_start..]
+                .iter()
+                .take_while(|b| b.is_ascii_hexdigit())
+                .count();
+        if hex_end > hex_start && bytes.get(hex_end) == Some(&b'_') {
+            out.push_str(&rendered[copied..i]);
+            out.push_str("t_$_");
+            i = hex_end + 1;
+            copied = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&rendered[copied..]);
+    out
+}
+
+/// Memo key for one pair of lowerings. `\u{1}` separates the sides so
+/// no rendering can straddle the boundary and alias another pair.
+fn difflift_memo_key(a: &[r2smt_ir::IrStmt], b: &[r2smt_ir::IrStmt]) -> String {
+    canonical_temp_names(&format!("{a:?}\u{1}{b:?}"))
+}
+
 /// Outcome of the differential-lift pass: the engine-integrity
 /// findings, the running agreement tally, how many pairwise
 /// comparisons were attempted, and whether the budget cut the scan
@@ -936,6 +997,44 @@ struct DiffLiftRun {
 /// instruction; the agreement tally feeds the reported metric. The
 /// solve is delegated through the user-selected backend, exactly like
 /// the branch pipeline.
+///
+/// Decided pairs are memoised: a real binary spells the same
+/// instruction hundreds of times and each appearance used to pay its
+/// own solver query. The tally is recorded on every comparison, hit or
+/// miss, so `compared` still counts the program and not the cache.
+///
+/// The soundness argument is about *direction*, not purity, and the
+/// difference is worth stating because the obvious claim is wrong.
+/// A cached `Agree` or `Disagree` is a completed proof — the solver
+/// returned unsat or produced a model — so replaying it cannot
+/// fabricate. What budget pressure produces is `Unknown`, i.e.
+/// [`r2smt_difflift::DiffVerdict::Inconclusive`], so the only verdict
+/// the cache can pin prematurely is the fail-closed one, which loses
+/// precision and never hides a disagreement.
+///
+/// That is not hypothetical, and the measurement is worth keeping
+/// because the naive reading of it is an accusation against the memo.
+/// One 314 KB `AArch64` sample, 7 906 comparisons, four runs:
+///
+/// | memo | `--rlimit` | agree | disagree | inconclusive | wall |
+/// |---|---|---|---|---|---|
+/// | on | 2 000 000 | 3 829 | **7** | 4 070 | 9 s |
+/// | off | 2 000 000 | 3 796 | **7** | 4 103 | 63 s |
+/// | on | unset | 4 040 | **7** | 3 859 | 75 s |
+/// | off | unset | 4 041 | **7** | 3 858 | 11 min 30 s |
+///
+/// At a *fixed* `--rlimit` the memo appears to decide 33 more
+/// comparisons, which looks like the cache changing answers. With the
+/// budget unset the two differ by **one**, which is what says it is
+/// not: Z3's per-check resource limit is not independent of what the
+/// shared thread-local context has already accumulated, so without the
+/// memo the repeats spend budget the later checks then lack. The memo
+/// relieves that pressure — it makes the harness *more* sensitive, not
+/// less. `disagree` is the number that must not move, and it is 7 in
+/// all four.
+///
+/// The last row is also why a corpus pass was not viable: this is the
+/// sample that "did not finish in 10 minutes".
 fn run_differential_lift(
     functions: &[Function],
     arch: r2smt_common::Arch,
@@ -946,6 +1045,7 @@ fn run_differential_lift(
     let mut findings: Vec<Finding> = Vec::new();
     let mut compared = 0usize;
     let mut truncated = false;
+    let mut memo: HashMap<String, r2smt_difflift::DiffVerdict> = HashMap::new();
     'outer: for func in functions {
         for block in &func.blocks {
             for insn in &block.instructions {
@@ -964,7 +1064,14 @@ fn run_differential_lift(
                 for (i, (_, sa)) in bodies.iter().enumerate() {
                     for (lb, sb) in &bodies[i + 1..] {
                         compared += 1;
-                        let verdict = compare_lowerings(sa, sb, arch, solver, options);
+                        let key = difflift_memo_key(sa, sb);
+                        let verdict = memo.get(&key).copied().unwrap_or_else(|| {
+                            let fresh = compare_lowerings(sa, sb, arch, solver, options);
+                            if memo.len() < MAX_DIFFLIFT_MEMO_ENTRIES {
+                                memo.insert(key, fresh);
+                            }
+                            fresh
+                        });
                         stats.record(verdict);
                         if verdict == r2smt_difflift::DiffVerdict::Disagree {
                             disagreeing.push(format!(
@@ -1059,5 +1166,68 @@ fn keep_finding(finding: &Finding, filters: &SolveFilters) -> bool {
         // `FindingKind` is `#[non_exhaustive]`; SuspiciousButUnknown and
         // any future unknown variants gate on `--include-suspicious`.
         _ => filters.include_suspicious,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+
+    use super::{canonical_temp_names, difflift_memo_key};
+    use r2smt_ir::expr::{Expr, Var};
+    use r2smt_ir::stmt::IrStmt;
+
+    fn assign(name: &str, value: u128) -> Vec<IrStmt> {
+        vec![IrStmt::Assign {
+            dst: Var::new(name, 64),
+            src: Expr::konst(value, 64),
+        }]
+    }
+
+    #[test]
+    fn test_the_same_instruction_at_two_addresses_shares_a_memo_key() {
+        assert_eq!(
+            difflift_memo_key(&assign("t_1000_0", 5), &assign("rax", 5)),
+            difflift_memo_key(&assign("t_2000_0", 5), &assign("rax", 5)),
+        );
+    }
+
+    #[test]
+    fn test_a_pc_relative_lowering_keeps_one_key_per_address() {
+        // The address survives as a *constant*, which the canonicaliser
+        // must not touch: two addresses are two equivalence questions.
+        assert_ne!(
+            difflift_memo_key(&assign("t_1000_0", 0x1008), &assign("rax", 0x1008)),
+            difflift_memo_key(&assign("t_2000_0", 0x2008), &assign("rax", 0x2008)),
+        );
+    }
+
+    #[test]
+    fn test_two_temporaries_of_one_instruction_stay_distinct() {
+        assert_ne!(
+            canonical_temp_names("t_1000_0"),
+            canonical_temp_names("t_1000_1"),
+        );
+    }
+
+    #[test]
+    fn test_the_canonical_name_cannot_alias_a_real_variable() {
+        // `$` is in no name either lifter mints, so the rewrite of
+        // `t_<addr>_<n>` can never collide with a register spelling.
+        assert_eq!(canonical_temp_names("t_1000_0"), "t_$_0");
+    }
+
+    #[test]
+    fn test_a_name_without_the_temporary_shape_is_left_alone() {
+        assert_eq!(canonical_temp_names("t_zz_0"), "t_zz_0");
+        assert_eq!(canonical_temp_names("__esil_old_0"), "__esil_old_0");
+    }
+
+    #[test]
+    fn test_the_two_sides_of_a_key_cannot_straddle_the_separator() {
+        assert_ne!(
+            difflift_memo_key(&assign("rax", 1), &assign("rbx", 2)),
+            difflift_memo_key(&assign("rbx", 2), &assign("rax", 1)),
+        );
     }
 }
