@@ -99,11 +99,6 @@ struct AgfjFunc {
     name: Option<String>,
     #[serde(default)]
     blocks: Vec<AgfjBlock>,
-    /// Per-function instruction-width hint from r2. `Some(16)` means
-    /// the function decodes as Thumb / Thumb-2 on `Arch::Arm`; any
-    /// other value (or absence) means 32-bit instructions.
-    #[serde(default)]
-    bits: Option<u8>,
 }
 
 /// Parse the response of `agfj @ <addr>` into a fully-populated
@@ -142,7 +137,9 @@ pub fn parse_function_blocks_opt(json: &str) -> Result<Option<Function>> {
         }
         let mut instructions: Vec<Instruction> = Vec::with_capacity(block.ops.len());
         for op in block.ops {
-            instructions.push(op_to_instruction(op, func.bits == Some(16))?);
+            // Always ARM state here. `agfj` carries no width hint of its
+            // own, so Thumb arrives from `aflj` via [`mark_thumb`].
+            instructions.push(op_to_instruction(op, false)?);
         }
         blocks.push(BasicBlock {
             address: Address(block.addr),
@@ -157,18 +154,24 @@ pub fn parse_function_blocks_opt(json: &str) -> Result<Option<Function>> {
         address: Address(func.addr),
         name: func.name,
         blocks,
-        is_thumb: func.bits == Some(16),
+        is_thumb: false,
     }))
 }
 
 /// Mark `func` and every instruction in it as decoding in Thumb state.
 ///
-/// Needed because **`agfj` emits no `bits` field at all** — measured
-/// against r2 6.1.8 — so the per-function hint
-/// [`parse_function_blocks_opt`] reads is always absent and every ARM32
-/// instruction arrived claiming ARM state. That is a wrong PC by four
-/// bytes on every literal-pool load and every `add Rd, pc`, since `pc`
-/// reads `address + 8` in ARM and `address + 4` in Thumb.
+/// This is the **only** source of Thumb state on the `agfj` path, and
+/// deliberately so: `agfj` emits no `bits` field at all — measured
+/// against r2 6.1.8 — so [`parse_function_blocks_opt`] reports ARM
+/// unconditionally and every ARM32 instruction would otherwise carry a
+/// PC four bytes off on every literal-pool load and every `add Rd, pc`,
+/// since `pc` reads `address + 8` in ARM and `address + 4` in Thumb.
+///
+/// The struct behind that parser used to keep a `bits` field for the
+/// hint. It was never once `Some(16)` in production, and the test that
+/// covered it passed only by fabricating the field into a JSON shape r2
+/// does not emit — so it was removed rather than left as a fallback for
+/// a future r2 that may add it back.
 ///
 /// The answer comes from [`FunctionRef::is_thumb`], which `aflj` does
 /// report. Deriving it from the binary-level `ij` instead is wrong on a

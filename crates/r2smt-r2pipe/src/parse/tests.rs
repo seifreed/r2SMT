@@ -376,7 +376,13 @@ fn parse_function_blocks_accepts_modern_addr_schema() {
 }
 
 #[test]
-fn parse_function_blocks_marks_thumb_when_bits_16() {
+fn parse_function_blocks_ignores_a_bits_field_agfj_never_emits() {
+    // The predecessor of this test fed `"bits": 16` into an `agfj` shape
+    // r2 does not produce and asserted the parser honoured it. It passed
+    // for months while the field was `None` in every real response, so
+    // it certified a path that never ran. Pin the opposite: even handed
+    // the field, this parser reports ARM, because Thumb is `aflj`'s
+    // answer and `mark_thumb` is the only thing that applies it.
     let json = r#"[
             {
                 "addr": 32774,
@@ -398,15 +404,24 @@ fn parse_function_blocks_marks_thumb_when_bits_16() {
             }
         ]"#;
     let func = parse_function_blocks(json).unwrap();
-    assert!(func.is_thumb);
-    assert!(func.blocks[0].instructions[0].is_thumb);
+    assert!(!func.is_thumb);
+    assert!(!func.blocks[0].instructions[0].is_thumb);
 }
 
 #[test]
-fn parse_function_blocks_defaults_to_arm_mode_when_bits_absent() {
-    // Most agfj responses omit `bits`. The parser must default to
-    // ARM mode (is_thumb == false) so existing fixtures keep
-    // working unchanged.
+fn mark_thumb_is_what_puts_a_function_into_thumb_state() {
+    // The real pairing: `agfj` reports ARM, `aflj` says otherwise, and
+    // `mark_thumb` reaches every instruction and not just the header —
+    // the lifter reads `Instruction::is_thumb`.
+    let mut func = parse_function_blocks(AGFJ_MODERN).unwrap();
+    assert!(!func.is_thumb);
+    crate::parse::mark_thumb(&mut func);
+    assert!(func.is_thumb);
+    assert!(func.blocks[0].instructions.iter().all(|i| i.is_thumb));
+}
+
+#[test]
+fn parse_function_blocks_defaults_to_arm_mode() {
     let func = parse_function_blocks(AGFJ_MODERN).unwrap();
     assert!(!func.is_thumb);
     assert!(!func.blocks[0].instructions[0].is_thumb);
