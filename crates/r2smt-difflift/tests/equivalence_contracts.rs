@@ -440,6 +440,28 @@ fn test_vector_width_mismatch_is_not_comparable_rather_than_a_disagreement() {
 }
 
 #[test]
+fn test_a_vector_store_against_the_esil_xmm_model_is_not_a_disagreement() {
+    // The memory comparison did not inherit the vector exemption the
+    // register side has above, and `movdqa [rsp], xmm0` is what that costs:
+    // r2's ESIL names `xmm0` at the pointer width and stores 64 bits where
+    // the per-mnemonic lowering stores 128. Ours is the correct one, so
+    // this is modelling depth and not a lifter defect — 135 of the 141
+    // disagreements measured on one x86-64 sample, every real finding
+    // buried underneath them.
+    let wide = vec![IrStmt::StoreMem {
+        address: Expr::var("rsp", 64),
+        value: Expr::var("xmm0", 128),
+        bits: 128,
+    }];
+    let narrow = vec![IrStmt::StoreMem {
+        address: Expr::var("rsp", 64),
+        value: Expr::var("xmm0", 64),
+        bits: 64,
+    }];
+    assert_ne!(diff(&wide, &narrow), DiffVerdict::Disagree);
+}
+
+#[test]
 fn test_query_renders_for_the_text_backends() {
     // The query a mismatched-width pair produces must be *renderable*,
     // not merely solvable by Z3. Those are different bars: Z3 answers a

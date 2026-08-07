@@ -196,12 +196,11 @@ pub fn build_equivalence_query(a: &[IrStmt], b: &[IrStmt], arch: Arch) -> Option
     // Memory is compiled away rather than modelled by the encoder, whose
     // store list is one per slice and whose initial memory is minted per
     // load — see the `mem` module for why both of those fabricate here.
-    let plan = mem::eliminate(
-        &side_a,
-        &side_b,
-        arch.pointer_bits(),
-        !tainted_a.memory && !tainted_b.memory,
-    )?;
+    let compare_memory = !tainted_a.memory
+        && !tainted_b.memory
+        && !lacks_simd_model(&ssa_a, arch)
+        && !lacks_simd_model(&ssa_b, arch);
+    let plan = mem::eliminate(&side_a, &side_b, arch.pointer_bits(), compare_memory)?;
     let statements = plan.statements;
 
     let condition = differ_condition(&finals_a, &finals_b, &plan.probes)?;
@@ -716,6 +715,36 @@ fn canonical_finals(
         out.remove(parent);
     }
     out
+}
+
+/// `true` when this side names a SIMD register at a width its own
+/// architectural view contradicts, which means it has no model of that
+/// register file at all.
+///
+/// This is the same modelling-depth category [`canonical_finals`] already
+/// exempts on the register side, extended to the memory comparison, which
+/// did not inherit it when `mem` landed. r2's ESIL carries no SIMD model
+/// and names `xmm0` at the pointer width, so a `movdqa [rsp], xmm0` stores
+/// 64 bits where the per-mnemonic lowering stores 128 — a disagreement
+/// about *width*, not about value, and the per-mnemonic side is the right
+/// one. Left unexempted it reported one finding per vector store and
+/// buried the rest: 135 of the 141 disagreements measured on one x86-64
+/// sample.
+///
+/// Reads are checked as well as writes, and that is the whole point:
+/// a store's value arrives as a **free input** (`Var("xmm0", 64)`), never
+/// as a def, so the def-only test [`canonical_finals`] performs does not
+/// see it.
+fn lacks_simd_model(ssa: &SsaLiftedSlice, arch: Arch) -> bool {
+    let inputs = ssa.inputs.iter().map(|v| (v.name.as_str(), v.bits));
+    let defs = ssa
+        .defs
+        .iter()
+        .filter_map(|v| v.name.rsplit_once('#').map(|(base, _)| (base, v.bits)));
+    inputs.chain(defs).any(|(name, bits)| {
+        register_layout(name, arch)
+            .is_some_and(|l| bits != l.width() && is_simd_parent(l.parent, arch))
+    })
 }
 
 /// Collect the final SSA version of every defined base name (the last
