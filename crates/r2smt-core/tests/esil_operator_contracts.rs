@@ -2,10 +2,11 @@
 //!
 //! The machine had ~45 tests before this file and all of them assert on
 //! the *shape* of an `Expr` tree; the per-mnemonic handlers have ~750
-//! that bind concrete values and ask a solver. That asymmetry is the
-//! whole reason `:=` is still ungated: lexing it moves the entire
-//! flag-setting population of every ISA off the handlers and onto this
-//! machine, so the machine has to be worth the move first.
+//! that bind concrete values and ask a solver. That asymmetry was the
+//! argument for keeping `:=` gated — and since 2026-08-07 the gate is
+//! *open* by default on x86, so it stopped being a reason to wait and
+//! became debt on the path that actually runs. These contracts are the
+//! repayment: every operator the machine supports now has one.
 //!
 //! Every string below is one radare2 6.1.8 emits or a minimal probe of
 //! one, and every expected value was measured with
@@ -16,13 +17,19 @@
 //! without it, and the VM's flag state persists between `ae` calls
 //! inside one session, so each probe needs its own process.
 //!
-//! Note what is deliberately *not* here: the multi-flag strings r2
-//! really emits (`1,eax,==,$z,zf,:=,32,$b,cf,:=,…`). Each flag write in
-//! those is `:=` precisely so it does not clobber the context the next
-//! flag token still reads, and `:=` does not lex yet — so a contract
-//! written with `=` can pin one flag per string and no more. That is a
-//! limit of the gate, not of the model, and these extend to the real
-//! strings the day it opens.
+//! The multi-flag strings r2 really emits
+//! (`1,eax,==,$z,zf,:=,32,$b,cf,:=,…`) are reachable now: each flag
+//! write in those is `:=` precisely so it does not clobber the context
+//! the next flag token still reads, and `:=` lexes since `4965d879`.
+//! The `AArch64` carry contract at the bottom of this file is one such
+//! string, verbatim.
+//!
+//! One trap of measurement is worth naming twice, because it has now
+//! produced two wrong beliefs about this machine. r2's own output
+//! redirection eats `>`, `>=` and `>>`, so an unquoted `ae 4,rax,>>=`
+//! writes a file named `=` and leaves the register untouched — which is
+//! exactly the evidence that put `>>=` on the "radare2 leaves it
+//! intact" list it did not belong on. Quote every probe.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use r2smt_common::smt::{SmtResult, SolveOptions};
@@ -797,6 +804,224 @@ fn test_the_negating_assignment_turns_zero_into_one() {
     // the test above and is still wrong.
     assert_eq!(
         solve_esil("rax,!=", &[("rax", 0, QWORD)], ("rax", QWORD), 1),
+        SmtResult::AlwaysTrue
+    );
+}
+
+// ---------------------------------------------------------------------
+// Predicated blocks. The highest-prevalence untested family by a wide
+// margin: 494 of the 5 339 ESIL strings in one x86-64 sample carry
+// `?{`, against zero for the comparators above. The machine lowers a
+// block by wrapping each `Assign` inside it in `Ite(cond, new, old)`,
+// and nothing pinned either arm.
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_a_taken_block_writes_its_body() {
+    // `ar rax=7; ae 1,?{,0x2a,rax,=,}` → 0x2a.
+    assert_eq!(
+        solve_esil(
+            "1,?{,0x2a,rax,=,}",
+            &[("rax", 7, QWORD)],
+            ("rax", QWORD),
+            0x2a
+        ),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_an_untaken_block_leaves_the_destination_alone() {
+    // The other arm of the `Ite`, and the one that fabricates if wrong:
+    // a block lowered unconditionally would answer 0x2a here.
+    assert_eq!(
+        solve_esil("0,?{,0x2a,rax,=,}", &[("rax", 7, QWORD)], ("rax", QWORD), 7),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_a_block_guard_is_zero_versus_non_zero_and_not_the_low_bit() {
+    // `ar rbx=2; ae rbx,?{,…}` takes the block: the guard is "non-zero",
+    // so reading it as bit 0 would skip every even condition.
+    assert_eq!(
+        solve_esil(
+            "rbx,?{,0x2a,rax,=,}",
+            &[("rax", 7, QWORD), ("rbx", 2, QWORD)],
+            ("rax", QWORD),
+            0x2a
+        ),
+        SmtResult::AlwaysTrue
+    );
+}
+
+// ---------------------------------------------------------------------
+// The bare binaries. `ae 4,10,<op>` answers `10 <op> 4`. `-` and `<<`
+// were already pinned; these are the rest, non-commutative first
+// because those are where the order is a wrong value rather than a
+// no-op. `>>` is one of the three operators r2's own output
+// redirection eats when a probe is not quoted.
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_a_bare_divide_takes_the_second_token_as_the_dividend() {
+    // `ae 4,10,/` → 2, i.e. `10 / 4` and never `4 / 10` (which is 0).
+    assert_eq!(
+        solve_esil("4,10,/,rax,=", &[], ("rax", QWORD), 2),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_a_bare_remainder_takes_the_second_token_as_the_dividend() {
+    // `ae 4,10,%` → 2, against `4 % 10` = 4.
+    assert_eq!(
+        solve_esil("4,10,%,rax,=", &[], ("rax", QWORD), 2),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_a_bare_logical_shift_right_shifts_the_second_token() {
+    // `ae 2,160,>>` → 0x28. Needs the `"…"` quoting to probe at all.
+    assert_eq!(
+        solve_esil("2,160,>>,rax,=", &[], ("rax", QWORD), 40),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_a_bare_shift_right_is_logical_and_not_arithmetic() {
+    // The sign bit must shift out as zero. An arithmetic shift would
+    // answer 0xffffffffffffffff — a wrong value on every negative
+    // operand, and invisible to the positive case above.
+    assert_eq!(
+        solve_esil(
+            "4,0x8000000000000000,>>,rax,=",
+            &[],
+            ("rax", QWORD),
+            0x0800_0000_0000_0000
+        ),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_a_bare_add_sums_both_tokens() {
+    assert_eq!(
+        solve_esil("4,10,+,rax,=", &[], ("rax", QWORD), 14),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_a_bare_multiply_multiplies_both_tokens() {
+    assert_eq!(
+        solve_esil("4,10,*,rax,=", &[], ("rax", QWORD), 40),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_a_bare_and_masks_both_tokens() {
+    assert_eq!(
+        solve_esil("4,10,&,rax,=", &[], ("rax", QWORD), 0),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_a_bare_or_merges_both_tokens() {
+    assert_eq!(
+        solve_esil("4,10,|,rax,=", &[], ("rax", QWORD), 14),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_a_bare_xor_differences_both_tokens() {
+    assert_eq!(
+        solve_esil("4,10,^,rax,=", &[], ("rax", QWORD), 14),
+        SmtResult::AlwaysTrue
+    );
+}
+
+// ---------------------------------------------------------------------
+// The remaining compound assigns. `-=` and `<<=` were pinned; these
+// five were not. `>>=` is here rather than on the out-by-decision list
+// — see the note on it below.
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_a_compound_multiply_multiplies_the_target() {
+    // `ar rax=10; ae 4,rax,*=` → 0x28.
+    assert_eq!(
+        solve_esil("4,rax,*=", &[("rax", 10, QWORD)], ("rax", QWORD), 40),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_a_compound_and_masks_the_target() {
+    assert_eq!(
+        solve_esil("4,rax,&=", &[("rax", 10, QWORD)], ("rax", QWORD), 0),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_a_compound_or_merges_into_the_target() {
+    assert_eq!(
+        solve_esil("4,rax,|=", &[("rax", 10, QWORD)], ("rax", QWORD), 14),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_a_compound_xor_differences_the_target() {
+    assert_eq!(
+        solve_esil("4,rax,^=", &[("rax", 10, QWORD)], ("rax", QWORD), 14),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_a_compound_shift_right_shifts_the_target_by_the_value() {
+    // `ar rax=0xff; ae 4,rax,>>=` → 0x0f.
+    //
+    // This operator was on the out-by-decision list, on the grounds that
+    // r2 6.1.8 "leaves the register intact for every input probed". It
+    // does not, and the claim is an artifact of the trap documented at
+    // the top of this file: unquoted, the `>>` in `ae 4,rax,>>=` is r2's
+    // own output redirection, which writes a file named `=` and leaves
+    // the register untouched. Reproduced both ways before writing this.
+    assert_eq!(
+        solve_esil("4,rax,>>=", &[("rax", 0xff, QWORD)], ("rax", QWORD), 0x0f),
+        SmtResult::AlwaysTrue
+    );
+}
+
+// ---------------------------------------------------------------------
+// Division by zero. Pinned as a *divergence*, not matched: r2 answers
+// zero, SMT-LIB defines `bvudiv` by zero as all-ones and `bvurem` by
+// zero as the dividend. Matching r2 would mean an `Ite` guard on every
+// divide to model a case that raises #DE on the real machine, so the
+// contract records what this pipeline does and why the gap is
+// deliberate.
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_a_divide_by_zero_takes_the_smtlib_value_and_not_radare2_s() {
+    assert_eq!(
+        solve_esil("0,10,/,rax,=", &[], ("rax", QWORD), u128::from(u64::MAX)),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn test_a_remainder_by_zero_yields_the_dividend() {
+    assert_eq!(
+        solve_esil("0,10,%,rax,=", &[], ("rax", QWORD), 10),
         SmtResult::AlwaysTrue
     );
 }
