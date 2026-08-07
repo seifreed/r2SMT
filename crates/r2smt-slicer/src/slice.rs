@@ -113,15 +113,17 @@ pub struct SliceLimits {
     /// its per-mnemonic handler.
     ///
     /// **x86 only, by construction.** On both ARM ISAs the rung is
-    /// skipped whatever this says, because radare2 emits ARM's
-    /// architectural carry where this pipeline stores its inverse — a
-    /// faithful lift there resolves every unsigned ARM branch to the
-    /// other arm. See the gate in [`crate::lift`].
+    /// skipped whatever this says: radare2 seeds an a64 `subs`'s flag
+    /// context from the destination write, so with `dst != src` its
+    /// carry depends on what the destination held before, and an
+    /// unsigned branch behind it resolves to the other arm. See the gate
+    /// in [`crate::lift`].
     ///
-    /// Off by default, which is byte-identical to the behaviour before
-    /// `:=` was lexed at all. It exists so the change of default can be
-    /// *measured* against a corpus before it is made.
-    #[serde(default)]
+    /// **On since 2026-08-07.** It was off while the differential
+    /// harness still disagreed, which is what it was for: the harness is
+    /// now at zero on x86 and at radare2's own bugs on both ARM ISAs.
+    /// Turn it off with `--no-esil-flags` to A/B the two lowerings.
+    #[serde(default = "default_true")]
     pub esil_flags: bool,
 }
 
@@ -134,9 +136,14 @@ impl Default for SliceLimits {
             allow_calls: false,
             unknowns_on_truncation: false,
             allow_join_merge: false,
-            esil_flags: false,
+            esil_flags: true,
         }
     }
+}
+
+/// Serde default for [`SliceLimits::esil_flags`], which is on.
+const fn default_true() -> bool {
+    true
 }
 
 /// Result of slicing a single branch.

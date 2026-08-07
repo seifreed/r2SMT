@@ -81,7 +81,7 @@ fn init_tracing(verbosity: u8) -> Result<()> {
 fn run(cli: Cli) -> Result<()> {
     let deep = cli.deep_analysis;
     let ir_pcode = cli.ir.wants_pcode();
-    let esil_flags = cli.esil_flags;
+    let esil_flags = !cli.no_esil_flags;
     match cli.command {
         Command::Version => {
             println!("r2smt {}", env!("CARGO_PKG_VERSION"));

@@ -462,7 +462,14 @@ pub fn lift_slice(slice: &Slice, arch: Arch) -> LiftedSlice {
 ///
 /// A separate entry point rather than a parameter on `lift_slice` so the
 /// 30-odd existing call sites — nearly all of them tests — stay
-/// untouched; `esil_flags = false` is what every one of them means.
+/// untouched.
+///
+/// Note that [`lift_slice`] therefore passes `false` while
+/// [`crate::SliceLimits::esil_flags`] now defaults to `true`, and the
+/// divergence is deliberate rather than an oversight: those call sites
+/// exist to exercise the **per-mnemonic handlers**, so opening the rung
+/// under them would silently stop testing the thing they name.
+/// Production reaches this function through `SliceLimits`.
 #[must_use]
 pub fn lift_slice_with(slice: &Slice, arch: Arch, esil_flags: bool) -> LiftedSlice {
     let mut ctx = LiftCtx::new(arch);
@@ -687,13 +694,6 @@ impl LiftCtx {
         }
     }
 
-    /// Whether a flag-setting ESIL string may lift here.
-    ///
-    /// Never on ARM, whatever the caller asked for — see the gate's
-    /// comment for the two measured reasons.
-    /// The value an `AArch32` `pc` read answers at the current
-    /// instruction: its own address plus 8 (ARM) or 4 (Thumb), aligned
-    /// down to a word. ARM ARM Vol. C §A2.3.
     /// `AArch32`'s `pc` as read by a **data** operand: this
     /// instruction's address plus a fixed distance, and *not*
     /// word-aligned.
@@ -714,6 +714,16 @@ impl LiftCtx {
         self.cur_addr.0.wrapping_add(ahead)
     }
 
+    /// Whether a flag-setting ESIL string may lift here.
+    ///
+    /// Never on ARM, whatever the caller asked for. Of the two measured
+    /// reasons for that, one is now fixed — the machine obeys the
+    /// pipeline's inverted carry convention since 2026-08-07 — and one
+    /// stands: radare2 seeds an a64 `subs`'s flag context from the
+    /// *destination* write, so with `dst != src` its carry depends on
+    /// whatever the destination held before. A faithful lift imports
+    /// that, and an unsigned branch behind it resolves to the arm the
+    /// machine does not take.
     fn allows_esil_flags(&self) -> bool {
         self.esil_flags && matches!(self.arch, Arch::X86 | Arch::X86_64)
     }

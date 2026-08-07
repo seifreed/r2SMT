@@ -34,18 +34,20 @@ pub(crate) struct Cli {
     #[arg(long, value_enum, default_value_t = IrSourceArg::Esil, global = true)]
     pub(crate) ir: IrSourceArg,
 
-    /// Let an **x86** instruction whose ESIL writes flags lift through
-    /// radare2's ESIL instead of this project's per-mnemonic handler.
+    /// Send every **x86** instruction whose ESIL writes flags to this
+    /// project's per-mnemonic handler instead of radare2's ESIL.
     ///
-    /// Off by default. The per-mnemonic handlers carry ~750
-    /// solver-backed contracts against the ESIL machine's 26, so the
-    /// flag exists to *measure* the swap over a corpus before the
-    /// default changes. It has no effect on either ARM ISA: radare2
-    /// emits ARM's architectural carry where this pipeline stores its
-    /// inverse, so a faithful lift there resolves every unsigned ARM
-    /// branch to the opposite arm.
+    /// The ESIL rung is on by default since 2026-08-07, when the
+    /// differential harness reached zero disagreements on x86. This is
+    /// the escape hatch: it restores the pre-2026-08-07 lowering so the
+    /// two can be A/B'd on one binary without rebuilding.
+    ///
+    /// It has no effect on either ARM ISA, where the rung is skipped
+    /// unconditionally — radare2 seeds an a64 `subs`'s flag context from
+    /// the destination write, so its carry depends on what the
+    /// destination held before.
     #[arg(long, global = true)]
-    pub(crate) esil_flags: bool,
+    pub(crate) no_esil_flags: bool,
 
     /// Subcommand to dispatch.
     #[command(subcommand)]
