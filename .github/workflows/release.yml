@@ -172,7 +172,7 @@ jobs:
               fi
 
               if echo "$output" | grep -q "Too Many Requests"; then
-                if [ "$attempt" -ge 3 ]; then
+                if [ "$attempt" -ge 5 ]; then
                   echo "$output"
                   echo "Failed publishing ${crate} after 5 rate-limit retries"
                   exit 1
