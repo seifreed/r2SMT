@@ -138,4 +138,54 @@ jobs:
       - name: Publish workspace crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --workspace --locked
+        run: |
+          set -euo pipefail
+
+          metadata="$(cargo metadata --format-version 1)"
+          version="$(echo "$metadata" | jq -r '.packages[] | select(.name == "r2smt-cli") | .version' | head -n 1)"
+
+          edge_file="$(mktemp)"
+          node_file="$(mktemp)"
+          trap 'rm -f "$edge_file" "$node_file"' EXIT
+
+          echo "$metadata" | jq -r '
+            . as $m
+            | ($m.packages | map({key: .id, value: .name}) | from_entries) as $ids
+            | $m.resolve.nodes[]
+            | .id as $from
+            | .deps[]
+            | select(.pkg | startswith("path+file://"))
+            | ($ids[$from] + " " + $ids[.pkg])
+          ' > "$edge_file"
+          echo "$metadata" | jq -r '.packages[] | select(.source == null) | .name' | awk '{print $1 " " $1}' > "$node_file"
+
+          for crate in $( (cat "$edge_file"; cat "$node_file") | tsort | tac ); do
+            if curl -fsSL "https://crates.io/api/v1/crates/${crate}/${version}" >/dev/null; then
+              echo "${crate} ${version} already exists on crates.io, skipping"
+              continue
+            fi
+
+            for attempt in 1 2 3; do
+              if output="$(cargo publish --locked -p "${crate}" 2>&1)"; then
+                echo "Published ${crate} ${version}"
+                break
+              fi
+
+              if echo "$output" | grep -q "Too Many Requests"; then
+                if [ "$attempt" -ge 3 ]; then
+                  echo "$output"
+                  echo "Failed publishing ${crate} after 3 rate-limit retries"
+                  exit 1
+                fi
+
+                wait=$((attempt * 75))
+                echo "${crate} publish rate-limited (attempt ${attempt}/3); retrying after ${wait}s"
+                sleep "$wait"
+                continue
+              fi
+
+              echo "$output"
+              echo "Failed publishing ${crate}; aborting"
+              exit 1
+            done
+          done
