@@ -60,6 +60,14 @@ jobs:
           READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
         run: cargo build --release --target ${{ matrix.triple }} -p r2smt-cli
 
+      - name: Bundle Z3 runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $z3 = Get-ChildItem "target/${{ matrix.triple }}/release/build/z3-sys-*/out/z3-*/bin/libz3.dll" | Select-Object -First 1
+          if (-not $z3) { throw "libz3.dll not found" }
+          Copy-Item $z3.FullName "target/${{ matrix.triple }}/release/libz3.dll"
+
       - name: Strip binary (Unix)
         if: runner.os != 'Windows'
         run: strip target/${{ matrix.triple }}/release/r2smt
@@ -96,7 +104,7 @@ jobs:
         shell: pwsh
         run: |
           $archive = "r2smt-${{ steps.tag.outputs.version }}-${{ matrix.triple }}.zip"
-          Compress-Archive -Path "target/${{ matrix.triple }}/release/r2smt.exe" -DestinationPath $archive
+          Compress-Archive -Path "target/${{ matrix.triple }}/release/r2smt.exe", "target/${{ matrix.triple }}/release/libz3.dll" -DestinationPath $archive
           "archive=$archive" >> $env:GITHUB_ENV
 
       - uses: actions/upload-artifact@v4
