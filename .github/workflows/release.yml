@@ -91,8 +91,33 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          name: r2SMT ${{ steps.tag.outputs.version }}
           files: ${{ env.tarball }}
-          generate_release_notes: true
+          body: |
+            # r2SMT ${{ steps.tag.outputs.version }}
+
+            This is the first release of r2SMT and publishes a full multi-crate workspace.
+            It includes the reverse-engineering analysis pipeline and tooling built around:
+
+            - `r2smt` command line interface (`r2smt`) for running analysis, patching, and reporting.
+            - Core orchestration and control flow through `r2smt-core`.
+            - Binary lifting for ESIL and Ghidra P-code in `r2smt-esil` and `r2smt-pcode`.
+            - Slicer and SSA conversion pipelines in `r2smt-slicer` and `r2smt-ssa`.
+            - SMT backend and solver abstractions in `r2smt-smt`, `r2smt-solver-port`, and `r2smt-z3fp`.
+            - Patch planning and application logic in `r2smt-patch`.
+            - Report generation in `r2smt-report`.
+            - Differential and cross-check tooling in `r2smt-difflift`.
+            - Exploration worker in `r2smt-explore`.
+            - Taint propagation with `r2smt-taint`.
+            - Shared data model and utilities in `r2smt-common`, `r2smt-ir`, and `r2smt-r2pipe`.
+
+            Binary packages are built for:
+            - Linux x86_64
+            - Linux ARM64
+            - macOS x86_64
+            - macOS ARM64
+
+            Release artifacts are attached to this release, and crates are also published to crates.io from this tag.
           fail_on_unmatched_files: true
 
   publish:
