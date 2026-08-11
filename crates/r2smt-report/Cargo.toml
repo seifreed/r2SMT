@@ -1,0 +1,23 @@
+[package]
+name         = "r2smt-report"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+description = "Renderers (JSON, Markdown, r2 script) for r2SMT Findings."
+
+[lints]
+workspace = true
+
+[dependencies]
+r2smt-common = { workspace = true }
+r2smt-core   = { workspace = true }
+r2smt-ir     = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+
+[dev-dependencies]
+r2smt-ir     = { workspace = true, features = ["testing"] }
+r2smt-slicer = { workspace = true }

@@ -1,0 +1,448 @@
+//! `AArch32` VFP `vcvt` contracts, solved rather than asserted
+//! structurally.
+//!
+//! The corpus cannot supply evidence here: its 32-bit ARM samples
+//! exercise no floating-point conversion inside an analysed branch
+//! predicate, so a verdict diff would be silent whether the lowering is
+//! right or wrong. What a wrong lowering produces is a *wrong value* —
+//! a rounding mode taken from the wrong end, an unsigned range folded
+//! into a signed one — so the only evidence worth having is a solver
+//! agreeing the destination equals a hand-computed ARM result.
+//!
+//! Each test below is aimed at a specific way the lowering could be
+//! wrong while still lifting cleanly.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use r2smt_common::smt::{SmtResult, SolveOptions};
+use r2smt_common::{Address, Arch};
+use r2smt_ir::expr::{Expr, Var};
+use r2smt_ir::program::{Instruction, Operand, OperandKind};
+use r2smt_ir::stmt::IrStmt;
+use r2smt_slicer::{
+    BranchCandidate, BranchCondition, BranchKind, LiftedSlice, SliceStatus, lift_per_mnemonic,
+};
+use r2smt_smt::solve_branch;
+use r2smt_ssa::ssa_convert;
+
+const TEST_SOLVE_TIMEOUT_MS: u32 = 10_000;
+const VECTOR_BITS: u16 = 128;
+
+/// `s0`–`s3` and `d0` are views of the synthetic parent `v0`; `s4` is
+/// the first view of `v1`. Sourcing from a different parent than the
+/// destination keeps the binding and the expectation independent.
+const DEST: &str = "s0";
+const SOURCE: &str = "s4";
+
+fn operand(raw: &str) -> Operand {
+    Operand {
+        raw: raw.into(),
+        kind: if raw.starts_with('#') {
+            OperandKind::Immediate
+        } else {
+            OperandKind::Register
+        },
+    }
+}
+
+fn branch() -> BranchCandidate {
+    let at = Address::new(0x1000);
+    BranchCandidate {
+        address: at,
+        function: at,
+        block: at,
+        kind: BranchKind::Jcc,
+        mnemonic: "converttest".to_string(),
+        condition: BranchCondition::NotEqual,
+        formula: "converttest".to_string(),
+        taken_target: None,
+        fallthrough_target: None,
+        compare_register: None,
+        bit_index: None,
+        upstream_resolved: None,
+        operand_raws: Vec::new(),
+        is_thumb: false,
+    }
+}
+
+/// Lift `mnemonic operands` on `Arch::Arm`, bind every named parent to a
+/// concrete value, and ask the solver whether the low 64 bits of `v0`
+/// are necessarily `expected`.
+///
+/// An `AArch32` VFP write merges, so every test binds `v0` as well as
+/// its source — the bits the conversion does not cover come from that
+/// binding rather than being free.
+fn solve_lowering(
+    mnemonic: &str,
+    operands: &[&str],
+    sources: &[(&str, u128)],
+    expected: u128,
+) -> SmtResult {
+    let insn = Instruction {
+        address: Address::new(0x1000),
+        size: 4,
+        bytes: vec![],
+        mnemonic: mnemonic.into(),
+        operands: operands.iter().map(|o| operand(o)).collect(),
+        esil: None,
+        pcode: None,
+        is_thumb: false,
+    };
+    let lifted = lift_per_mnemonic(&insn, Arch::Arm);
+    assert!(
+        lifted
+            .iter()
+            .all(|s| !matches!(s, IrStmt::Unsupported { .. })),
+        "{mnemonic} declined: {lifted:?}"
+    );
+
+    let mut statements: Vec<IrStmt> = sources
+        .iter()
+        .map(|(name, value)| IrStmt::Assign {
+            dst: Var::new(*name, VECTOR_BITS),
+            src: Expr::konst(*value, VECTOR_BITS),
+        })
+        .collect();
+    statements.extend(lifted);
+
+    let slice = LiftedSlice {
+        branch: branch(),
+        statements,
+        condition: Expr::eq(
+            Expr::extract(Expr::Var(Var::new("v0", VECTOR_BITS)), 63, 0),
+            Expr::konst(expected, 64),
+        ),
+        status: SliceStatus::Complete,
+        treat_truncation_as_inputs: false,
+        arch: Arch::Arm,
+    };
+    solve_branch(
+        &ssa_convert(&slice),
+        SolveOptions {
+            timeout_ms: TEST_SOLVE_TIMEOUT_MS,
+            ..SolveOptions::default()
+        },
+    )
+}
+
+/// Assert the lowering computes exactly `expected` in the low 64 bits
+/// of `v0`.
+fn assert_computes(mnemonic: &str, operands: &[&str], sources: &[(&str, u128)], expected: u128) {
+    assert_eq!(
+        solve_lowering(mnemonic, operands, sources, expected),
+        SmtResult::AlwaysTrue,
+        "{mnemonic} {operands:?} with {sources:x?} should give {expected:#x}"
+    );
+}
+
+/// The bindings for a conversion out of `SOURCE` into `DEST`: the
+/// source parent holds `bits`, and the destination parent is zero so
+/// the merge contributes nothing to the expectation.
+fn from_source(bits: u128) -> [(&'static str, u128); 2] {
+    [("v0", 0), ("v1", bits)]
+}
+
+#[test]
+fn vcvt_to_unsigned_covers_the_range_above_signed_maximum() {
+    // 3e9 is representable exactly in binary32 and sits above
+    // `i32::MAX`. The IR carries no unsigned conversion, so the lowering
+    // converts through the signed node one bit wider and truncates —
+    // which covers the unsigned range exactly. Going through the signed
+    // node at the destination's own width would saturate at 0x7fffffff.
+    assert_computes(
+        "vcvt.u32.f32",
+        &[DEST, SOURCE],
+        &from_source(0x4f32_d05e),
+        0xb2d0_5e00,
+    );
+}
+
+#[test]
+fn vcvt_to_signed_rounds_toward_zero() {
+    // Plain `vcvt` into an integer carries round-toward-zero in the
+    // opcode: -1.5 becomes -1. Rounding to nearest would give -2, and
+    // nothing about the lift would look wrong.
+    assert_computes(
+        "vcvt.s32.f32",
+        &[DEST, SOURCE],
+        &from_source(0xbfc0_0000),
+        0xffff_ffff,
+    );
+}
+
+#[test]
+fn vcvtm_rounds_toward_negative_infinity() {
+    // The companion direction, so the two forms are genuinely
+    // distinguished rather than both landing on round-toward-zero:
+    // `vcvtm` of -1.5 is -2 where `vcvt` is -1.
+    assert_computes(
+        "vcvtm.s32.f32",
+        &[DEST, SOURCE],
+        &from_source(0xbfc0_0000),
+        0xffff_fffe,
+    );
+}
+
+#[test]
+fn vcvtn_breaks_a_tie_to_even() {
+    // 2.5 is exactly between 2 and 3. `vcvtn` is round-to-nearest with
+    // ties to even, so it gives 2.
+    assert_computes(
+        "vcvtn.s32.f32",
+        &[DEST, SOURCE],
+        &from_source(0x4020_0000),
+        2,
+    );
+}
+
+#[test]
+fn vcvta_breaks_the_same_tie_away_from_zero() {
+    // The one input that tells `vcvta` from `vcvtn`: ties away from zero
+    // gives 3 where ties to even gives 2. Without this pair the two
+    // modes are indistinguishable on every test above.
+    assert_computes(
+        "vcvta.s32.f32",
+        &[DEST, SOURCE],
+        &from_source(0x4020_0000),
+        3,
+    );
+}
+
+#[test]
+fn vcvt_from_signed_integer_reads_the_source_as_signed() {
+    // `0xffffffff` is -1 read signed and 4294967295 read unsigned, so a
+    // lowering that lost the signedness would produce a large positive
+    // float rather than -1.0.
+    assert_computes(
+        "vcvt.f32.s32",
+        &[DEST, SOURCE],
+        &from_source(0xffff_ffff),
+        0xbf80_0000,
+    );
+}
+
+#[test]
+fn vcvt_from_unsigned_integer_reads_the_same_bits_as_unsigned() {
+    // The companion direction on the identical input: 4294967295 rounds
+    // to 4294967296.0 in binary32, whose pattern is 0x4f800000.
+    assert_computes(
+        "vcvt.f32.u32",
+        &[DEST, SOURCE],
+        &from_source(0xffff_ffff),
+        0x4f80_0000,
+    );
+}
+
+#[test]
+fn vcvt_between_float_widths_converts_the_value_not_the_bits() {
+    // `vcvt.f64.f32 d0, s4` widens 1.5f to 1.5. Reinterpreting the bit
+    // pattern instead would give a denormal, and reading the source at
+    // the destination's width would take 64 bits of `v1`.
+    assert_computes(
+        "vcvt.f64.f32",
+        &["d0", SOURCE],
+        &from_source(0x3fc0_0000),
+        0x3ff8_0000_0000_0000,
+    );
+}
+
+#[test]
+fn packed_vcvt_converts_every_lane_not_just_the_first() {
+    // The scalar VFP arm recognises the same mnemonic, so a packed form
+    // the NEON resolver missed would convert lane zero and leave the
+    // rest of the register standing. Two different lanes with two
+    // different values is what tells the two lowerings apart: 1.5 and
+    // 2.5 truncate to 1 and 2.
+    assert_computes(
+        "vcvt.s32.f32",
+        &["d0", "d2"],
+        &[("v0", 0), ("v1", 0x4020_0000_3fc0_0000)],
+        0x0000_0002_0000_0001,
+    );
+}
+
+#[test]
+fn packed_vcvt_from_integer_reads_lanes_as_signed() {
+    // -1 and 2 in adjacent lanes: reading them unsigned would make the
+    // low lane 4294967296.0 rather than -1.0.
+    assert_computes(
+        "vcvt.f32.s32",
+        &["d0", "d2"],
+        &[("v0", 0), ("v1", 0x0000_0002_ffff_ffff)],
+        0x4000_0000_bf80_0000,
+    );
+}
+
+#[test]
+fn vcvt_fixed_point_scales_by_the_fraction_width() {
+    // The fixed-point form reads the low 16 bits as a signed value
+    // scaled by 2^-8: 384 / 256 = 1.5. Ignoring the third operand would
+    // give 384.0 instead, and the instruction would still lift.
+    //
+    // ARM requires one register for both operands here, so the
+    // destination parent carries the source bits.
+    assert_computes(
+        "vcvt.f32.s16",
+        &[DEST, DEST, "#8"],
+        &[("v0", 0x0180)],
+        0x3fc0_0000,
+    );
+}
+
+// the half-precision pair
+//
+// `vcvtb` / `vcvtt` are the same conversion as `vcvt` plus a statement
+// of *which half* of a 32-bit register the binary16 end occupies — the
+// only reason they are two mnemonics. Getting the half wrong reads or
+// writes the neighbouring 16 bits, which is a wrong value and not a
+// decline, so every one of these binds both halves and checks both.
+
+/// Whether the lifter refuses `mnemonic` with these operands.
+fn declines(mnemonic: &str, operands: &[&str]) -> bool {
+    let insn = Instruction {
+        address: Address::new(0x1000),
+        size: 4,
+        bytes: vec![],
+        mnemonic: mnemonic.into(),
+        operands: operands.iter().map(|o| operand(o)).collect(),
+        esil: None,
+        pcode: None,
+        is_thumb: false,
+    };
+    lift_per_mnemonic(&insn, Arch::Arm)
+        .iter()
+        .any(|s| matches!(s, IrStmt::Unsupported { .. }))
+}
+
+/// `1.5` and `-2.5` in binary16 and binary32.
+const H_ONE_POINT_FIVE: u128 = 0x3e00;
+const H_MINUS_TWO_POINT_FIVE: u128 = 0xc100;
+const S_ONE_POINT_FIVE: u128 = 0x3fc0_0000;
+const S_MINUS_TWO_POINT_FIVE: u128 = 0xc020_0000;
+
+#[test]
+fn vcvtb_widens_the_low_half_of_the_source() {
+    // `s4` holds `-2.5` in its top half and `1.5` in its bottom. `vcvtb`
+    // must take the bottom one, so a lowering that ignored the index
+    // would answer the binary32 spelling of -2.5 instead.
+    assert_computes(
+        "vcvtb.f32.f16",
+        &[DEST, SOURCE],
+        &from_source((H_MINUS_TWO_POINT_FIVE << 16) | H_ONE_POINT_FIVE),
+        S_ONE_POINT_FIVE,
+    );
+}
+
+#[test]
+fn vcvtt_widens_the_top_half_of_the_source() {
+    // The mirror, on the same source word: this is the pair that makes
+    // the two mnemonics impossible to satisfy with one index.
+    assert_computes(
+        "vcvtt.f32.f16",
+        &[DEST, SOURCE],
+        &from_source((H_MINUS_TWO_POINT_FIVE << 16) | H_ONE_POINT_FIVE),
+        S_MINUS_TWO_POINT_FIVE,
+    );
+}
+
+#[test]
+fn vcvtb_narrows_into_the_low_half_and_preserves_the_top() {
+    // The write direction. `v0` is preset with ones in `s0`'s upper
+    // half, which `vcvtb` must leave standing — an `AArch32` VFP write
+    // merges. A lowering that wrote the whole `s` register would clear
+    // them.
+    assert_computes(
+        "vcvtb.f16.f32",
+        &[DEST, SOURCE],
+        &[("v0", 0xffff_0000), ("v1", S_ONE_POINT_FIVE)],
+        0xffff_0000 | H_ONE_POINT_FIVE,
+    );
+}
+
+#[test]
+fn vcvtt_narrows_into_the_top_half_and_preserves_the_bottom() {
+    assert_computes(
+        "vcvtt.f16.f32",
+        &[DEST, SOURCE],
+        &[("v0", 0x0000_ffff), ("v1", S_ONE_POINT_FIVE)],
+        (H_ONE_POINT_FIVE << 16) | 0xffff,
+    );
+}
+
+#[test]
+fn the_half_precision_pair_rejects_shapes_that_are_not_encodings() {
+    // Both ends must be floats and exactly one of them 16 bits: the
+    // mnemonics exist only to index a half-precision value, so an
+    // integer end or two equal widths names nothing.
+    assert!(declines("vcvtb.s32.f32", &[DEST, SOURCE]));
+    assert!(declines("vcvtt.f32.f32", &[DEST, SOURCE]));
+    assert!(declines("vcvtb.f16.s32", &[DEST, SOURCE]));
+}
+
+// the packed half-precision forms
+//
+// `vcvt.f16.f32 d0, q1` and its inverse. These change each lane's width
+// without changing the lane *count*, so the two operands name views of
+// different sizes — the one packed family here whose operands are not a
+// uniform view. Missing them is the hazard `neon/width.rs`'s doc
+// describes: the scalar VFP arm spells the same mnemonic, so a packed
+// form the resolver drops is lowered as a conversion of lane zero with
+// the rest of the register standing, not declined.
+
+#[test]
+fn packed_vcvt_narrows_every_lane_into_a_doubleword() {
+    // Four binary32 lanes in `q1` become four binary16 lanes in `d0`.
+    // The four values differ so a lowering that converted lane zero and
+    // copied, or that read the source at the destination's width, fails.
+    assert_computes(
+        "vcvt.f16.f32",
+        &["d0", "q1"],
+        &[
+            ("v0", 0),
+            (
+                "v1",
+                S_ONE_POINT_FIVE
+                    | (S_MINUS_TWO_POINT_FIVE << 32)
+                    | (S_ONE_POINT_FIVE << 64)
+                    | (S_MINUS_TWO_POINT_FIVE << 96),
+            ),
+        ],
+        H_ONE_POINT_FIVE
+            | (H_MINUS_TWO_POINT_FIVE << 16)
+            | (H_ONE_POINT_FIVE << 32)
+            | (H_MINUS_TWO_POINT_FIVE << 48),
+    );
+}
+
+#[test]
+fn packed_vcvt_widens_every_lane_into_a_quadword() {
+    // The inverse, whose destination is the wider operand. Only the low
+    // 64 bits of `v0` are asserted by this harness, which is two of the
+    // four widened lanes — enough to fail a lowering that read the
+    // source at the wrong width, since lane 1 would then be wrong.
+    assert_computes(
+        "vcvt.f32.f16",
+        &["q0", "d2"],
+        &[
+            ("v0", 0),
+            (
+                "v1",
+                H_ONE_POINT_FIVE
+                    | (H_MINUS_TWO_POINT_FIVE << 16)
+                    | (H_ONE_POINT_FIVE << 32)
+                    | (H_MINUS_TWO_POINT_FIVE << 48),
+            ),
+        ],
+        S_ONE_POINT_FIVE | (S_MINUS_TWO_POINT_FIVE << 32),
+    );
+}
+
+#[test]
+fn packed_vcvt_rejects_a_view_pair_that_is_not_an_encoding() {
+    // The lane count has to agree even though the widths do not, so a
+    // narrowing form whose source is only a doubleword names nothing.
+    // And the float-to-float direction has no fixed-point form, so a
+    // third operand is the parser having mis-read the shape.
+    assert!(declines("vcvt.f16.f32", &["d0", "d2"]));
+    assert!(declines("vcvt.f32.f16", &["q0", "q1"]));
+    assert!(declines("vcvt.f16.f32", &["d0", "q1", "#1"]));
+}

@@ -1,0 +1,1454 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use r2smt_common::Address;
+use r2smt_ir::program::{Instruction, Operand, OperandKind};
+
+use super::*;
+
+fn op(raw: &str, kind: OperandKind) -> Operand {
+    Operand {
+        raw: raw.into(),
+        kind,
+    }
+}
+
+fn insn(mnem: &str, operands: Vec<Operand>) -> Instruction {
+    Instruction {
+        address: Address(0),
+        size: 0,
+        bytes: vec![],
+        mnemonic: mnem.into(),
+        operands,
+        esil: None,
+        pcode: None,
+        is_thumb: false,
+    }
+}
+
+/// Test-only adapter so the existing x86 assertions stay terse.
+/// `AArch64`-specific tests use `analyze(..., Arch::Aarch64)`.
+fn ax86(i: &Instruction) -> InstructionEffect {
+    analyze(i, Arch::X86_64)
+}
+
+#[test]
+fn canonical_register_covers_aliases() {
+    for alias in ["rax", "eax", "ax", "al", "ah"] {
+        assert_eq!(canonical_register(alias, Arch::X86_64), Some("rax"));
+    }
+    assert_eq!(canonical_register("r8d", Arch::X86_64), Some("r8"));
+    // `xmm` now resolves (P40-b); MMX stays unmodelled. `st0` is the
+    // ESIL spelling of the x87 stack, which resolves only under the
+    // bare `st` token that the disassembly spelling `st(0)` yields.
+    assert_eq!(canonical_register("st0", Arch::X86_64), None);
+    assert_eq!(canonical_register("ptr", Arch::X86_64), None);
+    assert_eq!(canonical_register("0x10", Arch::X86_64), None);
+}
+
+#[test]
+fn registers_in_operand_extracts_from_memory_expression() {
+    let memory = op("dword ptr [rbp + rax*2 + 8]", OperandKind::Memory);
+    let regs = registers_in_operand(&memory, Arch::X86_64);
+    assert!(regs.contains(&"rbp"));
+    assert!(regs.contains(&"rax"));
+    assert_eq!(regs.len(), 2);
+}
+
+#[test]
+fn canonical_register_dispatches_on_arch() {
+    // `sp` is the 16-bit alias of `rsp` on x86, the 64-bit stack
+    // pointer on AArch64, and an alias of `r13` on AArch32. Same
+    // string, three different parents — proves the arch parameter
+    // is consulted instead of an ISA-blind table.
+    assert_eq!(canonical_register("sp", Arch::X86_64), Some("rsp"));
+    assert_eq!(canonical_register("sp", Arch::Aarch64), Some("sp"));
+    assert_eq!(canonical_register("sp", Arch::Arm), Some("r13"));
+}
+
+#[test]
+fn canonical_register_rejects_names_from_other_isas() {
+    // x86 names must not resolve under AArch64 / AArch32 and
+    // vice versa, otherwise cross-ISA disassembly noise pollutes
+    // the data-flow graph.
+    assert_eq!(canonical_register("rax", Arch::Aarch64), None);
+    assert_eq!(canonical_register("rax", Arch::Arm), None);
+    assert_eq!(canonical_register("x0", Arch::X86_64), None);
+    assert_eq!(canonical_register("x0", Arch::Arm), None);
+}
+
+#[test]
+fn registers_in_operand_dispatches_on_arch() {
+    // `[x0, x1]` is an AArch64 memory expression. Tokenising it
+    // under X86_64 yields nothing because x0/x1 are not x86 GPR
+    // names; under AArch64 it yields both registers.
+    let memory = op("[x0, x1]", OperandKind::Memory);
+    assert!(registers_in_operand(&memory, Arch::X86_64).is_empty());
+    let aa64 = registers_in_operand(&memory, Arch::Aarch64);
+    assert!(aa64.contains(&"x0"));
+    assert!(aa64.contains(&"x1"));
+}
+
+#[test]
+fn registers_in_operand_surfaces_arm_simd_names() {
+    // `v1.2d` is a common AArch64 NEON operand spelling. The
+    // tokenizer splits on the dot, so `v1` should surface even
+    // when paired with a width suffix the slicer doesn't model.
+    let neon = op("v1.2d", OperandKind::Register);
+    let aa64 = registers_in_operand(&neon, Arch::Aarch64);
+    assert!(aa64.contains(&"v1"));
+    // Under AArch32 the same string `v1` is the AAPCS alias for
+    // r4 (not a NEON register — NEON is qN/dN/sN under AArch32).
+    // The tokenizer therefore surfaces r4, not a synthetic v
+    // parent.
+    let arm = registers_in_operand(&neon, Arch::Arm);
+    assert!(arm.contains(&"r4"));
+    assert!(!arm.contains(&"v1"));
+}
+
+#[test]
+fn registers_in_operand_collapses_arm32_d_to_v_parent() {
+    // A NEON load list like `{d0, d1}` should surface a single
+    // parent (v0) — d0 and d1 are both halves of v0. The slicer
+    // can then see that subsequent reads of q0 or s2 also touch
+    // the same data-flow node.
+    let list = op("{d0, d1}", OperandKind::Register);
+    let arm = registers_in_operand(&list, Arch::Arm);
+    assert_eq!(arm, vec!["v0"]);
+}
+
+#[test]
+fn canonical_register_recognises_aarch64_simd_aliases() {
+    for alias in ["v0", "q0", "d0", "s0", "h0", "b0"] {
+        assert_eq!(canonical_register(alias, Arch::Aarch64), Some("v0"));
+    }
+    assert_eq!(canonical_register("d31", Arch::Aarch64), Some("v31"));
+    // Adding ARM SIMD does not accidentally widen the x86 table: MMX
+    // stays None, and so does the ESIL-only `st0` spelling of the x87
+    // stack (whose disassembly spelling `st(0)` tokenises to `st`).
+    assert_eq!(canonical_register("mm0", Arch::X86_64), None);
+    assert_eq!(canonical_register("st0", Arch::X86_64), None);
+}
+
+#[test]
+fn mov_reg_imm_defines_no_flags() {
+    let e = ax86(&insn(
+        "mov",
+        vec![
+            op("eax", OperandKind::Register),
+            op("0x10", OperandKind::Immediate),
+        ],
+    ));
+    assert_eq!(e.kind, InstructionKind::Mov);
+    assert_eq!(e.defs, vec!["rax"]);
+    assert!(e.uses.is_empty());
+    assert!(!e.defines_flags);
+}
+
+#[test]
+fn xor_same_register_is_zero_idiom() {
+    let e = ax86(&insn(
+        "xor",
+        vec![
+            op("eax", OperandKind::Register),
+            op("eax", OperandKind::Register),
+        ],
+    ));
+    assert_eq!(e.kind, InstructionKind::Xor);
+    assert_eq!(e.defs, vec!["rax"]);
+    assert!(e.uses.is_empty(), "zero idiom must not depend on prior eax");
+    assert!(e.defines_flags);
+}
+
+#[test]
+fn xor_different_registers_uses_both() {
+    let e = ax86(&insn(
+        "xor",
+        vec![
+            op("eax", OperandKind::Register),
+            op("ebx", OperandKind::Register),
+        ],
+    ));
+    assert_eq!(e.defs, vec!["rax"]);
+    assert_eq!(e.uses, vec!["rax", "rbx"]);
+    assert!(e.defines_flags);
+}
+
+#[test]
+fn cmp_uses_both_operands_no_def() {
+    let e = ax86(&insn(
+        "cmp",
+        vec![
+            op("eax", OperandKind::Register),
+            op("2", OperandKind::Immediate),
+        ],
+    ));
+    assert_eq!(e.kind, InstructionKind::Cmp);
+    assert!(e.defs.is_empty());
+    assert_eq!(e.uses, vec!["rax"]);
+    assert!(e.defines_flags);
+}
+
+#[test]
+fn test_uses_both_operands_no_def() {
+    let e = ax86(&insn(
+        "test",
+        vec![
+            op("eax", OperandKind::Register),
+            op("eax", OperandKind::Register),
+        ],
+    ));
+    assert_eq!(e.kind, InstructionKind::Test);
+    assert!(e.defs.is_empty());
+    assert_eq!(e.uses, vec!["rax"]);
+    assert!(e.defines_flags);
+}
+
+#[test]
+fn lea_does_not_access_memory() {
+    let e = ax86(&insn(
+        "lea",
+        vec![
+            op("eax", OperandKind::Register),
+            op("[rbp - 4]", OperandKind::Memory),
+        ],
+    ));
+    assert_eq!(e.kind, InstructionKind::Lea);
+    assert_eq!(e.defs, vec!["rax"]);
+    assert_eq!(e.uses, vec!["rbp"]);
+    assert!(!e.has_memory_access);
+    assert!(!e.defines_flags);
+}
+
+#[test]
+fn mov_load_from_register_indirect_is_modellable_memory() {
+    // `[rax]` is register-indirect — a memory access the byte model
+    // can build, so it flags `has_memory_access` but is NOT
+    // unmodellable (resolves without `--allow-memory`). The address
+    // register is a data-flow input.
+    let mem = op("[rax]", OperandKind::Memory);
+    let e = ax86(&insn(
+        "mov",
+        vec![op("eax", OperandKind::Register), mem.clone()],
+    ));
+    assert!(e.has_memory_access);
+    assert!(!has_unmodellable_memory(
+        std::slice::from_ref(&mem),
+        Arch::X86_64
+    ));
+    assert!(e.uses.contains(&"rax"));
+}
+
+#[test]
+fn mov_load_from_stack_slot_is_modellable_memory() {
+    // `[rbp - 4]` now lifts through the byte model like any other
+    // memory operand: `has_memory_access` is set and the base register
+    // `rbp` is a data-flow input, not a virtual stack slot.
+    let e = ax86(&insn(
+        "mov",
+        vec![
+            op("eax", OperandKind::Register),
+            op("[rbp - 4]", OperandKind::Memory),
+        ],
+    ));
+    assert!(e.has_memory_access);
+    assert!(e.uses.contains(&"rbp"));
+    assert!(e.defs.contains(&"rax"));
+}
+
+#[test]
+fn mov_store_to_stack_slot_uses_address_register_no_reg_def() {
+    // `mov [rbp - 8], 5` — a byte-model store: no register def, the
+    // address register `rbp` is a use.
+    let e = ax86(&insn(
+        "mov",
+        vec![
+            op("dword ptr [rbp - 8]", OperandKind::Memory),
+            op("5", OperandKind::Immediate),
+        ],
+    ));
+    assert!(e.has_memory_access);
+    assert!(e.uses.contains(&"rbp"));
+    assert!(
+        e.defs.is_empty(),
+        "memory stores must not define a register"
+    );
+}
+
+#[test]
+fn segment_prefixed_memory_is_unmodellable() {
+    // `fs:[0x30]` addresses `fs_base + 0x30`; the byte model declines
+    // it, so it must be gated (unmodellable) rather than resolved as
+    // an absolute `[0x30]`.
+    let seg = op("qword fs:[0x30]", OperandKind::Memory);
+    assert!(has_unmodellable_memory(
+        std::slice::from_ref(&seg),
+        Arch::X86_64
+    ));
+}
+
+#[test]
+fn stack_slot_rejects_dynamic_indexing() {
+    let dyn_op = op("[rbp + rax*4]", OperandKind::Memory);
+    assert!(stack_slot(&dyn_op).is_none());
+    let abs_op = op("[rax]", OperandKind::Memory);
+    assert!(stack_slot(&abs_op).is_none());
+}
+
+#[test]
+fn stack_slot_recognises_widths() {
+    let (name, bits) = stack_slot(&op("byte ptr [rbp - 1]", OperandKind::Memory)).unwrap();
+    assert_eq!(name, "stk_rbp_-1");
+    assert_eq!(bits, 8);
+    let (_, bits) = stack_slot(&op("qword ptr [rsp + 0x10]", OperandKind::Memory)).unwrap();
+    assert_eq!(bits, 64);
+}
+
+#[test]
+fn xor_sub_register_is_not_zero_idiom() {
+    // `xor ah, al` mixes two distinct sub-registers of rax. It is
+    // NOT a zero idiom; the result depends on the current bytes of
+    // rax. Regression for a Phase D false-positive that surfaced
+    // on APT10 ANELLOADER (every `xor ah, al` was being treated
+    // as a constant zero).
+    let e = ax86(&insn(
+        "xor",
+        vec![
+            op("ah", OperandKind::Register),
+            op("al", OperandKind::Register),
+        ],
+    ));
+    // Treated as plain arithmetic — defines rax (canonical of ah),
+    // uses rax (both operands canonicalise to it), sets flags.
+    assert!(!e.uses.is_empty(), "xor ah, al must read rax");
+    assert!(e.defines_flags);
+    // The defs set has rax because ah's write touches the rax
+    // virtual register; uses must also include rax (the source).
+    assert!(e.defs.contains(&"rax"));
+    assert!(e.uses.contains(&"rax"));
+}
+
+#[test]
+fn xor_eax_eax_is_still_zero_idiom() {
+    let e = ax86(&insn(
+        "xor",
+        vec![
+            op("eax", OperandKind::Register),
+            op("eax", OperandKind::Register),
+        ],
+    ));
+    assert_eq!(e.uses, Vec::<&'static str>::new());
+    assert_eq!(e.defs, vec!["rax"]);
+    assert!(e.defines_flags);
+}
+
+#[test]
+fn imul_two_operand_is_arithmetic() {
+    let e = ax86(&insn(
+        "imul",
+        vec![
+            op("eax", OperandKind::Register),
+            op("eax", OperandKind::Register),
+        ],
+    ));
+    assert_eq!(e.kind, InstructionKind::Imul);
+    assert_eq!(e.defs, vec!["rax"]);
+    assert_eq!(e.uses, vec!["rax"]);
+    assert!(e.defines_flags);
+}
+
+#[test]
+fn call_is_flagged() {
+    let e = ax86(&insn("call", vec![op("0x401000", OperandKind::Immediate)]));
+    assert_eq!(e.kind, InstructionKind::Call);
+    assert!(e.is_call);
+}
+
+#[test]
+fn unknown_mnemonic_is_other() {
+    let e = ax86(&insn("cpuid", vec![]));
+    assert_eq!(e.kind, InstructionKind::Other);
+    assert!(!e.is_call);
+}
+
+fn aa64(i: &Instruction) -> InstructionEffect {
+    analyze(i, Arch::Aarch64)
+}
+
+#[test]
+fn aarch64_mov_defines_destination_without_flags() {
+    let e = aa64(&insn(
+        "mov",
+        vec![
+            op("x0", OperandKind::Register),
+            op("x1", OperandKind::Register),
+        ],
+    ));
+    assert_eq!(e.kind, InstructionKind::Mov);
+    assert_eq!(e.defs, vec!["x0"]);
+    assert_eq!(e.uses, vec!["x1"]);
+    assert!(!e.defines_flags);
+}
+
+#[test]
+fn aarch64_add_is_3op_no_flags_adds_sets_flags() {
+    let plain = aa64(&insn(
+        "add",
+        vec![
+            op("x0", OperandKind::Register),
+            op("x1", OperandKind::Register),
+            op("x2", OperandKind::Register),
+        ],
+    ));
+    assert_eq!(plain.kind, InstructionKind::Add);
+    assert_eq!(plain.defs, vec!["x0"]);
+    assert_eq!(plain.uses, vec!["x1", "x2"]);
+    assert!(!plain.defines_flags);
+
+    let flag_set = aa64(&insn(
+        "adds",
+        vec![
+            op("x0", OperandKind::Register),
+            op("x1", OperandKind::Register),
+            op("x2", OperandKind::Register),
+        ],
+    ));
+    assert!(flag_set.defines_flags);
+}
+
+#[test]
+fn aarch64_cmp_uses_both_no_def() {
+    let e = aa64(&insn(
+        "cmp",
+        vec![
+            op("x0", OperandKind::Register),
+            op("#0", OperandKind::Immediate),
+        ],
+    ));
+    assert_eq!(e.kind, InstructionKind::Cmp);
+    assert!(e.defs.is_empty());
+    assert_eq!(e.uses, vec!["x0"]);
+    assert!(e.defines_flags);
+}
+
+#[test]
+fn aarch64_b_cond_is_jcc() {
+    let e = aa64(&insn("b.eq", vec![op("0x401080", OperandKind::Immediate)]));
+    assert_eq!(e.kind, InstructionKind::Jcc);
+}
+
+#[test]
+fn aarch64_unconditional_b_is_jmp() {
+    let e = aa64(&insn("b", vec![op("0x401080", OperandKind::Immediate)]));
+    assert_eq!(e.kind, InstructionKind::Jmp);
+}
+
+#[test]
+fn aarch64_bl_is_call() {
+    let e = aa64(&insn("bl", vec![op("0x402000", OperandKind::Immediate)]));
+    assert_eq!(e.kind, InstructionKind::Call);
+    assert!(e.is_call);
+}
+
+#[test]
+fn aarch64_w_subregister_canonicalises_to_x() {
+    let e = aa64(&insn(
+        "mov",
+        vec![
+            op("w0", OperandKind::Register),
+            op("w1", OperandKind::Register),
+        ],
+    ));
+    // AArch64 32-bit subregisters share the parent name; defs/uses
+    // collapse onto the 64-bit family for slicing.
+    assert_eq!(e.defs, vec!["x0"]);
+    assert_eq!(e.uses, vec!["x1"]);
+}
+
+#[test]
+fn x86_mnemonics_under_aarch64_are_other() {
+    // `xor` is x86; AArch64 uses `eor`. Under Arch::Aarch64 the
+    // analyzer must classify `xor` as Other so the slicer
+    // truncates instead of misinterpreting it.
+    let e = aa64(&insn(
+        "xor",
+        vec![
+            op("x0", OperandKind::Register),
+            op("x0", OperandKind::Register),
+        ],
+    ));
+    assert_eq!(e.kind, InstructionKind::Other);
+}
+
+#[test]
+fn shifts_define_dest_and_flags() {
+    let e = ax86(&insn(
+        "shl",
+        vec![
+            op("eax", OperandKind::Register),
+            op("4", OperandKind::Immediate),
+        ],
+    ));
+    assert_eq!(e.kind, InstructionKind::Shl);
+    assert_eq!(e.defs, vec!["rax"]);
+    assert_eq!(e.uses, vec!["rax"]);
+    assert!(e.defines_flags);
+}
+
+#[test]
+fn memory_operand_width_reads_simd_size_prefixes() {
+    assert_eq!(memory_operand_width("xmmword ptr [rsi]"), Some(128));
+    assert_eq!(memory_operand_width("ymmword [rsi]"), Some(256));
+    assert_eq!(memory_operand_width("zmmword ptr [rsi]"), Some(512));
+    assert_eq!(memory_operand_width("qword ptr [rbp - 8]"), Some(64));
+    assert_eq!(memory_operand_width("dword [rax]"), Some(32));
+    assert_eq!(memory_operand_width("byte ptr [rdi]"), Some(8));
+}
+
+#[test]
+fn memory_operand_width_ignores_size_keywords_inside_symbols() {
+    // A symbol whose name merely contains a size keyword is not a sized
+    // access — the specifier must be the leading token.
+    assert_eq!(memory_operand_width("[obj.dword_table]"), None);
+    assert_eq!(memory_operand_width("[byte_count]"), None);
+    assert_eq!(memory_operand_width("[rax]"), None);
+}
+
+#[test]
+fn aarch64_packed_add_defines_its_vector_destination() {
+    // The soundness contract this replaces: an arranged destination used
+    // to canonicalise to `None`, so the instruction passed with empty
+    // `defs` while `v1`/`v2` still resolved as `uses`. The slicer then
+    // neither truncated nor kept it, and a later read of `v0` bound to a
+    // stale definition. Now the packed handler models it, so the
+    // definition is reported.
+    let i = insn(
+        "add",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+            op("v2.4s", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert_eq!(effect.defs, vec!["v0"]);
+}
+
+#[test]
+fn aarch64_packed_add_reads_both_vector_sources() {
+    let i = insn(
+        "add",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+            op("v2.4s", OperandKind::Register),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).uses, vec!["v1", "v2"]);
+}
+
+#[test]
+fn aarch64_packed_add_is_classified_as_simd() {
+    let i = insn(
+        "add",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+            op("v2.4s", OperandKind::Register),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Simd);
+}
+
+#[test]
+fn aarch64_packed_floating_point_defines_its_vector_destination() {
+    let i = insn(
+        "fadd",
+        vec![
+            op("v0.2d", OperandKind::Register),
+            op("v1.2d", OperandKind::Register),
+            op("v2.2d", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert_eq!(effect.defs, vec!["v0"]);
+}
+
+#[test]
+fn aarch64_packed_vector_instruction_sets_no_flags() {
+    let i = insn(
+        "add",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+            op("v2.4s", OperandKind::Register),
+        ],
+    );
+    assert!(!analyze(&i, Arch::Aarch64).defines_flags);
+}
+
+#[test]
+fn aarch64_unmodelled_vector_mnemonic_declines() {
+    // Not modelled, so the effect table has to fail closed — otherwise
+    // the slicer retains a definition the lifter drops. `bfdot` is the
+    // canary now that `fmulx` lifts: a `FEAT_BF16` dot product, whose
+    // bfloat16 lanes name no IEEE format this pipeline carries.
+    let i = insn(
+        "bfdot",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.8h", OperandKind::Register),
+            op("v2.8h", OperandKind::Register),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);
+}
+
+#[test]
+fn aarch64_indexed_lane_operand_declines() {
+    let i = insn(
+        "mov",
+        vec![
+            op("w0", OperandKind::Register),
+            op("v0.s[1]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);
+}
+
+#[test]
+fn aarch64_multi_register_list_operand_recovers_every_parent() {
+    let i = insn(
+        "ld4",
+        vec![
+            op("{v16.4s, v17.4s, v18.4s, v19.4s}", OperandKind::Unknown),
+            op("[x2]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(
+        analyze(&i, Arch::Aarch64).defs,
+        vec!["v16", "v17", "v18", "v19"]
+    );
+}
+
+#[test]
+fn aarch64_structured_list_of_an_unmodelled_shape_still_declines() {
+    // A list the resolver cannot place -- here one whose registers are
+    // not consecutive -- must truncate the slice rather than pass with
+    // an empty `defs`.
+    let i = insn(
+        "ld4",
+        vec![
+            op("{v16.4s, v18.4s, v20.4s, v22.4s}", OperandKind::Unknown),
+            op("[x2]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).kind, InstructionKind::Other);
+}
+
+#[test]
+fn aarch64_scalar_arithmetic_is_unaffected_by_the_arrangement_guard() {
+    let i = insn(
+        "add",
+        vec![
+            op("x0", OperandKind::Register),
+            op("x1", OperandKind::Register),
+            op("x2", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert_eq!(effect.kind, InstructionKind::Add);
+    assert_eq!(effect.defs, vec!["x0"]);
+}
+
+#[test]
+fn aarch64_scalar_floating_point_is_unaffected_by_the_arrangement_guard() {
+    let i = insn(
+        "fadd",
+        vec![
+            op("s0", OperandKind::Register),
+            op("s1", OperandKind::Register),
+            op("s2", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert_eq!(effect.kind, InstructionKind::Simd);
+    assert_eq!(effect.defs, vec!["v0"]);
+}
+
+#[test]
+fn aarch32_indexed_vector_lane_declines() {
+    // AArch32 spells the indexed form without a dot (`d0[1]`), so it
+    // reaches the integer arms by a different route than AArch64's.
+    let i = insn(
+        "vmov",
+        vec![
+            op("r0", OperandKind::Register),
+            op("d0[1]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Arm).kind, InstructionKind::Other);
+}
+
+#[test]
+fn aarch32_aapcs_vector_alias_is_still_a_general_purpose_register() {
+    // `v1` on AArch32 is the AAPCS alias for `r4`, not a vector
+    // register: a bare name carries no arrangement and must survive.
+    let i = insn(
+        "add",
+        vec![
+            op("v1", OperandKind::Register),
+            op("v2", OperandKind::Register),
+            op("v3", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Arm);
+    assert_eq!(effect.kind, InstructionKind::Add);
+    assert_eq!(effect.defs, vec!["r4"]);
+}
+
+#[test]
+fn aarch32_packed_integer_defines_its_vector_destination() {
+    let i = insn(
+        "vadd.i32",
+        vec![
+            op("q0", OperandKind::Register),
+            op("q1", OperandKind::Register),
+            op("q2", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Arm);
+    assert_eq!(effect.defs, vec!["v0"]);
+}
+
+#[test]
+fn aarch32_packed_integer_also_reads_its_destination() {
+    // An AArch32 vector write merges, so the prior value stays live.
+    let i = insn(
+        "vadd.i32",
+        vec![
+            op("d0", OperandKind::Register),
+            op("d1", OperandKind::Register),
+            op("d2", OperandKind::Register),
+        ],
+    );
+    assert!(analyze(&i, Arch::Arm).uses.contains(&"v0"));
+}
+
+#[test]
+fn aarch32_untyped_bitwise_neon_is_classified_as_simd() {
+    let i = insn(
+        "vand",
+        vec![
+            op("q0", OperandKind::Register),
+            op("q1", OperandKind::Register),
+            op("q2", OperandKind::Register),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Arm).kind, InstructionKind::Simd);
+}
+
+#[test]
+fn aarch32_general_purpose_push_list_is_still_data_movement() {
+    // A GPR register list is spelled like a NEON one; judging it by the
+    // braces alone would truncate every AArch32 stack-frame setup.
+    let i = insn("push", vec![op("{r4, r5, lr}", OperandKind::Unknown)]);
+    assert_eq!(analyze(&i, Arch::Arm).kind, InstructionKind::Mov);
+}
+
+#[test]
+fn aarch32_general_purpose_register_list_is_not_a_vector_shape() {
+    // AArch32 spells push / pop / ldm operands with the same braces as
+    // an AArch64 vector list, so an arrangement guard that keys on the
+    // brace alone fails every stack-frame setup closed. The corpus
+    // cannot catch this: it holds no 32-bit ARM sample at all.
+    let i = insn("push", vec![op("{r4, r5, lr}", OperandKind::Unknown)]);
+    let effect = analyze(&i, Arch::Arm);
+    assert_eq!(effect.kind, InstructionKind::Mov);
+}
+
+#[test]
+fn aarch32_movs_defines_flags_unlike_plain_mov() {
+    let movs = insn(
+        "movs",
+        vec![
+            op("r0", OperandKind::Register),
+            op("r1", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&movs, Arch::Arm);
+    assert_eq!(effect.defs, vec!["r0"]);
+    assert!(effect.defines_flags);
+
+    let plain = insn(
+        "mov",
+        vec![
+            op("r0", OperandKind::Register),
+            op("r1", OperandKind::Register),
+        ],
+    );
+    assert!(!analyze(&plain, Arch::Arm).defines_flags);
+}
+
+#[test]
+fn aarch32_thumb_two_operand_arith_reads_its_destination() {
+    // `add r0, r1` ≡ `add r0, r0, r1`, so the destination is also a
+    // source — the slicer must keep r0 alive.
+    let short = insn(
+        "add",
+        vec![
+            op("r0", OperandKind::Register),
+            op("r1", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&short, Arch::Arm);
+    assert_eq!(effect.defs, vec!["r0"]);
+    assert_eq!(effect.uses, vec!["r0", "r1"]);
+}
+
+#[test]
+fn aarch32_thumb_wide_suffix_keeps_the_base_effect() {
+    // `add.w` must produce the same def / use chain as `add`, or the
+    // slicer truncates at every wide-encoded data-processing instruction.
+    let wide = insn(
+        "add.w",
+        vec![
+            op("r0", OperandKind::Register),
+            op("r1", OperandKind::Register),
+            op("r2", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&wide, Arch::Arm);
+    assert_eq!(effect.kind, InstructionKind::Add);
+    assert_eq!(effect.defs, vec!["r0"]);
+    assert_eq!(effect.uses, vec!["r1", "r2"]);
+}
+
+#[test]
+fn aarch32_vpop_range_records_every_member_parent() {
+    // `vpop {d0-d4}` defines sp and every vector parent the range
+    // touches (v0, v1, v2). A range parser that only saw the endpoints
+    // would miss v1, leaving whatever defined it bound to a stale value.
+    let i = insn("vpop", vec![op("{d0-d4}", OperandKind::Unknown)]);
+    let e = analyze(&i, Arch::Arm);
+    assert!(e.has_memory_access);
+    for reg in ["sp", "v0", "v1", "v2"] {
+        assert!(e.defs.contains(&reg), "def {reg} missing: {e:?}");
+    }
+}
+
+#[test]
+fn aarch32_vpush_reads_its_registers_and_writes_sp() {
+    let i = insn("vpush", vec![op("{d8, d9}", OperandKind::Unknown)]);
+    let e = analyze(&i, Arch::Arm);
+    assert!(e.has_memory_access);
+    assert_eq!(e.defs, vec!["sp"]);
+    assert!(e.uses.contains(&"sp") && e.uses.contains(&"v4"), "{e:?}");
+}
+
+#[test]
+fn aarch32_vldr_defines_its_register_and_touches_memory() {
+    // `vldr s0, [r0, #4]` defines the vector parent, reads it (merge)
+    // and the base, and flags memory access.
+    let i = insn(
+        "vldr",
+        vec![
+            op("s0", OperandKind::Register),
+            op("[r0, #4]", OperandKind::Memory),
+        ],
+    );
+    let e = analyze(&i, Arch::Arm);
+    assert!(e.has_memory_access);
+    assert_eq!(e.defs, vec!["v0"]);
+    assert!(e.uses.contains(&"v0") && e.uses.contains(&"r0"), "{e:?}");
+}
+
+#[test]
+fn aarch32_vstr_reads_its_register_and_defines_none() {
+    let i = insn(
+        "vstr",
+        vec![
+            op("d0", OperandKind::Register),
+            op("[r1]", OperandKind::Memory),
+        ],
+    );
+    let e = analyze(&i, Arch::Arm);
+    assert!(e.has_memory_access);
+    assert!(e.defs.is_empty());
+    assert!(e.uses.contains(&"v0") && e.uses.contains(&"r1"), "{e:?}");
+}
+
+#[test]
+fn aarch32_vmrs_flag_transfer_is_kept_not_truncated() {
+    // `vmrs APSR_nzcv, FPSCR` must define and read the flags so the
+    // slice walks past it to the `vcmp`, rather than falling to `Other`
+    // (which truncates a pending slice).
+    let vmrs = insn(
+        "vmrs",
+        vec![
+            op("APSR_nzcv", OperandKind::Register),
+            op("FPSCR", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&vmrs, Arch::Arm);
+    assert_ne!(effect.kind, InstructionKind::Other);
+    assert!(effect.defines_flags && effect.reads_flags);
+
+    // The GPR-read form is not modelled and truncates.
+    let gpr = insn(
+        "vmrs",
+        vec![
+            op("r0", OperandKind::Register),
+            op("FPSCR", OperandKind::Register),
+        ],
+    );
+    assert_eq!(analyze(&gpr, Arch::Arm).kind, InstructionKind::Other);
+}
+
+#[test]
+fn aarch32_cbz_reads_the_compared_register() {
+    // `cbz r0, 0x1000` is a Jcc that reads r0 (so the slicer keeps its
+    // definition) and touches no flags or register defs.
+    let cbz = insn(
+        "cbz",
+        vec![
+            op("r0", OperandKind::Register),
+            op("0x1000", OperandKind::Immediate),
+        ],
+    );
+    let effect = analyze(&cbz, Arch::Arm);
+    assert_eq!(effect.kind, InstructionKind::Jcc);
+    assert_eq!(effect.uses, vec!["r0"]);
+    assert!(effect.defs.is_empty());
+    assert!(!effect.defines_flags);
+}
+
+#[test]
+fn aarch32_bfi_is_not_a_conditional_branch() {
+    // `bfi` / `bfc` are 3-char `b`-words that *define* `Rd`. A length
+    // gate on the `b<cond>` arm swallowed them as flag-free `Jcc`, so
+    // the slicer walked over the definition and a later read bound a
+    // stale value. They must classify as `Other` (which truncates),
+    // never `Jcc`.
+    let bfi = insn(
+        "bfi",
+        vec![
+            op("r0", OperandKind::Register),
+            op("r1", OperandKind::Register),
+            op("0", OperandKind::Immediate),
+            op("8", OperandKind::Immediate),
+        ],
+    );
+    assert_eq!(analyze(&bfi, Arch::Arm).kind, InstructionKind::Other);
+}
+
+#[test]
+fn aarch32_ldrd_defines_both_named_registers() {
+    // Reporting only the first would let the walk step past this
+    // instruction while `r1` is live and bind the read elsewhere.
+    let ldrd = insn(
+        "ldrd",
+        vec![
+            op("r0", OperandKind::Register),
+            op("r1", OperandKind::Register),
+            op("[r2, 8]", OperandKind::Memory),
+        ],
+    );
+    let effect = analyze(&ldrd, Arch::Arm);
+    assert!(effect.defs.contains(&"r0") && effect.defs.contains(&"r1"));
+}
+
+#[test]
+fn aarch32_strd_reads_both_named_registers() {
+    let strd = insn(
+        "strd",
+        vec![
+            op("r0", OperandKind::Register),
+            op("r1", OperandKind::Register),
+            op("[r2, 8]", OperandKind::Memory),
+        ],
+    );
+    let effect = analyze(&strd, Arch::Arm);
+    assert!(effect.uses.contains(&"r0") && effect.uses.contains(&"r1"));
+}
+
+#[test]
+fn aarch32_ldrsb_is_a_modelled_load_not_an_opaque_other() {
+    // `Other` truncates a pending slice, so the effect table is the
+    // gate that decides whether the lifter is ever reached.
+    let ldrsb = insn(
+        "ldrsb",
+        vec![
+            op("r0", OperandKind::Register),
+            op("[r1]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(analyze(&ldrsb, Arch::Arm).kind, InstructionKind::Mov);
+}
+
+#[test]
+fn aarch32_pre_index_writeback_defines_its_base_register() {
+    // The lifter emits `r1 := r1 + 4` for the `!` form. Without the
+    // matching def the walk steps past this instruction while `r1` is
+    // live and binds the read to an earlier definition.
+    let ldr = insn(
+        "ldr",
+        vec![
+            op("r0", OperandKind::Register),
+            op("[r1, 4]!", OperandKind::Memory),
+        ],
+    );
+    assert!(analyze(&ldr, Arch::Arm).defs.contains(&"r1"));
+}
+
+#[test]
+fn aarch32_post_index_writeback_defines_its_base_register() {
+    let ldr = insn(
+        "ldr",
+        vec![
+            op("r0", OperandKind::Register),
+            op("[r1]", OperandKind::Memory),
+            op("4", OperandKind::Immediate),
+        ],
+    );
+    assert!(analyze(&ldr, Arch::Arm).defs.contains(&"r1"));
+}
+
+#[test]
+fn aarch32_plain_offset_load_does_not_define_its_base_register() {
+    // The companion direction: no writeback, no def, or every load
+    // would keep its base's prior definition alive for nothing.
+    let ldr = insn(
+        "ldr",
+        vec![
+            op("r0", OperandKind::Register),
+            op("[r1, 4]", OperandKind::Memory),
+        ],
+    );
+    assert!(!analyze(&ldr, Arch::Arm).defs.contains(&"r1"));
+}
+
+#[test]
+fn aarch32_register_post_index_reads_its_delta_register() {
+    // `r2` is named outside the brackets, so scanning the memory
+    // operand alone misses it.
+    let ldr = insn(
+        "ldr",
+        vec![
+            op("r0", OperandKind::Register),
+            op("[r1]", OperandKind::Memory),
+            op("r2", OperandKind::Register),
+        ],
+    );
+    assert!(analyze(&ldr, Arch::Arm).uses.contains(&"r2"));
+}
+
+#[test]
+fn aarch32_store_writeback_defines_its_base_register() {
+    let str_insn = insn(
+        "str",
+        vec![
+            op("r0", OperandKind::Register),
+            op("[r1, 4]!", OperandKind::Memory),
+        ],
+    );
+    assert!(analyze(&str_insn, Arch::Arm).defs.contains(&"r1"));
+}
+
+#[test]
+fn aarch32_predicated_instruction_also_reads_its_destination() {
+    // `moveq r2, 7` lifts to `Ite(ZF, 7, Var(r2))`: on the false path
+    // the destination keeps its previous value, so it is a use as well
+    // as a def. Without that the backward walk treats this instruction
+    // as satisfying `r2`'s liveness, drops whatever defined the old
+    // value, and the else-arm binds to a free input.
+    let moveq = insn(
+        "moveq",
+        vec![
+            op("r2", OperandKind::Register),
+            op("7", OperandKind::Immediate),
+        ],
+    );
+    let effect = analyze(&moveq, Arch::Arm);
+    assert!(effect.uses.contains(&"r2"));
+}
+
+#[test]
+fn aarch32_unpredicated_move_does_not_read_its_destination() {
+    // The companion direction: an unconditional `mov` overwrites, so
+    // adding the destination as a use would keep dead definitions alive.
+    let mov = insn(
+        "mov",
+        vec![
+            op("r2", OperandKind::Register),
+            op("7", OperandKind::Immediate),
+        ],
+    );
+    let effect = analyze(&mov, Arch::Arm);
+    assert!(!effect.uses.contains(&"r2"));
+}
+
+#[test]
+fn aarch32_bcond_is_still_a_conditional_branch() {
+    // The precise condition check must still recognise `b<cond>`.
+    let beq = insn("beq", vec![op("0x1000", OperandKind::Immediate)]);
+    assert_eq!(analyze(&beq, Arch::Arm).kind, InstructionKind::Jcc);
+    let blt = insn("blt", vec![op("0x1000", OperandKind::Immediate)]);
+    assert_eq!(analyze(&blt, Arch::Arm).kind, InstructionKind::Jcc);
+}
+
+#[test]
+fn aarch64_contiguous_load_defines_its_listed_register() {
+    let i = insn(
+        "ld1",
+        vec![
+            op("{v0.16b}", OperandKind::Unknown),
+            op("[x8]", OperandKind::Memory),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert_eq!(effect.defs, vec!["v0"]);
+}
+
+#[test]
+fn aarch64_contiguous_store_reads_its_listed_registers() {
+    let i = insn(
+        "st1",
+        vec![
+            op("{v0.4s, v1.4s}", OperandKind::Unknown),
+            op("[x8]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).uses, vec!["x8", "v0", "v1"]);
+}
+
+#[test]
+fn aarch64_structured_load_is_a_memory_access() {
+    let i = insn(
+        "ld1",
+        vec![
+            op("{v0.16b}", OperandKind::Unknown),
+            op("[x8]", OperandKind::Memory),
+        ],
+    );
+    assert!(analyze(&i, Arch::Aarch64).has_memory_access);
+}
+
+#[test]
+fn aarch64_structured_post_index_defines_its_base_register() {
+    let i = insn(
+        "ld1",
+        vec![
+            op("{v0.16b}", OperandKind::Unknown),
+            op("[x8]", OperandKind::Memory),
+            op("16", OperandKind::Immediate),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).defs, vec!["v0", "x8"]);
+}
+
+#[test]
+fn aarch64_structured_single_element_load_reads_its_destination() {
+    // One lane is replaced and the rest of the register preserved, so
+    // the prior definition is still live.
+    let i = insn(
+        "ld1",
+        vec![
+            op("{v0.s}[1]", OperandKind::Unknown),
+            op("[x8]", OperandKind::Memory),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert!(effect.uses.contains(&"v0"), "{effect:?}");
+}
+
+#[test]
+fn aarch64_deinterleaving_store_defines_no_register() {
+    let i = insn(
+        "st4",
+        vec![
+            op("{v16.4s, v17.4s, v18.4s, v19.4s}", OperandKind::Unknown),
+            op("[x8]", OperandKind::Memory),
+        ],
+    );
+    assert!(analyze(&i, Arch::Aarch64).defs.is_empty());
+}
+
+#[test]
+fn aarch64_element_insert_reads_its_destination() {
+    // `ins` preserves every lane it does not write, so the register's
+    // prior definition is still live and the slicer must keep it.
+    let i = insn(
+        "ins",
+        vec![
+            op("v0.s[1]", OperandKind::Register),
+            op("w1", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert!(effect.uses.contains(&"v0"), "{effect:?}");
+}
+
+#[test]
+fn aarch64_element_insert_still_defines_its_destination() {
+    let i = insn(
+        "ins",
+        vec![
+            op("v0.s[1]", OperandKind::Register),
+            op("w1", OperandKind::Register),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).defs, vec!["v0"]);
+}
+
+#[test]
+fn aarch64_permutation_does_not_read_its_destination() {
+    // A permutation writes every lane, so the prior value is dead.
+    let i = insn(
+        "zip1",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+            op("v2.4s", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert!(!effect.uses.contains(&"v0"), "{effect:?}");
+}
+
+#[test]
+fn aarch64_element_to_general_register_defines_the_general_register() {
+    let i = insn(
+        "umov",
+        vec![
+            op("w0", OperandKind::Register),
+            op("v1.s[1]", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert_eq!(effect.defs, vec!["x0"]);
+    assert_eq!(effect.uses, vec!["v1"]);
+}
+
+#[test]
+fn aarch64_broadcast_immediate_reads_no_register() {
+    let i = insn(
+        "movi",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("0x1", OperandKind::Immediate),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert_eq!(effect.defs, vec!["v0"]);
+    assert!(effect.uses.is_empty(), "{effect:?}");
+}
+
+#[test]
+fn aarch64_deinterleaving_load_defines_every_listed_register() {
+    let i = insn(
+        "ld2",
+        vec![
+            op("{v0.4s, v1.4s}", OperandKind::Unknown),
+            op("[x2]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).defs, vec!["v0", "v1"]);
+}
+
+#[test]
+fn aarch64_deinterleaving_load_reads_only_its_base_register() {
+    let i = insn(
+        "ld2",
+        vec![
+            op("{v0.4s, v1.4s}", OperandKind::Unknown),
+            op("[x2]", OperandKind::Memory),
+        ],
+    );
+    assert_eq!(analyze(&i, Arch::Aarch64).uses, vec!["x2"]);
+}
+
+#[test]
+fn aarch64_narrowing_two_form_reads_its_destination() {
+    // `xtn2` writes only the destination's upper half, so the lower half
+    // survives and its prior definition is still live.
+    let i = insn(
+        "xtn2",
+        vec![
+            op("v0.8h", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+        ],
+    );
+    assert!(analyze(&i, Arch::Aarch64).uses.contains(&"v0"));
+}
+
+#[test]
+fn aarch64_narrowing_base_form_does_not_read_its_destination() {
+    let i = insn(
+        "xtn",
+        vec![
+            op("v0.4h", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+        ],
+    );
+    assert!(!analyze(&i, Arch::Aarch64).uses.contains(&"v0"));
+}
+
+#[test]
+fn aarch64_widening_long_defines_its_destination() {
+    let i = insn(
+        "umull",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4h", OperandKind::Register),
+            op("v2.4h", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert_eq!(effect.defs, vec!["v0"]);
+    assert_eq!(effect.kind, InstructionKind::Simd);
+}
+
+#[test]
+fn aarch64_multiply_accumulate_reads_its_destination() {
+    // The accumulator's prior definition is live; without this the
+    // slicer drops it and the accumulation reads a free input.
+    let i = insn(
+        "mla",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4s", OperandKind::Register),
+            op("v2.4s", OperandKind::Register),
+        ],
+    );
+    let effect = analyze(&i, Arch::Aarch64);
+    assert!(effect.uses.contains(&"v0"), "{effect:?}");
+}
+
+#[test]
+fn aarch64_long_multiply_accumulate_reads_its_destination() {
+    let i = insn(
+        "umlal",
+        vec![
+            op("v0.4s", OperandKind::Register),
+            op("v1.4h", OperandKind::Register),
+            op("v2.4h", OperandKind::Register),
+        ],
+    );
+    assert!(analyze(&i, Arch::Aarch64).uses.contains(&"v0"));
+}
+
+#[test]
+fn aarch64_bitwise_select_reads_its_destination() {
+    // All three selects use the destination as an input — as the mask
+    // for `bsl`, as the surviving value for `bit` / `bif`.
+    for mnemonic in ["bsl", "bit", "bif"] {
+        let i = insn(
+            mnemonic,
+            vec![
+                op("v0.16b", OperandKind::Register),
+                op("v1.16b", OperandKind::Register),
+                op("v2.16b", OperandKind::Register),
+            ],
+        );
+        let effect = analyze(&i, Arch::Aarch64);
+        assert!(effect.uses.contains(&"v0"), "{mnemonic}: {effect:?}");
+    }
+}
+
+#[test]
+fn aarch64_scalar_saturating_unary_defines_its_destination() {
+    // The seam whose failure is silent. `sqabs b0, b1` carries no
+    // arrangement, so before the scalar-family allowlist in
+    // `vector_shape` it fell past every arm to `other_effect` — kind
+    // `Other`, `defs` empty. That does not merely truncate: with no def
+    // recorded, a later read of `v0` binds to whatever defined it
+    // *before* this instruction, which is a fabricated value rather than
+    // a lost one.
+    for mnemonic in ["sqabs", "sqneg"] {
+        let i = insn(
+            mnemonic,
+            vec![
+                op("b0", OperandKind::Register),
+                op("b1", OperandKind::Register),
+            ],
+        );
+        let effect = analyze(&i, Arch::Aarch64);
+        assert_eq!(effect.kind, InstructionKind::Simd, "{mnemonic}");
+        assert!(effect.defs.contains(&"v0"), "{mnemonic}: {effect:?}");
+        assert!(effect.uses.contains(&"v1"), "{mnemonic}: {effect:?}");
+    }
+}
+
+#[test]
+fn aarch64_scalar_saturating_unary_does_not_read_its_destination() {
+    // The other direction, and the reason it needs its own test: an
+    // `AArch64` scalar SIMD write zeroes the rest of the register rather
+    // than merging, so unlike the accumulating families the destination
+    // is a pure def. Recording it as a use as well would keep the prior
+    // definition alive and widen every slice through one of these.
+    let i = insn(
+        "sqabs",
+        vec![
+            op("s0", OperandKind::Register),
+            op("s1", OperandKind::Register),
+        ],
+    );
+    assert!(!analyze(&i, Arch::Aarch64).uses.contains(&"v0"));
+}
+
+#[test]
+fn aarch64_postindex_ldp_defines_its_base() {
+    // `ldp x29, x30, [sp], #0x10` advances sp; without sp in defs the
+    // slicer skips this instruction while sp is live and binds a later
+    // sp read to a stale value — a fabricated verdict in every epilogue.
+    let i = insn(
+        "ldp",
+        vec![
+            op("x29", OperandKind::Register),
+            op("x30", OperandKind::Register),
+            op("[sp]", OperandKind::Memory),
+            op("0x10", OperandKind::Immediate),
+        ],
+    );
+    assert!(analyze(&i, Arch::Aarch64).defs.contains(&"sp"));
+}
+
+#[test]
+fn aarch64_postindex_stp_defines_its_base() {
+    let i = insn(
+        "stp",
+        vec![
+            op("x29", OperandKind::Register),
+            op("x30", OperandKind::Register),
+            op("[sp]", OperandKind::Memory),
+            op("-0x10", OperandKind::Immediate),
+        ],
+    );
+    assert!(analyze(&i, Arch::Aarch64).defs.contains(&"sp"));
+}
+
+#[test]
+fn aarch64_preindex_str_defines_its_base() {
+    let i = insn(
+        "str",
+        vec![
+            op("x0", OperandKind::Register),
+            op("[sp, -0x10]!", OperandKind::Memory),
+        ],
+    );
+    assert!(analyze(&i, Arch::Aarch64).defs.contains(&"sp"));
+}
+
+#[test]
+fn aarch64_plain_offset_ldr_does_not_define_its_base() {
+    // A plain `[sp, #0x10]` access reads sp but must not define it, or a
+    // spurious sp definition would shadow the real one.
+    let i = insn(
+        "ldr",
+        vec![
+            op("x0", OperandKind::Register),
+            op("[sp, 0x10]", OperandKind::Memory),
+        ],
+    );
+    assert!(!analyze(&i, Arch::Aarch64).defs.contains(&"sp"));
+}

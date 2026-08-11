@@ -1,0 +1,34 @@
+[package]
+name         = "r2smt-explore"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+description = "Fenced exploration engine (radius2 driver): synthesises concrete inputs that reach a target. Explicitly UNSOUND — never produces an SmtResult and is dependency-fenced out of the verify/patch closure."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Off by default: keeps the radius2 / radare2 subprocess engine out of
+# the default dependency graph so the verify/patch closure can never
+# transitively reach it. Turn on to compile the actual explorer.
+oracle-radius2 = ["dep:radius2"]
+
+[[bin]]
+name = "r2smt-explore-worker"
+path = "src/bin/worker.rs"
+
+[dependencies]
+r2smt-common = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+tempfile     = { workspace = true }
+radius2      = { version = "1.0.28", optional = true }
+
+[dev-dependencies]
+trybuild = "1"

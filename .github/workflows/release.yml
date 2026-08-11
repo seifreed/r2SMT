@@ -1,0 +1,96 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.triple }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+            smoke: true
+          - os: ubuntu-22.04-arm
+            triple: aarch64-unknown-linux-gnu
+            smoke: true
+          - os: macos-13
+            triple: x86_64-apple-darwin
+            smoke: false
+          - os: macos-14
+            triple: aarch64-apple-darwin
+            smoke: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+          targets: ${{ matrix.triple }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.triple }}
+
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang
+
+      - name: Install build deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.triple }} -p r2smt-cli
+
+      - name: Strip binary
+        run: strip target/${{ matrix.triple }}/release/r2smt
+
+      - name: Smoke test
+        if: matrix.smoke
+        run: target/${{ matrix.triple }}/release/r2smt version
+
+      - name: Determine version tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          TARBALL="r2smt-${{ steps.tag.outputs.version }}-${{ matrix.triple }}.tar.gz"
+          tar czf "$TARBALL" -C target/${{ matrix.triple }}/release r2smt
+          echo "tarball=$TARBALL" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: r2smt-${{ matrix.triple }}
+          path: ${{ env.tarball }}
+          if-no-files-found: error
+
+      - name: Publish to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.tarball }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

@@ -1,0 +1,23 @@
+[package]
+name         = "r2smt-ssa"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+description = "Rename a r2SMT LiftedSlice into Static Single Assignment form ready for the SMT backend."
+
+[lints]
+workspace = true
+
+[dependencies]
+r2smt-common = { workspace = true }
+r2smt-ir     = { workspace = true }
+r2smt-slicer = { workspace = true }
+serde        = { workspace = true }
+tracing      = { workspace = true }
+
+[dev-dependencies]
+r2smt-ir   = { workspace = true, features = ["testing"] }
+serde_json = { workspace = true }

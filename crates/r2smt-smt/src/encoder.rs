@@ -1,0 +1,720 @@
+//! Translate a [`SsaLiftedSlice`] into Z3 bit-vector ASTs.
+//!
+//! Uses the thread-local Z3 context exposed by the `z3` 0.20 crate.
+
+use std::collections::HashMap;
+
+use r2smt_ir::expr::{Expr, RoundingMode, Var};
+use r2smt_ir::stmt::IrStmt;
+use r2smt_ssa::SsaLiftedSlice;
+use z3::ast::{BV, Bool, Float, RoundingMode as Z3RoundingMode};
+use z3::{Solver, Sort};
+
+/// A multi-bit bit-vector, a boolean, or a floating-point value produced
+/// by the encoder.
+#[derive(Debug, Clone)]
+enum Encoded {
+    Bv(BV),
+    Bool(Bool),
+    Fp(Float),
+}
+
+/// One byte recorded by an [`IrStmt::StoreMem`]: byte address (at the
+/// slice's pointer width) and its 8-bit value. A `LoadMem` walks the
+/// store list in reverse, building an [`Ite`] chain over the
+/// `byte_addr == store.addr` predicate and falling back to a fresh
+/// free byte — aliasing is resolved by the solver, no oracle decides.
+#[derive(Debug, Clone)]
+struct ByteStore {
+    addr: BV,
+    byte: BV,
+}
+
+/// Soft cap on the number of bytes the byte-granular memory model
+/// tracks before it havocs the store list and starts answering every
+/// subsequent `LoadMem` with a fresh free value. Generous — one full
+/// stack frame is well under this — but bounded so a pathological
+/// slice cannot blow up Z3's `Ite`-chain depth (Host-Side Safety:
+/// solver-bound resources must maintain explicit budgets).
+const MEM_BYTE_STORE_CAP: usize = 4096;
+
+/// Why a name is being declared, which decides what a *narrower* request
+/// for an already-declared name means.
+///
+/// The two are not symmetric: a narrow read is an exact sub-view, a
+/// narrow definition leaves the upper bits of the name unconstrained.
+#[derive(Clone, Copy)]
+enum Declare {
+    /// The name is being read. A narrower width is a sub-view.
+    Read,
+    /// The name is being defined. A narrower width under-constrains it.
+    Define,
+}
+
+/// Encodes IR expressions into Z3 ASTs and feeds the resulting
+/// assertions into a [`Solver`].
+pub struct Encoder {
+    vars: HashMap<String, BV>,
+    unknown_counter: u32,
+    /// P26 memory model. Byte-granular store list consulted by every
+    /// [`IrStmt::LoadMem`]; an empty list and a `false` `mem_havoced`
+    /// reproduces the pre-P26 "every load is fresh" behaviour exactly.
+    byte_stores: Vec<ByteStore>,
+    /// `true` once the byte-store cap fired — all subsequent loads
+    /// see a fresh free value (sound widen-only).
+    mem_havoced: bool,
+    /// Pointer width for the slice currently being encoded. Set at
+    /// the top of [`Encoder::encode`]; defaults to 64 for the rare
+    /// caller that drives `encode_*` directly without going through
+    /// `encode` (no slice → no memory state).
+    ptr_bits: u16,
+    /// Disambiguates the fresh per-byte free variables minted by
+    /// repeated `LoadMem` operations.
+    load_counter: u32,
+    /// Load memo restoring read-read consistency: two `LoadMem`s of
+    /// the same address + width with no intervening `StoreMem` must
+    /// yield the *same* value (otherwise `x = *p; y = *p; x == y`
+    /// would be `BothPossible` because each load minted independent
+    /// free bytes). Keyed by (canonical address rendering, width);
+    /// cleared on every store and on havoc so a stale value can never
+    /// be reused across a write.
+    load_memo: HashMap<(String, u16), BV>,
+    /// Set when a name was declared at two different widths; the
+    /// verdict built on this encoding is then unusable.
+    width_conflict: bool,
+}
+
+impl Default for Encoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Encoder {
+    /// Build a fresh encoder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            vars: HashMap::new(),
+            unknown_counter: 0,
+            byte_stores: Vec::new(),
+            mem_havoced: false,
+            ptr_bits: 64,
+            load_counter: 0,
+            load_memo: HashMap::new(),
+            width_conflict: false,
+        }
+    }
+
+    /// Declare and constrain every statement of `slice` into `solver`.
+    ///
+    /// Returns the Z3 boolean expression representing the branch
+    /// condition's *truth value*.
+    pub fn encode(&mut self, slice: &SsaLiftedSlice, solver: &Solver) -> Bool {
+        self.ptr_bits = slice.arch.pointer_bits();
+        for stmt in &slice.statements {
+            self.encode_stmt(stmt, solver);
+        }
+        self.encode_as_bool(&slice.condition)
+    }
+
+    fn encode_stmt(&mut self, stmt: &IrStmt, solver: &Solver) {
+        match stmt {
+            IrStmt::Assign { dst, src } => {
+                let rhs = self.encode_as_bv_with_width(src, dst.bits);
+                let dst_bv = self.declare(&dst.name, dst.bits, Declare::Define);
+                let assertion = dst_bv.eq(&rhs);
+                solver.assert(&assertion);
+            }
+            IrStmt::LoadMem { dst, address, bits } => {
+                self.encode_load_mem(dst, address, *bits, solver);
+            }
+            IrStmt::StoreMem {
+                address,
+                value,
+                bits,
+            } => {
+                self.encode_store_mem(address, value, *bits);
+            }
+            IrStmt::Unsupported { .. } | IrStmt::Nop => {}
+        }
+    }
+
+    /// Lower an [`IrStmt::LoadMem`] into a byte-granular value built
+    /// by walking the store list in reverse. Each output byte is an
+    /// [`Ite`] chain `byte_addr == store.addr ? store.byte : older`
+    /// folded from the most recent store backward, with a fresh free
+    /// byte as the base case. Aliasing is decided by the solver:
+    /// equal addresses pick the stored byte, unequal addresses fall
+    /// through to older stores or the fresh free value.
+    fn encode_load_mem(&mut self, dst: &Var, address: &Expr, bits: u16, solver: &Solver) {
+        let dst_bv = self.declare(&dst.name, bits, Declare::Define);
+        if bits == 0 {
+            return;
+        }
+        // Read-read consistency: reuse a prior identical load's value
+        // when no store has invalidated the memo since.
+        let memo_key = (format!("{address}"), bits);
+        if let Some(cached) = self.load_memo.get(&memo_key) {
+            let assertion = dst_bv.eq(cached);
+            solver.assert(&assertion);
+            return;
+        }
+        let addr_bv = self.encode_address(address);
+        let nbytes = bits.div_ceil(8);
+        let load_id = self.load_counter;
+        self.load_counter = self.load_counter.wrapping_add(1);
+        let mut acc: Option<BV> = None;
+        for i in 0..nbytes {
+            let byte_addr = bv_add_offset(&addr_bv, i, self.ptr_bits);
+            let mut byte_val = mint_free_byte(load_id, i);
+            if !self.mem_havoced {
+                // Walk stores OLDEST → LATEST so the latest write
+                // ends up as the *outermost* `Ite`: the resulting
+                // value reads `latest.alias ? latest.byte : (…older
+                // chain…)`. With the order reversed, the *oldest*
+                // matching write would shadow every subsequent
+                // overwrite — silently unsound.
+                for store in &self.byte_stores {
+                    let alias = byte_addr.eq(&store.addr);
+                    byte_val = alias.ite(&store.byte, &byte_val);
+                }
+            }
+            acc = Some(match acc.take() {
+                None => byte_val,
+                Some(prev) => byte_val.concat(&prev),
+            });
+        }
+        let Some(loaded) = acc else { return };
+        let value = coerce_bv(loaded, u32::from(bits));
+        self.load_memo.insert(memo_key, value.clone());
+        let assertion = dst_bv.eq(&value);
+        solver.assert(&assertion);
+    }
+
+    /// Record an [`IrStmt::StoreMem`] in the byte-granular store
+    /// list. Each byte is enqueued at `address + i`, little-endian.
+    /// Overflowing [`MEM_BYTE_STORE_CAP`] triggers a sound havoc:
+    /// the list is cleared and every subsequent load reads a fresh
+    /// free value (precision lost, soundness preserved).
+    fn encode_store_mem(&mut self, address: &Expr, value: &Expr, bits: u16) {
+        if bits == 0 {
+            return;
+        }
+        // Any store may alias a previously loaded address, so every
+        // memoized load value is now potentially stale — drop them.
+        self.load_memo.clear();
+        let nbytes = usize::from(bits.div_ceil(8));
+        if self.byte_stores.len().saturating_add(nbytes) > MEM_BYTE_STORE_CAP {
+            self.byte_stores.clear();
+            self.mem_havoced = true;
+            return;
+        }
+        let addr_bv = self.encode_address(address);
+        let value_bv = self.encode_as_bv_with_width(value, bits);
+        for i in 0..u16::try_from(nbytes).unwrap_or(u16::MAX) {
+            let byte_addr = bv_add_offset(&addr_bv, i, self.ptr_bits);
+            let lo = u32::from(i) * 8;
+            let hi = lo + 7;
+            let byte = value_bv.extract(hi, lo);
+            self.byte_stores.push(ByteStore {
+                addr: byte_addr,
+                byte,
+            });
+        }
+    }
+
+    /// Encode a memory address expression at the slice's pointer
+    /// width, the canonical type for both store and load indices.
+    fn encode_address(&mut self, address: &Expr) -> BV {
+        self.encode_as_bv_with_width(address, self.ptr_bits)
+    }
+
+    /// Declare a free bit-vector, memoised by name.
+    ///
+    /// Two `Var`s that share a name but not a width are a contract
+    /// violation upstream, and this used to answer with the *first*
+    /// width regardless — which either builds a silently wrong formula
+    /// or, where Z3 checks sorts, aborts the process. It really aborted:
+    /// `solve --differential-lift` panicked on a stock `AArch64` sample
+    /// with `SortDiffers { left: (_ BitVec 64), right: (_ BitVec 16) }`,
+    /// because the differential harness namespaces two lowerings into
+    /// one query and can pair a 64-bit definition with a 16-bit one.
+    ///
+    /// Neither answer is acceptable, so the collision is recorded and
+    /// the verdict fails closed (see [`Encoder::had_width_conflict`]). The
+    /// returned bit-vector has the width the caller asked for, keeping
+    /// the rest of the encoding well-sorted so it can finish without
+    /// aborting; its value is irrelevant, since the verdict built on top
+    /// of it is discarded.
+    fn declare(&mut self, name: &str, bits: u16, purpose: Declare) -> BV {
+        if let Some(existing) = self.vars.get(name) {
+            let have = existing.get_size();
+            let want = u32::from(bits);
+            if have == want {
+                return existing.clone();
+            }
+            // A *narrower* request is an exact sub-view of the same
+            // variable — x86 reaches this legitimately, reading a
+            // vector parent through a shorter view — so a *read* answers
+            // with the low bits rather than declaring a conflict.
+            // Returning the full-width variable instead is what used to
+            // abort the process inside the z3 crate.
+            //
+            // A narrower *definition* is a different question with a
+            // different answer. Constraining only the low bits leaves the
+            // rest of the name unrestricted, which in the production
+            // pipeline is a widening but in the differential harness lets
+            // the solver pick those bits per side and fabricate a
+            // disagreement. SSA is what makes this unreachable today —
+            // and that is an argument, not a fact, so the distinction is
+            // carried in the type instead.
+            if want < have {
+                if matches!(purpose, Declare::Read) {
+                    return existing.extract(want - 1, 0);
+                }
+                self.width_conflict = true;
+                return BV::fresh_const(name, want);
+            }
+            // A *wider* request has no sound answer: the extra bits are
+            // not described by anything already asserted, and inventing
+            // them (zero-extension) would be a definite wrong value.
+            self.width_conflict = true;
+            return BV::fresh_const(name, want);
+        }
+        let bv = BV::new_const(name, u32::from(bits));
+        self.vars.insert(name.to_string(), bv.clone());
+        bv
+    }
+
+    /// Whether any name was declared at two different widths while
+    /// encoding. A caller that gets `true` must discard the verdict —
+    /// the formula does not describe the slice.
+    #[must_use]
+    pub fn had_width_conflict(&self) -> bool {
+        self.width_conflict
+    }
+
+    fn encode_as_bv(&mut self, expr: &Expr) -> BV {
+        match self.encode_expr(expr) {
+            Encoded::Bv(bv) => bv,
+            Encoded::Bool(b) => Self::bool_to_bv(&b),
+            // A float used where a bit-vector is expected is its IEEE
+            // bit pattern (the lifter only does this via `FpToIeeeBv`,
+            // but coerce soundly here too).
+            Encoded::Fp(f) => f.to_ieee_bv(),
+        }
+    }
+
+    fn encode_as_bv_with_width(&mut self, expr: &Expr, target_bits: u16) -> BV {
+        let bv = self.encode_as_bv(expr);
+        let actual = bv.get_size();
+        let target = u32::from(target_bits);
+        match actual.cmp(&target) {
+            std::cmp::Ordering::Equal => bv,
+            std::cmp::Ordering::Less => bv.zero_ext(target - actual),
+            std::cmp::Ordering::Greater => bv.extract(target - 1, 0),
+        }
+    }
+
+    fn encode_as_bool(&mut self, expr: &Expr) -> Bool {
+        match self.encode_expr(expr) {
+            Encoded::Bool(b) => b,
+            Encoded::Bv(bv) => Self::bv_is_true(&bv),
+            // A float is never a boolean; fall back to a fresh free
+            // boolean (sound over-approximation). The lifter never
+            // produces this shape.
+            Encoded::Fp(_) => {
+                let free = self.fresh_unknown(1);
+                Self::bv_is_true(&free)
+            }
+        }
+    }
+
+    /// Encode `expr` expecting a floating-point value. Falls back to a
+    /// fresh free float (sound) if the expression does not encode as one
+    /// — a shape the lifter never emits.
+    fn encode_as_fp(&mut self, expr: &Expr) -> Float {
+        if let Encoded::Fp(f) = self.encode_expr(expr) {
+            return f;
+        }
+        let (ebits, sbits) = fp_sort_of(expr).unwrap_or((11, 53));
+        self.fresh_unknown_fp(ebits, sbits)
+    }
+
+    // Exhaustive `Expr` dispatch: FP arms mirror the BV arms' shape but stay separate for legibility (CLAUDE.md exhaustive-dispatch exception).
+    #[allow(clippy::match_same_arms, clippy::too_many_lines)]
+    fn encode_expr(&mut self, expr: &Expr) -> Encoded {
+        match expr {
+            Expr::Var(v) => Encoded::Bv(self.encode_var(v)),
+            Expr::Const { value, bits } => Encoded::Bv(bv_const(*value, *bits)),
+            Expr::Add(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvadd(&y)),
+            Expr::Sub(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvsub(&y)),
+            Expr::Mul(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvmul(&y)),
+            Expr::UDiv(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvudiv(&y)),
+            Expr::URem(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvurem(&y)),
+            Expr::SDiv(a, b) => self.bv_bin(a, b, Signedness::Signed, |x, y| x.bvsdiv(&y)),
+            Expr::SRem(a, b) => self.bv_bin(a, b, Signedness::Signed, |x, y| x.bvsrem(&y)),
+            Expr::And(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvand(&y)),
+            Expr::Or(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvor(&y)),
+            Expr::Xor(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvxor(&y)),
+            Expr::Shl(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvshl(&y)),
+            Expr::LShr(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvlshr(&y)),
+            // `bvror` at the operand width, so the identity that would
+            // lose the value at a zero rotate never arises.
+            Expr::Ror(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvrotr(&y)),
+            Expr::AShr(a, b) => self.bv_bin(a, b, Signedness::Unsigned, |x, y| x.bvashr(&y)),
+            Expr::Eq(a, b) => {
+                let lhs = self.encode_as_bv(a);
+                let rhs = self.encode_as_bv(b);
+                let (lhs, rhs) = match_widths(lhs, rhs, Signedness::Unsigned);
+                Encoded::Bool(lhs.eq(&rhs))
+            }
+            Expr::Ne(a, b) => {
+                let lhs = self.encode_as_bv(a);
+                let rhs = self.encode_as_bv(b);
+                let (lhs, rhs) = match_widths(lhs, rhs, Signedness::Unsigned);
+                Encoded::Bool(lhs.eq(&rhs).not())
+            }
+            Expr::Ult(a, b) => self.bool_cmp(a, b, Signedness::Unsigned, |x, y| x.bvult(&y)),
+            Expr::Ule(a, b) => self.bool_cmp(a, b, Signedness::Unsigned, |x, y| x.bvule(&y)),
+            Expr::Slt(a, b) => self.bool_cmp(a, b, Signedness::Signed, |x, y| x.bvslt(&y)),
+            Expr::Sle(a, b) => self.bool_cmp(a, b, Signedness::Signed, |x, y| x.bvsle(&y)),
+            Expr::BoolAnd(a, b) => {
+                let pa = self.encode_as_bool(a);
+                let pb = self.encode_as_bool(b);
+                Encoded::Bool(Bool::and(&[&pa, &pb]))
+            }
+            Expr::BoolOr(a, b) => {
+                let pa = self.encode_as_bool(a);
+                let pb = self.encode_as_bool(b);
+                Encoded::Bool(Bool::or(&[&pa, &pb]))
+            }
+            Expr::BoolNot(inner) => {
+                let p = self.encode_as_bool(inner);
+                Encoded::Bool(p.not())
+            }
+            Expr::Ite {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                let c = self.encode_as_bool(cond);
+                let t = self.encode_as_bv(then_expr);
+                let e = self.encode_as_bv(else_expr);
+                // Ite branches carry no signedness label; widen with
+                // zero-extension as the unsigned default. Lifter call
+                // sites that need a signed `Ite` should produce
+                // matched-width branches.
+                let (t, e) = match_widths(t, e, Signedness::Unsigned);
+                Encoded::Bv(c.ite(&t, &e))
+            }
+            Expr::Extract { src, hi, lo } => {
+                let bv = self.encode_as_bv(src);
+                // An out-of-range slice aborts the process inside the z3
+                // crate (`Option::unwrap` on `extract`). It is reachable:
+                // the differential harness pairs two lowerings of one
+                // instruction that need not agree about a value's width,
+                // so a 64-bit slice can land on a 16-bit operand. Treat
+                // it as the same contract violation a width collision is
+                // — record it, return a well-sorted placeholder so the
+                // encoding can finish, and let the verdict fail closed.
+                let width = bv.get_size();
+                if u32::from(*hi) >= width || lo > hi {
+                    self.width_conflict = true;
+                    let bits = u32::from(hi.saturating_sub(*lo)) + 1;
+                    return Encoded::Bv(BV::fresh_const("oob_extract", bits));
+                }
+                Encoded::Bv(bv.extract(u32::from(*hi), u32::from(*lo)))
+            }
+            Expr::Concat { high, low } => {
+                let h = self.encode_as_bv(high);
+                let l = self.encode_as_bv(low);
+                Encoded::Bv(h.concat(&l))
+            }
+            Expr::ZeroExtend { src, to_bits } => {
+                let bv = self.encode_as_bv(src);
+                let cur = bv.get_size();
+                let target = u32::from(*to_bits);
+                let result = match cur.cmp(&target) {
+                    std::cmp::Ordering::Equal => bv,
+                    std::cmp::Ordering::Less => bv.zero_ext(target - cur),
+                    std::cmp::Ordering::Greater => bv.extract(target - 1, 0),
+                };
+                Encoded::Bv(result)
+            }
+            Expr::SignExtend { src, to_bits } => {
+                let bv = self.encode_as_bv(src);
+                let cur = bv.get_size();
+                let target = u32::from(*to_bits);
+                let result = match cur.cmp(&target) {
+                    std::cmp::Ordering::Equal => bv,
+                    std::cmp::Ordering::Less => bv.sign_ext(target - cur),
+                    std::cmp::Ordering::Greater => bv.extract(target - 1, 0),
+                };
+                Encoded::Bv(result)
+            }
+            // Mint at the maximum modelled width (64). A free var
+            // narrower than its consumer is *zero-extended* by
+            // `match_widths` / `encode_as_bv_with_width`, which caps
+            // the unmodelled value's range (e.g. a 64-bit operand
+            // would only range over `[0, 2^32)`), fabricating a
+            // confident `AlwaysX` and breaking the "Unknowns only
+            // weaken, never fabricate" invariant. A 64-bit free var is
+            // only ever *truncated* downstream, which stays sound.
+            Expr::Unknown(_) => Encoded::Bv(self.fresh_unknown(64)),
+            // Floating point: precise IEEE-754 encoding via Z3's FP
+            // theory. The two BV↔FP reinterprets missing from the safe
+            // `z3` API come from the audited `r2smt-z3fp` shim; on the
+            // (never-in-practice) `None` we degrade to a fresh free
+            // float, which stays sound.
+            Expr::FAdd(a, b, rm) => {
+                let (fa, fb) = (self.encode_as_fp(a), self.encode_as_fp(b));
+                Encoded::Fp(fa.add_with_rounding_mode(&fb, &to_z3_rm(*rm)))
+            }
+            Expr::FSub(a, b, rm) => {
+                let (fa, fb) = (self.encode_as_fp(a), self.encode_as_fp(b));
+                Encoded::Fp(fa.sub_with_rounding_mode(&fb, &to_z3_rm(*rm)))
+            }
+            Expr::FMul(a, b, rm) => {
+                let (fa, fb) = (self.encode_as_fp(a), self.encode_as_fp(b));
+                Encoded::Fp(fa.mul_with_rounding_mode(&fb, &to_z3_rm(*rm)))
+            }
+            Expr::FDiv(a, b, rm) => {
+                let (fa, fb) = (self.encode_as_fp(a), self.encode_as_fp(b));
+                Encoded::Fp(fa.div_with_rounding_mode(&fb, &to_z3_rm(*rm)))
+            }
+            Expr::FEq(a, b) => {
+                let (fa, fb) = (self.encode_as_fp(a), self.encode_as_fp(b));
+                Encoded::Bool(fa.eq_fpa(&fb))
+            }
+            Expr::FLt(a, b) => {
+                let (fa, fb) = (self.encode_as_fp(a), self.encode_as_fp(b));
+                Encoded::Bool(fa.lt(&fb))
+            }
+            Expr::FLe(a, b) => {
+                let (fa, fb) = (self.encode_as_fp(a), self.encode_as_fp(b));
+                Encoded::Bool(fa.le(&fb))
+            }
+            Expr::FIsNaN(a) => Encoded::Bool(self.encode_as_fp(a).is_nan()),
+            Expr::FSqrt(a, rm) => {
+                let f = self.encode_as_fp(a);
+                Encoded::Fp(f.sqrt_with_rounding_mode(&to_z3_rm(*rm)))
+            }
+            Expr::FRoundToIntegral(a, rm) => {
+                let f = self.encode_as_fp(a);
+                Encoded::Fp(f.round_to_integral_with_rounding_mode(&to_z3_rm(*rm)))
+            }
+            Expr::FpConst { bits, ebits, sbits } => {
+                let bv = bv_const(*bits, ebits.saturating_add(*sbits));
+                Encoded::Fp(self.fp_from_bv(&bv, *ebits, *sbits))
+            }
+            Expr::BvToFp { src, ebits, sbits } => {
+                let bv = self.encode_as_bv(src);
+                Encoded::Fp(self.fp_from_bv(&bv, *ebits, *sbits))
+            }
+            Expr::FpToIeeeBv(src) => Encoded::Bv(self.encode_as_fp(src).to_ieee_bv()),
+            Expr::FpToSbv { src, rm, bits } => {
+                let f = self.encode_as_fp(src);
+                Encoded::Bv(f.to_sbv_with_rounding_mode(&to_z3_rm(*rm), u32::from(*bits)))
+            }
+            Expr::SbvToFp {
+                src,
+                rm,
+                ebits,
+                sbits,
+            } => {
+                let bv = self.encode_as_bv(src);
+                match r2smt_z3fp::sbv_to_fp(
+                    &bv,
+                    &to_z3_rm(*rm),
+                    u32::from(*ebits),
+                    u32::from(*sbits),
+                ) {
+                    Some(f) => Encoded::Fp(f),
+                    None => Encoded::Fp(self.fresh_unknown_fp(*ebits, *sbits)),
+                }
+            }
+            // Unlike the reinterprets, this goes through the safe `z3`
+            // API — no shim needed.
+            Expr::FpToFp {
+                src,
+                rm,
+                ebits,
+                sbits,
+            } => {
+                let f = self.encode_as_fp(src);
+                let sort = Sort::float(u32::from(*ebits), u32::from(*sbits));
+                Encoded::Fp(f.to_fp_with_rounding_mode(&to_z3_rm(*rm), &sort))
+            }
+        }
+    }
+
+    /// Reinterpret a bit-vector as a float via the audited shim, falling
+    /// back to a fresh free float if Z3 rejects the reinterpret.
+    fn fp_from_bv(&mut self, bv: &BV, ebits: u16, sbits: u16) -> Float {
+        r2smt_z3fp::bv_to_fp(bv, u32::from(ebits), u32::from(sbits))
+            .unwrap_or_else(|| self.fresh_unknown_fp(ebits, sbits))
+    }
+
+    /// A fresh free float of sort `(ebits, sbits)` — sound
+    /// over-approximation of an unmodelled floating-point value.
+    fn fresh_unknown_fp(&mut self, ebits: u16, sbits: u16) -> Float {
+        let name = format!("__unkfp_{}", self.unknown_counter);
+        self.unknown_counter += 1;
+        Float::new_const(name.as_str(), u32::from(ebits), u32::from(sbits))
+    }
+
+    fn encode_var(&mut self, var: &Var) -> BV {
+        self.declare(&var.name, var.bits, Declare::Read)
+    }
+
+    fn bv_bin<F>(&mut self, a: &Expr, b: &Expr, sign: Signedness, op: F) -> Encoded
+    where
+        F: FnOnce(BV, BV) -> BV,
+    {
+        let lhs = self.encode_as_bv(a);
+        let rhs = self.encode_as_bv(b);
+        let (lhs, rhs) = match_widths(lhs, rhs, sign);
+        Encoded::Bv(op(lhs, rhs))
+    }
+
+    fn bool_cmp<F>(&mut self, a: &Expr, b: &Expr, sign: Signedness, op: F) -> Encoded
+    where
+        F: FnOnce(BV, BV) -> Bool,
+    {
+        let lhs = self.encode_as_bv(a);
+        let rhs = self.encode_as_bv(b);
+        let (lhs, rhs) = match_widths(lhs, rhs, sign);
+        Encoded::Bool(op(lhs, rhs))
+    }
+
+    fn bv_is_true(bv: &BV) -> Bool {
+        // Truthiness is nonzero, matching ESIL's `cast_to_1bit`, C
+        // semantics, and the text backend's condition path (which tests
+        // `distinct 0` for a multi-bit value — see `build_query`). For the
+        // 1-bit values the production lifters actually place in boolean
+        // position this is identical to `== 1`, so no verdict moves. The
+        // two backends previously diverged on a wider value — Z3 answered
+        // `!= 0` here while the text condition coerced to bit 0 and
+        // answered `bit0 == 1` — which is now aligned so it stays a
+        // non-issue if a future lifter routes a wider value in.
+        let zero = BV::from_u64(0, bv.get_size());
+        bv.eq(&zero).not()
+    }
+
+    fn bool_to_bv(b: &Bool) -> BV {
+        let one = BV::from_u64(1, 1);
+        let zero = BV::from_u64(0, 1);
+        b.ite(&one, &zero)
+    }
+
+    fn fresh_unknown(&mut self, bits: u32) -> BV {
+        let name = format!("__unk_{}", self.unknown_counter);
+        self.unknown_counter += 1;
+        BV::new_const(name.as_str(), bits)
+    }
+}
+
+/// Floating-point sort `(ebits, sbits)` of an FP-typed expression,
+/// recovered from the sort it carries or the sort of its first operand.
+/// `None` for shapes that carry no sort (never an FP-typed node).
+fn fp_sort_of(expr: &Expr) -> Option<(u16, u16)> {
+    match expr {
+        Expr::FpConst { ebits, sbits, .. }
+        | Expr::BvToFp { ebits, sbits, .. }
+        | Expr::SbvToFp { ebits, sbits, .. }
+        | Expr::FpToFp { ebits, sbits, .. } => Some((*ebits, *sbits)),
+        Expr::FAdd(a, ..) | Expr::FSub(a, ..) | Expr::FMul(a, ..) | Expr::FDiv(a, ..) => {
+            fp_sort_of(a)
+        }
+        _ => None,
+    }
+}
+
+/// Map the IR's rounding mode onto Z3's.
+fn to_z3_rm(rm: RoundingMode) -> Z3RoundingMode {
+    match rm {
+        RoundingMode::NearestTiesEven => Z3RoundingMode::round_nearest_ties_to_even(),
+        RoundingMode::NearestTiesAway => Z3RoundingMode::round_nearest_ties_to_away(),
+        RoundingMode::TowardPositive => Z3RoundingMode::round_towards_positive(),
+        RoundingMode::TowardNegative => Z3RoundingMode::round_towards_negative(),
+        RoundingMode::TowardZero => Z3RoundingMode::round_towards_zero(),
+    }
+}
+
+/// Whether a binary operation interprets its operands as signed
+/// or unsigned bit-vectors when the encoder needs to widen one
+/// operand to match the other.
+#[derive(Debug, Clone, Copy)]
+enum Signedness {
+    Signed,
+    Unsigned,
+}
+
+fn match_widths(lhs: BV, rhs: BV, sign: Signedness) -> (BV, BV) {
+    let lw = lhs.get_size();
+    let rw = rhs.get_size();
+    match lw.cmp(&rw) {
+        std::cmp::Ordering::Equal => (lhs, rhs),
+        std::cmp::Ordering::Greater => {
+            let widened = widen(&rhs, lw - rw, sign);
+            (lhs, widened)
+        }
+        std::cmp::Ordering::Less => {
+            let widened = widen(&lhs, rw - lw, sign);
+            (widened, rhs)
+        }
+    }
+}
+
+fn widen(bv: &BV, extra: u32, sign: Signedness) -> BV {
+    match sign {
+        Signedness::Signed => bv.sign_ext(extra),
+        Signedness::Unsigned => bv.zero_ext(extra),
+    }
+}
+
+/// Build `base + offset` at `ptr_bits` width. `offset` is small
+/// enough to fit in a `u64`, so no truncation risk: it's the byte
+/// index inside a single memory access (≤ 16 for an `ldp` / `stp`).
+fn bv_add_offset(base: &BV, offset: u16, ptr_bits: u16) -> BV {
+    if offset == 0 {
+        return base.clone();
+    }
+    let off = BV::from_u64(u64::from(offset), u32::from(ptr_bits));
+    base.bvadd(&off)
+}
+
+/// Mint a fresh, anonymous 8-bit value for byte `i` of load `id` —
+/// the base case of a `LoadMem`'s `Ite` chain when no prior store
+/// aliases the byte's address.
+fn mint_free_byte(id: u32, i: u16) -> BV {
+    BV::new_const(format!("__load_{id}_b{i}").as_str(), 8)
+}
+
+/// Build a `bits`-wide Z3 bit-vector holding `value`. `BV::from_u64`
+/// only takes a `u64`, so a wider constant is assembled from its
+/// high/low 64-bit halves — the high half sits above the low half so
+/// the `Concat` reproduces the `u128` value bit-for-bit.
+fn bv_const(value: u128, bits: u16) -> BV {
+    let low = u64::try_from(value & u128::from(u64::MAX)).unwrap_or_default();
+    if bits <= 64 {
+        return BV::from_u64(low, u32::from(bits));
+    }
+    let high = u64::try_from(value >> 64).unwrap_or_default();
+    let low_bv = BV::from_u64(low, 64);
+    BV::from_u64(high, u32::from(bits) - 64).concat(&low_bv)
+}
+
+/// Truncate or zero-extend `bv` to exactly `target` bits. Used by
+/// the memory-load reconstruction to coerce the byte-concat (a
+/// multiple of 8 bits) to the load's exact width.
+fn coerce_bv(bv: BV, target: u32) -> BV {
+    let cur = bv.get_size();
+    match cur.cmp(&target) {
+        std::cmp::Ordering::Equal => bv,
+        std::cmp::Ordering::Greater => bv.extract(target - 1, 0),
+        std::cmp::Ordering::Less => bv.zero_ext(target - cur),
+    }
+}

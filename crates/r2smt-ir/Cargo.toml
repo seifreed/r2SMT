@@ -1,0 +1,23 @@
+[package]
+name         = "r2smt-ir"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+description = "Program model (functions, basic blocks, instructions) and the BinaryProvider port for r2SMT."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+testing = []
+
+[dependencies]
+r2smt-common = { workspace = true }
+serde        = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

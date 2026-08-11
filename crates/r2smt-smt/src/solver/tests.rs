@@ -1,0 +1,3791 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use r2smt_common::smt::SolveOptions;
+use r2smt_common::{Address, Arch};
+use r2smt_ir::program::{BasicBlock, Function, Instruction, Operand, OperandKind, Program};
+use r2smt_slicer::{SliceLimits, collect_branches, lift_slice, slice_branch};
+use r2smt_ssa::ssa_convert;
+
+use super::*;
+
+fn op(raw: &str, kind: OperandKind) -> Operand {
+    Operand {
+        raw: raw.into(),
+        kind,
+    }
+}
+
+fn insn(addr: u64, size: u8, mnemonic: &str, operands: Vec<Operand>) -> Instruction {
+    Instruction {
+        address: Address(addr),
+        size,
+        bytes: vec![],
+        mnemonic: mnemonic.into(),
+        operands,
+        esil: None,
+        pcode: None,
+        is_thumb: false,
+    }
+}
+
+fn one_block(insns: Vec<Instruction>) -> Program {
+    program_with_arch(insns, Arch::X86_64)
+}
+
+fn aarch64_block(insns: Vec<Instruction>) -> Program {
+    program_with_arch(insns, Arch::Aarch64)
+}
+
+fn program_with_arch(insns: Vec<Instruction>, arch: Arch) -> Program {
+    Program {
+        arch,
+        bits: arch.pointer_bits(),
+        entry: Some(Address(0x40_1000)),
+        functions: vec![Function {
+            address: Address(0x40_1000),
+            name: Some("sym.main".into()),
+            blocks: vec![BasicBlock {
+                address: Address(0x40_1000),
+                instructions: insns,
+                successors: vec![],
+            }],
+            is_thumb: false,
+        }],
+    }
+}
+
+/// Per-branch solver timeout for the full-pipeline verdict tests.
+/// Deliberately far larger than the production `SolveOptions` default
+/// (500 ms): `cargo test --all` runs every crate's test binary
+/// concurrently, and multiplication-heavy opaque predicates can exceed
+/// a tight budget under that CPU saturation, flaking into `Timeout`.
+///
+/// Almost every solve here completes in a few milliseconds, so this
+/// only bounds a genuinely stuck solver. The exceptions are the two
+/// x87 free-operand contracts, which are seconds rather than
+/// milliseconds and take [`solve_first_within_rlimit`] instead — a
+/// wall clock cannot bound those without depending on host load.
+const TEST_SOLVE_TIMEOUT_MS: u32 = 10_000;
+
+/// Deterministic resource budget for the solves a wall clock cannot
+/// bound fairly.
+///
+/// Sized by bisecting the budget until each contract flips between a
+/// verdict and `Timeout`, on an otherwise quiet host: the free-operand
+/// equality needs between 2 M and 4 M units, its extended-load sibling
+/// between 1 M and 2 M. This is 5× the larger requirement — a genuinely
+/// stuck solver still fails, in bounded *work* rather than bounded
+/// time.
+///
+/// Why not simply a bigger wall clock: the budget would still be
+/// measured in host seconds, so whether the contract passes would keep
+/// depending on what else is running. Measured under 2× CPU
+/// oversubscription, the old 10 s clock failed 2 runs in 3 while this
+/// budget passed 3 in 3. Setting `rlimit` costs no wall time — the same
+/// solve takes ~7.1 s either way — because it bounds the search rather
+/// than steering it.
+const TEST_SOLVE_RLIMIT: u32 = 20_000_000;
+
+/// A wall clock chosen only so it never binds when
+/// [`TEST_SOLVE_RLIMIT`] is the intended budget. `timeout` is set on
+/// the Z3 solver unconditionally, so an rlimit-bounded solve needs one
+/// that cannot fire first.
+const TEST_SOLVE_UNBOUNDED_MS: u32 = 600_000;
+
+fn solve_first(program: &Program) -> SmtResult {
+    solve_first_with_timeout(program, TEST_SOLVE_TIMEOUT_MS)
+}
+
+/// Solve under a deterministic resource budget rather than a wall
+/// clock. For the handful of contracts whose queries are genuinely
+/// expensive; see [`TEST_SOLVE_RLIMIT`].
+fn solve_first_within_rlimit(program: &Program) -> SmtResult {
+    solve_first_with_options(
+        program,
+        SolveOptions {
+            timeout_ms: TEST_SOLVE_UNBOUNDED_MS,
+            rlimit: TEST_SOLVE_RLIMIT,
+            ..SolveOptions::default()
+        },
+    )
+}
+
+fn solve_first_with_timeout(program: &Program, timeout_ms: u32) -> SmtResult {
+    solve_first_with_options(
+        program,
+        SolveOptions {
+            timeout_ms,
+            ..SolveOptions::default()
+        },
+    )
+}
+
+fn solve_first_with_options(program: &Program, options: SolveOptions) -> SmtResult {
+    let candidates = collect_branches(program);
+    let cand = candidates.first().expect("at least one branch");
+    let slice = slice_branch(
+        cand,
+        &program.functions[0],
+        &SliceLimits::default(),
+        program.arch,
+    );
+    let lifted = lift_slice(&slice, program.arch);
+    let ssa = ssa_convert(&lifted);
+    solve_branch(&ssa, options)
+}
+
+/// `mov eax, ecx ; imul eax, eax ; and eax, 1 ; cmp eax, 2 ; jne junk`.
+/// `(ecx * ecx) & 1` is in `{0, 1}`, never `2`, so `cmp eax, 2` sets
+/// `ZF = 0` always and `jne` fires every time → `AlwaysTrue`. A
+/// multiplication-bearing predicate is exactly the shape Z3's
+/// randomised search explores non-deterministically, so it doubles as
+/// the determinism fixture.
+fn canonical_opaque_predicate_program() -> Program {
+    one_block(vec![
+        insn(
+            0x40_1000,
+            2,
+            "mov",
+            vec![
+                op("eax", OperandKind::Register),
+                op("ecx", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1002,
+            3,
+            "imul",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1005,
+            3,
+            "and",
+            vec![
+                op("eax", OperandKind::Register),
+                op("1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            3,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op("2", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_100b,
+            6,
+            "jne",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ])
+}
+
+#[test]
+fn wide_unknown_operand_does_not_fabricate_dead_branch() {
+    // `mov rax, 0x100000000 ; cmp rax, <unmodelled> ; je` — the
+    // unmodelled operand is an arbitrary 64-bit value that CAN equal
+    // 2^32, so the branch is real (BothPossible). Minting the Unknown
+    // free var at 32 bits and zero-extending it would cap its range
+    // at [0, 2^32) and fabricate a confident AlwaysFalse / DeadBranch.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            10,
+            "mov",
+            vec![
+                op("rax", OperandKind::Register),
+                op("0x100000000", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_100a,
+            3,
+            "cmp",
+            vec![
+                op("rax", OperandKind::Register),
+                op("zzz", OperandKind::Unknown),
+            ],
+        ),
+        insn(
+            0x40_100d,
+            6,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::BothPossible);
+}
+
+#[test]
+fn x86_shift_count_is_masked_modulo_operand_width() {
+    // `shl eax, 32` is a HARDWARE NO-OP: x86 masks the count to 5 bits
+    // (32 & 0x1F = 0). With eax=1 fixed, `jz` is never taken
+    // (AlwaysFalse). An unmasked `bvshl(1, 32)` yields 0 in SMT-LIB,
+    // which would fabricate ZF=1 → a confident AlwaysTrue (verdict flip
+    // at High confidence). Fully constant slice → deterministic solve.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            5,
+            "mov",
+            vec![
+                op("eax", OperandKind::Register),
+                op("1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1005,
+            3,
+            "shl",
+            vec![
+                op("eax", OperandKind::Register),
+                op("32", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            2,
+            "test",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_100a,
+            6,
+            "jz",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysFalse);
+}
+
+#[test]
+fn stack_slot_store_then_load_then_cmp_resolves_constant() {
+    // Phase C minimal stack memory test:
+    //
+    //     mov dword ptr [rbp - 4], 5
+    //     mov eax, dword ptr [rbp - 4]
+    //     cmp eax, 5
+    //     je dest
+    //
+    // The slot value is constant 5, so `eax == 5` and the je is
+    // always taken. Verifies the slicer keeps the stack store /
+    // load chain and the solver resolves it to AlwaysTrue.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            7,
+            "mov",
+            vec![
+                op("dword ptr [rbp - 4]", OperandKind::Memory),
+                op("5", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1007,
+            3,
+            "mov",
+            vec![
+                op("eax", OperandKind::Register),
+                op("dword ptr [rbp - 4]", OperandKind::Memory),
+            ],
+        ),
+        insn(
+            0x40_100a,
+            3,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op("5", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_100d,
+            6,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let verdict = solve_first(&program);
+    assert_eq!(verdict, SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn xor_zero_idiom_then_jnz_is_always_false() {
+    // xor eax, eax ; test eax, eax ; jnz junk
+    // After xor: rax = 0, ZF = 1. test eax,eax recomputes flags
+    // from rax & rax = 0 → ZF = 1. jnz fires when ZF == 0, so the
+    // branch is **never** taken.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            2,
+            "xor",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1002,
+            2,
+            "test",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            6,
+            "jnz",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let verdict = solve_first(&program);
+    assert_eq!(verdict, SmtResult::AlwaysFalse, "jnz after zero idiom");
+}
+
+#[test]
+fn constant_propagation_je_is_always_true() {
+    // mov eax, 1 ; cmp eax, 1 ; je dest  →  always taken
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            5,
+            "mov",
+            vec![
+                op("eax", OperandKind::Register),
+                op("1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1005,
+            3,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op("1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            6,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let verdict = solve_first(&program);
+    assert_eq!(verdict, SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn constant_propagation_jne_is_always_false() {
+    // mov eax, 1 ; cmp eax, 1 ; jne junk  →  never taken
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            5,
+            "mov",
+            vec![
+                op("eax", OperandKind::Register),
+                op("1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1005,
+            3,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op("1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            6,
+            "jne",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let verdict = solve_first(&program);
+    assert_eq!(verdict, SmtResult::AlwaysFalse);
+}
+
+#[test]
+fn canonical_opaque_predicate_is_always_false() {
+    let verdict = solve_first(&canonical_opaque_predicate_program());
+    assert_eq!(verdict, SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn polynomial_identity_x_squared_eq_x_squared_is_always_true() {
+    // Polynomial-style opaque predicate that exercises the
+    // aggressive `simplify+propagate-values+ctx-simplify` tactic
+    // chain. The two `imul`s compute the same monomial through
+    // distinct register chains; `cmp` then drives ZF from the
+    // shared value rather than overwriting one of the operands.
+    //
+    //     mov eax, ecx     ; eax = x
+    //     imul eax, eax    ; eax = x*x
+    //     mov ebx, ecx     ; ebx = x
+    //     imul ebx, ebx    ; ebx = x*x
+    //     cmp eax, ebx     ; ZF = (x*x == x*x) = 1
+    //     je  dest         ; always taken
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            2,
+            "mov",
+            vec![
+                op("eax", OperandKind::Register),
+                op("ecx", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1002,
+            3,
+            "imul",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1005,
+            2,
+            "mov",
+            vec![
+                op("ebx", OperandKind::Register),
+                op("ecx", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1007,
+            3,
+            "imul",
+            vec![
+                op("ebx", OperandKind::Register),
+                op("ebx", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_100a,
+            2,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op("ebx", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_100c,
+            6,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    // Vendored Z3 in debug builds discharges this polynomial
+    // identity slower than the 500 ms default; give it the same
+    // generous budget as the sibling polynomial regression so the
+    // assertion does not flake on loaded hosts.
+    let verdict = solve_first_with_timeout(&program, TEST_SOLVE_TIMEOUT_MS);
+    assert_eq!(verdict, SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn polynomial_offset_x_squared_plus_seven_minus_x_squared_eq_seven_is_always_true() {
+    // (x*x + 7) - x*x == 7 — opaque predicate that hides behind a
+    // constant offset. Without the `som` normalisation the two
+    // `bvmul` subterms look distinct to the lightweight simplifier
+    // and the SAT loop has to discharge a non-trivial polynomial
+    // equation.
+    //
+    //     mov eax, ecx     ; eax = x
+    //     imul eax, eax    ; eax = x*x
+    //     add eax, 7       ; eax = x*x + 7
+    //     mov ebx, ecx     ; ebx = x
+    //     imul ebx, ebx    ; ebx = x*x
+    //     sub eax, ebx     ; eax = 7
+    //     cmp eax, 7       ; ZF = 1
+    //     je  dest         ; always taken
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            2,
+            "mov",
+            vec![
+                op("eax", OperandKind::Register),
+                op("ecx", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1002,
+            3,
+            "imul",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1005,
+            3,
+            "add",
+            vec![
+                op("eax", OperandKind::Register),
+                op("7", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            2,
+            "mov",
+            vec![
+                op("ebx", OperandKind::Register),
+                op("ecx", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_100a,
+            3,
+            "imul",
+            vec![
+                op("ebx", OperandKind::Register),
+                op("ebx", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_100d,
+            2,
+            "sub",
+            vec![
+                op("eax", OperandKind::Register),
+                op("ebx", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_100f,
+            3,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op("7", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1012,
+            6,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    // Z3 in debug builds with vendored linking takes noticeably
+    // longer to discharge polynomial identities; give the solver a
+    // larger budget than the 500 ms default so this regression does
+    // not flake on slow hosts.
+    let verdict = solve_first_with_timeout(&program, TEST_SOLVE_TIMEOUT_MS);
+    assert_eq!(verdict, SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x_eq_x_via_xor_self_je_is_always_true() {
+    // (x ^ x) == 0 — classic identity opaque predicate.
+    // xor eax, eax produces 0; cmp eax, 0 sets ZF=1; je fires.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            2,
+            "xor",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1002,
+            3,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op("0", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1005,
+            6,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let verdict = solve_first(&program);
+    assert_eq!(verdict, SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn unconstrained_input_jcc_is_both_possible() {
+    // test eax, eax ; jne junk — without prior knowledge of eax,
+    // both branches are reachable.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            2,
+            "test",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1002,
+            6,
+            "jne",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let verdict = solve_first(&program);
+    assert_eq!(verdict, SmtResult::BothPossible);
+}
+
+#[test]
+fn mov_al_then_cmp_al_resolves_constant() {
+    // mov al, 0x42 ; cmp al, 0x42 ; je dest
+    // Even though only the low byte of rax is written, the
+    // `cmp al, 0x42` reads exactly that byte, so ZF = 1 and `je`
+    // is always taken. Exercises the precise sub-register model.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            2,
+            "mov",
+            vec![
+                op("al", OperandKind::Register),
+                op("0x42", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1002,
+            2,
+            "cmp",
+            vec![
+                op("al", OperandKind::Register),
+                op("0x42", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            6,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let verdict = solve_first(&program);
+    assert_eq!(verdict, SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn cmp_ah_against_free_input_is_both_possible() {
+    // cmp ah, 0x42 ; jne junk — `ah` (bits 15:8 of rax) is a free
+    // input, so both branches are reachable. Verifies that the
+    // sub-register read translates into a Z3 extract that the
+    // solver can reason over (no longer collapses to Unknown via
+    // the old `sub_register_alias` hack).
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            2,
+            "cmp",
+            vec![
+                op("ah", OperandKind::Register),
+                op("0x42", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1002,
+            6,
+            "jne",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let verdict = solve_first(&program);
+    assert_eq!(verdict, SmtResult::BothPossible);
+}
+
+#[test]
+fn xor_ah_al_then_cmp_against_concrete_ah_is_both_possible() {
+    // xor ah, al ; cmp ah, 0 ; je dest.
+    // Under the old `sub_register_alias` Unknown hack the cmp
+    // collapsed to Unknown flags and the verdict was Unsound /
+    // BothPossible by default. Under the precise model the
+    // formula is `((rax[15:8] ^ rax[7:0]) == 0)` over a free
+    // input rax — solvable, both branches reachable.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            2,
+            "xor",
+            vec![
+                op("ah", OperandKind::Register),
+                op("al", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1002,
+            3,
+            "cmp",
+            vec![
+                op("ah", OperandKind::Register),
+                op("0", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1005,
+            6,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let verdict = solve_first(&program);
+    assert_eq!(verdict, SmtResult::BothPossible);
+}
+
+#[test]
+fn aarch64_constant_propagation_b_eq_is_always_true() {
+    // mov x0, #1 ; cmp x0, #1 ; b.eq dest → always taken.
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "mov",
+            vec![
+                op("x0", OperandKind::Register),
+                op("#1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "cmp",
+            vec![
+                op("x0", OperandKind::Register),
+                op("#1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            4,
+            "b.eq",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let verdict = solve_first(&program);
+    assert_eq!(verdict, SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn aarch64_canonical_opaque_predicate_is_always_true() {
+    // The canonical Collberg-style identity:
+    //   mov x0, x1
+    //   mul x0, x0, x0     ; x0 = x1 * x1
+    //   and x0, x0, #1     ; x0 ∈ {0, 1}
+    //   cmp x0, #2         ; flags: ZF = (x0 == 2) — always 0
+    //   b.ne junk          ; jne fires every time
+    // The mnemonic dispatch + 3-operand handlers + cmp/b.ne all
+    // have to compose for the solver to land AlwaysTrue.
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "mov",
+            vec![
+                op("x0", OperandKind::Register),
+                op("x1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "mul",
+            vec![
+                op("x0", OperandKind::Register),
+                op("x0", OperandKind::Register),
+                op("x0", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            4,
+            "and",
+            vec![
+                op("x0", OperandKind::Register),
+                op("x0", OperandKind::Register),
+                op("#1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_100c,
+            4,
+            "cmp",
+            vec![
+                op("x0", OperandKind::Register),
+                op("#2", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1010,
+            4,
+            "b.ne",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let verdict = solve_first(&program);
+    assert_eq!(verdict, SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn aarch64_subs_then_b_cs_resolves_unsigned_compare() {
+    // `subs x0, x1, x1` sets ZF=1 (and Z is the only flag b.eq
+    // / b.ne look at); same family as the cmp-then-branch shape
+    // but exercises the `s`-suffix code path.
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "subs",
+            vec![
+                op("x0", OperandKind::Register),
+                op("x1", OperandKind::Register),
+                op("x1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "b.eq",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let verdict = solve_first(&program);
+    assert_eq!(verdict, SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn aarch64_eor_self_then_b_eq_is_always_true() {
+    // The AArch64 zero idiom is `eor x0, x0, x0` (no flags, even
+    // with .s some encodings) — feeding the result into cmp
+    // produces ZF=1.
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "eor",
+            vec![
+                op("x0", OperandKind::Register),
+                op("x0", OperandKind::Register),
+                op("x0", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "cmp",
+            vec![
+                op("x0", OperandKind::Register),
+                op("#0", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            4,
+            "b.eq",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let verdict = solve_first(&program);
+    assert_eq!(verdict, SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn aarch64_free_input_b_eq_is_both_possible() {
+    // No prior knowledge of x0, so a b.eq after `cmp x0, #0` is
+    // a genuine choice. Verifies the slicer treats x0 as a free
+    // input rather than truncating.
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "cmp",
+            vec![
+                op("x0", OperandKind::Register),
+                op("#0", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "b.eq",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let verdict = solve_first(&program);
+    assert_eq!(verdict, SmtResult::BothPossible);
+}
+
+#[test]
+fn aarch64_b_lo_after_cmp_resolves_unsigned_compare() {
+    // mov x0, #1 ; cmp x0, #0 ; b.lo junk
+    // b.lo (= unsigned <) is "C == 0" on ARM but x86-polarity
+    // `CF == 1` in our model. cmp(1, 0) sets CF = (1 < 0) = 0,
+    // so b.lo branches when CF == 1 → never taken → AlwaysFalse.
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "mov",
+            vec![
+                op("x0", OperandKind::Register),
+                op("#1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "cmp",
+            vec![
+                op("x0", OperandKind::Register),
+                op("#0", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            4,
+            "b.lo",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let verdict = solve_first(&program);
+    assert_eq!(verdict, SmtResult::AlwaysFalse);
+}
+
+fn aarch32_block(insns: Vec<Instruction>) -> Program {
+    program_with_arch(insns, Arch::Arm)
+}
+
+#[test]
+fn aarch64_cbz_after_xzr_mov_is_always_true() {
+    // mov x0, xzr ; cbz x0, dest  →  always taken.
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "mov",
+            vec![
+                op("x0", OperandKind::Register),
+                op("xzr", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "cbz",
+            vec![
+                op("x0", OperandKind::Register),
+                op("0x401080", OperandKind::Immediate),
+            ],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn aarch64_cbnz_after_mov_one_is_always_true() {
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "mov",
+            vec![
+                op("x0", OperandKind::Register),
+                op("#1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "cbnz",
+            vec![
+                op("x0", OperandKind::Register),
+                op("0x401080", OperandKind::Immediate),
+            ],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn aarch64_tbz_bit_zero_of_one_is_always_false() {
+    // mov x0, #1 ; tbz x0, #0, dest
+    //   bit(x0, 0) = 1, so tbz (branch if bit 0) never fires.
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "mov",
+            vec![
+                op("x0", OperandKind::Register),
+                op("#1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "tbz",
+            vec![
+                op("x0", OperandKind::Register),
+                op("#0", OperandKind::Immediate),
+                op("0x401080", OperandKind::Immediate),
+            ],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysFalse);
+}
+
+// `csel` end-to-end solver test is deliberately deferred. The
+// lifter handler emits the correct `Ite` expression, but the
+// backward slicer does not yet model "reads flags" as a distinct
+// effect from "writes flags" — so a flag-setting `cmp` upstream
+// of a `csel` gets dropped from the slice and the cond-bit ends
+// up as a free input. Tracked as a remaining follow-up; the
+// shape-level effect / lift tests cover the handler.
+
+#[test]
+fn aarch32_canonical_opaque_predicate_is_always_true() {
+    // mov r0, r1 ; mul r0, r0, r0 ; and r0, r0, #1 ;
+    // cmp r0, #2 ; bne junk  →  always taken (x*x & 1 ≠ 2).
+    let program = aarch32_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "mov",
+            vec![
+                op("r0", OperandKind::Register),
+                op("r1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "mul",
+            vec![
+                op("r0", OperandKind::Register),
+                op("r0", OperandKind::Register),
+                op("r0", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            4,
+            "and",
+            vec![
+                op("r0", OperandKind::Register),
+                op("r0", OperandKind::Register),
+                op("#1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_100c,
+            4,
+            "cmp",
+            vec![
+                op("r0", OperandKind::Register),
+                op("#2", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1010,
+            4,
+            "bne",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn aarch64_udiv_then_compare_resolves_constant() {
+    // mov x0, #100 ; mov x1, #5 ; udiv x2, x0, x1 ;
+    // cmp x2, #20 ; b.eq dest  →  always taken (100 / 5 == 20).
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "mov",
+            vec![
+                op("x0", OperandKind::Register),
+                op("#100", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "mov",
+            vec![
+                op("x1", OperandKind::Register),
+                op("#5", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            4,
+            "udiv",
+            vec![
+                op("x2", OperandKind::Register),
+                op("x0", OperandKind::Register),
+                op("x1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_100c,
+            4,
+            "cmp",
+            vec![
+                op("x2", OperandKind::Register),
+                op("#20", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1010,
+            4,
+            "b.eq",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn aarch64_sdiv_negative_resolves_constant() {
+    // mov x0, #-30 (as #0xffffffffffffffe2) ; mov x1, #3 ;
+    // sdiv x2, x0, x1 ; cmp x2, #-10 ; b.eq dest  →  always taken.
+    //
+    // We exercise the `sdiv` path; the lifter forwards through
+    // `bvsdiv` which performs signed division with truncation
+    // towards zero. The numeric literal #-10 is encoded as the
+    // 64-bit two's-complement representation 0xffffffffffffff f6.
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "mov",
+            vec![
+                op("x0", OperandKind::Register),
+                op("0xffffffffffffffe2", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "mov",
+            vec![
+                op("x1", OperandKind::Register),
+                op("#3", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            4,
+            "sdiv",
+            vec![
+                op("x2", OperandKind::Register),
+                op("x0", OperandKind::Register),
+                op("x1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_100c,
+            4,
+            "cmp",
+            vec![
+                op("x2", OperandKind::Register),
+                op("0xfffffffffffffff6", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1010,
+            4,
+            "b.eq",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn aarch64_csinc_takes_rn_when_predicate_true() {
+    // mov x0, #5 ; mov x2, #5 ; mov x3, #3 ; cmp x0, #5 ;
+    // csinc x1, x2, x3, eq ; cmp x1, #5 ; b.eq dest
+    //   ZF=1 (x0 == 5), csinc returns x2=5, cmp sets ZF=1,
+    //   b.eq always taken.
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "mov",
+            vec![
+                op("x0", OperandKind::Register),
+                op("#5", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "mov",
+            vec![
+                op("x2", OperandKind::Register),
+                op("#5", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            4,
+            "mov",
+            vec![
+                op("x3", OperandKind::Register),
+                op("#3", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_100c,
+            4,
+            "cmp",
+            vec![
+                op("x0", OperandKind::Register),
+                op("#5", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1010,
+            4,
+            "csinc",
+            vec![
+                op("x1", OperandKind::Register),
+                op("x2", OperandKind::Register),
+                op("x3", OperandKind::Register),
+                op("eq", OperandKind::Unknown),
+            ],
+        ),
+        insn(
+            0x40_1014,
+            4,
+            "cmp",
+            vec![
+                op("x1", OperandKind::Register),
+                op("#5", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1018,
+            4,
+            "b.eq",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn aarch32_moveq_predicated_write_when_condition_true() {
+    // mov r0, #5 ; cmp r0, #5 ; moveq r1, #99 ; cmp r1, #99 ; beq dest
+    //   First cmp sets ZF=1, moveq writes r1=99 unconditionally
+    //   because predicate holds, second cmp keeps ZF=1, beq taken.
+    let program = aarch32_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "mov",
+            vec![
+                op("r0", OperandKind::Register),
+                op("#5", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "cmp",
+            vec![
+                op("r0", OperandKind::Register),
+                op("#5", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            4,
+            "moveq",
+            vec![
+                op("r1", OperandKind::Register),
+                op("#99", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_100c,
+            4,
+            "cmp",
+            vec![
+                op("r1", OperandKind::Register),
+                op("#99", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1010,
+            4,
+            "beq",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn aarch32_mov_imm_then_beq_resolves() {
+    let program = aarch32_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "mov",
+            vec![
+                op("r0", OperandKind::Register),
+                op("#1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "cmp",
+            vec![
+                op("r0", OperandKind::Register),
+                op("#1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            4,
+            "beq",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+fn solve_first_with(program: &Program, limits: &SliceLimits) -> SmtResult {
+    let candidates = collect_branches(program);
+    let cand = candidates.first().expect("at least one branch");
+    let slice = slice_branch(cand, &program.functions[0], limits, program.arch);
+    let lifted = lift_slice(&slice, program.arch);
+    let ssa = ssa_convert(&lifted);
+    solve_branch(&ssa, SolveOptions::default())
+}
+
+#[test]
+fn unknowns_on_truncation_resolves_call_then_cmp_eax_eax_to_always_false() {
+    // call f ; cmp eax, eax ; jne junk
+    //
+    // Under the default limits the call truncates the slice and
+    // the solver short-circuits to `Unsound`. With
+    // `unknowns_on_truncation = true`, SSA surfaces `eax` from the
+    // cmp as a free symbolic input and the predicate reduces to
+    // `(eax == eax) → ZF == 1 → jne never fires`. The verdict is
+    // sound because every value of the free input keeps the
+    // identity true.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            5,
+            "call",
+            vec![op("0x402000", OperandKind::Immediate)],
+        ),
+        insn(
+            0x40_1005,
+            2,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1007,
+            6,
+            "jne",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let baseline = solve_first(&program);
+    assert_eq!(
+        baseline,
+        SmtResult::Unsound,
+        "without the policy a truncated slice must stay Unsound",
+    );
+    let limits = SliceLimits {
+        unknowns_on_truncation: true,
+        ..SliceLimits::default()
+    };
+    let policy = solve_first_with(&program, &limits);
+    assert_eq!(policy, SmtResult::AlwaysFalse);
+}
+
+#[test]
+fn unknowns_on_truncation_leaves_real_branch_as_both_possible() {
+    // call f ; cmp eax, 1 ; jne junk
+    //
+    // With the policy the slicer still produces a truncated slice
+    // and SSA leaves `eax` as a free input. The predicate
+    // `eax == 1` is genuinely satisfiable in both polarities, so
+    // the verdict is `BothPossible` — i.e. the policy does not
+    // fabricate a definitive verdict where there isn't one.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            5,
+            "call",
+            vec![op("0x402000", OperandKind::Immediate)],
+        ),
+        insn(
+            0x40_1005,
+            3,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op("1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            6,
+            "jne",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let limits = SliceLimits {
+        unknowns_on_truncation: true,
+        ..SliceLimits::default()
+    };
+    let verdict = solve_first_with(&program, &limits);
+    assert_eq!(verdict, SmtResult::BothPossible);
+}
+
+#[test]
+fn esil_first_path_mixed_with_the_mnemonic_handler_keeps_the_subregister_link() {
+    // Same shape as `constant_propagation_je_is_always_true`, but
+    // every instruction now carries the ESIL string radare2 would
+    // emit. The slicer's lift loop must consume the ESIL first
+    // (via the `r2smt-esil` lifter); the per-mnemonic path is the
+    // fallback. Resolving to `AlwaysTrue` proves that the ESIL
+    // pipeline produces an IR equivalent to the mnemonic handler
+    // for this canonical case.
+    fn ins(addr: u64, size: u8, mnem: &str, ops: Vec<Operand>, esil: &str) -> Instruction {
+        Instruction {
+            address: Address(addr),
+            size,
+            bytes: vec![],
+            mnemonic: mnem.into(),
+            operands: ops,
+            esil: Some(esil.into()),
+            pcode: None,
+            is_thumb: false,
+        }
+    }
+    let program = Program {
+        arch: Arch::X86_64,
+        bits: 64,
+        entry: Some(Address(0x40_1000)),
+        functions: vec![Function {
+            address: Address(0x40_1000),
+            name: Some("sym.main".into()),
+            blocks: vec![BasicBlock {
+                address: Address(0x40_1000),
+                instructions: vec![
+                    ins(
+                        0x40_1000,
+                        5,
+                        "mov",
+                        vec![
+                            op("eax", OperandKind::Register),
+                            op("1", OperandKind::Immediate),
+                        ],
+                        "1,eax,=",
+                    ),
+                    ins(
+                        0x40_1005,
+                        3,
+                        "cmp",
+                        vec![
+                            op("eax", OperandKind::Register),
+                            op("1", OperandKind::Immediate),
+                        ],
+                        "1,eax,==,$z,zf,:=,32,$b,cf,:=,$p,pf,:=,31,$s,sf,:=",
+                    ),
+                    ins(
+                        0x40_1008,
+                        6,
+                        "je",
+                        vec![op("0x401080", OperandKind::Immediate)],
+                        "zf,?{,0x401080,rip,=,}",
+                    ),
+                ],
+                successors: vec![],
+            }],
+            is_thumb: false,
+        }],
+    };
+    // The `cmp` string is what radare2 6.1.8 actually emits, verified
+    // with `ao`. The fixture used to carry a hand-written
+    // `1,eax,-,$z,zf,=` instead, which encoded the very flag model the
+    // 2026-08-06 audit disproved — bare arithmetic seeding `$z` — and so
+    // the test passed *because* the model was wrong.
+    //
+    // With the real string, `:=` is unlexed and the whole `cmp` falls
+    // back to the per-mnemonic handler, while `mov` still lifts through
+    // ESIL. **That mix is the point of this test**, because it is what
+    // the ladder produces on every real function, and until 2026-08-06
+    // it resolved to `BothPossible`: the ESIL machine assigned a
+    // `Var("eax", 32)` while the per-mnemonic handler read `eax` as
+    // `Extract(Var("rax", 64), 31, 0)`, two different variables, so the
+    // constant never reached the compare.
+    //
+    // Both lifters now place a sub-register against its architectural
+    // parent through the one `r2smt_common::registers` table, so the
+    // flow survives the seam and this resolves as exactly as the pure
+    // per-mnemonic path does — see `constant_propagation_je_is_always_true`.
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn truncated_slice_is_reported_unsound() {
+    // call f ; cmp eax, 0 ; je → truncated.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            5,
+            "call",
+            vec![op("0x402000", OperandKind::Immediate)],
+        ),
+        insn(
+            0x40_1005,
+            3,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op("0", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            6,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    let verdict = solve_first(&program);
+    assert_eq!(verdict, SmtResult::Unsound);
+}
+
+// Bounded simple-diamond Φ-merge: end-to-end soundness
+
+/// `cmp ecx,0; je THEN` head; both arms write `eax`; reconverge at
+/// `cmp eax,7; je analysed`. THEN is the taken edge (`ecx==0`).
+fn diamond(then_imm: &str, else_imm: &str) -> Program {
+    Program {
+        arch: Arch::X86_64,
+        bits: 64,
+        entry: Some(Address(0x40_1000)),
+        functions: vec![Function {
+            address: Address(0x40_1000),
+            name: Some("sym.main".into()),
+            blocks: vec![
+                BasicBlock {
+                    address: Address(0x40_1000),
+                    instructions: vec![
+                        insn(
+                            0x40_1000,
+                            3,
+                            "cmp",
+                            vec![
+                                op("ecx", OperandKind::Register),
+                                op("0", OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1003,
+                            6,
+                            "je",
+                            vec![op("0x401100", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![Address(0x40_1100), Address(0x40_1009)],
+                },
+                BasicBlock {
+                    address: Address(0x40_1009),
+                    instructions: vec![insn(
+                        0x40_1009,
+                        5,
+                        "mov",
+                        vec![
+                            op("eax", OperandKind::Register),
+                            op(else_imm, OperandKind::Immediate),
+                        ],
+                    )],
+                    successors: vec![Address(0x40_1200)],
+                },
+                BasicBlock {
+                    address: Address(0x40_1100),
+                    instructions: vec![insn(
+                        0x40_1100,
+                        5,
+                        "mov",
+                        vec![
+                            op("eax", OperandKind::Register),
+                            op(then_imm, OperandKind::Immediate),
+                        ],
+                    )],
+                    successors: vec![Address(0x40_1200)],
+                },
+                BasicBlock {
+                    address: Address(0x40_1200),
+                    instructions: vec![
+                        insn(
+                            0x40_1200,
+                            3,
+                            "cmp",
+                            vec![
+                                op("eax", OperandKind::Register),
+                                op("7", OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1203,
+                            6,
+                            "je",
+                            vec![op("0x401300", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![],
+                },
+            ],
+            is_thumb: false,
+        }],
+    }
+}
+
+fn solve_diamond_join(program: &Program, allow_join_merge: bool) -> SmtResult {
+    let cands = collect_branches(program);
+    let join = cands
+        .iter()
+        .find(|c| c.address == Address(0x40_1203))
+        .expect("join branch present");
+    let limits = SliceLimits {
+        max_basic_blocks: 8,
+        allow_join_merge,
+        ..SliceLimits::default()
+    };
+    let slice = slice_branch(join, &program.functions[0], &limits, program.arch);
+    let lifted = lift_slice(&slice, program.arch);
+    let ssa = ssa_convert(&lifted);
+    solve_branch(&ssa, SolveOptions::default())
+}
+
+/// Solve a hand-built slice whose branch condition is `cond`. Borrows a
+/// valid `BranchCandidate` from a trivial program (no FP lifter exists
+/// yet), so this exercises the encoder's FP path directly.
+fn solve_fp_condition(cond: r2smt_ir::expr::Expr, inputs: Vec<r2smt_ir::expr::Var>) -> SmtResult {
+    let program = diamond("5", "5");
+    let cands = collect_branches(&program);
+    let branch = cands
+        .iter()
+        .find(|c| c.address == Address(0x40_1203))
+        .expect("branch present")
+        .clone();
+    let ssa = SsaLiftedSlice {
+        branch,
+        statements: Vec::new(),
+        condition: cond,
+        status: SliceStatus::Complete,
+        treat_truncation_as_inputs: false,
+        inputs,
+        defs: Vec::new(),
+        arch: Arch::X86_64,
+    };
+    solve_branch(&ssa, SolveOptions::default())
+}
+
+#[test]
+fn a_multibit_condition_is_true_when_nonzero_matching_the_text_backend() {
+    // Truthiness of a bit-vector in boolean position is "nonzero", the
+    // same convention the text backend's `bool_of` uses for a multi-bit
+    // operand. Value 2 is the discriminating case: it is nonzero but its
+    // low bit is clear, so the earlier Z3 `== 1` test answered false
+    // where the text renderer answered true — a cross-backend divergence.
+    // The condition is a constant 2, so the branch is unconditionally
+    // taken.
+    assert_eq!(
+        solve_fp_condition(r2smt_ir::expr::Expr::konst(2, 32), Vec::new()),
+        SmtResult::AlwaysTrue
+    );
+}
+
+/// `pxor xmm0, xmm0` (the zero idiom) followed by a self-compare, then
+/// `branch`. Comparing 0.0 with itself is ordered and equal, so the
+/// flags are fully determined without needing a memory operand to
+/// materialise a constant.
+fn zeroed_self_compare_then(branch: &str) -> Program {
+    one_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "pxor",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm0", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "ucomiss",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm0", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            6,
+            branch,
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ])
+}
+
+#[test]
+fn zeroed_scalar_fp_self_compare_makes_parity_branch_always_false() {
+    // End-to-end from instructions: 0.0 compared with itself is
+    // ordered, so PF is 0 and `jp` can never be taken. This is the
+    // whole point of lifting `ucomiss` — the NaN-check branch compilers
+    // emit becomes decidable.
+    assert_eq!(
+        solve_first(&zeroed_self_compare_then("jp")),
+        SmtResult::AlwaysFalse
+    );
+}
+
+#[test]
+fn zeroed_scalar_fp_self_compare_makes_equality_branch_always_true() {
+    assert_eq!(
+        solve_first(&zeroed_self_compare_then("je")),
+        SmtResult::AlwaysTrue
+    );
+}
+
+#[test]
+fn value_moved_by_movsd_reaches_the_compare_and_decides_the_branch() {
+    // End-to-end teeth for the scalar move: `pxor` zeroes xmm1, `movsd`
+    // carries that 0.0 into xmm0, and the self-compare then decides.
+    //
+    // `je` is the discriminating verdict. If the move were dropped, or
+    // written to a node disjoint from the vector parent the compare
+    // reads — which is what the ESIL model of `xmm` does — then xmm0
+    // would be a free input and the branch would stay `BothPossible`.
+    // Before the scalar moves were lifted, the slice truncated on the
+    // `movsd` and the verdict was `Unsound`.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "pxor",
+            vec![
+                op("xmm1", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "movsd",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            4,
+            "comisd",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_100c,
+            6,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn float_spilled_to_the_stack_and_reloaded_still_decides_the_branch() {
+    // The shape every compiler emits around a float: spill it, reload
+    // it, compare. Before SIMD memory operands were modelled the slice
+    // truncated at the store and the verdict was `Unsound`.
+    //
+    // `pxor` gives xmm1 a known 0.0 without needing a constant in
+    // memory; the store and the reload then have to round-trip through
+    // the byte-granular model for the compare to resolve.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "pxor",
+            vec![
+                op("xmm1", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            5,
+            "movsd",
+            vec![
+                op("qword [rbp - 8]", OperandKind::Memory),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1009,
+            5,
+            "movsd",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("qword [rbp - 8]", OperandKind::Memory),
+            ],
+        ),
+        insn(
+            0x40_100e,
+            4,
+            "comisd",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1012,
+            6,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn scalar_fp_compare_of_free_inputs_stays_both_possible() {
+    // The anti-fabrication direction: with nothing pinning the lanes,
+    // an ordered-compare branch must stay undecided.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "ucomiss",
+            vec![
+                op("xmm0", OperandKind::Register),
+                op("xmm1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            6,
+            "ja",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::BothPossible);
+}
+
+#[test]
+fn half_precision_is_solved_natively_by_the_z3_backend() {
+    // The text backends decline binary16 (cvc5 needs its experimental
+    // FP solver for it), but Z3 handles the sort natively — so the
+    // F16C conversions stay analysable on the default backend.
+    let half_one = r2smt_ir::expr::Expr::FpConst {
+        bits: 0x3c00,
+        ebits: 5,
+        sbits: 11,
+    };
+    let widened = r2smt_ir::expr::Expr::fp_to_fp(
+        half_one,
+        r2smt_ir::expr::RoundingMode::NearestTiesEven,
+        8,
+        24,
+    );
+    let cond = r2smt_ir::expr::Expr::eq(
+        r2smt_ir::expr::Expr::fp_to_ieee_bv(widened),
+        r2smt_ir::expr::Expr::konst(0x3f80_0000, 32),
+    );
+    assert_eq!(solve_fp_condition(cond, Vec::new()), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn float_square_root_is_encoded_precisely() {
+    // sqrt(4.0f) is exactly 2.0f, so the predicate must fold rather
+    // than stay undecided — the encoding is the real `fp.sqrt`, not an
+    // uninterpreted stand-in.
+    let four = r2smt_ir::expr::Expr::FpConst {
+        bits: 0x4080_0000,
+        ebits: 8,
+        sbits: 24,
+    };
+    let root = r2smt_ir::expr::Expr::fsqrt(four, r2smt_ir::expr::RoundingMode::NearestTiesEven);
+    let cond = r2smt_ir::expr::Expr::eq(
+        r2smt_ir::expr::Expr::fp_to_ieee_bv(root),
+        r2smt_ir::expr::Expr::konst(0x4000_0000, 32),
+    );
+    assert_eq!(solve_fp_condition(cond, Vec::new()), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn float_to_float_widening_is_encoded_exactly() {
+    // Widening single to double loses nothing, so `(float)1.0f` as a
+    // double must equal the double bit pattern of 1.0 exactly. An
+    // encoding that reinterpreted the bits instead of converting them
+    // would not satisfy this.
+    let single_one = r2smt_ir::expr::Expr::FpConst {
+        bits: 0x3f80_0000,
+        ebits: 8,
+        sbits: 24,
+    };
+    let widened = r2smt_ir::expr::Expr::fp_to_fp(
+        single_one,
+        r2smt_ir::expr::RoundingMode::NearestTiesEven,
+        11,
+        53,
+    );
+    let cond = r2smt_ir::expr::Expr::eq(
+        r2smt_ir::expr::Expr::fp_to_ieee_bv(widened),
+        r2smt_ir::expr::Expr::konst(0x3ff0_0000_0000_0000, 64),
+    );
+    assert_eq!(solve_fp_condition(cond, Vec::new()), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn float_to_float_narrowing_rounds_rather_than_truncating_bits() {
+    // The smallest double above 1.0 rounds back to 1.0f in single
+    // precision. A bit-level reinterpret would not.
+    let nudged_double = r2smt_ir::expr::Expr::FpConst {
+        bits: 0x3ff0_0000_0000_0001,
+        ebits: 11,
+        sbits: 53,
+    };
+    let narrowed = r2smt_ir::expr::Expr::fp_to_fp(
+        nudged_double,
+        r2smt_ir::expr::RoundingMode::NearestTiesEven,
+        8,
+        24,
+    );
+    let cond = r2smt_ir::expr::Expr::eq(
+        r2smt_ir::expr::Expr::fp_to_ieee_bv(narrowed),
+        r2smt_ir::expr::Expr::konst(0x3f80_0000, 32),
+    );
+    assert_eq!(solve_fp_condition(cond, Vec::new()), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn fp_precise_encoding_folds_constant_predicate_to_always_true() {
+    use r2smt_ir::expr::{Expr, RoundingMode};
+    // IEEE single-precision `(1.0 + 1.0) == 2.0` — always true, proved
+    // precisely by Z3's FP theory (the BV→FP reinterpret via the shim).
+    let one_bits = 0x3f80_0000u128;
+    let two_bits = 0x4000_0000u128;
+    let one = Expr::bv_to_fp(Expr::konst(one_bits, 32), 8, 24);
+    let cond = Expr::feq(
+        Expr::fadd(
+            one,
+            Expr::FpConst {
+                bits: one_bits,
+                ebits: 8,
+                sbits: 24,
+            },
+            RoundingMode::NearestTiesEven,
+        ),
+        Expr::FpConst {
+            bits: two_bits,
+            ebits: 8,
+            sbits: 24,
+        },
+    );
+    assert_eq!(solve_fp_condition(cond, Vec::new()), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn fp_free_input_predicate_stays_both_possible() {
+    use r2smt_ir::expr::{Expr, Var};
+    // A free 32-bit input reinterpreted as a float, compared to 2.0 —
+    // the verdict depends on the input, so BothPossible: the precise FP
+    // encoding must not fabricate an AlwaysX for a genuinely free value.
+    let cond = Expr::feq(
+        Expr::bv_to_fp(Expr::var("x", 32), 8, 24),
+        Expr::FpConst {
+            bits: 0x4000_0000,
+            ebits: 8,
+            sbits: 24,
+        },
+    );
+    assert_eq!(
+        solve_fp_condition(cond, vec![Var::new("x", 32)]),
+        SmtResult::BothPossible
+    );
+}
+
+/// Flag-merge diamond: each arm ends in `cmp eax, <imm>`, and the join
+/// is a bare `je` reading those flags directly. The join branch's flag
+/// obligation is discharged by merging NZCV across the arms.
+fn flag_diamond(then_cmp: &str, else_cmp: &str) -> Program {
+    let arm = |addr: u64, imm: &str| BasicBlock {
+        address: Address(addr),
+        instructions: vec![insn(
+            addr,
+            3,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op(imm, OperandKind::Immediate),
+            ],
+        )],
+        successors: vec![Address(0x40_1200)],
+    };
+    Program {
+        arch: Arch::X86_64,
+        bits: 64,
+        entry: Some(Address(0x40_1000)),
+        functions: vec![Function {
+            address: Address(0x40_1000),
+            name: Some("sym.main".into()),
+            blocks: vec![
+                BasicBlock {
+                    address: Address(0x40_1000),
+                    instructions: vec![
+                        insn(
+                            0x40_1000,
+                            3,
+                            "cmp",
+                            vec![
+                                op("ecx", OperandKind::Register),
+                                op("0", OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1003,
+                            6,
+                            "je",
+                            vec![op("0x401100", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![Address(0x40_1100), Address(0x40_1009)],
+                },
+                arm(0x40_1009, else_cmp),
+                arm(0x40_1100, then_cmp),
+                BasicBlock {
+                    address: Address(0x40_1200),
+                    instructions: vec![insn(
+                        0x40_1200,
+                        6,
+                        "je",
+                        vec![op("0x401300", OperandKind::Immediate)],
+                    )],
+                    successors: vec![],
+                },
+            ],
+            is_thumb: false,
+        }],
+    }
+}
+
+fn solve_flag_diamond(program: &Program) -> SmtResult {
+    let cands = collect_branches(program);
+    let join = cands
+        .iter()
+        .find(|c| c.address == Address(0x40_1200))
+        .expect("join branch present");
+    let limits = SliceLimits {
+        max_basic_blocks: 8,
+        allow_join_merge: true,
+        ..SliceLimits::default()
+    };
+    let slice = slice_branch(join, &program.functions[0], &limits, program.arch);
+    let lifted = lift_slice(&slice, program.arch);
+    let ssa = ssa_convert(&lifted);
+    solve_branch(&ssa, SolveOptions::default())
+}
+
+/// Counted self-loop: `eax` starts at `init` (written to `init_reg`), the
+/// body increments it and loops while `eax < trip`; after the loop the
+/// branch tests `eax == cmp_imm`. `init` is an operand spelling
+/// (immediate → concrete loop; register → non-concrete, declines the
+/// unroll). `init_reg` lets a test spell a sub-register init (`al`) whose
+/// write does not establish the full counter value.
+fn counted_loop(
+    init_reg: &str,
+    init: &str,
+    init_kind: OperandKind,
+    trip: &str,
+    cmp_imm: &str,
+) -> Program {
+    Program {
+        arch: Arch::X86_64,
+        bits: 64,
+        entry: Some(Address(0x40_1000)),
+        functions: vec![Function {
+            address: Address(0x40_1000),
+            name: Some("sym.main".into()),
+            blocks: vec![
+                BasicBlock {
+                    address: Address(0x40_1000),
+                    instructions: vec![insn(
+                        0x40_1000,
+                        5,
+                        "mov",
+                        vec![op(init_reg, OperandKind::Register), op(init, init_kind)],
+                    )],
+                    successors: vec![Address(0x40_1100)],
+                },
+                BasicBlock {
+                    address: Address(0x40_1100),
+                    instructions: vec![
+                        insn(
+                            0x40_1100,
+                            3,
+                            "add",
+                            vec![
+                                op("eax", OperandKind::Register),
+                                op("1", OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1103,
+                            3,
+                            "cmp",
+                            vec![
+                                op("eax", OperandKind::Register),
+                                op(trip, OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1106,
+                            2,
+                            "jl",
+                            vec![op("0x401100", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![Address(0x40_1100), Address(0x40_1200)],
+                },
+                BasicBlock {
+                    address: Address(0x40_1200),
+                    instructions: vec![
+                        insn(
+                            0x40_1200,
+                            3,
+                            "cmp",
+                            vec![
+                                op("eax", OperandKind::Register),
+                                op(cmp_imm, OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1203,
+                            6,
+                            "je",
+                            vec![op("0x401300", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![],
+                },
+            ],
+            is_thumb: false,
+        }],
+    }
+}
+
+fn solve_counted_loop(program: &Program, allow_join_merge: bool) -> SmtResult {
+    let cands = collect_branches(program);
+    let branch = cands
+        .iter()
+        .find(|c| c.address == Address(0x40_1203))
+        .expect("post-loop branch present");
+    let limits = SliceLimits {
+        max_basic_blocks: 8,
+        allow_join_merge,
+        ..SliceLimits::default()
+    };
+    let slice = slice_branch(branch, &program.functions[0], &limits, program.arch);
+    let lifted = lift_slice(&slice, program.arch);
+    let ssa = ssa_convert(&lifted);
+    solve_branch(&ssa, SolveOptions::default())
+}
+
+#[test]
+fn counted_loop_unrolls_to_exit_constant() {
+    // `for (eax = 0; eax < 3; eax++)` exits with `eax == 3`. The bounded
+    // unroll computes that constant, so `eax == 3` is provably always
+    // taken — precise only because the loop is concrete.
+    let program = counted_loop("eax", "0", OperandKind::Immediate, "3", "3");
+    assert_eq!(
+        solve_counted_loop(&program, true),
+        SmtResult::AlwaysTrue,
+        "concrete counted loop resolves the counter to its exit constant"
+    );
+}
+
+#[test]
+fn counted_loop_with_a_subregister_init_declines_the_unroll() {
+    // `mov al, 0` does not set the whole 32-bit `eax` counter — the upper
+    // 24 bits keep their prior (unknown) value — so treating the init as
+    // `eax = 0` would simulate from a wrong start and fabricate a definite
+    // verdict. The unroll must decline; the counter stays free and the
+    // post-loop `eax == 3` branch widens to BothPossible.
+    let program = counted_loop("al", "0", OperandKind::Immediate, "3", "3");
+    assert_eq!(
+        solve_counted_loop(&program, true),
+        SmtResult::BothPossible,
+        "a sub-register init must decline the unroll, not fabricate a verdict"
+    );
+}
+
+#[test]
+fn counted_loop_without_merge_is_sound_but_imprecise() {
+    // Merge off: no unroll, `eax` is a free input, verdict widens.
+    let program = counted_loop("eax", "0", OperandKind::Immediate, "3", "3");
+    assert_eq!(
+        solve_counted_loop(&program, false),
+        SmtResult::BothPossible,
+        "un-unrolled loop counter is free: sound, imprecise"
+    );
+}
+
+#[test]
+fn non_concrete_counted_loop_declines_unroll_soundly() {
+    // The counter is initialised from a register (`mov eax, ecx`), so
+    // the exit value is not a constant. The unroll must decline and the
+    // counter stays free — BothPossible, never a fabricated verdict.
+    let program = counted_loop("eax", "ecx", OperandKind::Register, "3", "3");
+    assert_eq!(
+        solve_counted_loop(&program, true),
+        SmtResult::BothPossible,
+        "non-concrete loop init must decline the unroll soundly"
+    );
+}
+
+/// A counted loop `mov eax, 0` → self-loop `loop_body` → `cmp eax, 3; je`,
+/// with a caller-supplied loop body so a test can perturb its shape.
+fn counted_loop_with_body(loop_body: Vec<Instruction>) -> Program {
+    Program {
+        arch: Arch::X86_64,
+        bits: 64,
+        entry: Some(Address(0x40_1000)),
+        functions: vec![Function {
+            address: Address(0x40_1000),
+            name: Some("sym.main".into()),
+            blocks: vec![
+                BasicBlock {
+                    address: Address(0x40_1000),
+                    instructions: vec![insn(
+                        0x40_1000,
+                        5,
+                        "mov",
+                        vec![
+                            op("eax", OperandKind::Register),
+                            op("0", OperandKind::Immediate),
+                        ],
+                    )],
+                    successors: vec![Address(0x40_1100)],
+                },
+                BasicBlock {
+                    address: Address(0x40_1100),
+                    instructions: loop_body,
+                    successors: vec![Address(0x40_1100), Address(0x40_1200)],
+                },
+                BasicBlock {
+                    address: Address(0x40_1200),
+                    instructions: vec![
+                        insn(
+                            0x40_1200,
+                            3,
+                            "cmp",
+                            vec![
+                                op("eax", OperandKind::Register),
+                                op("3", OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1203,
+                            6,
+                            "je",
+                            vec![op("0x401300", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![],
+                },
+            ],
+            is_thumb: false,
+        }],
+    }
+}
+
+#[test]
+fn counted_loop_with_compare_before_step_declines_the_unroll() {
+    // `cmp eax, 3; add eax, 1; jl` — the compare runs *before* the step,
+    // so the `jl` reads the `add`'s flags, not the `cmp`'s. The unroller's
+    // step-then-test model does not describe this loop; unrolling it would
+    // fabricate a wrong exit constant. It must decline → counter stays
+    // free → post-loop `eax == 3` widens to BothPossible.
+    let program = counted_loop_with_body(vec![
+        insn(
+            0x40_1100,
+            3,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op("3", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1103,
+            3,
+            "add",
+            vec![
+                op("eax", OperandKind::Register),
+                op("1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1106,
+            2,
+            "jl",
+            vec![op("0x401100", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(
+        solve_counted_loop(&program, true),
+        SmtResult::BothPossible,
+        "a compare-before-step loop must decline the unroll, not fabricate a verdict"
+    );
+}
+
+#[test]
+fn counted_loop_with_a_narrower_compare_declines_the_unroll() {
+    // `add eax, 1; cmp al, 3; jl` — the compare tests only the low byte of
+    // the counter, a different condition from `cmp eax, 3`. Unrolling as if
+    // the full counter were compared would fabricate a verdict; it must
+    // decline.
+    let program = counted_loop_with_body(vec![
+        insn(
+            0x40_1100,
+            3,
+            "add",
+            vec![
+                op("eax", OperandKind::Register),
+                op("1", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1103,
+            2,
+            "cmp",
+            vec![
+                op("al", OperandKind::Register),
+                op("3", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1105,
+            2,
+            "jl",
+            vec![op("0x401100", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(
+        solve_counted_loop(&program, true),
+        SmtResult::BothPossible,
+        "a width-mismatched compare must decline the unroll, not fabricate a verdict"
+    );
+}
+
+/// A counted self-loop reached from two entry blocks with different
+/// constant inits. Entry A (`eax = 0`) runs the loop to exit value 3;
+/// entry B (`eax = 10`) never enters the body and exits with `eax = 11`,
+/// so the post-loop `eax == 3` branch is genuinely path-dependent.
+fn two_entry_counted_loop() -> Program {
+    let header = Address(0x40_1100);
+    let exit = Address(0x40_1200);
+    let entry = |addr: u64, init: &str| BasicBlock {
+        address: Address(addr),
+        instructions: vec![insn(
+            addr,
+            5,
+            "mov",
+            vec![
+                op("eax", OperandKind::Register),
+                op(init, OperandKind::Immediate),
+            ],
+        )],
+        successors: vec![header],
+    };
+    Program {
+        arch: Arch::X86_64,
+        bits: 64,
+        entry: Some(Address(0x40_1000)),
+        functions: vec![Function {
+            address: Address(0x40_1000),
+            name: Some("sym.main".into()),
+            blocks: vec![
+                entry(0x40_1000, "0"),
+                entry(0x40_1010, "10"),
+                BasicBlock {
+                    address: header,
+                    instructions: vec![
+                        insn(
+                            0x40_1100,
+                            3,
+                            "add",
+                            vec![
+                                op("eax", OperandKind::Register),
+                                op("1", OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1103,
+                            3,
+                            "cmp",
+                            vec![
+                                op("eax", OperandKind::Register),
+                                op("3", OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1106,
+                            2,
+                            "jl",
+                            vec![op("0x401100", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![header, exit],
+                },
+                BasicBlock {
+                    address: exit,
+                    instructions: vec![
+                        insn(
+                            0x40_1200,
+                            3,
+                            "cmp",
+                            vec![
+                                op("eax", OperandKind::Register),
+                                op("3", OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1203,
+                            6,
+                            "je",
+                            vec![op("0x401300", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![],
+                },
+            ],
+            is_thumb: false,
+        }],
+    }
+}
+
+#[test]
+fn multi_entry_counted_loop_declines_unroll_soundly() {
+    // A loop header with two entry edges is not a single-constant init:
+    // the unroll must decline (the counter stays free) rather than commit
+    // to one arbitrary entry's constant and fabricate a definite verdict.
+    let program = two_entry_counted_loop();
+    assert_eq!(
+        solve_counted_loop(&program, true),
+        SmtResult::BothPossible,
+        "multi-entry loop header must decline the unroll soundly"
+    );
+}
+
+/// Memory diamond: each arm stores an immediate to the stack slot
+/// `[rbp-8]`, the join loads it back into `eax` and branches on
+/// `eax == cmp_imm`. Resolving the branch needs the conditional store.
+fn memory_diamond(then_store: &str, else_store: &str, cmp_imm: &str) -> Program {
+    let store = |addr: u64, imm: &str| BasicBlock {
+        address: Address(addr),
+        instructions: vec![insn(
+            addr,
+            7,
+            "mov",
+            vec![
+                op("dword [rbp-8]", OperandKind::Memory),
+                op(imm, OperandKind::Immediate),
+            ],
+        )],
+        successors: vec![Address(0x40_1200)],
+    };
+    Program {
+        arch: Arch::X86_64,
+        bits: 64,
+        entry: Some(Address(0x40_1000)),
+        functions: vec![Function {
+            address: Address(0x40_1000),
+            name: Some("sym.main".into()),
+            blocks: vec![
+                BasicBlock {
+                    address: Address(0x40_1000),
+                    instructions: vec![
+                        insn(
+                            0x40_1000,
+                            3,
+                            "cmp",
+                            vec![
+                                op("ecx", OperandKind::Register),
+                                op("0", OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1003,
+                            6,
+                            "je",
+                            vec![op("0x401100", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![Address(0x40_1100), Address(0x40_1009)],
+                },
+                store(0x40_1009, else_store),
+                store(0x40_1100, then_store),
+                BasicBlock {
+                    address: Address(0x40_1200),
+                    instructions: vec![
+                        insn(
+                            0x40_1200,
+                            3,
+                            "mov",
+                            vec![
+                                op("eax", OperandKind::Register),
+                                op("dword [rbp-8]", OperandKind::Memory),
+                            ],
+                        ),
+                        insn(
+                            0x40_1203,
+                            3,
+                            "cmp",
+                            vec![
+                                op("eax", OperandKind::Register),
+                                op(cmp_imm, OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(
+                            0x40_1206,
+                            6,
+                            "je",
+                            vec![op("0x401300", OperandKind::Immediate)],
+                        ),
+                    ],
+                    successors: vec![],
+                },
+            ],
+            is_thumb: false,
+        }],
+    }
+}
+
+fn solve_memory_diamond(program: &Program, allow_join_merge: bool) -> SmtResult {
+    let cands = collect_branches(program);
+    let branch = cands
+        .iter()
+        .find(|c| c.address == Address(0x40_1206))
+        .expect("join branch present");
+    let limits = SliceLimits {
+        max_basic_blocks: 8,
+        allow_join_merge,
+        ..SliceLimits::default()
+    };
+    let slice = slice_branch(branch, &program.functions[0], &limits, program.arch);
+    let lifted = lift_slice(&slice, program.arch);
+    let ssa = ssa_convert(&lifted);
+    solve_branch(&ssa, SolveOptions::default())
+}
+
+#[test]
+fn memory_diamond_opaque_predicate_resolves_precisely() {
+    // Arms store 5 / 7 to `[rbp-8]`; the join loads it and tests
+    // `eax==6`. `[rbp-8] ∈ {5,7}` never equals 6, so the branch is
+    // never taken — but only the conditional store makes that provable.
+    let program = memory_diamond("5", "7", "6");
+    assert_eq!(
+        solve_memory_diamond(&program, true),
+        SmtResult::AlwaysFalse,
+        "conditional store must resolve the memory opaque predicate"
+    );
+}
+
+#[test]
+fn memory_diamond_without_merge_is_sound_but_imprecise() {
+    // Merge off: the arm stores are dropped, so the load reads a free
+    // byte and the verdict widens to BothPossible. Sound, imprecise.
+    let program = memory_diamond("5", "7", "6");
+    assert_eq!(
+        solve_memory_diamond(&program, false),
+        SmtResult::BothPossible,
+        "without the merge the loaded byte is free: sound, imprecise"
+    );
+}
+
+#[test]
+fn memory_diamond_path_sensitive_stays_both_possible() {
+    // Soundness guard: arms store 5 / 6, join tests `eax==6`. The stored
+    // value genuinely depends on the free head input `ecx`, so the
+    // verdict must be BothPossible — never a fabricated AlwaysX.
+    let program = memory_diamond("5", "6", "6");
+    assert_eq!(
+        solve_memory_diamond(&program, true),
+        SmtResult::BothPossible,
+        "path-sensitive memory predicate must not be fabricated into AlwaysX"
+    );
+}
+
+/// Two chained diamonds: inner sets `esi ∈ {then,else}`, outer branches
+/// on `esi==15` to set `eax ∈ {1,2}`, sliced branch tests `eax==1`.
+fn chained_diamond(inner_then: &str, inner_else: &str) -> Program {
+    let mov = |addr: u64, reg: &str, imm: &str, succ: u64| BasicBlock {
+        address: Address(addr),
+        instructions: vec![insn(
+            addr,
+            5,
+            "mov",
+            vec![
+                op(reg, OperandKind::Register),
+                op(imm, OperandKind::Immediate),
+            ],
+        )],
+        successors: vec![Address(succ)],
+    };
+    let head = |addr: u64, reg: &str, imm: &str, jmp: &str, taken: u64, ft: u64| BasicBlock {
+        address: Address(addr),
+        instructions: vec![
+            insn(
+                addr,
+                3,
+                "cmp",
+                vec![
+                    op(reg, OperandKind::Register),
+                    op(imm, OperandKind::Immediate),
+                ],
+            ),
+            insn(
+                addr + 3,
+                6,
+                jmp,
+                vec![op(&format!("{taken:#x}"), OperandKind::Immediate)],
+            ),
+        ],
+        successors: vec![Address(taken), Address(ft)],
+    };
+    Program {
+        arch: Arch::X86_64,
+        bits: 64,
+        entry: Some(Address(0x1000)),
+        functions: vec![Function {
+            address: Address(0x1000),
+            name: Some("sym.main".into()),
+            blocks: vec![
+                head(0x1000, "edx", "0", "jne", 0x1100, 0x1009),
+                mov(0x1009, "esi", inner_else, 0x1200),
+                mov(0x1100, "esi", inner_then, 0x1200),
+                head(0x1200, "esi", "15", "je", 0x1300, 0x1209),
+                mov(0x1209, "eax", "2", 0x1400),
+                mov(0x1300, "eax", "1", 0x1400),
+                BasicBlock {
+                    address: Address(0x1400),
+                    instructions: vec![
+                        insn(
+                            0x1400,
+                            3,
+                            "cmp",
+                            vec![
+                                op("eax", OperandKind::Register),
+                                op("1", OperandKind::Immediate),
+                            ],
+                        ),
+                        insn(0x1403, 6, "je", vec![op("0x1500", OperandKind::Immediate)]),
+                    ],
+                    successors: vec![],
+                },
+            ],
+            is_thumb: false,
+        }],
+    }
+}
+
+fn solve_chained_diamond(program: &Program, allow_join_merge: bool) -> SmtResult {
+    let cands = collect_branches(program);
+    let branch = cands
+        .iter()
+        .find(|c| c.address == Address(0x1403))
+        .expect("sliced branch present");
+    let limits = SliceLimits {
+        max_basic_blocks: 8,
+        allow_join_merge,
+        ..SliceLimits::default()
+    };
+    let slice = slice_branch(branch, &program.functions[0], &limits, program.arch);
+    let lifted = lift_slice(&slice, program.arch);
+    let ssa = ssa_convert(&lifted);
+    solve_branch(&ssa, SolveOptions::default())
+}
+
+#[test]
+fn chained_diamonds_resolve_opaque_predicate_precisely() {
+    // `esi ∈ {10,20}` never equals 15, so `eax` is always 2 and the
+    // sliced `je` (`eax==1`) is never taken. Proving this needs BOTH
+    // merges — the outer to bind `eax`, the inner to bind `esi`.
+    let program = chained_diamond("10", "20");
+    assert_eq!(
+        solve_chained_diamond(&program, true),
+        SmtResult::AlwaysFalse,
+        "chained merge must resolve the two-level opaque predicate"
+    );
+}
+
+#[test]
+fn chained_diamonds_without_merge_are_sound_but_imprecise() {
+    // Same program, merge off: `esi` is a free input, so `esi==15` is
+    // possible and the verdict widens to BothPossible. Sound, imprecise.
+    let program = chained_diamond("10", "20");
+    assert_eq!(
+        solve_chained_diamond(&program, false),
+        SmtResult::BothPossible,
+        "without chaining esi is free: sound, imprecise"
+    );
+}
+
+#[test]
+fn chained_diamonds_path_sensitive_stays_both_possible() {
+    // Soundness guard: inner arm makes `esi==15` genuinely reachable,
+    // so `eax==1` depends on the free head input `edx`. The chained
+    // merge must NOT fabricate an AlwaysX here.
+    let program = chained_diamond("15", "20");
+    assert_eq!(
+        solve_chained_diamond(&program, true),
+        SmtResult::BothPossible,
+        "path-sensitive chained predicate must stay BothPossible"
+    );
+}
+
+#[test]
+fn flag_merge_path_sensitive_predicate_stays_both_possible() {
+    // Soundness guard for the flag merge: arms set ZF differently
+    // (`eax==5` vs `eax==6`), so the merged `ZF = Ite(ecx==0, eax==5,
+    // eax==6)` depends on the free head input — the verdict must be
+    // BothPossible, NEVER a fabricated AlwaysX.
+    let program = flag_diamond("5", "6");
+    assert_eq!(
+        solve_flag_diamond(&program),
+        SmtResult::BothPossible,
+        "path-sensitive flag predicate must not be fabricated into AlwaysX"
+    );
+}
+
+#[test]
+fn diamond_path_insensitive_predicate_is_always_false_with_merge() {
+    // Both arms set eax=5, so `eax==7` is false regardless of the
+    // head condition. The bounded Φ-merge recovers this precisely.
+    let program = diamond("5", "5");
+    assert_eq!(
+        solve_diamond_join(&program, true),
+        SmtResult::AlwaysFalse,
+        "path-insensitive predicate must resolve precisely under Φ-merge"
+    );
+}
+
+#[test]
+fn diamond_without_merge_is_sound_but_imprecise() {
+    // Same program, merge disabled: the pre-existing path leaves
+    // eax a free input → the verdict widens to BothPossible. Sound
+    // (never a fabricated AlwaysX), just less precise — this is
+    // the gap the merge closes.
+    let program = diamond("5", "5");
+    assert_eq!(
+        solve_diamond_join(&program, false),
+        SmtResult::BothPossible,
+        "without the merge eax is a free input: sound, imprecise"
+    );
+}
+
+#[test]
+fn diamond_path_sensitive_predicate_stays_both_possible() {
+    // Soundness guard: arms genuinely differ (5 vs 7). `eax==7`
+    // now depends on the (free) head input `ecx`, so the verdict
+    // must be BothPossible — the merge must NEVER fabricate an
+    // AlwaysTrue / AlwaysFalse here.
+    let program = diamond("5", "7");
+    let verdict = solve_diamond_join(&program, true);
+    assert_eq!(
+        verdict,
+        SmtResult::BothPossible,
+        "path-sensitive predicate must not be fabricated into AlwaysX"
+    );
+}
+
+#[test]
+fn combine_table_contract_is_exhaustive_and_sound() {
+    // The (cond-SAT, not-cond-SAT) → verdict table is a hard soundness
+    // contract. Weakening any cell — especially `(Unsat,Unsat)→Unsound`
+    // (never a confident verdict from a contradictory encoding) and
+    // `Unknown→Timeout` (never a definitive verdict from an undecided
+    // solver) — would let the engine fabricate or hide a verdict. This
+    // test fails closed if anyone changes the mapping.
+    use z3::SatResult::{Sat, Unknown, Unsat};
+    let cases: [(z3::SatResult, z3::SatResult, SmtResult); 9] = [
+        (Sat, Unsat, SmtResult::AlwaysTrue),
+        (Unsat, Sat, SmtResult::AlwaysFalse),
+        (Sat, Sat, SmtResult::BothPossible),
+        (Unsat, Unsat, SmtResult::Unsound),
+        (Unknown, Sat, SmtResult::Timeout),
+        (Unknown, Unsat, SmtResult::Timeout),
+        (Unknown, Unknown, SmtResult::Timeout),
+        (Sat, Unknown, SmtResult::Timeout),
+        (Unsat, Unknown, SmtResult::Timeout),
+    ];
+    for (i, (t, f, want)) in cases.into_iter().enumerate() {
+        assert_eq!(combine(t, f), want, "z3 combine table case {i} violated");
+    }
+}
+
+#[test]
+fn determinism_verdict_is_stable_across_repeated_solves() {
+    // Same query, same pinned seed, solved N times: a deterministic
+    // solver must return the *identical* verdict every time. This is
+    // the regression guard for the P24 `random_seed` pinning — a
+    // flaky `AlwaysTrue`/`Timeout` split here means the pin regressed.
+    let program = canonical_opaque_predicate_program();
+    let options = SolveOptions {
+        timeout_ms: TEST_SOLVE_TIMEOUT_MS,
+        random_seed: 0x00C0_FFEE,
+        rlimit: 0,
+    };
+    let verdicts: Vec<SmtResult> = (0..8)
+        .map(|_| solve_first_with_options(&program, options))
+        .collect();
+    assert!(
+        verdicts.iter().all(|v| *v == SmtResult::AlwaysTrue),
+        "verdict not stable across repeats: {verdicts:?}"
+    );
+}
+
+#[test]
+fn determinism_verdict_is_invariant_across_random_seeds() {
+    // The PRNG seed steers the solver's search path, never the
+    // SAT/UNSAT result of a sound query. A seed that changes the
+    // verdict would be an encoding/soundness bug, not mere flakiness.
+    let program = canonical_opaque_predicate_program();
+    for seed in [0u32, 1, 7, 99_991, u32::MAX] {
+        let verdict = solve_first_with_options(
+            &program,
+            SolveOptions {
+                timeout_ms: TEST_SOLVE_TIMEOUT_MS,
+                random_seed: seed,
+                rlimit: 0,
+            },
+        );
+        assert_eq!(
+            verdict,
+            SmtResult::AlwaysTrue,
+            "seed {seed} changed the verdict"
+        );
+    }
+}
+
+#[test]
+fn aarch64_float_moved_between_registers_decides_the_compare() {
+    // End-to-end through the real AArch64 pipeline: `scvtf` turns a
+    // zeroed integer register into 0.0, `fmov` carries it, and the
+    // compare then resolves.
+    //
+    // `b.eq` is the discriminating verdict. If the move landed on a
+    // node disjoint from the vector parent the compare reads — the
+    // failure mode the ESIL model of `s0` would produce — `s1` would be
+    // a free input and this would stay `BothPossible`.
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "mov",
+            vec![
+                op("w0", OperandKind::Register),
+                op("0", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "scvtf",
+            vec![
+                op("s0", OperandKind::Register),
+                op("w0", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            4,
+            "fmov",
+            vec![
+                op("s1", OperandKind::Register),
+                op("s0", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_100c,
+            4,
+            "fcmp",
+            vec![
+                op("s0", OperandKind::Register),
+                op("s1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1010,
+            4,
+            "b.eq",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn aarch64_unordered_compare_does_not_satisfy_equality() {
+    // The anti-fabrication direction: with the operands free, an
+    // equality branch after `fcmp` must stay undecided — NaN alone
+    // makes it false, so it can never be proven always-taken.
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "fcmp",
+            vec![
+                op("s0", OperandKind::Register),
+                op("s1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "b.eq",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::BothPossible);
+}
+
+/// `fld1 ; fstp <dst> ; mov rax, qword [rbp - 0x20] ; cmp rax, <expect>
+/// ; je` — the whole x87 path end to end, with the reload reading
+/// whichever bytes the store wrote.
+fn x87_store_one_program(dst: &str, expect: &str) -> Program {
+    one_block(vec![
+        insn(0x40_1000, 2, "fld1", vec![]),
+        insn(0x40_1002, 3, "fstp", vec![op(dst, OperandKind::Memory)]),
+        insn(
+            0x40_1005,
+            4,
+            "mov",
+            vec![
+                op("rax", OperandKind::Register),
+                op("qword [rbp - 0x20]", OperandKind::Memory),
+            ],
+        ),
+        insn(
+            0x40_1009,
+            10,
+            "cmp",
+            vec![
+                op("rax", OperandKind::Register),
+                op(expect, OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1013,
+            2,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ])
+}
+
+/// A chain pushed onto the x87 stack, stored to `m64fp`, and compared
+/// against `expect` as an integer bit pattern.
+fn x87_chain_program(chain: Vec<(&str, Vec<Operand>)>, expect: &str) -> Program {
+    let mut out = Vec::new();
+    let mut addr = 0x40_1000u64;
+    for (mnemonic, operands) in chain {
+        out.push(insn(addr, 2, mnemonic, operands));
+        addr += 2;
+    }
+    out.push(insn(
+        addr,
+        3,
+        "fstp",
+        vec![op("qword [rbp - 0x20]", OperandKind::Memory)],
+    ));
+    out.push(insn(
+        addr + 3,
+        4,
+        "mov",
+        vec![
+            op("rax", OperandKind::Register),
+            op("qword [rbp - 0x20]", OperandKind::Memory),
+        ],
+    ));
+    out.push(insn(
+        addr + 7,
+        10,
+        "cmp",
+        vec![
+            op("rax", OperandKind::Register),
+            op(expect, OperandKind::Immediate),
+        ],
+    ));
+    out.push(insn(
+        addr + 17,
+        2,
+        "je",
+        vec![op("0x401080", OperandKind::Immediate)],
+    ));
+    one_block(out)
+}
+
+#[test]
+fn x87_one_operand_pop_writes_the_named_slot_not_the_top() {
+    // `de c1` is `faddp st(1)`: ST(1) := ST(1) + ST(0), then pop, so
+    // the sum survives as the new top. Writing ST(0) instead would put
+    // the sum in the slot the pop discards and leave 1.0 behind, which
+    // is why the constants are chosen to differ under that mistake.
+    let program = x87_chain_program(
+        vec![
+            ("fld1", vec![]),
+            ("fld1", vec![]),
+            ("faddp", vec![op("st(1)", OperandKind::Register)]),
+        ],
+        "0x4000000000000000",
+    );
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_reverse_suffix_swaps_the_operands_of_a_one_operand_pop() {
+    // `fsubrp st(1)` is ST(1) := ST(0) - ST(1). With ST(0) = 0.0 and
+    // ST(1) = 1.0 that is -1.0; the non-reversed form would give +1.0.
+    // Intel swaps the mnemonics between the D8 and DC opcode groups,
+    // so getting this backwards is a wrong value, not a decline.
+    let program = x87_chain_program(
+        vec![
+            ("fld1", vec![]),
+            ("fldz", vec![]),
+            ("fsubrp", vec![op("st(1)", OperandKind::Register)]),
+        ],
+        "0xbff0000000000000",
+    );
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_extended_sort_stores_the_binary64_image_of_one() {
+    // Pins that `FloatingPoint(15, 64)` really denotes x87's
+    // double-extended format and that `X87_ONE` is its `+1.0` pattern:
+    // narrowing it to `m64fp` must produce binary64's own `+1.0`.
+    // Nothing here is asserted about the sort by the lifter — Z3 is
+    // computing the conversion.
+    let program = x87_store_one_program("qword [rbp - 0x20]", "0x3ff0000000000000");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_extended_sort_stores_the_explicit_integer_bit() {
+    // The 79-to-80 bit bridge, checked where it is observable: the low
+    // eight bytes of the stored `m80fp` image of `+1.0` are the
+    // explicit integer bit alone, the fraction being zero. Reading the
+    // sort's own 79-bit pattern instead would put the exponent's low
+    // bit there and this would not hold.
+    let program = x87_store_one_program("xword [rbp - 0x20]", "0x8000000000000000");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_extended_sort_keeps_a_free_extended_load_undecided() {
+    // The anti-fabrication direction. With the source bytes free, no
+    // definite verdict may come back — in particular the non-canonical
+    // double-extended encodings must not be silently resolved to their
+    // canonical counterparts.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            3,
+            "fld",
+            vec![op("xword [rbp - 0x10]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_1003,
+            3,
+            "fstp",
+            vec![op("qword [rbp - 0x20]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_1006,
+            4,
+            "mov",
+            vec![
+                op("rax", OperandKind::Register),
+                op("qword [rbp - 0x20]", OperandKind::Memory),
+            ],
+        ),
+        insn(
+            0x40_100a,
+            10,
+            "cmp",
+            vec![
+                op("rax", OperandKind::Register),
+                op("0x3ff0000000000000", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1014,
+            2,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    // Needs 1–2 M rlimit units, orders of magnitude above every other
+    // solve in this file, so it takes the resource budget.
+    assert_eq!(solve_first_within_rlimit(&program), SmtResult::BothPossible);
+}
+
+/// `fld1 ; fldz` leaves `ST(0) = +0.0` above `ST(1) = +1.0`, so a
+/// compare of the two is unambiguously "less than" — the shape every
+/// x87 compare test below branches on.
+fn x87_zero_below_one(rest: Vec<Instruction>) -> Program {
+    let mut instructions = vec![
+        insn(0x40_1000, 2, "fld1", vec![]),
+        insn(0x40_1002, 2, "fldz", vec![]),
+    ];
+    instructions.extend(rest);
+    one_block(instructions)
+}
+
+#[test]
+fn x87_status_word_idiom_resolves_through_test_ah() {
+    // The ending that dominates 32-bit binaries. `fcomp` records
+    // "less than" as C0 = 1, C2 = 0, C3 = 0; `fnstsw ax` puts those at
+    // AH bits 0, 2 and 6; `test ah, 0x41` masks C0 and C3, which is
+    // non-zero, so `jz` never fires. Nothing in the `test` / `jz` half
+    // is x87-aware — it resolves through the ordinary integer path.
+    let program = x87_zero_below_one(vec![
+        insn(
+            0x40_1004,
+            2,
+            "fcomp",
+            vec![op("st(1)", OperandKind::Register)],
+        ),
+        insn(
+            0x40_1006,
+            2,
+            "fnstsw",
+            vec![op("ax", OperandKind::Register)],
+        ),
+        insn(
+            0x40_1008,
+            3,
+            "test",
+            vec![
+                op("ah", OperandKind::Register),
+                op("0x41", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_100b,
+            2,
+            "jz",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysFalse);
+}
+
+#[test]
+fn x87_status_word_idiom_resolves_through_sahf() {
+    // The other ending. `sahf` transfers AH bit 0 into CF, so the C0
+    // the compare set makes `jb` always fire. The bit positions are
+    // load-bearing on both sides and neither is asserted anywhere —
+    // Z3 is deriving this from the status word the lifter built.
+    let program = x87_zero_below_one(vec![
+        insn(
+            0x40_1004,
+            2,
+            "fcomp",
+            vec![op("st(1)", OperandKind::Register)],
+        ),
+        insn(
+            0x40_1006,
+            2,
+            "fnstsw",
+            vec![op("ax", OperandKind::Register)],
+        ),
+        insn(0x40_1008, 1, "sahf", vec![]),
+        insn(
+            0x40_1009,
+            2,
+            "jb",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_flag_compare_writes_eflags_directly() {
+    // `fcomi` skips the status word entirely, writing CF/ZF/PF in the
+    // encoding the existing `jcc` lowering already reads.
+    let program = x87_zero_below_one(vec![
+        insn(
+            0x40_1004,
+            2,
+            "fcomi",
+            vec![
+                op("st(0)", OperandKind::Register),
+                op("st(1)", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1006,
+            2,
+            "jb",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_equality_after_a_free_compare_stays_undecided() {
+    // The anti-fabrication direction, and the reason the unordered
+    // predicate is carried at all: with both operands free, NaN alone
+    // makes an equality branch false, so it can never be proven
+    // always-taken.
+    let program = one_block(vec![
+        insn(
+            0x40_1000,
+            3,
+            "fld",
+            vec![op("qword [rbp - 0x10]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_1003,
+            3,
+            "fld",
+            vec![op("qword [rbp - 0x18]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_1006,
+            2,
+            "fcomi",
+            vec![
+                op("st(0)", OperandKind::Register),
+                op("st(1)", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            2,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ]);
+    // The most expensive solve in the suite: 2–4 M rlimit units, some
+    // seconds of Z3 work on the `(15, 64)` sort. A wall clock cannot
+    // bound this fairly; see `TEST_SOLVE_RLIMIT`.
+    assert_eq!(solve_first_within_rlimit(&program), SmtResult::BothPossible);
+}
+
+/// `mov dword [rbp - 8], <seed> ; fld1 ; <mnemonic> dword [rbp - 8] ;
+/// fstp qword [rbp - 0x20] ; mov rax, … ; cmp rax, <expect> ; je`.
+///
+/// Seeds a definite integer in memory so the integer-operand family's
+/// conversion is observable as a value rather than as IR shape: read as
+/// an `m32fp` bit pattern instead, a small seed is a denormal that
+/// leaves `+1.0` unchanged, and every expectation below fails.
+fn x87_integer_operand_program(mnemonic: &str, seed: &str, expect: &str) -> Program {
+    one_block(vec![
+        insn(
+            0x40_1000,
+            7,
+            "mov",
+            vec![
+                op("dword [rbp - 0x8]", OperandKind::Memory),
+                op(seed, OperandKind::Immediate),
+            ],
+        ),
+        insn(0x40_1007, 2, "fld1", vec![]),
+        insn(
+            0x40_1009,
+            3,
+            mnemonic,
+            vec![op("dword [rbp - 0x8]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_100c,
+            3,
+            "fstp",
+            vec![op("qword [rbp - 0x20]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_100f,
+            4,
+            "mov",
+            vec![
+                op("rax", OperandKind::Register),
+                op("qword [rbp - 0x20]", OperandKind::Memory),
+            ],
+        ),
+        insn(
+            0x40_1013,
+            10,
+            "cmp",
+            vec![
+                op("rax", OperandKind::Register),
+                op(expect, OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_101d,
+            2,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ])
+}
+
+#[test]
+fn x87_integer_operand_add_converts_its_operand_as_an_integer() {
+    // `1.0 + 2` is `3.0` — binary64 `0x4008000000000000`. Reading the
+    // seed as a float bit pattern gives a denormal near 2.8e-45, whose
+    // sum with 1.0 rounds back to 1.0, so the mistake is a definite
+    // wrong number rather than a decline.
+    let program = x87_integer_operand_program("fiadd", "2", "0x4008000000000000");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_integer_operand_reverse_subtract_takes_the_memory_operand_first() {
+    // `fisubr m32int` is `m - ST(0)`: `4 - 1.0` is `3.0`. The
+    // non-reversed direction would give `-3.0`, which is the same
+    // magnitude with the sign bit set — a wrong value the shape of the
+    // expression alone would not catch.
+    let program = x87_integer_operand_program("fisubr", "4", "0x4008000000000000");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_integer_operand_source_is_two_s_complement() {
+    // `1.0 + (-2)` is `-1.0`. An unsigned reading of the same bytes
+    // would be 4294967294, so this pins the signedness of the
+    // conversion and not merely that some conversion happens.
+    let program = x87_integer_operand_program("fiadd", "-2", "0xbff0000000000000");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+/// `mov dword [rbp - 8], 0x40300000 ; fld dword [rbp - 8] ;
+/// <mnemonic> dword [rbp - 0x20] ; mov eax, dword [rbp - 0x20] ;
+/// cmp eax, <expect> ; je`.
+///
+/// `0x40300000` is binary32 `+2.75`, chosen because truncation and
+/// round-to-nearest disagree about it: `2` against `3`.
+fn x87_integer_store_program(mnemonic: &str, expect: &str) -> Program {
+    one_block(vec![
+        insn(
+            0x40_1000,
+            7,
+            "mov",
+            vec![
+                op("dword [rbp - 0x8]", OperandKind::Memory),
+                op("0x40300000", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1007,
+            3,
+            "fld",
+            vec![op("dword [rbp - 0x8]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_100a,
+            3,
+            mnemonic,
+            vec![op("dword [rbp - 0x20]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_100d,
+            3,
+            "mov",
+            vec![
+                op("eax", OperandKind::Register),
+                op("dword [rbp - 0x20]", OperandKind::Memory),
+            ],
+        ),
+        insn(
+            0x40_1010,
+            3,
+            "cmp",
+            vec![
+                op("eax", OperandKind::Register),
+                op(expect, OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1013,
+            2,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ])
+}
+
+#[test]
+fn x87_truncating_integer_store_rounds_toward_zero() {
+    // `fisttp` of `+2.75` stores `2`. Reading the pinned control-word
+    // mode instead would store `3`, so this fails against exactly the
+    // mistake the mnemonic exists to avoid.
+    let program = x87_integer_store_program("fisttp", "2");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_rounding_integer_store_rounds_to_nearest() {
+    // The teeth: `fistp` of the same value stores `3`, which is what
+    // makes the pair a discrimination rather than a coincidence.
+    let program = x87_integer_store_program("fistp", "3");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+/// `xor eax, eax ; fldz ; fld1 ; <mnemonic> st(0), st(1) ;
+/// fstp qword [rbp - 0x20] ; mov rax, … ; cmp rax, <expect> ; je`.
+///
+/// The `xor` fixes `ZF = 1`, so the two polarities of the same
+/// conditional move select different slots: `ST(1)` holds `+0.0` and
+/// `ST(0)` holds `+1.0`.
+fn x87_conditional_move_program(mnemonic: &str, expect: &str) -> Program {
+    one_block(vec![
+        insn(
+            0x40_1000,
+            2,
+            "xor",
+            vec![
+                op("eax", OperandKind::Register),
+                op("eax", OperandKind::Register),
+            ],
+        ),
+        insn(0x40_1002, 2, "fldz", vec![]),
+        insn(0x40_1004, 2, "fld1", vec![]),
+        insn(
+            0x40_1006,
+            2,
+            mnemonic,
+            vec![
+                op("st(0)", OperandKind::Register),
+                op("st(1)", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            3,
+            "fstp",
+            vec![op("qword [rbp - 0x20]", OperandKind::Memory)],
+        ),
+        insn(
+            0x40_100b,
+            4,
+            "mov",
+            vec![
+                op("rax", OperandKind::Register),
+                op("qword [rbp - 0x20]", OperandKind::Memory),
+            ],
+        ),
+        insn(
+            0x40_100f,
+            10,
+            "cmp",
+            vec![
+                op("rax", OperandKind::Register),
+                op(expect, OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1019,
+            2,
+            "je",
+            vec![op("0x401080", OperandKind::Immediate)],
+        ),
+    ])
+}
+
+#[test]
+fn x87_conditional_move_takes_the_source_when_the_condition_holds() {
+    // `ZF = 1`, so `fcmove` overwrites the top of stack with `ST(1)`,
+    // which is `+0.0`.
+    let program = x87_conditional_move_program("fcmove", "0");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn x87_conditional_move_keeps_the_destination_when_it_does_not() {
+    // The teeth, and the reason both polarities are pinned: with the
+    // condition inverted the same fixture must keep `+1.0`. A lowering
+    // whose `Ite` branches are swapped passes one of these two tests
+    // and fails the other.
+    let program = x87_conditional_move_program("fcmovne", "0x3ff0000000000000");
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn aarch64_scalar_convert_zeroes_the_vector_register_above_the_element() {
+    // The seam between the scalar-FP write path and the vector one.
+    //
+    // `fcvtzs s0, s1` writes a *SIMD* register, and on `AArch64` a
+    // scalar SIMD write clears every bit above the element. Reading
+    // lane 1 of the same register as a vector must therefore give zero,
+    // and `cbz` must be always-taken.
+    //
+    // Before the fix this was `BothPossible`, for two stacked reasons
+    // that a single-instruction harness cannot show: the scalar path
+    // wrote `v0` through `build_parent_write`, which sizes the parent
+    // at `LiftCtx::bits` — 64 on this ISA, not the 128 the register has
+    // — and took its partial-write branch, which *preserves* the bits
+    // above the element instead of clearing them. Lane 1 then read a
+    // free input.
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "mov",
+            vec![
+                op("w0", OperandKind::Register),
+                op("0", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "scvtf",
+            vec![
+                op("s1", OperandKind::Register),
+                op("w0", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            4,
+            "fcvtzs",
+            vec![
+                op("s0", OperandKind::Register),
+                op("s1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_100c,
+            4,
+            "umov",
+            vec![
+                op("w1", OperandKind::Register),
+                op("v0.s[1]", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1010,
+            4,
+            "cbz",
+            vec![
+                op("w1", OperandKind::Register),
+                op("0x401080", OperandKind::Immediate),
+            ],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+#[test]
+fn aarch64_scalar_convert_and_a_vector_read_agree_on_the_register_width() {
+    // The same seam read from above bit 63, which is where the width
+    // collision stops being a wrong value and becomes a crash: the
+    // encoder keys its declarations by name and keeps the *first*
+    // width it saw, so a `v0` minted at 64 bits by the scalar write
+    // meets an `Extract(.., 127, 64)` from the vector read. That is an
+    // out-of-range `Z3_mk_extract`, and the `z3` crate unwraps it.
+    //
+    // Passing at all is most of what this asserts; the verdict pins the
+    // value on top.
+    let program = aarch64_block(vec![
+        insn(
+            0x40_1000,
+            4,
+            "mov",
+            vec![
+                op("w0", OperandKind::Register),
+                op("0", OperandKind::Immediate),
+            ],
+        ),
+        insn(
+            0x40_1004,
+            4,
+            "scvtf",
+            vec![
+                op("s1", OperandKind::Register),
+                op("w0", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1008,
+            4,
+            "fcvtzs",
+            vec![
+                op("s0", OperandKind::Register),
+                op("s1", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_100c,
+            4,
+            "umov",
+            vec![
+                op("x1", OperandKind::Register),
+                op("v0.d[1]", OperandKind::Register),
+            ],
+        ),
+        insn(
+            0x40_1010,
+            4,
+            "cbz",
+            vec![
+                op("x1", OperandKind::Register),
+                op("0x401080", OperandKind::Immediate),
+            ],
+        ),
+    ]);
+    assert_eq!(solve_first(&program), SmtResult::AlwaysTrue);
+}
+
+/// A minimal slice whose only job is to drive `Encoder::declare` twice
+/// for one name. The branch condition is a constant, so any verdict
+/// other than `Unsound` means the encoding was accepted.
+fn width_collision_slice(statements: Vec<r2smt_ir::stmt::IrStmt>) -> r2smt_ssa::SsaLiftedSlice {
+    use r2smt_ir::expr::Expr;
+    use r2smt_slicer::{BranchCandidate, BranchCondition, BranchKind, SliceStatus};
+    let z = Address::new(0x1000);
+    r2smt_ssa::SsaLiftedSlice {
+        branch: BranchCandidate {
+            address: z,
+            function: z,
+            block: z,
+            kind: BranchKind::Jcc,
+            mnemonic: "widthtest".into(),
+            condition: BranchCondition::NotEqual,
+            formula: "widthtest".into(),
+            taken_target: None,
+            fallthrough_target: None,
+            compare_register: None,
+            bit_index: None,
+            upstream_resolved: None,
+            operand_raws: Vec::new(),
+            is_thumb: false,
+        },
+        statements,
+        condition: Expr::konst(1, 1),
+        status: SliceStatus::Complete,
+        treat_truncation_as_inputs: false,
+        inputs: Vec::new(),
+        defs: Vec::new(),
+        arch: Arch::Aarch64,
+    }
+}
+
+/// `t := sp` at 64 bits, which declares `sp`, followed by `dst` at
+/// `dst_bits` — a second declaration of the same name.
+fn redeclare_after_reading_sp(
+    dst: &str,
+    dst_bits: u16,
+    read_sp_at: Option<u16>,
+) -> r2smt_ssa::SsaLiftedSlice {
+    use r2smt_ir::expr::{Expr, Var};
+    use r2smt_ir::stmt::IrStmt;
+    let second = IrStmt::Assign {
+        dst: Var::new(dst, dst_bits),
+        src: read_sp_at.map_or_else(|| Expr::konst(1, dst_bits), |bits| Expr::var("sp", bits)),
+    };
+    width_collision_slice(vec![
+        IrStmt::Assign {
+            dst: Var::new("t", 64),
+            src: Expr::var("sp", 64),
+        },
+        second,
+    ])
+}
+
+#[test]
+fn a_narrower_definition_of_an_already_declared_name_fails_closed() {
+    // A narrow *definition* constrains only the low bits and leaves the
+    // rest of the name free. In the production pipeline that is a
+    // widening, but in the differential harness the solver picks those
+    // bits independently per side and fabricates a disagreement — so it
+    // fails closed rather than being answered with a sub-view.
+    let slice = redeclare_after_reading_sp("sp", 16, None);
+    assert_eq!(
+        solve_branch(&slice, SolveOptions::default()),
+        SmtResult::Unsound
+    );
+}
+
+#[test]
+fn a_narrower_read_of_an_already_declared_name_stays_precise() {
+    // The other half of the asymmetry, and the reason this is a
+    // parameter rather than a blanket refusal: a narrow *read* is an
+    // exact sub-view, which x86 reaches legitimately by reading a vector
+    // parent through a shorter view.
+    let slice = redeclare_after_reading_sp("u", 16, Some(16));
+    assert_ne!(
+        solve_branch(&slice, SolveOptions::default()),
+        SmtResult::Unsound
+    );
+}
+
+#[test]
+fn a_definition_at_the_declared_width_is_not_a_conflict() {
+    // Teeth: the refusal is about the width disagreeing, not about
+    // defining a name that was read earlier.
+    let slice = redeclare_after_reading_sp("sp", 64, None);
+    assert_ne!(
+        solve_branch(&slice, SolveOptions::default()),
+        SmtResult::Unsound
+    );
+}
