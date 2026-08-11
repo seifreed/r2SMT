@@ -35,10 +35,10 @@ pub fn z3_bool_to_infix(b: &Bool) -> String {
 
 /// Render any Z3 dynamic node (bool or bit-vector) as infix.
 fn render_dyn(node: &Dynamic) -> String {
-    if let Some(b) = node.as_bool() {
-        if let Some(v) = b.as_bool() {
-            return if v { "true".into() } else { "false".into() };
-        }
+    if let Some(b) = node.as_bool()
+        && let Some(v) = b.as_bool()
+    {
+        return if v { "true".into() } else { "false".into() };
     }
     if let Some(bv) = node.as_bv() {
         if let Some(value) = bv.as_u64() {

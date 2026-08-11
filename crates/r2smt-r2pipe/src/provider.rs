@@ -692,7 +692,7 @@ impl BytePatcher for R2PipeProvider {
 }
 
 fn decode_hex(s: &str) -> Result<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(Error::r2pipe(format!("odd-length hex from r2: '{s}'")));
     }
     let mut out = Vec::with_capacity(s.len() / 2);

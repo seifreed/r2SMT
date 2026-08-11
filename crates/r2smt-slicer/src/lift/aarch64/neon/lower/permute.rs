@@ -249,7 +249,7 @@ fn permuted_source(
         PermuteKind::Zip { upper } => {
             let base = if upper { half } else { 0 };
             let pair = index / 2;
-            if index % 2 == 0 {
+            if index.is_multiple_of(2) {
                 (PermuteSource::First, base.checked_add(pair)?)
             } else {
                 (PermuteSource::Second, base.checked_add(pair)?)
@@ -273,7 +273,7 @@ fn permuted_source(
         PermuteKind::Trn { odd } => {
             let pair = index / 2;
             let source_lane = pair.checked_mul(2)?.checked_add(u16::from(odd))?;
-            if index % 2 == 0 {
+            if index.is_multiple_of(2) {
                 (PermuteSource::First, source_lane)
             } else {
                 (PermuteSource::Second, source_lane)

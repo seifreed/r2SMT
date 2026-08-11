@@ -1301,7 +1301,7 @@ impl LiftCtx {
     /// Number of `lane_bits`-wide lanes in a `view_bits`-wide vector
     /// view, or `None` when the view is not a whole multiple of the lane.
     pub(super) fn packed_lane_count(view_bits: u16, lane_bits: u16) -> Option<u16> {
-        if lane_bits == 0 || view_bits % lane_bits != 0 {
+        if lane_bits == 0 || !view_bits.is_multiple_of(lane_bits) {
             return None;
         }
         Some(view_bits / lane_bits)

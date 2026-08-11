@@ -1536,7 +1536,8 @@ const SHUFFLE_SELECTOR_MASK: u64 = 0b11;
 /// How many whole 128-bit blocks a view divides into, or `None` if it is
 /// not a multiple of one.
 fn permute_blocks(view: u16) -> Option<u16> {
-    (view % PERMUTE_BLOCK_BITS == 0).then_some(view / PERMUTE_BLOCK_BITS)
+    view.is_multiple_of(PERMUTE_BLOCK_BITS)
+        .then_some(view / PERMUTE_BLOCK_BITS)
 }
 
 /// The destination lane table of a `pshuf*`.

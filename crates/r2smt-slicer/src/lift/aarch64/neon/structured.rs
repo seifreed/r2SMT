@@ -583,7 +583,7 @@ impl LiftCtx {
 /// Byte width of a `bits`-wide unit, or `None` when it is not a whole
 /// number of bytes.
 fn byte_width(bits: u16) -> Option<u16> {
-    if bits == 0 || bits % BITS_PER_BYTE != 0 {
+    if bits == 0 || !bits.is_multiple_of(BITS_PER_BYTE) {
         return None;
     }
     Some(bits / BITS_PER_BYTE)

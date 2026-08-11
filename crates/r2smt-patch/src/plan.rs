@@ -551,15 +551,14 @@ fn measure_instruction_size(finding: &Finding, patcher: &mut dyn BytePatcher) ->
     // `fallthrough - address` is the instruction size.
     if let Some(ft) = finding.fallthrough_target {
         let raw = ft.get().saturating_sub(finding.address.get());
-        if raw > 0 {
-            if let Ok(size) = usize::try_from(raw) {
-                if size <= MAX_INSTRUCTION_SIZE {
-                    // Sanity: verify the patcher can actually read that
-                    // many bytes — surfaces unmapped addresses up front.
-                    let _ = patcher.read_bytes(finding.address, size)?;
-                    return Ok(size);
-                }
-            }
+        if raw > 0
+            && let Ok(size) = usize::try_from(raw)
+            && size <= MAX_INSTRUCTION_SIZE
+        {
+            // Sanity: verify the patcher can actually read that
+            // many bytes — surfaces unmapped addresses up front.
+            let _ = patcher.read_bytes(finding.address, size)?;
+            return Ok(size);
         }
     }
     Err(Error::parse(

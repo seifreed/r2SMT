@@ -107,7 +107,7 @@ impl Structured {
 
     /// Elements each member holds.
     fn lanes(&self) -> Option<u16> {
-        (self.element_bits != 0 && DOUBLEWORD_BITS % self.element_bits == 0)
+        (self.element_bits != 0 && DOUBLEWORD_BITS.is_multiple_of(self.element_bits))
             .then(|| DOUBLEWORD_BITS / self.element_bits)
     }
 }
@@ -183,7 +183,7 @@ fn validate_shape(shape: ListShape, element_bits: u16, stores: bool) -> Option<(
         // has no store dual.
         ListShape::Replicate => (!stores).then_some(()),
         ListShape::Element(index) => {
-            let lanes = (element_bits != 0 && DOUBLEWORD_BITS % element_bits == 0)
+            let lanes = (element_bits != 0 && DOUBLEWORD_BITS.is_multiple_of(element_bits))
                 .then(|| DOUBLEWORD_BITS / element_bits)?;
             (index < lanes).then_some(())
         }

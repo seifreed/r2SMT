@@ -188,7 +188,7 @@ pub(super) fn paired_source(
                 index
                     .checked_div(2)?
                     .checked_add(if into_second { half } else { 0 })?;
-            if index % 2 == 0 {
+            if index.is_multiple_of(2) {
                 (PairSource::First, source_lane)
             } else {
                 (PairSource::Second, source_lane)
@@ -220,7 +220,7 @@ pub(super) fn paired_source(
                 .checked_div(2)?
                 .checked_mul(2)?
                 .checked_add(u16::from(into_second))?;
-            if index % 2 == 0 {
+            if index.is_multiple_of(2) {
                 (PairSource::First, source_lane)
             } else {
                 (PairSource::Second, source_lane)

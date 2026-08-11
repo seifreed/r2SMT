@@ -89,7 +89,7 @@ pub fn arm_nop_bytes(arch: Arch) -> Result<[u8; 4]> {
 /// Returns [`Error::Parse`] if `arch` is not an ARM ISA or `len` is
 /// not a multiple of 4.
 pub fn arm_nop_buffer(arch: Arch, len: usize) -> Result<Vec<u8>> {
-    if len % ARM_INSTRUCTION_BYTES != 0 {
+    if !len.is_multiple_of(ARM_INSTRUCTION_BYTES) {
         return Err(Error::parse(
             "arm_encoding.nop_buffer",
             format!("{len} is not a multiple of {ARM_INSTRUCTION_BYTES}"),
@@ -116,7 +116,7 @@ pub fn arm_nop_buffer(arch: Arch, len: usize) -> Result<Vec<u8>> {
 ///
 /// Returns [`Error::Parse`] if `len` is not a multiple of 2.
 pub fn thumb_nop_buffer(len: usize) -> Result<Vec<u8>> {
-    if len % THUMB_HALFWORD_BYTES != 0 {
+    if !len.is_multiple_of(THUMB_HALFWORD_BYTES) {
         return Err(Error::parse(
             "arm_encoding.thumb_nop_buffer",
             format!("{len} is not a multiple of {THUMB_HALFWORD_BYTES}"),
