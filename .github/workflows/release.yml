@@ -160,15 +160,15 @@ jobs:
           echo "$metadata" | jq -r '.packages[] | select(.source == null) | .name' | awk '{print $1 " " $1}' > "$node_file"
 
           for crate in $( (cat "$edge_file"; cat "$node_file") | tsort | tac ); do
-            if curl -fsSL "https://crates.io/api/v1/crates/${crate}/${version}" >/dev/null; then
-              echo "${crate} ${version} already exists on crates.io, skipping"
-              continue
-            fi
-
             for attempt in 1 2 3; do
               if output="$(cargo publish --locked -p "${crate}" 2>&1)"; then
                 echo "Published ${crate} ${version}"
-                break
+                continue 2
+              fi
+
+              if echo "$output" | grep -q "already exists on crates.io index"; then
+                echo "${crate} ${version} already exists on crates.io, skipping"
+                continue 2
               fi
 
               if echo "$output" | grep -q "Too Many Requests"; then
