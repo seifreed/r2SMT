@@ -71,7 +71,7 @@ jobs:
       - name: Smoke test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: target/${{ matrix.triple }}/release/r2smt.exe version
+        run: '& "target/${{ matrix.triple }}/release/r2smt.exe" version'
 
       - name: Determine version tag
         id: tag
@@ -126,27 +126,22 @@ jobs:
           body: |
             # r2SMT ${{ github.ref_name }}
 
-            This is the first release of r2SMT and publishes a full multi-crate workspace.
-            It includes the reverse-engineering analysis pipeline and tooling built around:
+            r2SMT 0.1.1 expands the first release with broader binary distribution and Rust 1.97 compatibility.
 
-            - `r2smt` command line interface (`r2smt`) for running analysis, patching, and reporting.
-            - Core orchestration and control flow through `r2smt-core`.
-            - Binary lifting for ESIL and Ghidra P-code in `r2smt-esil` and `r2smt-pcode`.
-            - Slicer and SSA conversion pipelines in `r2smt-slicer` and `r2smt-ssa`.
-            - SMT backend and solver abstractions in `r2smt-smt`, `r2smt-solver-port`, and `r2smt-z3fp`.
-            - Patch planning and application logic in `r2smt-patch`.
-            - Report generation in `r2smt-report`.
-            - Differential and cross-check tooling in `r2smt-difflift`.
-            - Exploration worker in `r2smt-explore`.
-            - Taint propagation with `r2smt-taint`.
-            - Shared data model and utilities in `r2smt-common`, `r2smt-ir`, and `r2smt-r2pipe`.
+            ## What's new
 
-            Binary packages are built for:
-            - Linux x86_64 and ARM64
-            - macOS x86_64 and ARM64
-            - Windows x86_64 and ARM64
+            - Added prebuilt command-line binaries for Linux, macOS, and Windows on both x86_64 and ARM64.
+            - Added native release builds, smoke tests, and platform-specific archives for all six targets.
+            - Upgraded the release runtime to Z3 4.16.0, including official Windows ARM64 support.
+            - Updated the codebase for the Clippy lints shipped with Rust 1.97 while preserving behavior.
 
-            Release artifacts are attached to this release, and crates are also published to crates.io from this tag.
+            ## Downloads
+
+            - Linux x86_64 and ARM64: `.tar.gz`
+            - macOS x86_64 and ARM64: `.tar.gz`
+            - Windows x86_64 and ARM64: `.zip`
+
+            All workspace crates are also published to crates.io at version 0.1.1.
           fail_on_unmatched_files: true
 
   publish:
