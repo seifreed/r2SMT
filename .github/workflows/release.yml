@@ -160,7 +160,7 @@ jobs:
           echo "$metadata" | jq -r '.packages[] | select(.source == null) | .name' | awk '{print $1 " " $1}' > "$node_file"
 
           for crate in $( (cat "$edge_file"; cat "$node_file") | tsort | tac ); do
-            for attempt in 1 2 3; do
+            for attempt in 1 2 3 4 5; do
               if output="$(cargo publish --locked -p "${crate}" 2>&1)"; then
                 echo "Published ${crate} ${version}"
                 continue 2
@@ -174,12 +174,12 @@ jobs:
               if echo "$output" | grep -q "Too Many Requests"; then
                 if [ "$attempt" -ge 3 ]; then
                   echo "$output"
-                  echo "Failed publishing ${crate} after 3 rate-limit retries"
+                  echo "Failed publishing ${crate} after 5 rate-limit retries"
                   exit 1
                 fi
 
-                wait=$((attempt * 75))
-                echo "${crate} publish rate-limited (attempt ${attempt}/3); retrying after ${wait}s"
+                wait=$((attempt * 120))
+                echo "${crate} publish rate-limited (attempt ${attempt}/5); retrying after ${wait}s"
                 sleep "$wait"
                 continue
               fi
