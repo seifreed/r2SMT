@@ -61,13 +61,14 @@ TARBALL := r2smt-v$(VERSION)-$(TRIPLE).tar.gz
 
 .PHONY: install install-from-source install-prebuilt install-macros uninstall test clean
 
-install: install-macros
+install:
 ifeq ($(USE_PREBUILT),1)
 	@$(MAKE) -f $(firstword $(MAKEFILE_LIST)) install-prebuilt \
 		|| $(MAKE) -f $(firstword $(MAKEFILE_LIST)) install-from-source
 else
 	@$(MAKE) -f $(firstword $(MAKEFILE_LIST)) install-from-source
 endif
+	@$(MAKE) -f $(firstword $(MAKEFILE_LIST)) install-macros
 	@echo "[r2smt] installed binary: $(R2PM_BINDIR)/r2smt"
 	@echo "[r2smt] installed macros: $(R2PM_PLUGDIR)/r2smt.r2"
 	@echo "[r2smt] load with: r2 -i $(R2PM_PLUGDIR)/r2smt.r2 <binary>"
@@ -82,9 +83,7 @@ install-prebuilt:
 	@curl -fLsS $(RELEASE_BASE)/$(TARBALL) | tar -xz -C $(R2PM_BINDIR) r2smt
 
 install-from-source:
-	cd $(CURDIR)/.. && $(CARGO) build --release -p r2smt-cli
-	mkdir -p $(R2PM_BINDIR)
-	cp $(CURDIR)/../target/release/r2smt $(R2PM_BINDIR)/r2smt
+	$(MAKE) -C $(CURDIR)/.. install BINDIR="$(R2PM_BINDIR)" PLUGDIR="$(R2PM_PLUGDIR)"
 
 install-macros:
 	mkdir -p $(R2PM_PLUGDIR)
