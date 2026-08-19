@@ -134,22 +134,22 @@ jobs:
           body: |
             # r2SMT ${{ github.ref_name }}
 
-            r2SMT 0.1.1 expands the first release with broader binary distribution and Rust 1.97 compatibility.
+            r2SMT 0.1.2 makes the project easier to build and package, and brings the documentation back in line with the code.
 
             ## What's new
 
-            - Added prebuilt command-line binaries for Linux, macOS, and Windows on both x86_64 and ARM64.
-            - Added native release builds, smoke tests, and platform-specific archives for all six targets.
-            - Upgraded the release runtime to Z3 4.16.0, including official Windows ARM64 support.
-            - Updated the codebase for the Clippy lints shipped with Rust 1.97 while preserving behavior.
+            - Added a `Makefile` and updated the r2pm package recipe, and lowered the minimum supported Rust version to 1.95. Huge thanks to **@trufae** (pancake, the author of radare2) for contributing this in his first PR to the project (#17)!
+            - Realigned the README with the current state of the project: prebuilt-binary installation, the `taint` subcommand, the `--ir` / `--deep-analysis` flags, the real CI gates, and the complete crate list.
+            - Fixed the `--no-esil-flags` help text, which still described the ESIL rung as permanently closed on ARM — it has been open on all three ISAs since 2026-08-10.
+            - Applied Dependabot dependency updates.
 
             ## Downloads
 
             - Linux x86_64 and ARM64: `.tar.gz`
             - macOS x86_64 and ARM64: `.tar.gz`
-            - Windows x86_64 and ARM64: `.zip`
+            - Windows x86_64 and ARM64: `.zip` (bundles the Z3 runtime)
 
-            All workspace crates are also published to crates.io at version 0.1.1.
+            All workspace crates are also published to crates.io at version 0.1.2.
           fail_on_unmatched_files: true
 
   publish:

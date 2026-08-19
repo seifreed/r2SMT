@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "r2smt-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap 4.6.6",
@@ -1282,7 +1282,7 @@ dependencies = [
 
 [[package]]
 name = "r2smt-common"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1291,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "r2smt-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "r2smt-common",
  "r2smt-esil",
@@ -1307,7 +1307,7 @@ dependencies = [
 
 [[package]]
 name = "r2smt-difflift"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "r2smt-common",
  "r2smt-esil",
@@ -1322,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "r2smt-esil"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "r2smt-common",
  "r2smt-ir",
@@ -1330,7 +1330,7 @@ dependencies = [
 
 [[package]]
 name = "r2smt-explore"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "r2smt-common",
  "radius2",
@@ -1343,7 +1343,7 @@ dependencies = [
 
 [[package]]
 name = "r2smt-ir"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "r2smt-common",
  "serde",
@@ -1352,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "r2smt-patch"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hex",
  "r2smt-common",
@@ -1369,7 +1369,7 @@ dependencies = [
 
 [[package]]
 name = "r2smt-pcode"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "r2smt-common",
  "r2smt-ir",
@@ -1377,7 +1377,7 @@ dependencies = [
 
 [[package]]
 name = "r2smt-r2pipe"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "r2pipe 0.8.0",
  "r2smt-common",
@@ -1389,7 +1389,7 @@ dependencies = [
 
 [[package]]
 name = "r2smt-report"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "r2smt-common",
  "r2smt-core",
@@ -1401,7 +1401,7 @@ dependencies = [
 
 [[package]]
 name = "r2smt-slicer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "r2smt-common",
  "r2smt-esil",
@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "r2smt-smt"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "r2smt-common",
  "r2smt-ir",
@@ -1430,7 +1430,7 @@ dependencies = [
 
 [[package]]
 name = "r2smt-solver-port"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "r2smt-common",
  "r2smt-ssa",
@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "r2smt-ssa"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "r2smt-common",
  "r2smt-ir",
@@ -1450,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "r2smt-taint"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "r2smt-common",
  "r2smt-ir",
@@ -1462,7 +1462,7 @@ dependencies = [
 
 [[package]]
 name = "r2smt-z3fp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "z3",
  "z3-sys",
