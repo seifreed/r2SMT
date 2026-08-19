@@ -34,19 +34,16 @@ pub(crate) struct Cli {
     #[arg(long, value_enum, default_value_t = IrSourceArg::Esil, global = true)]
     pub(crate) ir: IrSourceArg,
 
-    /// Send every **x86** instruction whose ESIL writes flags to this
+    /// Send every instruction whose ESIL writes flags to this
     /// project's per-mnemonic handler instead of radare2's ESIL.
     ///
-    /// The ESIL rung is on by default since 2026-08-07, when the
-    /// differential harness reached zero disagreements on x86. This is
-    /// the escape hatch: it restores the pre-2026-08-07 lowering so the
-    /// two can be A/B'd on one binary without rebuilding.
-    ///
-    /// It has no effect on either ARM ISA, where the rung is skipped
-    /// unconditionally. Note that the measured reason for that skip —
-    /// radare2 seeding an a64 `subs`'s flag context from the destination
-    /// write — was fixed upstream in radare2 6.2.0; the gate has not been
-    /// re-evaluated since. See `LiftCtx::allows_esil_flags`.
+    /// The ESIL rung is on by default: since 2026-08-07 on x86, when the
+    /// differential harness reached zero disagreements there, and since
+    /// 2026-08-10 on both ARM ISAs, when its own corpus verdict diff
+    /// added 7 actionable findings and lost none. This is the escape
+    /// hatch: it restores the flags-declining lowering so the two can be
+    /// A/B'd on one binary without rebuilding. See
+    /// `LiftCtx::allows_esil_flags`.
     #[arg(long, global = true)]
     pub(crate) no_esil_flags: bool,
 

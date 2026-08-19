@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/seifreed/r2SMT/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/seifreed/r2SMT/ci.yml?style=flat-square&logo=github&label=CI" alt="CI Status"></a>
   <a href="https://github.com/seifreed/r2SMT/releases"><img src="https://img.shields.io/github/v/release/seifreed/r2SMT?style=flat-square&logo=github&label=release" alt="Latest Release"></a>
-  <img src="https://img.shields.io/badge/rust-1.85%2B-orange?style=flat-square&logo=rust&logoColor=white" alt="Rust Version">
+  <img src="https://img.shields.io/badge/rust-1.95%2B-orange?style=flat-square&logo=rust&logoColor=white" alt="Rust Version">
   <img src="https://img.shields.io/badge/edition-2024-orange?style=flat-square&logo=rust&logoColor=white" alt="Rust Edition">
   <a href="https://github.com/seifreed/r2SMT/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License"></a>
 </p>
@@ -67,6 +67,10 @@ An opaque predicate **is** the second question, and forward symbolic execution i
 ---
 
 ## Installation
+
+### Prebuilt Binaries
+
+Tagged releases ship prebuilt binaries for six targets (Linux / macOS / Windows, x86_64 and ARM64) on the [Releases page](https://github.com/seifreed/r2SMT/releases). The Windows archive bundles the Z3 runtime.
 
 ### From Source
 
@@ -153,6 +157,7 @@ r2smt batch ./corpus --threads 8 --json corpus.json --markdown corpus.md
 | `r2smt annotate` | Write findings back as r2 comments (dry-run or apply) |
 | `r2smt patch` | Plan, apply (with backup + manifest), or roll back byte patches |
 | `r2smt batch` | Analyze every sample in a directory and aggregate the results |
+| `r2smt taint` | Sound may-taint analysis: which values at an address derive from a seeded source |
 | `r2smt why` | **Unsound** best-effort witness search (radius2 oracle) |
 
 ### Common Flags
@@ -165,6 +170,7 @@ r2smt batch ./corpus --threads 8 --json corpus.json --markdown corpus.md
 | `--solver <z3\|cvc5\|bitwuzla>` | Select the SMT backend |
 | `--allow-memory` / `--allow-calls` / `--max-blocks <n>` | Widen slicing scope (stays sound) |
 | `--allow-join-merge` / `--unknowns-on-truncation` | Recover diamonds / free-input boundaries (stays sound) |
+| `--ir <esil\|pcode\|auto>` / `--deep-analysis` | Prefer r2ghidra P-code per instruction / run r2's deeper `aaaa` analysis |
 
 ### Verdicts & Findings
 
@@ -188,16 +194,23 @@ Patching only acts at `--min-confidence high` by default; lower it explicitly an
 r2SMT is a Cargo workspace of layered crates, so its analysis stages can be embedded independently of the CLI. Domain crates depend only on ports; adapters (radare2, Z3) are wired at the composition root.
 
 ```text
-r2smt-common   errors, primitives, register-layout tables
-r2smt-ir       program model + symbolic IR (Expr / IrStmt) + ports
-r2smt-r2pipe   radare2 adapter (BinaryProvider / Annotator / BytePatcher)
-r2smt-slicer   branch collection, backward slicing, and the lifters
-r2smt-ssa      SSA rename pass
-r2smt-smt      Z3 / CVC5 / Bitwuzla backends
-r2smt-core     orchestration, findings, and the decision engine
-r2smt-report   Markdown / JSON / r2-script renderers
-r2smt-patch    plan / apply / rollback with a durable manifest
-r2smt-cli      the `r2smt` binary (composition root)
+r2smt-common       errors, primitives, register-layout tables
+r2smt-ir           program model + symbolic IR (Expr / IrStmt) + ports
+r2smt-r2pipe       radare2 adapter (BinaryProvider / Annotator / BytePatcher)
+r2smt-esil         ESIL stack-machine lifter (radare2 ESIL → IR)
+r2smt-pcode        Ghidra/SLEIGH P-code lifter (`pdgsd` → IR)
+r2smt-slicer       branch collection, backward slicing, and the per-mnemonic lifter
+r2smt-ssa          SSA rename pass
+r2smt-difflift     differential harness: P-code ≡ ESIL ≡ per-mnemonic by SMT equivalence
+r2smt-taint        sound may-taint lattice over the SSA data flow
+r2smt-solver-port  the narrow contract every SMT backend implements
+r2smt-smt          Z3 / CVC5 / Bitwuzla backends
+r2smt-z3fp         thin audited FFI shim for Z3 FP constructors missing from the safe API
+r2smt-core         orchestration, findings, and the decision engine
+r2smt-report       Markdown / JSON / r2-script renderers
+r2smt-patch        plan / apply / rollback with a durable manifest
+r2smt-explore      fenced UNSOUND exploration engine (optional radius2 oracle)
+r2smt-cli          the `r2smt` binary (composition root)
 ```
 
 ---
@@ -208,9 +221,11 @@ Every change must pass the same gates CI enforces (see `scripts/quality-gates.sh
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --workspace --exclude r2smt-explore --all-targets --all-features -- -D warnings
+cargo clippy -p r2smt-explore --all-targets -- -D warnings
 cargo test --all
-cargo doc --workspace --no-deps --all-features        # under RUSTDOCFLAGS="-D warnings"
+cargo doc --workspace --exclude r2smt-explore --no-deps --all-features   # under RUSTDOCFLAGS="-D warnings"
+cargo doc -p r2smt-explore --no-deps                                     # idem
 ./scripts/quality-gates.sh supply-chain               # cargo audit
 ./scripts/quality-gates.sh solver-contracts           # Z3 / CVC5 / Bitwuzla verdict parity
 ./scripts/quality-gates.sh determinism                # pinned-seed verdict stability
@@ -222,7 +237,7 @@ The codebase is safe Rust throughout — no `unsafe`, no `unwrap`/`expect` in pr
 
 ## Requirements
 
-- **Rust 1.85+** (edition 2024) to build from source
+- **Rust 1.95+** (edition 2024) to build from source
 - A **C++ toolchain + CMake** to build the vendored Z3
 - **radare2 ≥ 6.1** on `PATH`
 - Optional: **CVC5** / **Bitwuzla** binaries for the portfolio backends
