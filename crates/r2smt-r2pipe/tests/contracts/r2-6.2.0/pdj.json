@@ -1,0 +1,11 @@
+[
+  {
+    "addr": 4096,
+    "size": 4,
+    "opcode": "mov w0, 0",
+    "disasm": "mov w0, 0",
+    "bytes": "00008052",
+    "esil": "0x0,w0,=",
+    "type": "mov"
+  }
+]

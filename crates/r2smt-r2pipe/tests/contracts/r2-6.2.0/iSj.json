@@ -1,0 +1,10 @@
+[
+  {
+    "name": ".text",
+    "size": 8,
+    "vsize": 8,
+    "perm": "-r-x",
+    "paddr": 512,
+    "vaddr": 4096
+  }
+]

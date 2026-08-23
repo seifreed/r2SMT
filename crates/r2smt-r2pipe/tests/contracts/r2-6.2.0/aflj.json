@@ -1,0 +1,11 @@
+[
+  {
+    "addr": 4096,
+    "name": "sym.main",
+    "size": 8,
+    "bits": 64,
+    "type": "fcn",
+    "nbbs": 1,
+    "ninstrs": 2
+  }
+]

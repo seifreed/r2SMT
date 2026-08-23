@@ -1,0 +1,31 @@
+[
+  {
+    "name": "sym.main",
+    "addr": 4096,
+    "ninstr": 2,
+    "blocks": [
+      {
+        "addr": 4096,
+        "size": 8,
+        "ops": [
+          {
+            "addr": 4096,
+            "size": 4,
+            "opcode": "mov w0, 0",
+            "bytes": "00008052",
+            "esil": "0x0,w0,=",
+            "type": "mov"
+          },
+          {
+            "addr": 4100,
+            "size": 4,
+            "opcode": "ret",
+            "bytes": "c0035fd6",
+            "esil": "lr,pc,:=",
+            "type": "ret"
+          }
+        ]
+      }
+    ]
+  }
+]

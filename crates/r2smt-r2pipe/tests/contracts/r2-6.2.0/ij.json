@@ -1,0 +1,4 @@
+{
+  "core": {"file": "<fixture>", "format": "mach064"},
+  "bin": {"arch": "arm", "bits": 64, "baddr": 4096, "stripped": true}
+}

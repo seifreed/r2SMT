@@ -28,11 +28,11 @@ Available gates:
                        mask a determinism regression.
   supply-chain         `cargo audit` plus the committed cargo-deny
                        advisory/license/ban/source policy.
+  r2pipe-contracts     Validate live radare2 command response shapes.
   all                  Run check + solver-contracts + determinism +
                        supply-chain.
 
 Planned gates (not yet implemented):
-  r2pipe-contracts     Verify r2pipe extraction JSON shape.
   real-binaries        End-to-end on synthetic labeled fixtures.
 EOF
 }
@@ -137,6 +137,12 @@ gate_supply_chain() {
   cargo deny check
 }
 
+gate_r2pipe_contracts() {
+  echo "==> r2pipe contracts"
+  cargo test -p r2smt-r2pipe --test contract_fixtures
+  "${SCRIPT_DIR}/r2pipe-contracts.sh" "${R2SMT_SMOKE_BIN:-/bin/true}"
+}
+
 main() {
   if [[ $# -lt 1 ]]; then
     usage
@@ -156,11 +162,15 @@ main() {
     supply-chain)
       gate_supply_chain
       ;;
+    r2pipe-contracts)
+      gate_r2pipe_contracts
+      ;;
     all)
       gate_check
       gate_solver_contracts
       gate_determinism
       gate_supply_chain
+      gate_r2pipe_contracts
       ;;
     help|-h|--help)
       usage

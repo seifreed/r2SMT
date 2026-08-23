@@ -99,6 +99,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - name: 6.1.8
+            version: 6.1.8
+            from_git: "false"
           - name: 6.2.0
             version: 6.2.0
             from_git: "false"
@@ -115,10 +118,11 @@ jobs:
           version: ${{ matrix.version }}
           from-git: ${{ matrix.from_git }}
       - run: cargo build --locked -p r2smt-cli
-      - name: Real analysis smoke test
+      - name: Real analysis and r2pipe contracts
         run: |
           target/debug/r2smt doctor
           target/debug/r2smt analyze /usr/bin/true
+          ./scripts/quality-gates.sh r2pipe-contracts
 
   r2pm-install:
     name: r2pm source install
