@@ -26,11 +26,8 @@ Available gates:
                        invariant verdict. Run single-threaded
                        (`--test-threads=1`) so a contended host cannot
                        mask a determinism regression.
-  supply-chain         `cargo audit` against the RustSec advisory DB.
-                       NOTE: `cargo deny` is intentionally NOT run here —
-                       deny.toml is kept local-only by maintainer
-                       decision, so the license/bans/sources policy is a
-                       manual local check, not a CI gate.
+  supply-chain         `cargo audit` plus the committed cargo-deny
+                       advisory/license/ban/source policy.
   all                  Run check + solver-contracts + determinism +
                        supply-chain.
 
@@ -131,6 +128,13 @@ gate_supply_chain() {
     exit 1
   fi
   cargo audit
+
+  echo "==> cargo deny check"
+  if ! command -v cargo-deny >/dev/null 2>&1; then
+    echo "cargo-deny not found. Install: cargo install --locked cargo-deny" >&2
+    exit 1
+  fi
+  cargo deny check
 }
 
 main() {
