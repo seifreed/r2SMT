@@ -132,6 +132,24 @@ fn run(cli: Cli) -> Result<()> {
     if matches!(&cli.command, Command::Doctor) {
         return doctor::doctor();
     }
+    if let Command::R2il { arch, bytes, json } = &cli.command {
+        let lift = r2smt_r2il::lift_bytes(bytes, arch.to_adapter())?;
+        if let Some(path) = json {
+            fs::write(path, serde_json::to_string_pretty(&lift)?)
+                .with_context(|| format!("writing {}", path.display()))?;
+        } else {
+            println!(
+                "r2il operations: {} | r2smt statements: {} | {} ms",
+                lift.r2il_operations,
+                lift.ir_statements.len(),
+                lift.elapsed_ms
+            );
+            for statement in lift.ir_statements {
+                println!("{statement}");
+            }
+        }
+        return Ok(());
+    }
     let deep = cli.deep_analysis;
     let ir_pcode = cli.ir.wants_pcode();
     let esil_flags = !cli.no_esil_flags && doctor::esil_flags_supported();
@@ -143,7 +161,10 @@ fn run(cli: Cli) -> Result<()> {
         );
     }
     match cli.command {
-        Command::Version | Command::Doctor | Command::AnalysisWorker { .. } => Ok(()),
+        Command::Version
+        | Command::Doctor
+        | Command::R2il { .. }
+        | Command::AnalysisWorker { .. } => Ok(()),
         Command::Why {
             file,
             addr,

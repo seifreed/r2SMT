@@ -1,0 +1,20 @@
+[package]
+name = "r2smt-r2il"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Experimental process-boundary adapter from r2sleigh R2IL exports to r2SMT IR."
+
+[lints]
+workspace = true
+
+[dependencies]
+r2smt-common = { workspace = true }
+r2smt-esil = { workspace = true }
+r2smt-ir = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

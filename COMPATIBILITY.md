@@ -26,6 +26,7 @@ subset of instructions; unsupported instructions fail closed as described in
 | Tool | Purpose | Required |
 |---|---|---|
 | r2ghidra | P-code ingestion and decompiler context | Only for `--ir pcode|auto` or decompiler output |
+| r2sleigh | Experimental R2IL adapter | Only for the `r2il` subcommand |
 | Z3 | Default in-process SMT backend | Built with r2SMT |
 | CVC5 | Independent SMT-LIB backend | `--solver cvc5` or `--solver portfolio` |
 | Bitwuzla | Independent SMT-LIB backend | `--solver bitwuzla` or `--solver portfolio` |
@@ -36,6 +37,14 @@ verdict disagreement fails closed to `Unsound`.
 
 `doctor` reports missing optional tools as unavailable. Their absence does not
 disable the default ESIL plus Z3 path.
+
+The experimental `r2il` command consumes the external tool's
+`run --action lift --format r2cmd` contract and never links r2sleigh. The
+LGPL-3.0-only executable is installed and distributed separately from r2SMT's
+MIT binaries. The adapter validates each R2IL JSON sidecar and fails closed if
+the paired ESIL operation is outside r2SMT's strict subset. Its fixture tracks
+r2sleigh master commit `60942f62cdd36717e08544bdfc1dafdd3fa514d9` and R2IL
+format v4; future upstream contract changes must update that fixture first.
 
 ## Analysis worker isolation
 

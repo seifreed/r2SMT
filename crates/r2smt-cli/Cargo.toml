@@ -19,6 +19,7 @@ workspace = true
 r2smt-common       = { workspace = true }
 r2smt-ir           = { workspace = true }
 r2smt-r2pipe       = { workspace = true }
+r2smt-r2il         = { workspace = true }
 r2smt-slicer       = { workspace = true }
 r2smt-ssa          = { workspace = true }
 r2smt-solver-port  = { workspace = true }

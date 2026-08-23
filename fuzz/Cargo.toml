@@ -14,6 +14,7 @@ r2smt-common = { path = "../crates/r2smt-common" }
 r2smt-esil = { path = "../crates/r2smt-esil" }
 r2smt-pcode = { path = "../crates/r2smt-pcode" }
 r2smt-patch = { path = "../crates/r2smt-patch" }
+r2smt-r2il = { path = "../crates/r2smt-r2il" }
 r2smt-report = { path = "../crates/r2smt-report" }
 
 [workspace]
@@ -43,6 +44,13 @@ bench = false
 [[bin]]
 name = "patch_manifest"
 path = "fuzz_targets/patch_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "r2il_r2cmd"
+path = "fuzz_targets/r2il_r2cmd.rs"
 test = false
 doc = false
 bench = false

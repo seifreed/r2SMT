@@ -91,6 +91,19 @@ pub(crate) enum Command {
     /// Report runtime dependency versions and compatibility gates.
     Doctor,
 
+    /// Experimentally adapt one instruction from r2sleigh R2IL.
+    R2il {
+        /// Architecture shared by r2sleigh and r2SMT.
+        #[arg(long, value_enum)]
+        arch: R2ilArchArg,
+        /// Instruction bytes as an even-length hexadecimal string.
+        #[arg(long)]
+        bytes: String,
+        /// Write the measured adapted IR as JSON.
+        #[arg(long, value_name = "PATH")]
+        json: Option<PathBuf>,
+    },
+
     /// Open a binary with radare2 and emit the normalized program.
     Analyze {
         /// Path to the binary to analyze.
@@ -858,6 +871,27 @@ pub(crate) enum SolverArg {
     /// Require identical verdicts from Z3, CVC5, and Bitwuzla.
     /// Missing backends fail the analysis; disagreements fail closed.
     Portfolio,
+}
+
+/// Architecture selector for the experimental r2sleigh adapter.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub(crate) enum R2ilArchArg {
+    /// 64-bit x86.
+    X86_64,
+    /// 32-bit x86.
+    X86,
+    /// 32-bit ARM.
+    Arm,
+}
+
+impl R2ilArchArg {
+    pub(crate) const fn to_adapter(self) -> r2smt_r2il::R2sleighArch {
+        match self {
+            Self::X86_64 => r2smt_r2il::R2sleighArch::X86_64,
+            Self::X86 => r2smt_r2il::R2sleighArch::X86,
+            Self::Arm => r2smt_r2il::R2sleighArch::Arm,
+        }
+    }
 }
 
 impl ConfidenceArg {

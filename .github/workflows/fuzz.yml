@@ -25,6 +25,6 @@ jobs:
       - name: Run bounded campaigns
         working-directory: fuzz
         run: |
-          for target in esil pcode report_json patch_manifest; do
+          for target in esil pcode report_json patch_manifest r2il_r2cmd; do
             cargo fuzz run "$target" -- -runs=10000
           done

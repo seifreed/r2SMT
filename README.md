@@ -175,6 +175,15 @@ r2smt batch ./corpus --threads 8 --json corpus.json --markdown corpus.md
 | `--allow-join-merge` / `--unknowns-on-truncation` | Recover diamonds / free-input boundaries (stays sound) |
 | `--ir <esil\|pcode\|auto>` / `--deep-analysis` | Prefer r2ghidra P-code per instruction / run r2's deeper `aaaa` analysis |
 
+Experimental r2sleigh interop is available without linking its LGPL code:
+
+```bash
+r2smt r2il --arch x86-64 --bytes 31c0
+```
+
+The command validates `r2sleigh`'s R2IL sidecars, adapts their paired ESIL to
+r2SMT IR, and reports operation count, statement count, and elapsed time.
+
 ### Verdicts & Findings
 
 | Verdict | Meaning |
@@ -249,6 +258,7 @@ The codebase is safe Rust throughout — no `unsafe`, no `unwrap`/`expect` in pr
 - A **C++ toolchain + CMake** to build the vendored Z3
 - **radare2 ≥ 6.1** on `PATH` (≥ 6.2 for ESIL flag lifting)
 - Optional: **CVC5** / **Bitwuzla** binaries for the portfolio backends
+- Optional: **r2sleigh** for the experimental process-boundary R2IL adapter
 
 ---
 

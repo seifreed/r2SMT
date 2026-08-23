@@ -29,6 +29,7 @@ rayon              = "1"
 r2smt-common  = { path = "crates/r2smt-common",  version = "0.1.2" }
 r2smt-ir      = { path = "crates/r2smt-ir",      version = "0.1.2" }
 r2smt-r2pipe  = { path = "crates/r2smt-r2pipe",  version = "0.1.2" }
+r2smt-r2il    = { path = "crates/r2smt-r2il",    version = "0.1.2" }
 r2smt-esil    = { path = "crates/r2smt-esil",    version = "0.1.2" }
 r2smt-pcode   = { path = "crates/r2smt-pcode",   version = "0.1.2" }
 r2smt-slicer  = { path = "crates/r2smt-slicer",  version = "0.1.2" }

@@ -9,6 +9,7 @@ wires radare2, lifters, solvers, reports, and patching together.
 ```text
 binary
   -> r2smt-r2pipe: radare2 JSON, ESIL, optional r2ghidra P-code
+  -> r2smt-r2il: optional external r2sleigh R2IL/r2cmd adapter
   -> r2smt-ir: normalized Program and symbolic expressions
   -> r2smt-slicer: branch collection and bounded backward slices
   -> r2smt-esil / r2smt-pcode / mnemonic handlers: typed IR
@@ -37,7 +38,7 @@ use the separately documented transaction boundary.
 | Layer | Crates | Responsibility |
 |---|---|---|
 | Shared domain | `r2smt-common`, `r2smt-ir` | Errors, architecture data, program model, expressions, and adapter ports |
-| Ingestion | `r2smt-r2pipe` | Own the radare2 session and normalize `ij`/`aflj`/`agfj`/`aoj`/`pdgsd` data |
+| Ingestion | `r2smt-r2pipe`, `r2smt-r2il` | Normalize radare2 data; experimentally adapt external r2sleigh R2IL exports |
 | Semantics | `r2smt-esil`, `r2smt-pcode`, `r2smt-slicer`, `r2smt-ssa` | Lift instructions, slice dependencies, and build solver-ready SSA |
 | Proof | `r2smt-solver-port`, `r2smt-smt`, `r2smt-z3fp` | Solver contract and concrete SMT backends |
 | Decision | `r2smt-core`, `r2smt-difflift`, `r2smt-taint` | Classification, confidence, differential checks, and taint |
@@ -51,6 +52,8 @@ use the separately documented transaction boundary.
   files.
 - `r2smt-r2pipe` is the only normal-analysis adapter that owns a live radare2
   session.
+- `r2smt-r2il` never links r2sleigh; the optional LGPL tool remains behind a
+  bounded subprocess and a validated `r2cmd` contract.
 - `r2smt-cli` is allowed to know every concrete adapter and is the only layer
   that writes normal command output.
 - `r2smt-explore` is optional and cannot upgrade an authoritative verdict.

@@ -18,6 +18,7 @@ struct Radare2Probe {
 
 static RADARE2: OnceLock<Radare2Probe> = OnceLock::new();
 static R2GHIDRA: OnceLock<String> = OnceLock::new();
+static R2SLEIGH: OnceLock<String> = OnceLock::new();
 static CVC5: OnceLock<String> = OnceLock::new();
 static BITWUZLA: OnceLock<String> = OnceLock::new();
 static PORTFOLIO: OnceLock<String> = OnceLock::new();
@@ -103,6 +104,12 @@ pub(crate) fn r2ghidra_version() -> &'static str {
         .as_str()
 }
 
+fn r2sleigh_version() -> &'static str {
+    R2SLEIGH
+        .get_or_init(|| executable_version("r2sleigh"))
+        .as_str()
+}
+
 fn executable_version(program: &str) -> String {
     output(program, &["--version"]).map_or_else(
         |_| "unavailable".to_string(),
@@ -135,6 +142,7 @@ pub(crate) fn doctor() -> Result<()> {
     println!("r2smt      {}", env!("CARGO_PKG_VERSION"));
     println!("radare2    {}", r2.detail);
     println!("r2ghidra   {}", r2ghidra_version());
+    println!("r2sleigh   {}", r2sleigh_version());
     println!("z3         {}", solver_version(SolverArg::Z3));
     println!("cvc5       {}", solver_version(SolverArg::Cvc5));
     println!("bitwuzla   {}", solver_version(SolverArg::Bitwuzla));
