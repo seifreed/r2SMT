@@ -3,7 +3,7 @@
 
 /// Knobs that control how aggressive the analyzer is.
 ///
-/// Defaults match the v0 limits documented in `SPEC.md` §5.4.
+/// Defaults match the conservative limits exposed by the CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AnalyzerConfig {
     /// Maximum instructions per backward slice.
@@ -64,7 +64,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_matches_spec_v0() {
+    fn default_config_is_conservative() {
         let cfg = AnalyzerConfig::default();
         assert_eq!(cfg.max_slice_instructions, 32);
         assert_eq!(cfg.max_basic_blocks, 1);

@@ -59,8 +59,8 @@ use loop_unroll::try_unroll_counted_loop;
 
 /// Limits applied while slicing.
 ///
-/// Defaults follow `SPEC.md` §5.4. `max_basic_blocks = 1` keeps the
-/// historical single-block behavior; raising it enables the
+/// `max_basic_blocks = 1` keeps the historical single-block behavior;
+/// raising it enables the
 /// multi-block walk through unique-predecessor chains (see the
 /// module docs).
 // `clippy::struct_excessive_bools`: justified, reviewed exception.
@@ -108,21 +108,14 @@ pub struct SliceLimits {
     /// historical hard-truncate-at-join behavior byte-identical.
     #[serde(default)]
     pub allow_join_merge: bool,
-    /// When set, an x86 instruction whose ESIL writes flags (any string
+    /// When set, an instruction whose ESIL writes flags (any string
     /// carrying `:=`) may take the ESIL rung instead of being sent to
     /// its per-mnemonic handler.
     ///
-    /// **x86 only, by construction.** On both ARM ISAs the rung is
-    /// skipped whatever this says: radare2 seeds an a64 `subs`'s flag
-    /// context from the destination write, so with `dst != src` its
-    /// carry depends on what the destination held before, and an
-    /// unsigned branch behind it resolves to the other arm. See the gate
-    /// in [`crate::lift`].
-    ///
-    /// **On since 2026-08-07.** It was off while the differential
-    /// harness still disagreed, which is what it was for: the harness is
-    /// now at zero on x86 and at radare2's own bugs on both ARM ISAs.
-    /// Turn it off with `--no-esil-flags` to A/B the two lowerings.
+    /// Supported on x86, x86-64, AArch32, and AArch64. The CLI disables
+    /// this rung automatically before radare2 6.2.0, where the required
+    /// ARM `subs` ESIL fix is unavailable. Turn it off explicitly with
+    /// `--no-esil-flags` to A/B the two lowerings.
     #[serde(default = "default_true")]
     pub esil_flags: bool,
 }

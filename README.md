@@ -28,7 +28,7 @@
 
 **r2SMT** is a Rust toolkit that combines **radare2** with an **SMT solver** (Z3 / CVC5 / Bitwuzla) to reason about the control flow of a binary. It asks the solver whether each conditional branch can *actually* go both ways: branches that cannot are **opaque predicates**, **dead branches**, or **constant conditions** — classic obfuscation — which r2SMT then lets you annotate or patch away.
 
-The pipeline is `radare2 disasm → typed IR → backward slice → SSA → SMT → verdict`. It is **sound and fail-closed**: it emits a verdict only when it can prove one, and says *unknown* rather than guessing. It is also **sample-agnostic** by design — no hardcoded malware-family IOCs, so it applies to arbitrary binaries.
+The pipeline is `radare2 disasm → typed IR → backward slice → SSA → SMT → verdict`. It is **sound under explicit assumptions and fail-closed**: it emits a verdict only when it can prove one, and says *unknown* rather than guessing. It is also **sample-agnostic** by design — no hardcoded malware-family IOCs, so it applies to arbitrary binaries. The exact boundary is documented in [SOUNDNESS.md](SOUNDNESS.md).
 
 ### Key Features
 
@@ -92,7 +92,7 @@ cargo build --release
 cargo build --release -p r2smt-explore --features oracle-radius2
 ```
 
-> **Runtime dependency:** `radare2` ≥ 6.1 must be on your `PATH`. The CVC5 and Bitwuzla portfolio backends are invoked as external binaries when selected with `--solver`.
+> **Runtime dependency:** `radare2` ≥ 6.1 must be on your `PATH`. On 6.1.x, r2SMT automatically disables ESIL lifting for flag-writing instructions; radare2 ≥ 6.2 enables the fully validated path. Run `r2smt doctor` and see [COMPATIBILITY.md](COMPATIBILITY.md). The CVC5 and Bitwuzla portfolio backends are invoked as external binaries when selected with `--solver`.
 
 ---
 
@@ -150,6 +150,7 @@ r2smt batch ./corpus --threads 8 --json corpus.json --markdown corpus.md
 | Command | Description |
 |---------|-------------|
 | `r2smt branches` | List the conditional branches in a binary |
+| `r2smt doctor` | Report dependency versions and active compatibility gates |
 | `r2smt solve` | Classify every branch (`json` / `markdown` / `r2-script` output) |
 | `r2smt at` | One-line verdict for a single branch (r2-driven entrypoint) |
 | `r2smt analyze` | Dump the normalized program model |
@@ -213,6 +214,8 @@ r2smt-explore      fenced UNSOUND exploration engine (optional radius2 oracle)
 r2smt-cli          the `r2smt` binary (composition root)
 ```
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for dependency rules and the runtime flow.
+
 ---
 
 ## CI & Quality Gates
@@ -239,7 +242,7 @@ The codebase is safe Rust throughout — no `unsafe`, no `unwrap`/`expect` in pr
 
 - **Rust 1.95+** (edition 2024) to build from source
 - A **C++ toolchain + CMake** to build the vendored Z3
-- **radare2 ≥ 6.1** on `PATH`
+- **radare2 ≥ 6.1** on `PATH` (≥ 6.2 for ESIL flag lifting)
 - Optional: **CVC5** / **Bitwuzla** binaries for the portfolio backends
 
 ---

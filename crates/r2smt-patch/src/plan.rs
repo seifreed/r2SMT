@@ -3,7 +3,7 @@
 //! Translates each actionable [`Finding`] into a concrete byte
 //! sequence the patcher will write. Strategy v0 supports
 //! `nop_jcc` and `replace_jcc_with_jmp` — operand-aware
-//! `setcc` / `cmovcc` synthesis stays deferred per `SPEC.md` §5.7.
+//! `setcc` / `cmovcc` synthesis is handled by dedicated encoders.
 
 use r2smt_common::smt::SmtResult;
 use r2smt_common::{Address, Arch, Error, Result};

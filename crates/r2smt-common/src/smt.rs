@@ -72,7 +72,6 @@ pub const DEFAULT_RLIMIT: u32 = 2_000_000;
 
 impl Default for SolveOptions {
     fn default() -> Self {
-        // `timeout_ms` matches SPEC.md §5.6.
         Self {
             timeout_ms: 500,
             random_seed: 0,

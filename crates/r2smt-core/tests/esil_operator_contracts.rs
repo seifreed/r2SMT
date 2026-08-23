@@ -464,7 +464,7 @@ fn test_an_unseeding_assignment_still_writes_its_destination() {
 }
 
 // The gate itself. `lift_slice_with`'s third argument opens the ESIL
-// rung for flag-setting instructions — on x86 only.
+// rung for flag-setting instructions.
 
 /// One `cmp eax, 1` carrying the ESIL string radare2 6.1.8 emits for it,
 /// lifted as a whole slice so the ladder's decision is what is observed.

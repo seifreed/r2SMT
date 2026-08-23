@@ -13,7 +13,7 @@ use r2smt_core::{Finding, FindingKind};
 pub struct PatchSuggestion {
     /// Address of the conditional instruction being patched.
     pub address: Address,
-    /// Strategy name (matches `SPEC.md` §5.7 list).
+    /// Strategy selected by the patch planner.
     pub strategy: PatchStrategy,
     /// Human-readable rationale.
     pub rationale: String,
@@ -23,7 +23,7 @@ pub struct PatchSuggestion {
     pub r2_command: String,
 }
 
-/// Patch strategies supported in the SPEC.
+/// Patch strategies supported by the planner and report format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PatchStrategy {
     /// Replace a `jcc` whose taken-target is reachable with an
