@@ -29,11 +29,11 @@ Available gates:
   supply-chain         `cargo audit` plus the committed cargo-deny
                        advisory/license/ban/source policy.
   r2pipe-contracts     Validate live radare2 command response shapes.
+  real-binaries        Build and score the labeled host fixture; fail
+                       on any false actionable finding.
   all                  Run check + solver-contracts + determinism +
                        supply-chain.
 
-Planned gates (not yet implemented):
-  real-binaries        End-to-end on synthetic labeled fixtures.
 EOF
 }
 
@@ -143,6 +143,17 @@ gate_r2pipe_contracts() {
   "${SCRIPT_DIR}/r2pipe-contracts.sh" "${R2SMT_SMOKE_BIN:-/bin/true}"
 }
 
+gate_real_binaries() {
+  echo "==> labeled real-binary corpus"
+  cargo run --quiet -p r2smt-bench -- validate bench/corpus
+  binary="$("${SCRIPT_DIR}/build-bench-corpus.sh")"
+  report="${binary}.report.json"
+  cargo run --quiet -p r2smt-cli -- solve "$binary" \
+    --include-real --include-suspicious --json "$report"
+  cargo run --quiet -p r2smt-bench -- score \
+    "$report" bench/corpus/control-flow
+}
+
 main() {
   if [[ $# -lt 1 ]]; then
     usage
@@ -165,12 +176,16 @@ main() {
     r2pipe-contracts)
       gate_r2pipe_contracts
       ;;
+    real-binaries)
+      gate_real_binaries
+      ;;
     all)
       gate_check
       gate_solver_contracts
       gate_determinism
       gate_supply_chain
       gate_r2pipe_contracts
+      gate_real_binaries
       ;;
     help|-h|--help)
       usage

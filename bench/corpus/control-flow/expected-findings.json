@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "actionable": [
+    {"kind": "opaque_predicate", "mnemonic": "je"},
+    {"kind": "opaque_predicate", "mnemonic": "je"}
+  ]
+}

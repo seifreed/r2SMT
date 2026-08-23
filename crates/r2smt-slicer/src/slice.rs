@@ -112,7 +112,7 @@ pub struct SliceLimits {
     /// carrying `:=`) may take the ESIL rung instead of being sent to
     /// its per-mnemonic handler.
     ///
-    /// Supported on x86, x86-64, AArch32, and AArch64. The CLI disables
+    /// Supported on x86, x86-64, `AArch32`, and `AArch64`. The CLI disables
     /// this rung automatically before radare2 6.2.0, where the required
     /// ARM `subs` ESIL fix is unavailable. Turn it off explicitly with
     /// `--no-esil-flags` to A/B the two lowerings.

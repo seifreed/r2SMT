@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "total": 6,
+  "labels": [
+    "signed comparison",
+    "unsigned comparison",
+    "loop back-edge",
+    "opaque parity predicate",
+    "MBA equality predicate",
+    "diamond join"
+  ]
+}

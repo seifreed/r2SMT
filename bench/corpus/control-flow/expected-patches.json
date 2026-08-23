@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "patches": [
+    {"finding": "opaque parity predicate", "strategy": "replace_jcc_with_jmp"},
+    {"finding": "MBA equality predicate", "strategy": "replace_jcc_with_jmp"}
+  ]
+}

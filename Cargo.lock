@@ -1254,6 +1254,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "r2smt-bench"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "r2smt-common",
+ "r2smt-core",
+ "r2smt-report",
+ "r2smt-slicer",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "r2smt-cli"
 version = "0.1.2"
 dependencies = [
