@@ -30,3 +30,9 @@ pub use pretty::z3_bool_to_infix;
 pub use r2smt_common::smt::{SmtResult, SolveOptions};
 pub use smtlib::{RenderError, emit_preamble, emit_query, emit_query_strict};
 pub use solver::{SolveOutcome, solve_branch, solve_branch_with_pretty};
+
+/// Exact version of the Z3 library linked into this process.
+#[must_use]
+pub fn z3_version() -> &'static str {
+    z3::full_version()
+}

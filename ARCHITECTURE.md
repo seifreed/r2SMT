@@ -18,10 +18,13 @@ binary
   -> r2smt-report / r2smt-patch: analyst output or explicit write-back
 ```
 
-The normal CLI path currently owns orchestration in `r2smt-cli::support`.
-`r2smt-core::Analyzer` is still a configuration holder, not the public
-end-to-end application API. This is intentional current-state documentation,
-not a claim that the library API has already reached CLI parity.
+`r2smt-core::Analyzer` is the public application API for the authoritative
+`load -> target resolution -> slice -> SSA -> solve -> classify` path. It
+accepts the `BinaryProvider` and `Solver` ports plus an `AnalysisRequest`, and
+returns an `AnalysisResult` with program context, provenance, metrics, and
+findings. `solve`, `annotate`, `batch`, and patch planning all call this path.
+The CLI remains responsible only for concrete adapter selection, optional
+differential/decompiler enrichment, rendering, and explicit write effects.
 
 ## Crate responsibilities
 
@@ -33,7 +36,7 @@ not a claim that the library API has already reached CLI parity.
 | Proof | `r2smt-solver-port`, `r2smt-smt`, `r2smt-z3fp` | Solver contract and concrete SMT backends |
 | Decision | `r2smt-core`, `r2smt-difflift`, `r2smt-taint` | Classification, confidence, differential checks, and taint |
 | Effects | `r2smt-report`, `r2smt-patch`, `r2smt-explore` | Reports, explicit patching, and fenced unsound witness exploration |
-| Composition | `r2smt-cli` | CLI parsing, dependency wiring, orchestration, and user-facing output |
+| Composition | `r2smt-cli` | CLI parsing, adapter wiring, optional enrichment, effects, and user-facing output |
 
 ## Dependency rules
 

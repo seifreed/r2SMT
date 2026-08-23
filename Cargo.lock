@@ -1312,6 +1312,7 @@ dependencies = [
  "r2smt-r2pipe",
  "r2smt-slicer",
  "r2smt-smt",
+ "r2smt-solver-port",
  "r2smt-ssa",
  "serde",
  "serde_json",

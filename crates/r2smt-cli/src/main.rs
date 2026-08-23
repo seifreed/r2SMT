@@ -14,14 +14,10 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use r2smt_core::{
-    Confidence, Finding, FindingKind, classify_finding_with_pretty, dump_program, prepare_ssa,
-};
+use r2smt_core::{Confidence, Finding, FindingKind, dump_program};
 use r2smt_explore::{ExploreBudget, ExploreRequest};
 use r2smt_ir::Annotator;
-use r2smt_ir::NameHints;
 use r2smt_ir::program::Function;
-use r2smt_report::Report;
 use r2smt_slicer::SliceLimits;
 use r2smt_smt::SolveOptions;
 use tracing::{debug, error, warn};
@@ -34,8 +30,8 @@ mod render;
 use render::{print_annotation_preview, print_findings_summary};
 mod support;
 use support::{
-    attach_pseudocode, compute_findings, difflift_scope, dispatch_solver, open_provider,
-    resolve_folded_branch, resolve_targets,
+    ReportRun, analyze_provider, attach_pseudocode, compute_findings, difflift_scope,
+    dispatch_solver, open_provider, report_from_findings,
 };
 mod commands;
 use commands::batch::batch;
@@ -715,7 +711,7 @@ fn at_command(
 // config struct would only shuffle field names without reducing
 // surface area; the parameters are independent and read at distinct
 // stages. Same rationale applies to `solve` below.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn annotate(
     file: &Path,
     deep: bool,
@@ -737,40 +733,12 @@ fn annotate(
     // verdicts (and therefore the written comments / saved project) diverge
     // from `solve --ir pcode` on the same branches.
     provider.set_attach_pcode(ir_pcode);
-    let program = dump_program(&mut provider)
-        .with_context(|| format!("loading program from {}", file.display()))?;
-    let arch = program.arch;
-    let bits = program.bits;
-    let function_count = program.functions.len();
-
-    let (ctx, filtered) = resolve_targets(&mut provider, file, program, at, function_filter)?;
-    let merged_functions: Vec<Function> = ctx.all_functions().cloned().collect();
-
-    let mut findings: Vec<Finding> = Vec::with_capacity(filtered.len());
-    for cand in &filtered {
-        if let Some(finding) = resolve_folded_branch(
-            &mut provider,
-            cand,
-            ctx.program.arch,
-            limits,
-            solver,
-            options,
-        )? {
-            findings.push(finding);
-            continue;
-        }
-        let Some(function) = ctx.find_function(cand.function) else {
-            continue;
-        };
-        let ssa = prepare_ssa(function, cand, limits, ctx.program.arch);
-        let (verdict, z3_pretty) = dispatch_solver(solver, &ssa, options)?;
-        findings.push(classify_finding_with_pretty(
-            &ssa,
-            verdict,
-            z3_pretty,
-            &NameHints::default(),
-        ));
-    }
+    let result = analyze_provider(&mut provider, at, function_filter, limits, options, solver)?;
+    let arch = result.program.arch;
+    let bits = result.program.bits;
+    let function_count = result.metrics.functions_analyzed;
+    let merged_functions: Vec<Function> = result.all_functions().cloned().collect();
+    let findings = result.findings;
 
     let actionable: Vec<Finding> = findings
         .into_iter()
@@ -786,15 +754,24 @@ fn annotate(
         })
         .collect();
 
-    let report = Report::from_findings(
-        env!("CARGO_PKG_VERSION"),
-        file.display().to_string(),
+    let report = report_from_findings(
+        &ReportRun {
+            file,
+            deep,
+            at,
+            function_filter,
+            limits,
+            options,
+            solver,
+            with_decompiler: false,
+            ir_pcode,
+            differential_lift: false,
+        },
         arch,
         bits,
         function_count,
         actionable.clone(),
-    )
-    .with_radare2_version(doctor::radare2_version());
+    )?;
     let annotations = report.annotations(&merged_functions);
 
     if plan.r2_script {
@@ -884,57 +861,28 @@ fn solve(
 
     let mut provider = open_provider(file, deep)?;
     provider.set_attach_pcode(ir_pcode);
-    let program = dump_program(&mut provider)
-        .with_context(|| format!("loading program from {}", file.display()))?;
-    let arch = program.arch;
-    let bits = program.bits;
-    let function_count = program.functions.len();
-
-    let (ctx, filtered) = resolve_targets(&mut provider, file, program, at, function_filter)?;
-    let merged_functions: Vec<Function> = ctx.all_functions().cloned().collect();
-
-    let mut findings: Vec<Finding> = Vec::with_capacity(filtered.len());
-    for cand in &filtered {
-        if let Some(finding) = resolve_folded_branch(
-            &mut provider,
-            cand,
-            ctx.program.arch,
-            limits,
-            solver,
-            options,
-        )? {
-            findings.push(finding);
-            continue;
-        }
-        let Some(function) = ctx.find_function(cand.function) else {
-            continue;
-        };
-        let ssa = prepare_ssa(function, cand, limits, ctx.program.arch);
-        let (verdict, z3_pretty) = dispatch_solver(solver, &ssa, options)?;
-        findings.push(classify_finding_with_pretty(
-            &ssa,
-            verdict,
-            z3_pretty,
-            &NameHints::default(),
-        ));
-    }
-
+    let mut result = analyze_provider(&mut provider, at, function_filter, limits, options, solver)?;
+    let arch = result.program.arch;
+    let bits = result.program.bits;
+    let function_count = result.metrics.functions_analyzed;
     if difflift.enabled {
-        let scope = difflift_scope(&ctx, at, function_filter, &filtered);
+        let scope = difflift_scope(&result, at, function_filter);
         let dl = run_differential_lift(
             &scope,
-            ctx.program.arch,
+            result.program.arch,
             solver,
             options,
             difflift.max_comparisons,
         );
         print_lifter_agreement(&dl);
-        findings.extend(dl.findings);
+        result.findings.extend(dl.findings);
     }
 
     if with_decompiler {
-        attach_pseudocode(&mut provider, &mut findings);
+        attach_pseudocode(&mut provider, &mut result.findings);
     }
+    let merged_functions: Vec<Function> = result.all_functions().cloned().collect();
+    let findings = result.findings;
 
     let displayed: Vec<&Finding> = findings
         .iter()
@@ -944,15 +892,24 @@ fn solve(
     let any_file =
         outputs.json.is_some() || outputs.markdown.is_some() || outputs.r2_script.is_some();
     if any_file {
-        let report = Report::from_findings(
-            env!("CARGO_PKG_VERSION"),
-            file.display().to_string(),
+        let report = report_from_findings(
+            &ReportRun {
+                file,
+                deep,
+                at,
+                function_filter,
+                limits,
+                options,
+                solver,
+                with_decompiler,
+                ir_pcode,
+                differential_lift: difflift.enabled,
+            },
             arch,
             bits,
             function_count,
             findings.clone(),
-        )
-        .with_radare2_version(doctor::radare2_version());
+        )?;
         if let Some(path) = outputs.json {
             let json = report.render_json().context("serialising report to JSON")?;
             fs::write(path, json).with_context(|| format!("writing JSON to {}", path.display()))?;

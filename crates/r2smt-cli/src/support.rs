@@ -6,19 +6,103 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use r2smt_common::{Address, Arch};
 use r2smt_core::{
-    Finding, classify_finding_with_pretty, classify_lowered_upstream, dump_program, prepare_ssa,
-    reconcile_folded,
+    AnalysisRequest, AnalysisResult, AnalysisTarget, Analyzer, Finding, dump_program, prepare_ssa,
 };
 use r2smt_ir::BinaryProvider;
 use r2smt_ir::Decompiler;
-use r2smt_ir::NameHints;
 use r2smt_ir::program::{Function, Program};
 use r2smt_r2pipe::{AnalysisLevel, R2PipeProvider};
+use r2smt_report::{AnalysisOptions, IrPolicy, Report, ReportMetadata, SolverProvenance};
 use r2smt_slicer::{BranchCandidate, SliceLimits, collect_branches, collect_function_branches};
 use r2smt_smt::SolveOptions;
 
 use crate::args::SolverArg;
+use crate::doctor;
 use crate::render::truncate_on_char_boundary;
+
+/// Inputs needed to stamp a stable report with the exact analysis policy.
+// Mirrors independently named CLI flags into a serde DTO; replacing
+// them with enums would obscure the JSON provenance without reducing state.
+#[allow(clippy::struct_excessive_bools)]
+pub(crate) struct ReportRun<'a> {
+    pub(crate) file: &'a Path,
+    pub(crate) deep: bool,
+    pub(crate) at: Option<&'a str>,
+    pub(crate) function_filter: Option<&'a str>,
+    pub(crate) limits: &'a SliceLimits,
+    pub(crate) options: SolveOptions,
+    pub(crate) solver: SolverArg,
+    pub(crate) with_decompiler: bool,
+    pub(crate) ir_pcode: bool,
+    pub(crate) differential_lift: bool,
+}
+
+pub(crate) fn report_from_findings(
+    run: &ReportRun<'_>,
+    arch: Arch,
+    bits: u16,
+    functions_analyzed: usize,
+    findings: Vec<Finding>,
+) -> Result<Report> {
+    let branch = run
+        .at
+        .map(str::parse)
+        .transpose()
+        .with_context(|| "parsing report branch scope")?;
+    let function = run
+        .function_filter
+        .map(str::parse)
+        .transpose()
+        .with_context(|| "parsing report function scope")?;
+    let metadata = ReportMetadata {
+        radare2_version: doctor::radare2_version().to_string(),
+        r2ghidra_version: doctor::r2ghidra_version().to_string(),
+        solver: SolverProvenance {
+            name: solver_name(run.solver).to_string(),
+            version: doctor::solver_version(run.solver).to_string(),
+            timeout_ms: run.options.timeout_ms,
+            rlimit: run.options.rlimit,
+            random_seed: run.options.random_seed,
+        },
+        ir_policy: if run.ir_pcode {
+            IrPolicy::PcodeEsilMnemonic
+        } else {
+            IrPolicy::EsilMnemonic
+        },
+        binary_sha256: r2smt_patch::sha256_hex(run.file)?,
+        analysis_options: AnalysisOptions {
+            deep: run.deep,
+            branch,
+            function,
+            max_slice_instructions: run.limits.max_instructions,
+            max_basic_blocks: run.limits.max_basic_blocks,
+            allow_memory: run.limits.allow_memory,
+            allow_calls: run.limits.allow_calls,
+            unknowns_on_truncation: run.limits.unknowns_on_truncation,
+            allow_join_merge: run.limits.allow_join_merge,
+            esil_flags: run.limits.esil_flags,
+            differential_lift: run.differential_lift,
+            with_decompiler: run.with_decompiler,
+        },
+    };
+    Ok(Report::from_findings(
+        env!("CARGO_PKG_VERSION"),
+        run.file.display().to_string(),
+        arch,
+        bits,
+        functions_analyzed,
+        findings,
+    )
+    .with_metadata(metadata))
+}
+
+const fn solver_name(solver: SolverArg) -> &'static str {
+    match solver {
+        SolverArg::Z3 => "z3",
+        SolverArg::Cvc5 => "cvc5",
+        SolverArg::Bitwuzla => "bitwuzla",
+    }
+}
 
 pub(crate) fn analysis_level(deep: bool) -> AnalysisLevel {
     if deep {
@@ -147,22 +231,22 @@ pub(crate) fn resolve_targets(
 /// the synthesised block when the address lies outside any analysed
 /// function.
 pub(crate) fn difflift_scope(
-    ctx: &AnalysisContext,
+    result: &AnalysisResult,
     at: Option<&str>,
     function_filter: Option<&str>,
-    candidates: &[BranchCandidate],
 ) -> Vec<Function> {
     let target = function_filter
         .and_then(|raw| raw.parse::<Address>().ok())
         .or_else(|| {
-            candidates
+            result
+                .findings
                 .first()
-                .map(|c| c.function)
+                .map(|finding| finding.function)
                 .filter(|_| at.is_some())
         });
-    match target.and_then(|addr| ctx.find_function(addr)) {
+    match target.and_then(|addr| result.find_function(addr)) {
         Some(function) => vec![function.clone()],
-        None => ctx.all_functions().cloned().collect(),
+        None => result.all_functions().cloned().collect(),
     }
 }
 
@@ -208,43 +292,43 @@ pub(crate) fn compute_findings(
 ) -> Result<(Arch, Vec<Finding>)> {
     let mut provider = open_provider(file, deep)?;
     provider.set_attach_pcode(ir_pcode);
-    let program = dump_program(&mut provider)
-        .with_context(|| format!("loading program from {}", file.display()))?;
-    let arch = program.arch;
-
-    let (ctx, filtered) = resolve_targets(&mut provider, file, program, at, function_filter)?;
-
-    let mut hint_cache: std::collections::BTreeMap<Address, NameHints> =
-        std::collections::BTreeMap::new();
-    let mut findings: Vec<Finding> = Vec::with_capacity(filtered.len());
-    for cand in &filtered {
-        if let Some(finding) = resolve_folded_branch(
-            &mut provider,
-            cand,
-            ctx.program.arch,
-            limits,
-            solver,
-            options,
-        )? {
-            findings.push(finding);
-            continue;
-        }
-        let Some(function) = ctx.find_function(cand.function) else {
-            continue;
-        };
-        let ssa = prepare_ssa(function, cand, limits, ctx.program.arch);
-        let (verdict, z3_pretty) = dispatch_solver(solver, &ssa, options)?;
-        let hints = hint_cache
-            .entry(cand.function)
-            .or_insert_with(|| provider.name_hints(cand.function).unwrap_or_default());
-        findings.push(classify_finding_with_pretty(
-            &ssa, verdict, z3_pretty, hints,
-        ));
-    }
+    let result = analyze_provider(&mut provider, at, function_filter, limits, options, solver)?;
+    let arch = result.program.arch;
+    let mut findings = result.findings;
     if with_decompiler {
         attach_pseudocode(&mut provider, &mut findings);
     }
     Ok((arch, findings))
+}
+
+pub(crate) fn analyze_provider(
+    provider: &mut dyn BinaryProvider,
+    at: Option<&str>,
+    function_filter: Option<&str>,
+    limits: &SliceLimits,
+    options: SolveOptions,
+    solver: SolverArg,
+) -> Result<AnalysisResult> {
+    let target = match (at, function_filter) {
+        (Some(raw), None) => AnalysisTarget::Branch(
+            raw.parse()
+                .with_context(|| format!("parsing --at value '{raw}'"))?,
+        ),
+        (None, Some(raw)) => AnalysisTarget::Function(
+            raw.parse()
+                .with_context(|| format!("parsing --function value '{raw}'"))?,
+        ),
+        (None, None) => AnalysisTarget::All,
+        (Some(_), Some(_)) => anyhow::bail!("--at and --function are mutually exclusive"),
+    };
+    let request = AnalysisRequest {
+        target,
+        slicing: *limits,
+        solving: options,
+    };
+    Analyzer::default()
+        .analyze_request(provider, build_solver(solver).as_ref(), &request)
+        .map_err(anyhow::Error::from)
 }
 
 /// Build the SSA slices for the targeted branches without solving them.
@@ -316,60 +400,15 @@ fn build_solver(solver: SolverArg) -> Box<dyn r2smt_solver_port::Solver> {
     }
 }
 
-/// Per-branch analysis-maturity fallback (always active).
-///
-/// Returns `Ok(None)` for branches radare2 did **not** fold (the
-/// caller's normal slice → solve pipeline handles them unchanged). For
-/// a branch `aaa` already collapsed to a single successor, it
-/// independently re-derives a verdict: `BinaryProvider::load_block_at`
-/// performs a *raw linear decode* of the containing block (its
-/// shellcode-synthesis step does not apply r2's CFG folding), so the
-/// genuine two-way `jcc` reappears and goes through the full
-/// slice → optimize → SMT pipeline. The result is then reconciled
-/// against the CFG shortcut via [`reconcile_folded`]: a sound SMT
-/// proof wins; an inconclusive one falls back to r2's CFG verdict.
-///
-/// Cost is bounded — at most one extra block synthesis + one SMT
-/// solve per folded branch — and accepted by design (always-on).
-pub(crate) fn resolve_folded_branch(
-    provider: &mut R2PipeProvider,
-    cand: &BranchCandidate,
-    arch: r2smt_common::Arch,
-    limits: &SliceLimits,
-    solver: SolverArg,
-    options: SolveOptions,
-) -> Result<Option<Finding>> {
-    if cand.upstream_resolved.is_none() {
-        return Ok(None);
-    }
-    let rederived = match provider.load_block_at(cand.address) {
-        Ok(synth) => collect_function_branches(&synth, arch)
-            .iter()
-            .find(|c| c.address == cand.address)
-            .map(|scand| {
-                let ssa = prepare_ssa(&synth, scand, limits, arch);
-                let (verdict, z3) = dispatch_solver(solver, &ssa, options)?;
-                Ok::<_, anyhow::Error>(classify_finding_with_pretty(
-                    &ssa,
-                    verdict,
-                    z3,
-                    &NameHints::default(),
-                ))
-            })
-            .transpose()?,
-        // Synthesis failed (unmapped / undecodable): no re-derivation,
-        // the CFG shortcut below is the only evidence available.
-        Err(_) => None,
-    };
-    Ok(reconcile_folded(rederived, classify_lowered_upstream(cand)))
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
 
-    use super::{AnalysisContext, difflift_scope};
+    use super::difflift_scope;
     use r2smt_common::{Address, Arch};
+    use r2smt_core::{
+        AnalysisMetrics, AnalysisProvenance, AnalysisResult, classify_lowered_upstream,
+    };
     use r2smt_ir::program::{Function, Program};
     use r2smt_slicer::{BranchCandidate, BranchCondition, BranchKind};
 
@@ -382,13 +421,26 @@ mod tests {
         }
     }
 
-    fn ctx() -> AnalysisContext {
-        AnalysisContext::new(Program {
-            arch: Arch::X86_64,
-            bits: 64,
-            entry: None,
-            functions: vec![function(0x1000), function(0x2000)],
-        })
+    fn result(candidates: &[BranchCandidate]) -> AnalysisResult {
+        AnalysisResult {
+            program: Program {
+                arch: Arch::X86_64,
+                bits: 64,
+                entry: None,
+                functions: vec![function(0x1000), function(0x2000)],
+            },
+            extra_functions: Vec::new(),
+            findings: candidates
+                .iter()
+                .filter_map(classify_lowered_upstream)
+                .collect(),
+            provenance: AnalysisProvenance {
+                solver: "test".into(),
+                arch: Arch::X86_64,
+                bits: 64,
+            },
+            metrics: AnalysisMetrics::default(),
+        }
     }
 
     fn candidate_in(function: u64) -> BranchCandidate {
@@ -400,11 +452,11 @@ mod tests {
             mnemonic: "je".into(),
             condition: BranchCondition::Equal,
             formula: "ZF".into(),
-            taken_target: None,
-            fallthrough_target: None,
+            taken_target: Some(Address::new(function + 8)),
+            fallthrough_target: Some(Address::new(function + 6)),
             compare_register: None,
             bit_index: None,
-            upstream_resolved: None,
+            upstream_resolved: Some(Address::new(function + 8)),
             operand_raws: Vec::new(),
             is_thumb: false,
         }
@@ -412,13 +464,13 @@ mod tests {
 
     #[test]
     fn test_difflift_scope_unfiltered_covers_the_whole_program() {
-        let scope = difflift_scope(&ctx(), None, None, &[]);
+        let scope = difflift_scope(&result(&[]), None, None);
         assert_eq!(scope.len(), 2);
     }
 
     #[test]
     fn test_difflift_scope_function_filter_keeps_only_that_function() {
-        let scope = difflift_scope(&ctx(), None, Some("0x2000"), &[]);
+        let scope = difflift_scope(&result(&[]), None, Some("0x2000"));
         assert_eq!(
             scope.iter().map(|f| f.address).collect::<Vec<_>>(),
             vec![Address::new(0x2000)]
@@ -429,13 +481,13 @@ mod tests {
     fn test_difflift_scope_function_filter_holds_without_any_candidate() {
         // A function with no conditional branch yields no candidate, and
         // must still be cross-checked rather than widening to the program.
-        let scope = difflift_scope(&ctx(), None, Some("0x1000"), &[]);
+        let scope = difflift_scope(&result(&[]), None, Some("0x1000"));
         assert_eq!(scope.len(), 1);
     }
 
     #[test]
     fn test_difflift_scope_at_keeps_the_function_containing_the_address() {
-        let scope = difflift_scope(&ctx(), Some("0x2004"), None, &[candidate_in(0x2000)]);
+        let scope = difflift_scope(&result(&[candidate_in(0x2000)]), Some("0x2004"), None);
         assert_eq!(
             scope.iter().map(|f| f.address).collect::<Vec<_>>(),
             vec![Address::new(0x2000)]
@@ -444,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_difflift_scope_falls_back_to_the_program_when_the_function_is_absent() {
-        let scope = difflift_scope(&ctx(), None, Some("0x9999"), &[]);
+        let scope = difflift_scope(&result(&[]), None, Some("0x9999"));
         assert_eq!(scope.len(), 2);
     }
 }

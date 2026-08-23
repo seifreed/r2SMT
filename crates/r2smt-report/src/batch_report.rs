@@ -12,15 +12,25 @@ use r2smt_common::Arch;
 use r2smt_core::Finding;
 use serde::{Deserialize, Serialize};
 
-use crate::report::{KindCounts, Report};
+use crate::report::{
+    AnalysisMetrics, AnalysisOptions, IrPolicy, KindCounts, REPORT_SCHEMA_VERSION, Report,
+    SolverProvenance,
+};
 
 /// Upper bound on actionable findings retained per sample. Counts are
 /// always exact (`actionable_total`); only the detail list is capped.
 pub const MAX_FINDINGS_PER_SAMPLE: usize = 200;
 
+const fn batch_schema_version() -> u32 {
+    REPORT_SCHEMA_VERSION
+}
+
 /// Aggregated result of analysing a directory of samples.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchReport {
+    /// Stable JSON schema version.
+    #[serde(default = "batch_schema_version")]
+    pub schema_version: u32,
     /// r2SMT version string.
     pub r2smt_version: String,
     /// Display path of the swept root directory.
@@ -45,7 +55,7 @@ pub enum BatchOutcome {
     /// The sample was analysed; carries its bounded summary.
     Analyzed {
         /// Bounded per-sample summary.
-        summary: BatchSampleSummary,
+        summary: Box<BatchSampleSummary>,
     },
     /// The sample failed to analyse; carries a human-readable reason.
     Failed {
@@ -60,6 +70,24 @@ pub struct BatchSampleSummary {
     /// Exact radare2 version used for this sample.
     #[serde(default)]
     pub radare2_version: String,
+    /// Exact r2ghidra version available to this sample.
+    #[serde(default)]
+    pub r2ghidra_version: String,
+    /// Solver identity, version, and budgets.
+    #[serde(default)]
+    pub solver: SolverProvenance,
+    /// Ordered IR fallback policy.
+    #[serde(default)]
+    pub ir_policy: IrPolicy,
+    /// SHA-256 of the analyzed sample.
+    #[serde(default)]
+    pub binary_sha256: String,
+    /// Result-affecting analysis options.
+    #[serde(default)]
+    pub analysis_options: AnalysisOptions,
+    /// Metrics derived from the complete, uncapped finding set.
+    #[serde(default)]
+    pub metrics: AnalysisMetrics,
     /// Target architecture.
     pub arch: Arch,
     /// Pointer width in bits.
@@ -97,6 +125,12 @@ impl BatchSampleSummary {
         actionable.truncate(MAX_FINDINGS_PER_SAMPLE);
         Self {
             radare2_version: report.radare2_version.clone(),
+            r2ghidra_version: report.r2ghidra_version.clone(),
+            solver: report.solver.clone(),
+            ir_policy: report.ir_policy,
+            binary_sha256: report.binary_sha256.clone(),
+            analysis_options: report.analysis_options.clone(),
+            metrics: report.metrics.clone(),
             arch: report.arch,
             bits: report.bits,
             functions_analyzed: report.functions_analyzed,
@@ -118,6 +152,7 @@ impl BatchReport {
         samples: Vec<BatchSampleEntry>,
     ) -> Self {
         Self {
+            schema_version: REPORT_SCHEMA_VERSION,
             r2smt_version: version.into(),
             root: root.into(),
             samples,
@@ -274,7 +309,7 @@ mod tests {
             BatchSampleEntry {
                 path: "/x/a".into(),
                 outcome: BatchOutcome::Analyzed {
-                    summary: BatchSampleSummary::from_report(&report_with(2)),
+                    summary: Box::new(BatchSampleSummary::from_report(&report_with(2))),
                 },
             },
             BatchSampleEntry {
@@ -298,7 +333,7 @@ mod tests {
             BatchSampleEntry {
                 path: "/x/ok".into(),
                 outcome: BatchOutcome::Analyzed {
-                    summary: BatchSampleSummary::from_report(&report_with(3)),
+                    summary: Box::new(BatchSampleSummary::from_report(&report_with(3))),
                 },
             },
             BatchSampleEntry {

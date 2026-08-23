@@ -12,7 +12,10 @@ pub mod dump;
 pub mod finding;
 pub mod prepare;
 
-pub use analyzer::{Analyzer, AnalyzerConfig};
+pub use analyzer::{
+    AnalysisMetrics, AnalysisProvenance, AnalysisRequest, AnalysisResult, AnalysisTarget, Analyzer,
+    AnalyzerConfig,
+};
 pub use consensus::{OracleReconciliation, reconcile_finding_with_oracle, reconcile_with_oracle};
 pub use dump::dump_program;
 pub use finding::{

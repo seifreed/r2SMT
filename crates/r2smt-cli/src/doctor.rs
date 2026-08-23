@@ -6,6 +6,8 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use serde_json::Value;
 
+use crate::args::SolverArg;
+
 const MIN_ESIL_FLAGS_VERSION: (u64, u64, u64) = (6, 2, 0);
 
 #[derive(Debug)]
@@ -15,6 +17,9 @@ struct Radare2Probe {
 }
 
 static RADARE2: OnceLock<Radare2Probe> = OnceLock::new();
+static R2GHIDRA: OnceLock<String> = OnceLock::new();
+static CVC5: OnceLock<String> = OnceLock::new();
+static BITWUZLA: OnceLock<String> = OnceLock::new();
 
 fn output(program: &str, args: &[&str]) -> std::result::Result<String, String> {
     let result = Command::new(program)
@@ -72,25 +77,29 @@ pub(crate) fn esil_flags_supported() -> bool {
         .is_some_and(|version| version >= MIN_ESIL_FLAGS_VERSION)
 }
 
-fn r2ghidra_version() -> String {
-    let Ok(raw) = output("r2", &["-q", "-N", "-c", "Lcj;q", "malloc://1"]) else {
-        return "unavailable".to_string();
-    };
-    serde_json::from_str::<Vec<Value>>(&raw)
-        .ok()
-        .and_then(|plugins| {
-            plugins.into_iter().find_map(|plugin| {
-                let name = plugin.get("name")?.as_str()?;
-                name.contains("ghidra").then(|| {
-                    plugin
-                        .get("version")
-                        .and_then(Value::as_str)
-                        .unwrap_or("installed (version unavailable)")
-                        .to_string()
+pub(crate) fn r2ghidra_version() -> &'static str {
+    R2GHIDRA
+        .get_or_init(|| {
+            let Ok(raw) = output("r2", &["-q", "-N", "-c", "Lcj;q", "malloc://1"]) else {
+                return "unavailable".to_string();
+            };
+            serde_json::from_str::<Vec<Value>>(&raw)
+                .ok()
+                .and_then(|plugins| {
+                    plugins.into_iter().find_map(|plugin| {
+                        let name = plugin.get("name")?.as_str()?;
+                        name.contains("ghidra").then(|| {
+                            plugin
+                                .get("version")
+                                .and_then(Value::as_str)
+                                .unwrap_or("installed (version unavailable)")
+                                .to_string()
+                        })
+                    })
                 })
-            })
+                .unwrap_or_else(|| "unavailable".to_string())
         })
-        .unwrap_or_else(|| "unavailable".to_string())
+        .as_str()
 }
 
 fn executable_version(program: &str) -> String {
@@ -100,14 +109,24 @@ fn executable_version(program: &str) -> String {
     )
 }
 
+pub(crate) fn solver_version(solver: SolverArg) -> &'static str {
+    match solver {
+        SolverArg::Z3 => r2smt_smt::z3_version(),
+        SolverArg::Cvc5 => CVC5.get_or_init(|| executable_version("cvc5")).as_str(),
+        SolverArg::Bitwuzla => BITWUZLA
+            .get_or_init(|| executable_version("bitwuzla"))
+            .as_str(),
+    }
+}
+
 pub(crate) fn doctor() -> Result<()> {
     let r2 = radare2();
     println!("r2smt      {}", env!("CARGO_PKG_VERSION"));
     println!("radare2    {}", r2.detail);
     println!("r2ghidra   {}", r2ghidra_version());
-    println!("z3         {}", executable_version("z3"));
-    println!("cvc5       {}", executable_version("cvc5"));
-    println!("bitwuzla   {}", executable_version("bitwuzla"));
+    println!("z3         {}", solver_version(SolverArg::Z3));
+    println!("cvc5       {}", solver_version(SolverArg::Cvc5));
+    println!("bitwuzla   {}", solver_version(SolverArg::Bitwuzla));
     println!(
         "esil flags {} (requires radare2 >= 6.2.0)",
         if esil_flags_supported() {

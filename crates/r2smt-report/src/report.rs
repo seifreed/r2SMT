@@ -1,17 +1,177 @@
 //! `Report` aggregates program metadata plus a `Vec<Finding>` and
 //! exposes three renderers.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use r2smt_common::{Address, Arch};
 use r2smt_core::{Finding, FindingKind};
 use r2smt_ir::program::Function;
+use r2smt_slicer::slice::SliceStatus;
 use serde::{Deserialize, Serialize};
 
 use crate::patch_suggestion::suggest_patch;
 
 fn unknown_tool_version() -> String {
     "unknown".to_string()
+}
+
+/// Stable JSON schema emitted by [`Report`].
+pub const REPORT_SCHEMA_VERSION: u32 = 1;
+
+const fn report_schema_version() -> u32 {
+    REPORT_SCHEMA_VERSION
+}
+
+/// Solver identity and exact budgets used for the run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SolverProvenance {
+    /// Stable backend name (`z3`, `cvc5`, or `bitwuzla`).
+    pub name: String,
+    /// Backend version reported by the installed executable or library.
+    pub version: String,
+    /// Per-query wall-clock budget.
+    pub timeout_ms: u32,
+    /// Deterministic resource budget (`0` means unset).
+    pub rlimit: u32,
+    /// Pinned backend random seed.
+    pub random_seed: u32,
+}
+
+impl Default for SolverProvenance {
+    fn default() -> Self {
+        Self {
+            name: "unknown".into(),
+            version: unknown_tool_version(),
+            timeout_ms: 0,
+            rlimit: 0,
+            random_seed: 0,
+        }
+    }
+}
+
+/// Ordered lowering policy used to obtain the typed IR.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IrPolicy {
+    /// radare2 ESIL with per-mnemonic fallback.
+    #[default]
+    EsilMnemonic,
+    /// r2ghidra P-code, then ESIL, then per-mnemonic fallback.
+    PcodeEsilMnemonic,
+}
+
+/// Analysis knobs that materially affect report results.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalysisOptions {
+    /// Whether radare2 used the deeper `aaaa` analysis level.
+    pub deep: bool,
+    /// Optional single branch address requested by the caller.
+    pub branch: Option<Address>,
+    /// Optional single function address requested by the caller.
+    pub function: Option<Address>,
+    /// Maximum instructions retained per backward slice.
+    pub max_slice_instructions: usize,
+    /// Maximum basic blocks traversed per slice.
+    pub max_basic_blocks: u32,
+    /// Whether slicing follows memory effects.
+    pub allow_memory: bool,
+    /// Whether slicing follows calls.
+    pub allow_calls: bool,
+    /// Whether truncated roots become free symbolic inputs.
+    pub unknowns_on_truncation: bool,
+    /// Whether bounded join recovery is enabled.
+    pub allow_join_merge: bool,
+    /// Whether the ESIL flag-writing rung is enabled.
+    pub esil_flags: bool,
+    /// Whether differential lifting was requested.
+    pub differential_lift: bool,
+    /// Whether decompiler context was attached.
+    pub with_decompiler: bool,
+}
+
+/// Stable machine-readable reason for an inconclusive finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisReasonCode {
+    /// Solver exhausted its time or resource budget.
+    SolverTimeout,
+    /// Solver returned unknown for another reason.
+    SolverUnknown,
+    /// The soundness gate declined the model.
+    UnsoundModel,
+    /// Candidate block was absent from the function model.
+    BlockNotFound,
+    /// Candidate instruction was absent from its block.
+    InstructionNotFound,
+    /// A configured slice budget was exhausted.
+    SliceBudget,
+    /// Backward traversal encountered a cycle.
+    SliceCycle,
+    /// Backward traversal reached an unresolved CFG join.
+    SliceJoin,
+    /// The slice crossed disabled or unmodellable memory.
+    MemoryBoundary,
+    /// The slice crossed a disabled or unmodellable call.
+    CallBoundary,
+    /// An instruction or semantic effect is unsupported.
+    UnsupportedInstruction,
+    /// A floating-point control word made the active mode unknown.
+    FloatingPointControl,
+    /// No sound definition for the branch flags was found.
+    MissingFlagDefinition,
+    /// A CFG predecessor referenced by radare2 was unavailable.
+    MissingPredecessor,
+    /// Truncation did not match a more specific stable category.
+    OtherTruncation,
+}
+
+/// Stable code plus the original human-readable diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindingDiagnostic {
+    /// Finding address this diagnostic belongs to.
+    pub address: Address,
+    /// Stable reason code suitable for aggregation.
+    pub code: AnalysisReasonCode,
+    /// Additional human-readable detail, not part of the stable code.
+    pub detail: Option<String>,
+}
+
+/// Metrics computed from the complete finding set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalysisMetrics {
+    /// Number of functions discovered by radare2.
+    pub functions_analyzed: usize,
+    /// Number of candidate branches considered.
+    pub branches_analyzed: usize,
+    /// Findings backed by complete slices.
+    pub complete_slices: usize,
+    /// Findings backed by truncated slices.
+    pub truncated_slices: usize,
+    /// Findings with a definitive true/false/both-possible verdict.
+    pub definitive_findings: usize,
+    /// Findings eligible for annotation or patch planning.
+    pub actionable_findings: usize,
+    /// Inconclusive findings grouped by stable code.
+    pub unknown_by_code: BTreeMap<AnalysisReasonCode, usize>,
+}
+
+/// Provenance and options attached by the application composition root.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReportMetadata {
+    /// Exact radare2 version.
+    pub radare2_version: String,
+    /// Exact r2ghidra version.
+    pub r2ghidra_version: String,
+    /// Solver identity and budgets.
+    pub solver: SolverProvenance,
+    /// Ordered IR fallback policy.
+    pub ir_policy: IrPolicy,
+    /// SHA-256 of the analyzed input.
+    pub binary_sha256: String,
+    /// Analysis knobs that affect the result.
+    pub analysis_options: AnalysisOptions,
 }
 
 /// A single textual annotation derived from a [`Finding`].
@@ -67,12 +227,30 @@ impl KindCounts {
 /// Top-level r2SMT report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Report {
+    /// Stable JSON schema version.
+    #[serde(default = "report_schema_version")]
+    pub schema_version: u32,
     /// r2SMT version string (typically `env!("CARGO_PKG_VERSION")` from
     /// the CLI).
     pub r2smt_version: String,
     /// Exact radare2 version used for the analysis.
     #[serde(default = "unknown_tool_version")]
     pub radare2_version: String,
+    /// Exact r2ghidra version used for P-code, or `unavailable`.
+    #[serde(default = "unknown_tool_version")]
+    pub r2ghidra_version: String,
+    /// Solver identity, version, and budgets.
+    #[serde(default)]
+    pub solver: SolverProvenance,
+    /// Ordered IR fallback policy.
+    #[serde(default)]
+    pub ir_policy: IrPolicy,
+    /// SHA-256 of the analyzed binary.
+    #[serde(default)]
+    pub binary_sha256: String,
+    /// Analysis knobs that materially affect results.
+    #[serde(default)]
+    pub analysis_options: AnalysisOptions,
     /// Display path of the analysed binary.
     pub binary: String,
     /// Target architecture.
@@ -85,6 +263,12 @@ pub struct Report {
     pub branches_analyzed: usize,
     /// Aggregated counts by `FindingKind`.
     pub summary: KindCounts,
+    /// Metrics derived from the complete finding set.
+    #[serde(default)]
+    pub metrics: AnalysisMetrics,
+    /// Stable inconclusive-reason codes with human-readable detail.
+    #[serde(default)]
+    pub diagnostics: Vec<FindingDiagnostic>,
     /// Findings, in the same order they were emitted by the solver.
     pub findings: Vec<Finding>,
 }
@@ -102,15 +286,24 @@ impl Report {
     ) -> Self {
         let summary = count_kinds(&findings);
         let branches_analyzed = findings.len();
+        let (metrics, diagnostics) = analysis_metrics(functions_analyzed, &findings);
         Self {
+            schema_version: REPORT_SCHEMA_VERSION,
             r2smt_version: version.into(),
             radare2_version: unknown_tool_version(),
+            r2ghidra_version: unknown_tool_version(),
+            solver: SolverProvenance::default(),
+            ir_policy: IrPolicy::default(),
+            binary_sha256: String::new(),
+            analysis_options: AnalysisOptions::default(),
             binary: binary.into(),
             arch,
             bits,
             functions_analyzed,
             branches_analyzed,
             summary,
+            metrics,
+            diagnostics,
             findings,
         }
     }
@@ -119,6 +312,18 @@ impl Report {
     #[must_use]
     pub fn with_radare2_version(mut self, version: impl Into<String>) -> Self {
         self.radare2_version = version.into();
+        self
+    }
+
+    /// Attach complete application provenance and result-affecting options.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: ReportMetadata) -> Self {
+        self.radare2_version = metadata.radare2_version;
+        self.r2ghidra_version = metadata.r2ghidra_version;
+        self.solver = metadata.solver;
+        self.ir_policy = metadata.ir_policy;
+        self.binary_sha256 = metadata.binary_sha256;
+        self.analysis_options = metadata.analysis_options;
         self
     }
 
@@ -291,6 +496,90 @@ fn count_kinds(findings: &[Finding]) -> KindCounts {
         }
     }
     c
+}
+
+fn analysis_metrics(
+    functions_analyzed: usize,
+    findings: &[Finding],
+) -> (AnalysisMetrics, Vec<FindingDiagnostic>) {
+    let mut metrics = AnalysisMetrics {
+        functions_analyzed,
+        branches_analyzed: findings.len(),
+        ..AnalysisMetrics::default()
+    };
+    let mut diagnostics = Vec::new();
+    for finding in findings {
+        match &finding.evidence.slice_status {
+            SliceStatus::Complete => metrics.complete_slices += 1,
+            SliceStatus::Truncated { reason } => {
+                metrics.truncated_slices += 1;
+                diagnostics.push(FindingDiagnostic {
+                    address: finding.address,
+                    code: truncation_code(reason),
+                    detail: Some(reason.clone()),
+                });
+            }
+        }
+        if matches!(
+            finding.verdict,
+            r2smt_common::smt::SmtResult::AlwaysTrue
+                | r2smt_common::smt::SmtResult::AlwaysFalse
+                | r2smt_common::smt::SmtResult::BothPossible
+        ) {
+            metrics.definitive_findings += 1;
+        }
+        if finding.is_actionable() {
+            metrics.actionable_findings += 1;
+        }
+        if matches!(finding.evidence.slice_status, SliceStatus::Complete) {
+            let code = match finding.verdict {
+                r2smt_common::smt::SmtResult::Timeout => Some(AnalysisReasonCode::SolverTimeout),
+                r2smt_common::smt::SmtResult::Unknown => Some(AnalysisReasonCode::SolverUnknown),
+                r2smt_common::smt::SmtResult::Unsound => Some(AnalysisReasonCode::UnsoundModel),
+                _ => None,
+            };
+            if let Some(code) = code {
+                diagnostics.push(FindingDiagnostic {
+                    address: finding.address,
+                    code,
+                    detail: None,
+                });
+            }
+        }
+    }
+    for diagnostic in &diagnostics {
+        *metrics.unknown_by_code.entry(diagnostic.code).or_default() += 1;
+    }
+    (metrics, diagnostics)
+}
+
+fn truncation_code(reason: &str) -> AnalysisReasonCode {
+    let reason = reason.to_ascii_lowercase();
+    if reason.contains("candidate instruction not found") {
+        AnalysisReasonCode::InstructionNotFound
+    } else if reason.contains("block not found") {
+        AnalysisReasonCode::BlockNotFound
+    } else if reason.contains("budget") || reason.contains("instruction limit") {
+        AnalysisReasonCode::SliceBudget
+    } else if reason.contains("cycle") || reason.contains("loop") {
+        AnalysisReasonCode::SliceCycle
+    } else if reason.contains("join") || reason.contains("predecessors") {
+        AnalysisReasonCode::SliceJoin
+    } else if reason.contains("memory") || reason.contains("load") || reason.contains("store") {
+        AnalysisReasonCode::MemoryBoundary
+    } else if reason.contains("call") {
+        AnalysisReasonCode::CallBoundary
+    } else if reason.contains("unsupported") || reason.contains("unmodellable") {
+        AnalysisReasonCode::UnsupportedInstruction
+    } else if reason.contains("fpu control") || reason.contains("rounding mode") {
+        AnalysisReasonCode::FloatingPointControl
+    } else if reason.contains("flag-defining") {
+        AnalysisReasonCode::MissingFlagDefinition
+    } else if reason.contains("predecessor block") {
+        AnalysisReasonCode::MissingPredecessor
+    } else {
+        AnalysisReasonCode::OtherTruncation
+    }
 }
 
 fn render_finding_markdown(s: &mut String, f: &Finding, functions: &[Function]) {
@@ -474,6 +763,59 @@ mod tests {
         let json = r.render_json().unwrap();
         let back: Report = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn json_schema_carries_provenance_metrics_and_stable_reason_codes() {
+        let mut f = finding(
+            SmtResult::Unsound,
+            FindingKind::SuspiciousButUnknown,
+            "jne",
+            0x40_1050,
+        );
+        f.evidence.slice_status = SliceStatus::truncated("block budget 2 exhausted");
+        let report = Report::from_findings("0.2.0", "sample.exe", Arch::X86_64, 64, 1, vec![f])
+            .with_metadata(ReportMetadata {
+                radare2_version: "6.2.0".into(),
+                r2ghidra_version: "6.2.0".into(),
+                solver: SolverProvenance {
+                    name: "z3".into(),
+                    version: "4.15.3".into(),
+                    timeout_ms: 500,
+                    rlimit: 2_000_000,
+                    random_seed: 0,
+                },
+                ir_policy: IrPolicy::PcodeEsilMnemonic,
+                binary_sha256: "00".repeat(32),
+                analysis_options: AnalysisOptions {
+                    max_slice_instructions: 32,
+                    max_basic_blocks: 2,
+                    ..AnalysisOptions::default()
+                },
+            });
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["schema_version"], REPORT_SCHEMA_VERSION);
+        assert_eq!(json["solver"]["name"], "z3");
+        assert_eq!(json["ir_policy"], "pcode_esil_mnemonic");
+        assert_eq!(json["metrics"]["truncated_slices"], 1);
+        assert_eq!(json["diagnostics"][0]["code"], "slice_budget");
+        assert_eq!(json["diagnostics"][0]["detail"], "block budget 2 exhausted");
+    }
+
+    #[test]
+    fn truncation_reason_mapping_is_stable() {
+        assert_eq!(
+            truncation_code("call encountered at 0x401000"),
+            AnalysisReasonCode::CallBoundary
+        );
+        assert_eq!(
+            truncation_code("predecessor block 0x10 not present in function"),
+            AnalysisReasonCode::MissingPredecessor
+        );
+        assert_eq!(
+            truncation_code("new diagnostic text"),
+            AnalysisReasonCode::OtherTruncation
+        );
     }
 
     #[test]
