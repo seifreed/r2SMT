@@ -855,6 +855,9 @@ pub(crate) enum SolverArg {
     /// to be available on `$PATH`. A third independent `QF_BV`
     /// cross-check.
     Bitwuzla,
+    /// Require identical verdicts from Z3, CVC5, and Bitwuzla.
+    /// Missing backends fail the analysis; disagreements fail closed.
+    Portfolio,
 }
 
 impl ConfidenceArg {

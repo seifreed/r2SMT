@@ -23,7 +23,7 @@ pub mod pretty;
 pub mod smtlib;
 pub mod solver;
 
-pub use adapter::{BitwuzlaSolver, Cvc5Solver, Z3Solver};
+pub use adapter::{BitwuzlaSolver, Cvc5Solver, PortfolioSolver, Z3Solver};
 pub use bitwuzla::{BitwuzlaError, solve_branch_bitwuzla};
 pub use cvc5::{Cvc5Error, solve_branch_cvc5};
 pub use pretty::z3_bool_to_infix;

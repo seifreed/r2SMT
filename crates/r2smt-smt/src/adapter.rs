@@ -115,6 +115,44 @@ impl Solver for BitwuzlaSolver {
     }
 }
 
+/// Consensus backend requiring Z3, CVC5, and Bitwuzla to agree.
+/// Missing backends are reported as errors; disagreements fail closed
+/// to [`r2smt_common::smt::SmtResult::Unsound`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PortfolioSolver;
+
+impl Solver for PortfolioSolver {
+    fn solve(
+        &self,
+        slice: &SsaLiftedSlice,
+        options: SolveOptions,
+    ) -> Result<SolverOutcome, SolverError> {
+        let z3 = Z3Solver.solve(slice, options)?;
+        let cvc5 = Cvc5Solver.solve(slice, options)?;
+        let bitwuzla = BitwuzlaSolver.solve(slice, options)?;
+        Ok(consensus(z3, &cvc5, &bitwuzla))
+    }
+
+    fn name(&self) -> &'static str {
+        "portfolio"
+    }
+
+    fn role(&self) -> SolverRole {
+        SolverRole::Sound
+    }
+}
+
+fn consensus(
+    mut authoritative: SolverOutcome,
+    cvc5: &SolverOutcome,
+    bitwuzla: &SolverOutcome,
+) -> SolverOutcome {
+    if authoritative.verdict != cvc5.verdict || authoritative.verdict != bitwuzla.verdict {
+        authoritative.verdict = r2smt_common::smt::SmtResult::Unsound;
+    }
+    authoritative
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +168,28 @@ mod tests {
         assert_eq!(Cvc5Solver.role(), SolverRole::Sound);
         assert_eq!(BitwuzlaSolver.name(), "bitwuzla");
         assert_eq!(BitwuzlaSolver.role(), SolverRole::Sound);
+        assert_eq!(PortfolioSolver.name(), "portfolio");
+        assert_eq!(PortfolioSolver.role(), SolverRole::Sound);
+    }
+
+    #[test]
+    fn portfolio_requires_three_identical_verdicts() {
+        let outcome = |verdict| SolverOutcome {
+            verdict,
+            formula_pretty: None,
+        };
+        let agreed = consensus(
+            outcome(r2smt_common::smt::SmtResult::AlwaysTrue),
+            &outcome(r2smt_common::smt::SmtResult::AlwaysTrue),
+            &outcome(r2smt_common::smt::SmtResult::AlwaysTrue),
+        );
+        assert_eq!(agreed.verdict, r2smt_common::smt::SmtResult::AlwaysTrue);
+
+        let disagreed = consensus(
+            outcome(r2smt_common::smt::SmtResult::AlwaysTrue),
+            &outcome(r2smt_common::smt::SmtResult::AlwaysFalse),
+            &outcome(r2smt_common::smt::SmtResult::AlwaysTrue),
+        );
+        assert_eq!(disagreed.verdict, r2smt_common::smt::SmtResult::Unsound);
     }
 }

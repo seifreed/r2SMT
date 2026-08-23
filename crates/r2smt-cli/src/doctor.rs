@@ -20,6 +20,7 @@ static RADARE2: OnceLock<Radare2Probe> = OnceLock::new();
 static R2GHIDRA: OnceLock<String> = OnceLock::new();
 static CVC5: OnceLock<String> = OnceLock::new();
 static BITWUZLA: OnceLock<String> = OnceLock::new();
+static PORTFOLIO: OnceLock<String> = OnceLock::new();
 
 fn output(program: &str, args: &[&str]) -> std::result::Result<String, String> {
     let result = Command::new(program)
@@ -115,6 +116,16 @@ pub(crate) fn solver_version(solver: SolverArg) -> &'static str {
         SolverArg::Cvc5 => CVC5.get_or_init(|| executable_version("cvc5")).as_str(),
         SolverArg::Bitwuzla => BITWUZLA
             .get_or_init(|| executable_version("bitwuzla"))
+            .as_str(),
+        SolverArg::Portfolio => PORTFOLIO
+            .get_or_init(|| {
+                format!(
+                    "z3 {}; cvc5 {}; bitwuzla {}",
+                    solver_version(SolverArg::Z3),
+                    solver_version(SolverArg::Cvc5),
+                    solver_version(SolverArg::Bitwuzla)
+                )
+            })
             .as_str(),
     }
 }

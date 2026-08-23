@@ -27,8 +27,12 @@ subset of instructions; unsupported instructions fail closed as described in
 |---|---|---|
 | r2ghidra | P-code ingestion and decompiler context | Only for `--ir pcode|auto` or decompiler output |
 | Z3 | Default in-process SMT backend | Built with r2SMT |
-| CVC5 | Independent SMT-LIB backend | Only for `--solver cvc5` |
-| Bitwuzla | Independent SMT-LIB backend | Only for `--solver bitwuzla` |
+| CVC5 | Independent SMT-LIB backend | `--solver cvc5` or `--solver portfolio` |
+| Bitwuzla | Independent SMT-LIB backend | `--solver bitwuzla` or `--solver portfolio` |
+
+`--solver portfolio` requires all three backends and emits a decisive verdict
+only when Z3, CVC5, and Bitwuzla agree. A missing backend is an error and any
+verdict disagreement fails closed to `Unsound`.
 
 `doctor` reports missing optional tools as unavailable. Their absence does not
 disable the default ESIL plus Z3 path.

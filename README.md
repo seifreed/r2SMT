@@ -170,7 +170,7 @@ r2smt batch ./corpus --threads 8 --json corpus.json --markdown corpus.md
 | `--at <addr>` / `--function <addr>` | Restrict analysis to one branch or one function |
 | `--timeout-ms <ms>` / `--rlimit <n>` | Per-branch solver budgets (clock and resource) |
 | `--min-confidence <high\|medium\|low>` | Confidence floor for annotate / patch actions |
-| `--solver <z3\|cvc5\|bitwuzla>` | Select the SMT backend |
+| `--solver <z3\|cvc5\|bitwuzla\|portfolio>` | Select one backend or require three-way consensus |
 | `--allow-memory` / `--allow-calls` / `--max-blocks <n>` | Widen slicing scope (stays sound) |
 | `--allow-join-merge` / `--unknowns-on-truncation` | Recover diamonds / free-input boundaries (stays sound) |
 | `--ir <esil\|pcode\|auto>` / `--deep-analysis` | Prefer r2ghidra P-code per instruction / run r2's deeper `aaaa` analysis |

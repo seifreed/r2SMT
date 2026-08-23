@@ -109,6 +109,7 @@ const fn solver_name(solver: SolverArg) -> &'static str {
         SolverArg::Z3 => "z3",
         SolverArg::Cvc5 => "cvc5",
         SolverArg::Bitwuzla => "bitwuzla",
+        SolverArg::Portfolio => "portfolio",
     }
 }
 
@@ -414,6 +415,7 @@ fn build_solver(solver: SolverArg) -> Box<dyn r2smt_solver_port::Solver> {
         SolverArg::Z3 => Box::new(r2smt_smt::Z3Solver),
         SolverArg::Cvc5 => Box::new(r2smt_smt::Cvc5Solver),
         SolverArg::Bitwuzla => Box::new(r2smt_smt::BitwuzlaSolver),
+        SolverArg::Portfolio => Box::new(r2smt_smt::PortfolioSolver),
     }
 }
 
