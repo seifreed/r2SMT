@@ -104,6 +104,7 @@ pub(super) fn plan_aarch64_cset(
         confidence: finding.confidence,
         size,
         new_bytes: encoded,
+        expected_successors: None,
         rationale: cs_rationale(finding, &asm),
     }))
 }
@@ -148,6 +149,7 @@ pub(super) fn plan_aarch64_csel(
         confidence: finding.confidence,
         size,
         new_bytes: encoded,
+        expected_successors: None,
         rationale: cs_rationale(finding, &asm),
     }))
 }
@@ -211,6 +213,7 @@ pub(super) fn plan_aarch64_cs_arith(
         confidence: finding.confidence,
         size,
         new_bytes: encoded,
+        expected_successors: None,
         rationale: cs_rationale(finding, &asm),
     }))
 }

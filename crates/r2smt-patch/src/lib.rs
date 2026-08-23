@@ -20,9 +20,9 @@ pub mod manifest;
 pub mod plan;
 pub mod x86_encoding;
 
-pub use apply::{ApplyConfig, apply_plan, rollback_from_manifest};
+pub use apply::{ApplyConfig, apply_plan, rollback_from_manifest, verify_manifest};
 pub use arm_encoding::{ARM_INSTRUCTION_BYTES, arm_nop_buffer, arm_nop_bytes};
 pub use digest::sha256_hex;
-pub use manifest::{PatchManifest, PatchRecord};
+pub use manifest::{PatchManifest, PatchRecord, PatchStatus};
 pub use plan::{PatchPlan, PlanOperation, build_plan};
 pub use x86_encoding::{nop_buffer, patch_cmovcc_to_mov, patch_setcc};

@@ -3,7 +3,8 @@
 //! Manifests are written to JSON next to the patched binary. They
 //! drive both human review and machine rollback ([`crate::apply::rollback_from_manifest`]).
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::Path;
 
 use r2smt_common::{Address, Error, Result};
@@ -15,7 +16,20 @@ use serde::{Deserialize, Serialize};
 /// Bumped on any incompatible schema change. Rollback refuses to
 /// operate on manifests with an unknown version so out-of-date tools
 /// cannot accidentally corrupt newer patches.
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 2;
+
+/// Durable state of a patch transaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchStatus {
+    /// Every write and postcondition completed.
+    #[default]
+    Committed,
+    /// A write failed and every completed write was restored.
+    Recovered,
+    /// A write failed and at least one recovery write also failed.
+    RecoveryFailed,
+}
 
 /// One byte-level patch operation as recorded in a [`PatchManifest`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +47,10 @@ pub struct PatchRecord {
     pub original_bytes_hex: String,
     /// Lowercase hex of the bytes the patch wrote at `address`.
     pub patched_bytes_hex: String,
+    /// Exact CFG successors expected after reanalysis, when the patch
+    /// changes control flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_successors: Option<Vec<Address>>,
     /// Human-readable explanation forwarded from the suggestion engine.
     pub rationale: String,
 }
@@ -74,6 +92,12 @@ pub struct PatchManifest {
     pub binary_sha256_after: String,
     /// Absolute path of the backup created before patching.
     pub backup_path: String,
+    /// Transaction outcome.
+    #[serde(default)]
+    pub status: PatchStatus,
+    /// Failure diagnostic for recovered or recovery-failed runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
     /// Operations applied, in execution order.
     pub operations: Vec<PatchRecord>,
 }
@@ -100,7 +124,9 @@ impl PatchManifest {
     /// Propagates I/O and serialisation failures.
     pub fn write_to(&self, path: impl AsRef<Path>) -> Result<()> {
         let json = self.to_json()?;
-        fs::write(path, json)?;
+        let mut file = File::create(path)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
         Ok(())
     }
 
@@ -115,9 +141,11 @@ impl PatchManifest {
     /// written by a future schema version.
     pub fn read_from(path: impl AsRef<Path>) -> Result<Self> {
         let raw = fs::read_to_string(path)?;
-        let parsed: Self = serde_json::from_str(&raw)
+        let mut parsed: Self = serde_json::from_str(&raw)
             .map_err(|e| Error::parse("patch_manifest", e.to_string()))?;
-        if parsed.manifest_version != MANIFEST_VERSION {
+        if parsed.manifest_version == 1 {
+            parsed.manifest_version = MANIFEST_VERSION;
+        } else if parsed.manifest_version != MANIFEST_VERSION {
             return Err(Error::parse(
                 "patch_manifest",
                 format!(
@@ -147,6 +175,8 @@ mod tests {
             binary_sha256_before: "a".repeat(64),
             binary_sha256_after: "b".repeat(64),
             backup_path: "/tmp/sample.exe.r2smt.bak".into(),
+            status: PatchStatus::Committed,
+            failure: None,
             operations: vec![PatchRecord {
                 address: Address(0x40_1050),
                 strategy: "nop_jcc".into(),
@@ -154,6 +184,7 @@ mod tests {
                 confidence: Confidence::High,
                 original_bytes_hex: "7505".into(),
                 patched_bytes_hex: "9090".into(),
+                expected_successors: Some(vec![Address(0x40_1052)]),
                 rationale: "jne is never taken".into(),
             }],
         }
@@ -185,6 +216,25 @@ mod tests {
         let err = PatchManifest::read_from(tmp.path()).unwrap_err();
         let rendered = err.to_string();
         assert!(rendered.contains("unsupported manifest version"));
+    }
+
+    #[test]
+    fn read_from_migrates_version_one_defaults() {
+        let mut value = serde_json::to_value(sample_manifest()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.insert("manifest_version".into(), serde_json::json!(1));
+        object.remove("status");
+        object.remove("failure");
+        object["operations"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_successors");
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), serde_json::to_vec(&value).unwrap()).unwrap();
+        let migrated = PatchManifest::read_from(tmp.path()).unwrap();
+        assert_eq!(migrated.manifest_version, MANIFEST_VERSION);
+        assert_eq!(migrated.status, PatchStatus::Committed);
+        assert_eq!(migrated.operations[0].expected_successors, None);
     }
 
     #[test]

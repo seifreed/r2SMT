@@ -313,6 +313,10 @@ fn run(cli: Cli) -> Result<()> {
             max_blocks,
             min_confidence,
             apply,
+            output,
+            in_place,
+            expect_sha256,
+            verify_only,
             backup,
             manifest,
             rollback,
@@ -330,6 +334,10 @@ fn run(cli: Cli) -> Result<()> {
             let cfg = PatchCli {
                 min_confidence: min_confidence.to_confidence(),
                 apply,
+                output: output.as_deref(),
+                in_place,
+                expected_sha256: expect_sha256.as_deref(),
+                verify_only,
                 backup: backup.as_deref(),
                 manifest: manifest.as_deref(),
                 rollback,
@@ -675,9 +683,14 @@ fn at_command(
     }
     let backup = file.with_extension("r2smt.bak");
     let manifest = file.with_extension("r2smt.manifest.json");
+    let expected_sha256 = r2smt_patch::sha256_hex(file)?;
     let cfg = PatchCli {
         min_confidence: Confidence::High,
         apply: true,
+        output: None,
+        in_place: false,
+        expected_sha256: Some(&expected_sha256),
+        verify_only: false,
         backup: Some(backup.as_path()),
         manifest: Some(manifest.as_path()),
         rollback: false,

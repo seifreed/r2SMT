@@ -48,7 +48,7 @@ The pipeline is `radare2 disasm → typed IR → backward slice → SSA → SMT 
 ```text
 Findings      JSON report, human-readable Markdown, one-line CLI verdicts
 Annotations   radare2 script (CCu comments) or a live r2 session write-back
-Patches       In-place byte rewrites + rollback manifest (pre/post SHA-256)
+Patches       Transactional output + verified rollback manifest (pre/post SHA-256)
 Batch         Aggregated JSON / Markdown histogram over a directory of samples
 Stages        Slice, lifted IR, and SSA dumps — exactly what the solver sees
 ```
@@ -137,9 +137,11 @@ r2smt annotate ./sample --dry-run
 r2smt annotate ./sample --min-confidence high --save-project triage
 
 # Patch — always backed up, always reversible
-r2smt patch ./sample                                # plan only, writes nothing
-r2smt patch ./sample --apply --min-confidence high  # backup + manifest + patch
-r2smt patch ./sample --rollback                     # restore originals from manifest
+r2smt patch ./sample                                      # plan + required input SHA-256
+r2smt patch ./sample --apply --expect-sha256 <sha256>     # verified .r2smt.patched output
+r2smt patch ./sample --apply --expect-sha256 <sha256> --in-place  # explicit backup + patch
+r2smt patch ./sample.r2smt.patched --verify-only          # reopen and verify bytes, CFG, analysis
+r2smt patch ./sample --rollback                           # restore originals from manifest
 
 # Sweep a directory (aggregated report)
 r2smt batch ./corpus --threads 8 --json corpus.json --markdown corpus.md
@@ -156,7 +158,7 @@ r2smt batch ./corpus --threads 8 --json corpus.json --markdown corpus.md
 | `r2smt analyze` | Dump the normalized program model |
 | `r2smt slice` / `lift` / `ssa` | Inspect the per-branch slice, IR, and SSA stages |
 | `r2smt annotate` | Write findings back as r2 comments (dry-run or apply) |
-| `r2smt patch` | Plan, apply (with backup + manifest), or roll back byte patches |
+| `r2smt patch` | Plan, transactionally apply, verify, or roll back byte patches |
 | `r2smt batch` | Analyze every sample in a directory and aggregate the results |
 | `r2smt taint` | Sound may-taint analysis: which values at an address derive from a seeded source |
 | `r2smt why` | **Unsound** best-effort witness search (radius2 oracle) |

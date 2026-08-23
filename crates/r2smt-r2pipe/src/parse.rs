@@ -380,6 +380,33 @@ pub fn parse_aoj(json: &str) -> Result<Vec<AojInstruction>> {
     entries.into_iter().map(parse_aoj_entry).collect()
 }
 
+#[derive(Debug, Deserialize)]
+struct RelocationEntry {
+    #[serde(default, alias = "addr")]
+    vaddr: Option<u64>,
+    #[serde(default)]
+    size: Option<u64>,
+}
+
+/// Parse `irj` into half-open virtual-address relocation ranges.
+///
+/// # Errors
+///
+/// Returns [`Error::Parse`] when the response is malformed.
+pub fn parse_relocation_ranges(json: &str) -> Result<Vec<(u64, u64)>> {
+    let entries: Vec<RelocationEntry> =
+        serde_json::from_str(json).map_err(|e| Error::parse("irj", e.to_string()))?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| {
+            let start = entry.vaddr?;
+            start
+                .checked_add(entry.size.unwrap_or(1).max(1))
+                .map(|end| (start, end))
+        })
+        .collect())
+}
+
 fn parse_aoj_entry(entry: AojEntry) -> Result<AojInstruction> {
     let bytes = match entry.bytes.as_deref() {
         Some(s) if !s.is_empty() => decode_hex_bytes(s)?,

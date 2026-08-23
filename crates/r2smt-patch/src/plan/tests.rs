@@ -758,3 +758,25 @@ fn aarch64_cset_with_both_possible_verdict_is_skipped() {
     // assert no operation produced.
     assert!(plan.operations.is_empty());
 }
+
+#[test]
+fn overlapping_operations_are_rejected_before_apply() {
+    let first = finding(
+        SmtResult::AlwaysFalse,
+        FindingKind::DeadBranch,
+        Confidence::High,
+        "jne",
+        0x40_1050,
+        2,
+    );
+    let second = first.clone();
+    let mut patcher = make_patcher();
+    let error = build_plan(
+        &[first, second],
+        Confidence::High,
+        Arch::X86_64,
+        &mut patcher,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("overlapping operations"));
+}

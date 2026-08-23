@@ -13,6 +13,19 @@ use r2smt_common::{Address, Result};
 /// underlying adapter is responsible for mapping those to file
 /// offsets — `r2smt-patch` never assumes a particular file layout.
 pub trait BytePatcher {
+    /// Confirm that `[address, address + size)` is exactly one decoded
+    /// instruction and does not overlap relocation data.
+    ///
+    /// Adapters without format metadata may keep the conservative
+    /// default; production adapters should override it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter-specific error when the range is unsafe.
+    fn validate_patch_range(&mut self, _address: Address, _size: usize) -> Result<()> {
+        Ok(())
+    }
+
     /// Read `size` bytes starting at `address`.
     ///
     /// # Errors

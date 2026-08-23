@@ -40,6 +40,10 @@ pub struct PlanOperation {
     pub size: usize,
     /// Bytes to write at `address`.
     pub new_bytes: Vec<u8>,
+    /// Exact CFG successors expected after reanalysis for branch
+    /// rewrites. `None` for value-producing rewrites that do not alter
+    /// control flow.
+    pub expected_successors: Option<Vec<Address>>,
     /// Human-readable rationale forwarded for the manifest.
     pub rationale: String,
 }
@@ -97,6 +101,28 @@ pub fn build_plan(
         match consider_finding(finding, min_confidence, arch, patcher)? {
             FindingDecision::Plan(op) => operations.push(op),
             FindingDecision::Skip(reason) => skipped.push((finding.address, reason)),
+        }
+    }
+
+    let mut ranges: Vec<&PlanOperation> = operations.iter().collect();
+    ranges.sort_by_key(|op| op.address);
+    for pair in ranges.windows(2) {
+        let left_end = pair[0]
+            .address
+            .get()
+            .checked_add(
+                u64::try_from(pair[0].size)
+                    .map_err(|e| Error::parse("patch_plan", e.to_string()))?,
+            )
+            .ok_or_else(|| Error::parse("patch_plan", "operation range overflow"))?;
+        if left_end > pair[1].address.get() {
+            return Err(Error::parse(
+                "patch_plan",
+                format!(
+                    "overlapping operations at {} and {}",
+                    pair[0].address, pair[1].address
+                ),
+            ));
         }
     }
 
@@ -159,6 +185,7 @@ fn consider_finding(
             addr = finding.address,
         )));
     }
+    patcher.validate_patch_range(finding.address, size)?;
 
     match kind {
         MnemonicKind::Jcc => plan_jcc(finding, size, arch, patcher),
@@ -318,6 +345,11 @@ fn plan_jcc(
         confidence: finding.confidence,
         size,
         new_bytes,
+        expected_successors: match strategy {
+            PatchStrategy::NopJcc => finding.fallthrough_target.map(|target| vec![target]),
+            PatchStrategy::ReplaceJccWithJmp => finding.taken_target.map(|target| vec![target]),
+            _ => None,
+        },
         rationale: rationale_for(finding, strategy),
     }))
 }
@@ -366,6 +398,7 @@ fn plan_setcc(
         confidence: finding.confidence,
         size,
         new_bytes,
+        expected_successors: None,
         rationale: setcc_rationale(finding, value),
     }))
 }
@@ -422,6 +455,7 @@ fn plan_cmovcc(
         confidence: finding.confidence,
         size,
         new_bytes,
+        expected_successors: None,
         rationale: cmovcc_rationale(finding, always_true),
     }))
 }

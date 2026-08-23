@@ -637,6 +637,37 @@ impl Decompiler for R2PipeProvider {
 }
 
 impl BytePatcher for R2PipeProvider {
+    fn validate_patch_range(&mut self, address: Address, size: usize) -> Result<()> {
+        let decoded = self.cmd(&format!("aoj 1 @ {}", address.get()))?;
+        let instructions = parse::parse_aoj(&decoded)?;
+        let Some(instruction) = instructions.first() else {
+            return Err(Error::r2pipe(format!(
+                "no instruction decoded at {address}"
+            )));
+        };
+        if instruction.address != address || usize::from(instruction.size) != size {
+            return Err(Error::r2pipe(format!(
+                "patch range at {address} is {size} bytes but radare2 decoded {} bytes",
+                instruction.size
+            )));
+        }
+
+        let patch_start = address.get();
+        let patch_end = patch_start
+            .checked_add(u64::try_from(size).map_err(|e| Error::r2pipe(e.to_string()))?)
+            .ok_or_else(|| Error::r2pipe("patch range overflow"))?;
+        let relocations = parse::parse_relocation_ranges(&self.cmd("irj")?)?;
+        if let Some((start, end)) = relocations
+            .into_iter()
+            .find(|(start, end)| *start < patch_end && patch_start < *end)
+        {
+            return Err(Error::r2pipe(format!(
+                "patch range at {address} overlaps relocation 0x{start:x}..0x{end:x}"
+            )));
+        }
+        Ok(())
+    }
+
     fn read_bytes(&mut self, address: Address, size: usize) -> Result<Vec<u8>> {
         if size == 0 {
             return Ok(Vec::new());

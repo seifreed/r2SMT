@@ -458,6 +458,13 @@ fn parse_aoj_falls_back_to_mnemonic_when_type_missing() {
 }
 
 #[test]
+fn parse_relocation_ranges_uses_vaddr_and_size() {
+    let ranges =
+        parse_relocation_ranges(r#"[{"vaddr":4096,"size":8},{"addr":8192},{"paddr":32}]"#).unwrap();
+    assert_eq!(ranges, vec![(4096, 4104), (8192, 8193)]);
+}
+
+#[test]
 fn insn_flow_ends_block_only_for_terminators() {
     assert!(InsnFlow::ConditionalBranch.ends_block());
     assert!(InsnFlow::UnconditionalJump.ends_block());

@@ -272,6 +272,26 @@ pub(crate) enum Command {
         #[arg(long)]
         apply: bool,
 
+        /// Write the committed result to this new path. When neither
+        /// `--output` nor `--in-place` is supplied, defaults to
+        /// `<binary>.r2smt.patched`.
+        #[arg(long, value_name = "PATH", conflicts_with = "in_place")]
+        output: Option<PathBuf>,
+
+        /// Atomically replace the input after verification. Requires a
+        /// backup and is mutually exclusive with `--output`.
+        #[arg(long, conflicts_with = "output")]
+        in_place: bool,
+
+        /// Required SHA-256 of the unmodified input for `--apply`.
+        #[arg(long, value_name = "HEX")]
+        expect_sha256: Option<String>,
+
+        /// Verify the manifest, patched bytes, instruction decoding,
+        /// CFG successors, and affected findings without writing.
+        #[arg(long, conflicts_with_all = ["apply", "rollback"])]
+        verify_only: bool,
+
         /// Override the default backup path
         /// (`<binary>.r2smt.bak`).
         #[arg(long, value_name = "PATH")]

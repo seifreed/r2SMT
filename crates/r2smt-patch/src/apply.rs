@@ -8,43 +8,67 @@ use r2smt_ir::byte_patcher::BytePatcher;
 use tracing::{info, warn};
 
 use crate::digest::sha256_hex;
-use crate::manifest::{MANIFEST_VERSION, PatchManifest, PatchRecord};
+use crate::manifest::{MANIFEST_VERSION, PatchManifest, PatchRecord, PatchStatus};
 use crate::plan::PatchPlan;
 
 /// Inputs to [`apply_plan`] that are not part of the plan itself.
 ///
-/// The caller is responsible for creating `backup_path` *before*
-/// invoking the patcher — backups taken after writes have started
-/// would already be corrupted.
+/// For in-place commits the caller creates `backup_path` from the
+/// untouched target after this function has safely patched a temporary
+/// copy.
 #[derive(Debug, Clone)]
 pub struct ApplyConfig {
     /// Path of the binary being patched (used to compute integrity
     /// hashes for the manifest).
     pub binary_path: PathBuf,
+    /// Final destination recorded in the manifest (the active path may
+    /// be a temporary transaction copy).
+    pub target_path: PathBuf,
     /// Path of the full-file backup created before patching.
     pub backup_path: PathBuf,
     /// r2SMT version string recorded in the manifest.
     pub r2smt_version: String,
+    /// Mandatory SHA-256 precondition supplied by the caller.
+    pub expected_sha256: String,
+    /// Durable record written when preflight, write, or recovery fails.
+    pub failure_manifest_path: PathBuf,
 }
 
 /// Apply every operation in `plan` through `patcher`, returning the
 /// durable manifest that records what changed.
 ///
-/// On a partial failure (any `read` or `write` returning `Err`) the
-/// function aborts immediately and propagates the error; the manifest
-/// for the *partial* run is *not* returned, so the caller must use
-/// the backup at `config.backup_path` to recover.
+/// All reads and range sizes are checked before the first write. On a
+/// partial write failure, completed operations are restored in reverse
+/// order and a failure manifest is persisted.
 ///
 /// # Errors
 ///
 /// Propagates I/O failures from hashing the binary, plus any error
 /// produced by the underlying [`BytePatcher`].
+// Transaction order is the safety contract; keeping it linear makes
+// preflight, writes, reverse recovery, and manifest state auditable.
+#[allow(clippy::too_many_lines)]
 pub fn apply_plan(
     patcher: &mut dyn BytePatcher,
     plan: &PatchPlan,
     config: &ApplyConfig,
 ) -> Result<PatchManifest> {
     let binary_sha256_before = sha256_hex(&config.binary_path)?;
+    if binary_sha256_before != config.expected_sha256 {
+        let message = format!(
+            "SHA-256 precondition failed: expected {}, got {}",
+            config.expected_sha256, binary_sha256_before
+        );
+        let manifest = failure_manifest(
+            config,
+            &binary_sha256_before,
+            Vec::new(),
+            PatchStatus::Recovered,
+            &message,
+        );
+        manifest.write_to(&config.failure_manifest_path)?;
+        return Err(Error::parse("patch_apply", message));
+    }
     info!(
         target: "r2smt::patch",
         binary = %config.binary_path.display(),
@@ -56,7 +80,21 @@ pub fn apply_plan(
 
     let mut records: Vec<PatchRecord> = Vec::with_capacity(plan.operations.len());
     for op in &plan.operations {
-        let original = patcher.read_bytes(op.address, op.size)?;
+        let original = match patcher.read_bytes(op.address, op.size) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let message = format!("preflight read failed at {}: {err}", op.address);
+                failure_manifest(
+                    config,
+                    &binary_sha256_before,
+                    Vec::new(),
+                    PatchStatus::Recovered,
+                    &message,
+                )
+                .write_to(&config.failure_manifest_path)?;
+                return Err(Error::parse("patch_apply", message));
+            }
+        };
         if original.len() != op.new_bytes.len() {
             warn!(
                 target: "r2smt::patch",
@@ -65,17 +103,22 @@ pub fn apply_plan(
                 new = op.new_bytes.len(),
                 "plan size disagreed with read; aborting"
             );
-            return Err(r2smt_common::Error::parse(
-                "patch_apply",
-                format!(
-                    "size mismatch at {addr}: original {orig}, new {new}",
-                    addr = op.address,
-                    orig = original.len(),
-                    new = op.new_bytes.len(),
-                ),
-            ));
+            let message = format!(
+                "size mismatch at {addr}: original {orig}, new {new}",
+                addr = op.address,
+                orig = original.len(),
+                new = op.new_bytes.len(),
+            );
+            failure_manifest(
+                config,
+                &binary_sha256_before,
+                Vec::new(),
+                PatchStatus::Recovered,
+                &message,
+            )
+            .write_to(&config.failure_manifest_path)?;
+            return Err(Error::parse("patch_apply", message));
         }
-        patcher.write_bytes(op.address, &op.new_bytes)?;
         records.push(PatchRecord {
             address: op.address,
             strategy: op.strategy.as_str().to_string(),
@@ -83,8 +126,40 @@ pub fn apply_plan(
             confidence: op.confidence,
             original_bytes_hex: hex::encode(&original),
             patched_bytes_hex: hex::encode(&op.new_bytes),
+            expected_successors: op.expected_successors.clone(),
             rationale: op.rationale.clone(),
         });
+    }
+
+    for (index, (op, record)) in plan.operations.iter().zip(&records).enumerate() {
+        if let Err(write_error) = patcher.write_bytes(op.address, &op.new_bytes) {
+            let mut recovery_errors = Vec::new();
+            for applied in records[..=index].iter().rev() {
+                let original = applied.original_bytes()?;
+                if let Err(err) = patcher.write_bytes(applied.address, &original) {
+                    recovery_errors.push(format!("{}: {err}", applied.address));
+                }
+            }
+            let status = if recovery_errors.is_empty() {
+                PatchStatus::Recovered
+            } else {
+                PatchStatus::RecoveryFailed
+            };
+            let mut message = format!("write failed at {}: {write_error}", record.address);
+            if !recovery_errors.is_empty() {
+                message.push_str("; recovery failed at ");
+                message.push_str(&recovery_errors.join(", "));
+            }
+            failure_manifest(
+                config,
+                &binary_sha256_before,
+                records[..=index].to_vec(),
+                status,
+                &message,
+            )
+            .write_to(&config.failure_manifest_path)?;
+            return Err(Error::parse("patch_apply", message));
+        }
     }
 
     let binary_sha256_after = sha256_hex(&config.binary_path)?;
@@ -98,12 +173,77 @@ pub fn apply_plan(
     Ok(PatchManifest {
         manifest_version: MANIFEST_VERSION,
         r2smt_version: config.r2smt_version.clone(),
-        binary: config.binary_path.display().to_string(),
+        binary: config.target_path.display().to_string(),
         binary_sha256_before,
         binary_sha256_after,
         backup_path: absolute_or_display(&config.backup_path),
+        status: PatchStatus::Committed,
+        failure: None,
         operations: records,
     })
+}
+
+fn failure_manifest(
+    config: &ApplyConfig,
+    binary_sha256_before: &str,
+    operations: Vec<PatchRecord>,
+    status: PatchStatus,
+    failure: &str,
+) -> PatchManifest {
+    PatchManifest {
+        manifest_version: MANIFEST_VERSION,
+        r2smt_version: config.r2smt_version.clone(),
+        binary: config.target_path.display().to_string(),
+        binary_sha256_before: binary_sha256_before.to_string(),
+        binary_sha256_after: sha256_hex(&config.binary_path).unwrap_or_default(),
+        backup_path: absolute_or_display(&config.backup_path),
+        status,
+        failure: Some(failure.to_string()),
+        operations,
+    }
+}
+
+/// Verify the committed file hash and every patched byte slot.
+///
+/// # Errors
+///
+/// Returns [`Error::Parse`] if the manifest is not committed, the file
+/// hash differs, or any recorded slot no longer contains patched bytes.
+pub fn verify_manifest(
+    patcher: &mut dyn BytePatcher,
+    manifest: &PatchManifest,
+    binary_path: &Path,
+) -> Result<()> {
+    if manifest.status != PatchStatus::Committed {
+        return Err(Error::parse(
+            "patch_verify",
+            format!(
+                "manifest transaction is {:?}, not committed",
+                manifest.status
+            ),
+        ));
+    }
+    let hash = sha256_hex(binary_path)?;
+    if hash != manifest.binary_sha256_after {
+        return Err(Error::parse(
+            "patch_verify",
+            format!(
+                "binary SHA-256 differs from manifest ({} vs {})",
+                hash, manifest.binary_sha256_after
+            ),
+        ));
+    }
+    for record in &manifest.operations {
+        let expected = record.patched_bytes()?;
+        let current = patcher.read_bytes(record.address, expected.len())?;
+        if current != expected {
+            return Err(Error::parse(
+                "patch_verify",
+                format!("patched bytes differ at {}", record.address),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn absolute_or_display(path: &Path) -> String {
@@ -192,6 +332,7 @@ mod tests {
     use r2smt_common::smt::SmtResult;
     use r2smt_common::{Address, Arch};
     use r2smt_core::{Confidence, Finding, FindingEvidence, FindingKind};
+    use r2smt_ir::byte_patcher::BytePatcher;
     use r2smt_ir::testing::InMemoryBytePatcher;
     use r2smt_report::PatchStrategy;
     use r2smt_slicer::condition::BranchCondition;
@@ -237,6 +378,40 @@ mod tests {
         tmp
     }
 
+    fn apply_config(tmp: &NamedTempFile) -> ApplyConfig {
+        ApplyConfig {
+            binary_path: tmp.path().to_path_buf(),
+            target_path: tmp.path().to_path_buf(),
+            backup_path: tmp.path().with_extension("bak"),
+            r2smt_version: "test".into(),
+            expected_sha256: sha256_hex(tmp.path()).unwrap(),
+            failure_manifest_path: tmp.path().with_extension("failure.json"),
+        }
+    }
+
+    struct FailSecondWrite {
+        inner: InMemoryBytePatcher,
+        writes: usize,
+    }
+
+    impl BytePatcher for FailSecondWrite {
+        fn read_bytes(&mut self, address: Address, size: usize) -> Result<Vec<u8>> {
+            self.inner.read_bytes(address, size)
+        }
+
+        fn write_bytes(&mut self, address: Address, bytes: &[u8]) -> Result<()> {
+            self.writes += 1;
+            if self.writes == 2 {
+                return Err(Error::r2pipe("injected second-write failure"));
+            }
+            self.inner.write_bytes(address, bytes)
+        }
+
+        fn assemble(&mut self, address: Address, asm: &str) -> Result<Vec<u8>> {
+            self.inner.assemble(address, asm)
+        }
+    }
+
     #[test]
     fn apply_records_original_and_new_bytes() {
         let bytes = vec![0x75, 0x05, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90];
@@ -246,11 +421,7 @@ mod tests {
         let plan = build_plan(&[finding], Confidence::High, Arch::X86_64, &mut patcher).unwrap();
         assert_eq!(plan.operations.len(), 1);
 
-        let config = ApplyConfig {
-            binary_path: tmp.path().to_path_buf(),
-            backup_path: tmp.path().with_extension("bak"),
-            r2smt_version: "test".into(),
-        };
+        let config = apply_config(&tmp);
         let manifest = apply_plan(&mut patcher, &plan, &config).unwrap();
 
         assert_eq!(manifest.operations.len(), 1);
@@ -280,6 +451,8 @@ mod tests {
             binary_sha256_before: String::new(),
             binary_sha256_after: String::new(),
             backup_path: String::new(),
+            status: PatchStatus::Committed,
+            failure: None,
             operations: vec![PatchRecord {
                 address: Address(0x40_1050),
                 strategy: PatchStrategy::NopJcc.as_str().to_string(),
@@ -287,6 +460,7 @@ mod tests {
                 confidence: Confidence::High,
                 original_bytes_hex: "750500".into(), // 3 bytes
                 patched_bytes_hex: "9090".into(),    // 2 bytes
+                expected_successors: None,
                 rationale: "test".into(),
             }],
         };
@@ -309,11 +483,7 @@ mod tests {
         let mut patcher = InMemoryBytePatcher::new(Address(0x40_1050), bytes.clone());
         let finding = dead_branch_finding(0x40_1050, 2);
         let plan = build_plan(&[finding], Confidence::High, Arch::X86_64, &mut patcher).unwrap();
-        let config = ApplyConfig {
-            binary_path: tmp.path().to_path_buf(),
-            backup_path: tmp.path().with_extension("bak"),
-            r2smt_version: "test".into(),
-        };
+        let config = apply_config(&tmp);
         let manifest = apply_plan(&mut patcher, &plan, &config).unwrap();
 
         // The plan wrote NOPs; ensure the buffer now diverges from
@@ -337,11 +507,7 @@ mod tests {
         let mut patcher = InMemoryBytePatcher::new(Address(0x40_1050), bytes.clone());
         let finding = dead_branch_finding(0x40_1050, 2);
         let plan = build_plan(&[finding], Confidence::High, Arch::X86_64, &mut patcher).unwrap();
-        let config = ApplyConfig {
-            binary_path: tmp.path().to_path_buf(),
-            backup_path: tmp.path().with_extension("bak"),
-            r2smt_version: "test".into(),
-        };
+        let config = apply_config(&tmp);
         let manifest = apply_plan(&mut patcher, &plan, &config).unwrap();
 
         // Simulate the file drifting away from the recorded patch.
@@ -367,6 +533,7 @@ mod tests {
             confidence: Confidence::High,
             size: 2,
             new_bytes: vec![0x90, 0x90],
+            expected_successors: None,
             rationale: "test".into(),
         });
         // Second operation writes past the end of the in-memory
@@ -378,16 +545,43 @@ mod tests {
             confidence: Confidence::High,
             size: 2,
             new_bytes: vec![0x90, 0x90],
+            expected_successors: None,
             rationale: "test".into(),
         });
-        let config = ApplyConfig {
-            binary_path: tmp.path().to_path_buf(),
-            backup_path: tmp.path().with_extension("bak"),
-            r2smt_version: "test".into(),
-        };
+        let config = apply_config(&tmp);
         let err = apply_plan(&mut patcher, &plan, &config).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("past end") || msg.contains("address"));
+    }
+
+    #[test]
+    fn apply_recovers_completed_writes_and_persists_failure_manifest() {
+        let original = vec![0x75, 0x05, 0x75, 0x05];
+        let tmp = writable_temp_file_with_bytes(&original);
+        let mut patcher = FailSecondWrite {
+            inner: InMemoryBytePatcher::new(Address(0x40_1050), original.clone()),
+            writes: 0,
+        };
+        let mut plan = PatchPlan::default();
+        for address in [0x40_1050, 0x40_1052] {
+            plan.operations.push(PlanOperation {
+                address: Address(address),
+                strategy: PatchStrategy::NopJcc,
+                kind: FindingKind::DeadBranch,
+                confidence: Confidence::High,
+                size: 2,
+                new_bytes: vec![0x90, 0x90],
+                expected_successors: None,
+                rationale: "test".into(),
+            });
+        }
+        let config = apply_config(&tmp);
+        let error = apply_plan(&mut patcher, &plan, &config).unwrap_err();
+        assert!(error.to_string().contains("injected second-write failure"));
+        assert_eq!(patcher.inner.bytes, original);
+        let failure = PatchManifest::read_from(&config.failure_manifest_path).unwrap();
+        assert_eq!(failure.status, PatchStatus::Recovered);
+        assert_eq!(failure.operations.len(), 2);
     }
 
     #[test]
@@ -397,11 +591,7 @@ mod tests {
         let mut patcher = InMemoryBytePatcher::new(Address(0x40_1050), bytes);
         let finding = dead_branch_finding(0x40_1050, 2);
         let plan = build_plan(&[finding], Confidence::High, Arch::X86_64, &mut patcher).unwrap();
-        let config = ApplyConfig {
-            binary_path: tmp.path().to_path_buf(),
-            backup_path: tmp.path().with_extension("bak"),
-            r2smt_version: "test".into(),
-        };
+        let config = apply_config(&tmp);
 
         // Capture the file's SHA-256 before apply. The in-memory
         // patcher does not write to the file, so the post hash also

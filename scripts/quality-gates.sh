@@ -152,6 +152,35 @@ gate_real_binaries() {
     --include-real --include-suspicious --json "$report"
   cargo run --quiet -p r2smt-bench -- score \
     "$report" bench/corpus/control-flow
+
+  patchable="$(dirname "$binary")/patch-control-flow"
+  patched="${patchable}.patched"
+  manifest="${patched}.r2smt.manifest.json"
+  rm -f "$patched" "$manifest"
+  if command -v sha256sum >/dev/null 2>&1; then
+    precondition="$(sha256sum "$patchable" | awk '{print $1}')"
+  else
+    precondition="$(shasum -a 256 "$patchable" | awk '{print $1}')"
+  fi
+  cargo run --quiet -p r2smt-cli -- patch "$patchable" \
+    --apply --expect-sha256 "$precondition" --output "$patched"
+  cargo run --quiet -p r2smt-cli -- patch "$patched" --verify-only
+
+  in_place="${patchable}.in-place"
+  backup="${in_place}.r2smt.bak"
+  in_place_manifest="${in_place}.r2smt.manifest.json"
+  rm -f "$in_place" "$backup" "$in_place_manifest"
+  cp "$patchable" "$in_place"
+  cargo run --quiet -p r2smt-cli -- patch "$in_place" \
+    --apply --expect-sha256 "$precondition" --in-place --backup "$backup"
+  cargo run --quiet -p r2smt-cli -- patch "$in_place" --verify-only
+  cargo run --quiet -p r2smt-cli -- patch "$in_place" --rollback
+  if command -v sha256sum >/dev/null 2>&1; then
+    postcondition="$(sha256sum "$in_place" | awk '{print $1}')"
+  else
+    postcondition="$(shasum -a 256 "$in_place" | awk '{print $1}')"
+  fi
+  [[ "$postcondition" == "$precondition" ]]
 }
 
 main() {
