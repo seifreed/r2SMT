@@ -185,6 +185,12 @@ pub(crate) enum Command {
         #[arg(long)]
         dry_run: bool,
 
+        /// Emit the selected annotations as radare2 commands on stdout
+        /// and do not modify the child session. Intended for r2's
+        /// `.!command` so comments land in the current session.
+        #[arg(long)]
+        r2_script: bool,
+
         /// Save the annotated r2 session as a project under this name
         /// (`Ps <name>`). Implies the comments were applied.
         #[arg(long, value_name = "NAME")]

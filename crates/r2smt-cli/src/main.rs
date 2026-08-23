@@ -71,6 +71,7 @@ fn init_tracing(verbosity: u8) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_writer(std::io::stderr)
         .try_init()
         .map_err(|e| anyhow::anyhow!("tracing init failed: {e}"))?;
     Ok(())
@@ -267,6 +268,7 @@ fn run(cli: Cli) -> Result<()> {
             max_blocks,
             min_confidence,
             dry_run,
+            r2_script,
             save_project,
         } => {
             let limits = build_slice_limits(
@@ -282,6 +284,7 @@ fn run(cli: Cli) -> Result<()> {
             let plan = AnnotatePlan {
                 min_confidence: min_confidence.to_confidence(),
                 dry_run,
+                r2_script,
                 save_project: save_project.as_deref(),
             };
             annotate(
@@ -534,6 +537,7 @@ struct SolveFilters {
 struct AnnotatePlan<'a> {
     min_confidence: Confidence,
     dry_run: bool,
+    r2_script: bool,
     save_project: Option<&'a str>,
 }
 
@@ -779,6 +783,11 @@ fn annotate(
     )
     .with_radare2_version(doctor::radare2_version());
     let annotations = report.annotations(&merged_functions);
+
+    if plan.r2_script {
+        print!("{}", report.render_r2_script(&merged_functions));
+        return Ok(());
+    }
 
     println!(
         "annotations: {n} (from {act} actionable findings, min_confidence={mc:?})",

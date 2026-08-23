@@ -1,0 +1,50 @@
+R2PM_BEGIN
+
+R2PM_GIT "https://github.com/seifreed/r2SMT"
+R2PM_DESC "SMT-assisted opaque-predicate deobfuscator for radare2 (MIT)"
+R2PM_NEEDS "curl tar"
+
+R2PM_INSTALL() {
+	VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' Cargo.toml)"
+	if [ -z "${VERSION}" ]; then
+		echo "[r2smt] cannot read workspace version" >&2
+		exit 1
+	fi
+
+	TRIPLE=""
+	case "$(uname -s):$(uname -m)" in
+		Darwin:arm64) TRIPLE="aarch64-apple-darwin" ;;
+		Darwin:x86_64) TRIPLE="x86_64-apple-darwin" ;;
+		Linux:aarch64) TRIPLE="aarch64-unknown-linux-gnu" ;;
+		Linux:x86_64) TRIPLE="x86_64-unknown-linux-gnu" ;;
+	esac
+
+	INSTALLED=0
+	if [ "${USE_PREBUILT:-1}" = 1 ] && [ -n "${TRIPLE}" ]; then
+		ARCHIVE="${TMPDIR:-/tmp}/r2smt-v${VERSION}-${TRIPLE}-$$.tar.gz"
+		URL="https://github.com/seifreed/r2SMT/releases/download/v${VERSION}/r2smt-v${VERSION}-${TRIPLE}.tar.gz"
+		echo "[r2smt] fetching ${URL}"
+		if curl -fLsS -o "${ARCHIVE}" "${URL}"; then
+			mkdir -p "${R2PM_BINDIR}"
+			if tar -xzf "${ARCHIVE}" -C "${R2PM_BINDIR}" r2smt; then
+				INSTALLED=1
+			fi
+		fi
+		rm -f "${ARCHIVE}"
+	fi
+
+	if [ "${INSTALLED}" != 1 ]; then
+		echo "[r2smt] prebuilt unavailable; building from source"
+		make user-install || exit 1
+	fi
+
+	mkdir -p "${R2PM_PLUGDIR}"
+	cp r2pm/r2smt.r2 "${R2PM_PLUGDIR}/r2smt.r2"
+}
+
+R2PM_UNINSTALL() {
+	rm -f "${R2PM_BINDIR}/r2smt"
+	rm -f "${R2PM_PLUGDIR}/r2smt.r2"
+}
+
+R2PM_END

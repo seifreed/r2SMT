@@ -7,17 +7,20 @@ manually invoking `cargo`.
 ## Install (local clone)
 
 ```bash
-# from this checkout
-r2pm -ci r2smt
+# from this checkout (use its package database entry)
+R2PM_DBDIR="$PWD/r2pm" r2pm -ci r2smt
 ```
 
-`r2pm -ci` runs `make install` from the cloned r2pm package
-directory. The manifest:
+`r2pm -ci` installs the matching prebuilt release for supported Linux
+and macOS hosts. If that download is unavailable, it falls back to a
+source build. The manifest:
 
-1. Runs `cargo build --release -p r2smt-cli`.
-2. Copies `target/release/r2smt` into r2pm's `BINDIR` (the binary the
-   `!r2smt …` shell-out relies on).
-3. Copies `r2smt.r2` into r2pm's `PLUGDIR` so the cursor-aware macros
+1. Reads the package version from the workspace `Cargo.toml`.
+2. Downloads the matching release archive, or runs
+   `cargo build --release -p r2smt-cli` as a fallback.
+3. Installs `r2smt` into r2pm's `BINDIR` (the binary the
+   `!r2smt ...` shell-out relies on).
+4. Copies `r2smt.r2` into r2pm's `PLUGDIR` so the cursor-aware macros
    are discoverable.
 
 ## Use inside radare2
@@ -41,7 +44,7 @@ run one of the helpers:
 | `$r2smt-solve-deep`   | Same, but with `--deep-analysis` (runs `aaaa` for harder samples).                                   |
 | `$r2smt-ctx`          | `$r2smt-solve` plus r2ghidra / r2dec pseudocode context for the finding.                             |
 | `$r2smt-sweep`        | One-line verdict for **every** branch in the current function (`--function $FB`).                    |
-| `$r2smt-annotate`     | Apply `CCu` comments live to the current r2 session for the branch.                                  |
+| `$r2smt-annotate`     | Generate `CCu` commands in r2SMT and interpret them in the current r2 session.                       |
 | `$r2smt-patch`        | Full-file backup, apply the byte patch, persist a manifest, then refresh the disasm view.            |
 | `$r2smt-patch-dry`    | Show the planned patch without writing anything.                                                     |
 | `$r2smt-rollback`     | Reverse the most recent patch using the sibling manifest, then refresh the disasm view.              |
@@ -61,10 +64,9 @@ r2pm -u r2smt
 
 ## Notes
 
-- Requires `cargo` and a system `libz3` (macOS: `brew install z3`,
-  Debian: `apt-get install libz3-dev`).
+- Prebuilt installs require `curl` and `tar`. Source fallback additionally
+  requires Rust, Cargo, CMake, and a C++ toolchain; Z3 is vendored.
 - The macros shell out to the installed `r2smt` binary; they do not
-  run inside the r2 process. Findings still come from a fresh r2
-  session spawned by r2SMT, so comments applied with
-  `$r2smt-annotate` are visible *after* the macro returns control to
-  the prompt (run `CC` to inspect them).
+  run analysis inside the r2 process. `$r2smt-annotate` is the exception
+  for write-back: radare2 interprets the generated `CCu` commands in the
+  parent session, so `CC` shows the comments immediately.
