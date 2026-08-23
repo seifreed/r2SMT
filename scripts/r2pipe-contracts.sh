@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-binary="${1:-/bin/true}"
+binary="${1:-$(type -P true)}"
 if [[ ! -f "$binary" ]]; then
   echo "contract binary not found: $binary" >&2
   exit 1

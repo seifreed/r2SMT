@@ -74,6 +74,17 @@ impl IrSourceArg {
 /// Top-level subcommand the user invoked.
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Internal subprocess entrypoint used by the analysis watchdog.
+    #[command(name = "__analysis-worker", hide = true)]
+    AnalysisWorker {
+        /// JSON request written by the parent process.
+        #[arg(long)]
+        request: PathBuf,
+        /// JSON result written atomically by the worker.
+        #[arg(long)]
+        result: PathBuf,
+    },
+
     /// Print the build version and exit.
     Version,
 
@@ -821,7 +832,18 @@ pub(crate) enum ConfidenceArg {
 }
 
 /// SMT backend selector exposed via `--solver`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    clap::ValueEnum,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum SolverArg {
     /// Z3 via the in-process `z3` crate (default).
     #[default]

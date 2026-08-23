@@ -8,6 +8,7 @@ use r2smt_ir::program::{Function, Program};
 use r2smt_ir::{BinaryProvider, NameHints};
 use r2smt_slicer::{BranchCandidate, SliceLimits, collect_branches, collect_function_branches};
 use r2smt_solver_port::{Solver, SolverRole};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     Finding, classify_finding_with_pretty, classify_lowered_upstream, dump_program, prepare_ssa,
@@ -15,7 +16,7 @@ use crate::{
 };
 
 /// Knobs used by [`Analyzer::analyze`] when no custom request is needed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalyzerConfig {
     /// Maximum instructions per backward slice.
     pub max_slice_instructions: u32,
@@ -42,7 +43,8 @@ impl Default for AnalyzerConfig {
 }
 
 /// Scope of one analysis request.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "address", rename_all = "snake_case")]
 pub enum AnalysisTarget {
     /// Analyze every conditional branch discovered in the program.
     #[default]
@@ -54,7 +56,7 @@ pub enum AnalysisTarget {
 }
 
 /// Complete request accepted by [`Analyzer::analyze_request`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalysisRequest {
     /// Program scope to analyze.
     pub target: AnalysisTarget,
@@ -62,10 +64,32 @@ pub struct AnalysisRequest {
     pub slicing: SliceLimits,
     /// Solver budgets and deterministic seed.
     pub solving: SolveOptions,
+    /// Maximum functions accepted from the provider before analysis.
+    #[serde(default = "unbounded_items")]
+    pub max_functions: usize,
+    /// Maximum branch candidates accepted before solving.
+    #[serde(default = "unbounded_items")]
+    pub max_branches: usize,
+}
+
+const fn unbounded_items() -> usize {
+    usize::MAX
+}
+
+impl Default for AnalysisRequest {
+    fn default() -> Self {
+        Self {
+            target: AnalysisTarget::All,
+            slicing: SliceLimits::default(),
+            solving: SolveOptions::default(),
+            max_functions: usize::MAX,
+            max_branches: usize::MAX,
+        }
+    }
 }
 
 /// Tool-independent provenance produced by the core engine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalysisProvenance {
     /// Stable solver backend name.
     pub solver: String,
@@ -76,7 +100,7 @@ pub struct AnalysisProvenance {
 }
 
 /// Counts produced by a core analysis run.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalysisMetrics {
     /// Functions discovered by the provider.
     pub functions_analyzed: usize,
@@ -87,7 +111,7 @@ pub struct AnalysisMetrics {
 }
 
 /// Result of one application-level analysis request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalysisResult {
     /// Normalized program loaded from the provider.
     pub program: Program,
@@ -159,6 +183,8 @@ impl Analyzer {
                 timeout_ms: self.config.solver_timeout_ms,
                 ..SolveOptions::default()
             },
+            max_functions: usize::MAX,
+            max_branches: usize::MAX,
         };
         self.analyze_request(provider, solver, &request)
     }
@@ -183,9 +209,23 @@ impl Analyzer {
             ));
         }
         let program = dump_program(provider)?;
+        if program.functions.len() > request.max_functions {
+            return Err(Error::Unsupported(format!(
+                "function limit exceeded: {} > {}",
+                program.functions.len(),
+                request.max_functions
+            )));
+        }
         let mut extra_functions = Vec::new();
         let candidates =
             resolve_candidates(provider, &program, &mut extra_functions, request.target)?;
+        if candidates.len() > request.max_branches {
+            return Err(Error::Unsupported(format!(
+                "branch limit exceeded: {} > {}",
+                candidates.len(),
+                request.max_branches
+            )));
+        }
         let mut findings = Vec::with_capacity(candidates.len());
         let mut hint_cache: BTreeMap<Address, NameHints> = BTreeMap::new();
         for candidate in &candidates {

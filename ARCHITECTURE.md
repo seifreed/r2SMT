@@ -26,6 +26,12 @@ findings. `solve`, `annotate`, `batch`, and patch planning all call this path.
 The CLI remains responsible only for concrete adapter selection, optional
 differential/decompiler enrichment, rendering, and explicit write effects.
 
+Authoritative CLI analysis executes `Analyzer` through an internal worker
+subcommand. The parent enforces a total deadline, aggregate process-group RSS,
+bounded logs/results, function and branch caps, network denial, a temporary
+home, and a read-only host filesystem. Patch writes remain in the parent and
+use the separately documented transaction boundary.
+
 ## Crate responsibilities
 
 | Layer | Crates | Responsibility |

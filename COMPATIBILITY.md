@@ -33,6 +33,22 @@ subset of instructions; unsupported instructions fail closed as described in
 `doctor` reports missing optional tools as unavailable. Their absence does not
 disable the default ESIL plus Z3 path.
 
+## Analysis worker isolation
+
+`solve`, `annotate`, `at`, `patch`, and every `batch` sample run in a
+subprocess group with a 120-second wall-clock deadline, a 2 GiB aggregate RSS
+limit, 1 MiB stdout/stderr caps, and explicit function/branch caps. The worker
+uses an isolated temporary `HOME`, opens the sample read-only, and returns a
+bounded JSON result to the parent.
+
+On macOS the worker requires the system `sandbox-exec`; on Linux it requires
+`bubblewrap`. Both deny networking and expose the host filesystem read-only,
+with writes allowed only inside the worker's temporary directory. If that
+sandbox is unavailable, authoritative analysis fails closed. Windows builds
+currently retain inspection and doctor commands, but authoritative analysis is
+disabled until an equivalent restricted-token/job-object sandbox is available.
+`r2smt doctor` reports the active worker sandbox.
+
 ## Build hosts
 
 Release artifacts target Linux, macOS, and Windows on x86-64 and ARM64. Source

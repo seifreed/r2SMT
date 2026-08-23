@@ -19,6 +19,9 @@ use r2smt_smt::SolveOptions;
 use crate::args::SolverArg;
 use crate::doctor;
 use crate::render::truncate_on_char_boundary;
+use crate::worker::{
+    AnalysisWorkerRequest, MAX_BRANCHES, MAX_FUNCTIONS, MEMORY_MIB, WALL_CLOCK_MS, run_isolated,
+};
 
 /// Inputs needed to stamp a stable report with the exact analysis policy.
 // Mirrors independently named CLI flags into a serde DTO; replacing
@@ -83,6 +86,11 @@ pub(crate) fn report_from_findings(
             esil_flags: run.limits.esil_flags,
             differential_lift: run.differential_lift,
             with_decompiler: run.with_decompiler,
+            worker_isolated: true,
+            worker_wall_clock_ms: WALL_CLOCK_MS,
+            worker_memory_mib: MEMORY_MIB,
+            max_functions: MAX_FUNCTIONS,
+            max_branches: MAX_BRANCHES,
         },
     };
     Ok(Report::from_findings(
@@ -290,24 +298,31 @@ pub(crate) fn compute_findings(
     with_decompiler: bool,
     ir_pcode: bool,
 ) -> Result<(Arch, Vec<Finding>)> {
-    let mut provider = open_provider(file, deep)?;
-    provider.set_attach_pcode(ir_pcode);
-    let result = analyze_provider(&mut provider, at, function_filter, limits, options, solver)?;
+    let result = run_isolated(&AnalysisWorkerRequest::new(
+        file,
+        deep,
+        at,
+        function_filter,
+        limits,
+        options,
+        solver,
+        with_decompiler,
+        ir_pcode,
+    )?)?;
     let arch = result.program.arch;
-    let mut findings = result.findings;
-    if with_decompiler {
-        attach_pseudocode(&mut provider, &mut findings);
-    }
-    Ok((arch, findings))
+    Ok((arch, result.findings))
 }
 
-pub(crate) fn analyze_provider(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn analyze_provider_with_caps(
     provider: &mut dyn BinaryProvider,
     at: Option<&str>,
     function_filter: Option<&str>,
     limits: &SliceLimits,
     options: SolveOptions,
     solver: SolverArg,
+    max_functions: usize,
+    max_branches: usize,
 ) -> Result<AnalysisResult> {
     let target = match (at, function_filter) {
         (Some(raw), None) => AnalysisTarget::Branch(
@@ -325,6 +340,8 @@ pub(crate) fn analyze_provider(
         target,
         slicing: *limits,
         solving: options,
+        max_functions,
+        max_branches,
     };
     Analyzer::default()
         .analyze_request(provider, build_solver(solver).as_ref(), &request)

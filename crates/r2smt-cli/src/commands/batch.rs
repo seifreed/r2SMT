@@ -6,7 +6,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use r2smt_core::Finding;
 use r2smt_report::{BatchOutcome, BatchReport, BatchSampleEntry, BatchSampleSummary, Report};
 use r2smt_slicer::SliceLimits;
 use r2smt_smt::SolveOptions;
@@ -14,9 +13,8 @@ use rayon::ThreadPoolBuilder;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::args::SolverArg;
-use crate::support::{
-    ReportRun, analyze_provider, attach_pseudocode, open_provider, report_from_findings,
-};
+use crate::support::{ReportRun, report_from_findings};
+use crate::worker::{AnalysisWorkerRequest, run_isolated};
 
 /// Analyse one sample end-to-end and return its [`Report`]. Mirrors
 /// the core of `solve()` with no stdout / file side effects, so it is
@@ -35,16 +33,21 @@ fn analyze_one(
     if !file.exists() {
         anyhow::bail!("input file does not exist: {}", file.display());
     }
-    let mut provider = open_provider(file, deep)?;
-    provider.set_attach_pcode(ir_pcode);
-    let result = analyze_provider(&mut provider, None, None, limits, options, solver)?;
+    let result = run_isolated(&AnalysisWorkerRequest::new(
+        file,
+        deep,
+        None,
+        None,
+        limits,
+        options,
+        solver,
+        with_decompiler,
+        ir_pcode,
+    )?)?;
     let arch = result.program.arch;
     let bits = result.program.bits;
     let function_count = result.metrics.functions_analyzed;
-    let mut findings: Vec<Finding> = result.findings;
-    if with_decompiler {
-        attach_pseudocode(&mut provider, &mut findings);
-    }
+    let findings = result.findings;
 
     report_from_findings(
         &ReportRun {

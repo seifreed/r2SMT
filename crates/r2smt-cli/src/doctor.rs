@@ -127,6 +127,7 @@ pub(crate) fn doctor() -> Result<()> {
     println!("z3         {}", solver_version(SolverArg::Z3));
     println!("cvc5       {}", solver_version(SolverArg::Cvc5));
     println!("bitwuzla   {}", solver_version(SolverArg::Bitwuzla));
+    println!("worker     {}", crate::worker::sandbox_status());
     println!(
         "esil flags {} (requires radare2 >= 6.2.0)",
         if esil_flags_supported() {

@@ -35,7 +35,7 @@ pub enum SmtResult {
 /// only set `timeout_ms` keeps its behaviour by spreading
 /// `..SolveOptions::default()`, and the defaults are chosen so the
 /// observable verdict is unchanged unless a caller opts in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SolveOptions {
     /// Per-branch solver budget in milliseconds (wall-clock).
     pub timeout_ms: u32,

@@ -140,7 +140,7 @@ gate_supply_chain() {
 gate_r2pipe_contracts() {
   echo "==> r2pipe contracts"
   cargo test -p r2smt-r2pipe --test contract_fixtures
-  "${SCRIPT_DIR}/r2pipe-contracts.sh" "${R2SMT_SMOKE_BIN:-/bin/true}"
+  "${SCRIPT_DIR}/r2pipe-contracts.sh" "${R2SMT_SMOKE_BIN:-$(type -P true)}"
 }
 
 gate_real_binaries() {

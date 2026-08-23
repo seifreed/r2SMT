@@ -30,10 +30,11 @@ mod render;
 use render::{print_annotation_preview, print_findings_summary};
 mod support;
 use support::{
-    ReportRun, analyze_provider, attach_pseudocode, compute_findings, difflift_scope,
-    dispatch_solver, open_provider, report_from_findings,
+    ReportRun, compute_findings, difflift_scope, dispatch_solver, open_provider,
+    report_from_findings,
 };
 mod commands;
+mod worker;
 use commands::batch::batch;
 use commands::inspect::{analyze, branches, lift, slice, ssa};
 use commands::patch::{PatchCli, patch};
@@ -121,6 +122,9 @@ fn build_solve_options(timeout_ms: Option<u32>, rlimit: Option<u32>) -> SolveOpt
 // for this dispatcher specifically.
 #[allow(clippy::too_many_lines)]
 fn run(cli: Cli) -> Result<()> {
+    if let Command::AnalysisWorker { request, result } = &cli.command {
+        return worker::worker_entry(request, result);
+    }
     if matches!(&cli.command, Command::Version) {
         println!("r2smt {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -139,7 +143,7 @@ fn run(cli: Cli) -> Result<()> {
         );
     }
     match cli.command {
-        Command::Version | Command::Doctor => Ok(()),
+        Command::Version | Command::Doctor | Command::AnalysisWorker { .. } => Ok(()),
         Command::Why {
             file,
             addr,
@@ -727,13 +731,17 @@ fn annotate(
         anyhow::bail!("input file does not exist: {}", file.display());
     }
 
-    let mut provider = open_provider(file, deep)?;
-    // Honour the global `--ir` flag like every other analysis path: without
-    // this the annotate pipeline runs the ESIL lifter regardless, and its
-    // verdicts (and therefore the written comments / saved project) diverge
-    // from `solve --ir pcode` on the same branches.
-    provider.set_attach_pcode(ir_pcode);
-    let result = analyze_provider(&mut provider, at, function_filter, limits, options, solver)?;
+    let result = worker::run_isolated(&worker::AnalysisWorkerRequest::new(
+        file,
+        deep,
+        at,
+        function_filter,
+        limits,
+        options,
+        solver,
+        false,
+        ir_pcode,
+    )?)?;
     let arch = result.program.arch;
     let bits = result.program.bits;
     let function_count = result.metrics.functions_analyzed;
@@ -793,6 +801,7 @@ fn annotate(
         return Ok(());
     }
 
+    let mut provider = open_provider(file, deep)?;
     let mut applied = 0usize;
     for ann in &annotations {
         provider
@@ -859,9 +868,17 @@ fn solve(
         anyhow::bail!("input file does not exist: {}", file.display());
     }
 
-    let mut provider = open_provider(file, deep)?;
-    provider.set_attach_pcode(ir_pcode);
-    let mut result = analyze_provider(&mut provider, at, function_filter, limits, options, solver)?;
+    let mut result = worker::run_isolated(&worker::AnalysisWorkerRequest::new(
+        file,
+        deep,
+        at,
+        function_filter,
+        limits,
+        options,
+        solver,
+        with_decompiler,
+        ir_pcode,
+    )?)?;
     let arch = result.program.arch;
     let bits = result.program.bits;
     let function_count = result.metrics.functions_analyzed;
@@ -878,9 +895,6 @@ fn solve(
         result.findings.extend(dl.findings);
     }
 
-    if with_decompiler {
-        attach_pseudocode(&mut provider, &mut result.findings);
-    }
     let merged_functions: Vec<Function> = result.all_functions().cloned().collect();
     let findings = result.findings;
 

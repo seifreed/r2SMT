@@ -89,6 +89,16 @@ pub struct AnalysisOptions {
     pub differential_lift: bool,
     /// Whether decompiler context was attached.
     pub with_decompiler: bool,
+    /// Whether the authoritative pipeline ran in a sandboxed worker.
+    pub worker_isolated: bool,
+    /// Total per-sample worker deadline.
+    pub worker_wall_clock_ms: u64,
+    /// Aggregate worker process-group RSS limit.
+    pub worker_memory_mib: u64,
+    /// Maximum functions accepted from the provider.
+    pub max_functions: usize,
+    /// Maximum branch candidates accepted before solving.
+    pub max_branches: usize,
 }
 
 /// Stable machine-readable reason for an inconclusive finding.

@@ -208,6 +208,12 @@ impl R2PipeProvider {
             None
         };
         let mut r2 = R2Pipe::spawn(path_str, opts).map_err(Error::r2pipe)?;
+        // Patch addresses are file offsets, not loader-dependent virtual
+        // addresses. Pin the session instead of inheriting ~/.radare2rc;
+        // an isolated worker has a clean HOME while an interactive parent
+        // may not, and mixing the two address spaces corrupts patch plans.
+        r2.cmd("e io.va=false; e io.cache=false; e bin.cache=false")
+            .map_err(Error::r2pipe)?;
         let command = level.command();
         debug!(target: "r2smt::r2pipe", command, "running analysis pass");
         r2.cmd(command).map_err(Error::r2pipe)?;
