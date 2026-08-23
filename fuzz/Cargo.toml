@@ -1,0 +1,48 @@
+[package]
+name = "r2smt-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+serde_json = "1"
+r2smt-common = { path = "../crates/r2smt-common" }
+r2smt-esil = { path = "../crates/r2smt-esil" }
+r2smt-pcode = { path = "../crates/r2smt-pcode" }
+r2smt-patch = { path = "../crates/r2smt-patch" }
+r2smt-report = { path = "../crates/r2smt-report" }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "esil"
+path = "fuzz_targets/esil.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pcode"
+path = "fuzz_targets/pcode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "report_json"
+path = "fuzz_targets/report_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "patch_manifest"
+path = "fuzz_targets/patch_manifest.rs"
+test = false
+doc = false
+bench = false

@@ -117,6 +117,30 @@ impl PatchManifest {
             .map_err(|e| Error::parse("patch_manifest", e.to_string()))
     }
 
+    /// Parse and validate a manifest from JSON text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Parse`] for malformed JSON or an unsupported
+    /// schema version.
+    pub fn from_json(raw: &str) -> Result<Self> {
+        let mut parsed: Self =
+            serde_json::from_str(raw).map_err(|e| Error::parse("patch_manifest", e.to_string()))?;
+        if parsed.manifest_version == 1 {
+            parsed.manifest_version = MANIFEST_VERSION;
+        } else if parsed.manifest_version != MANIFEST_VERSION {
+            return Err(Error::parse(
+                "patch_manifest",
+                format!(
+                    "unsupported manifest version {got} (this build only handles {expected})",
+                    got = parsed.manifest_version,
+                    expected = MANIFEST_VERSION,
+                ),
+            ));
+        }
+        Ok(parsed)
+    }
+
     /// Write the manifest to `path` as pretty-printed JSON.
     ///
     /// # Errors
@@ -141,21 +165,7 @@ impl PatchManifest {
     /// written by a future schema version.
     pub fn read_from(path: impl AsRef<Path>) -> Result<Self> {
         let raw = fs::read_to_string(path)?;
-        let mut parsed: Self = serde_json::from_str(&raw)
-            .map_err(|e| Error::parse("patch_manifest", e.to_string()))?;
-        if parsed.manifest_version == 1 {
-            parsed.manifest_version = MANIFEST_VERSION;
-        } else if parsed.manifest_version != MANIFEST_VERSION {
-            return Err(Error::parse(
-                "patch_manifest",
-                format!(
-                    "unsupported manifest version {got} (this build only handles {expected})",
-                    got = parsed.manifest_version,
-                    expected = MANIFEST_VERSION,
-                ),
-            ));
-        }
-        Ok(parsed)
+        Self::from_json(&raw)
     }
 }
 

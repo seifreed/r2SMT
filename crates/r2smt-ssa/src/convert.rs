@@ -672,4 +672,68 @@ mod tests {
         let ssa = convert_first(&program, Arch::X86);
         assert!(matches!(ssa.status, SliceStatus::Truncated { .. }));
     }
+
+    #[test]
+    fn generated_assignment_sequences_have_unique_monotonic_versions() {
+        const REGS: [&str; 4] = ["rax", "rbx", "rcx", "rdx"];
+        let fixture = one_block_program(vec![
+            insn(
+                0x40_1000,
+                3,
+                "cmp",
+                vec![
+                    op("eax", OperandKind::Register),
+                    op("0", OperandKind::Immediate),
+                ],
+            ),
+            insn(
+                0x40_1003,
+                6,
+                "jne",
+                vec![op("0x401080", OperandKind::Immediate)],
+            ),
+        ]);
+        let branch = collect_branches(&fixture)[0].clone();
+        let register_count = u64::try_from(REGS.len()).expect("register count fits u64");
+
+        for seed in 0_u64..128 {
+            let mut state = seed + 1;
+            let mut statements = Vec::new();
+            let generated_len = 8 + usize::try_from(seed % 24).expect("bounded length");
+            for _ in 0..generated_len {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                let dst = REGS[usize::try_from(state % register_count).expect("bounded index")];
+                let src =
+                    REGS[usize::try_from((state >> 16) % register_count).expect("bounded index")];
+                statements.push(IrStmt::Assign {
+                    dst: Var::new(dst, 64),
+                    src: Expr::add(Expr::var(src, 64), Expr::konst(u128::from(state), 64)),
+                });
+            }
+            let lifted = r2smt_slicer::LiftedSlice {
+                branch: branch.clone(),
+                statements,
+                condition: Expr::eq(Expr::var("rax", 64), Expr::konst(0, 64)),
+                status: SliceStatus::Complete,
+                treat_truncation_as_inputs: false,
+                arch: Arch::X86_64,
+            };
+            let first = ssa_convert(&lifted);
+            let second = ssa_convert(&lifted);
+            assert_eq!(first, second, "seed {seed} must be deterministic");
+
+            let mut next = std::collections::HashMap::<&str, u32>::new();
+            let mut unique = std::collections::HashSet::new();
+            for def in &first.defs {
+                let (base, version) = def.name.rsplit_once('#').expect("versioned definition");
+                let version: u32 = version.parse().expect("numeric SSA version");
+                let expected = next.entry(base).or_default();
+                assert_eq!(version, *expected, "seed {seed}: {}", def.name);
+                *expected += 1;
+                assert!(unique.insert(def.name.as_str()), "duplicate {}", def.name);
+            }
+        }
+    }
 }

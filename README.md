@@ -224,6 +224,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for dependency rules and the runtime flow
 
 Every change must pass the same gates CI enforces (see `scripts/quality-gates.sh`):
 
+Parser and manifest fuzz targets are documented in [FUZZING.md](FUZZING.md)
+and run on the scheduled `Fuzz` workflow.
+
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --exclude r2smt-explore --all-targets --all-features -- -D warnings

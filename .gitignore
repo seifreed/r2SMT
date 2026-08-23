@@ -1,1 +1,3 @@
 target
+fuzz/artifacts
+fuzz/corpus
