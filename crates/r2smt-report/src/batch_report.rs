@@ -57,6 +57,9 @@ pub enum BatchOutcome {
 /// Bounded summary of a single sample's [`Report`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchSampleSummary {
+    /// Exact radare2 version used for this sample.
+    #[serde(default)]
+    pub radare2_version: String,
     /// Target architecture.
     pub arch: Arch,
     /// Pointer width in bits.
@@ -93,6 +96,7 @@ impl BatchSampleSummary {
         let findings_truncated = actionable_total > MAX_FINDINGS_PER_SAMPLE;
         actionable.truncate(MAX_FINDINGS_PER_SAMPLE);
         Self {
+            radare2_version: report.radare2_version.clone(),
             arch: report.arch,
             bits: report.bits,
             functions_analyzed: report.functions_analyzed,

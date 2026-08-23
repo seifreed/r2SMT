@@ -29,6 +29,7 @@ use tracing_subscriber::EnvFilter;
 
 mod args;
 use args::{Cli, Command, SolverArg};
+mod doctor;
 mod render;
 use render::{print_annotation_preview, print_findings_summary};
 mod support;
@@ -123,14 +124,25 @@ fn build_solve_options(timeout_ms: Option<u32>, rlimit: Option<u32>) -> SolveOpt
 // for this dispatcher specifically.
 #[allow(clippy::too_many_lines)]
 fn run(cli: Cli) -> Result<()> {
+    if matches!(&cli.command, Command::Version) {
+        println!("r2smt {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if matches!(&cli.command, Command::Doctor) {
+        return doctor::doctor();
+    }
     let deep = cli.deep_analysis;
     let ir_pcode = cli.ir.wants_pcode();
-    let esil_flags = !cli.no_esil_flags;
+    let esil_flags = !cli.no_esil_flags && doctor::esil_flags_supported();
+    if !cli.no_esil_flags && !esil_flags {
+        warn!(
+            target: "r2smt::compat",
+            radare2_version = doctor::radare2_version(),
+            "disabling ESIL flag lifting; radare2 6.2.0 or newer is required"
+        );
+    }
     match cli.command {
-        Command::Version => {
-            println!("r2smt {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
+        Command::Version | Command::Doctor => Ok(()),
         Command::Why {
             file,
             addr,
@@ -764,7 +776,8 @@ fn annotate(
         bits,
         function_count,
         actionable.clone(),
-    );
+    )
+    .with_radare2_version(doctor::radare2_version());
     let annotations = report.annotations(&merged_functions);
 
     println!(
@@ -916,7 +929,8 @@ fn solve(
             bits,
             function_count,
             findings.clone(),
-        );
+        )
+        .with_radare2_version(doctor::radare2_version());
         if let Some(path) = outputs.json {
             let json = report.render_json().context("serialising report to JSON")?;
             fs::write(path, json).with_context(|| format!("writing JSON to {}", path.display()))?;

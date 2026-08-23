@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::patch_suggestion::suggest_patch;
 
+fn unknown_tool_version() -> String {
+    "unknown".to_string()
+}
+
 /// A single textual annotation derived from a [`Finding`].
 ///
 /// Used both as the source of truth for the `CCu` lines emitted by
@@ -66,6 +70,9 @@ pub struct Report {
     /// r2SMT version string (typically `env!("CARGO_PKG_VERSION")` from
     /// the CLI).
     pub r2smt_version: String,
+    /// Exact radare2 version used for the analysis.
+    #[serde(default = "unknown_tool_version")]
+    pub radare2_version: String,
     /// Display path of the analysed binary.
     pub binary: String,
     /// Target architecture.
@@ -97,6 +104,7 @@ impl Report {
         let branches_analyzed = findings.len();
         Self {
             r2smt_version: version.into(),
+            radare2_version: unknown_tool_version(),
             binary: binary.into(),
             arch,
             bits,
@@ -105,6 +113,13 @@ impl Report {
             summary,
             findings,
         }
+    }
+
+    /// Attach the exact radare2 version used to produce this report.
+    #[must_use]
+    pub fn with_radare2_version(mut self, version: impl Into<String>) -> Self {
+        self.radare2_version = version.into();
+        self
     }
 
     /// Render the report as pretty-printed JSON.
@@ -127,6 +142,7 @@ impl Report {
         let _ = writeln!(s, "| Field | Value |");
         let _ = writeln!(s, "|-------|-------|");
         let _ = writeln!(s, "| r2SMT version | {} |", self.r2smt_version);
+        let _ = writeln!(s, "| radare2 version | {} |", self.radare2_version);
         let _ = writeln!(s, "| Binary | `{}` |", self.binary);
         let _ = writeln!(s, "| Architecture | {:?} ({} bits) |", self.arch, self.bits);
         let _ = writeln!(s, "| Functions analyzed | {} |", self.functions_analyzed);

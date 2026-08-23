@@ -77,6 +77,9 @@ pub(crate) enum Command {
     /// Print the build version and exit.
     Version,
 
+    /// Report runtime dependency versions and compatibility gates.
+    Doctor,
+
     /// Open a binary with radare2 and emit the normalized program.
     Analyze {
         /// Path to the binary to analyze.

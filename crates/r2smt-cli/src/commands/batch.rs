@@ -17,6 +17,7 @@ use rayon::ThreadPoolBuilder;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::args::SolverArg;
+use crate::doctor;
 use crate::support::{
     attach_pseudocode, dispatch_solver, open_provider, resolve_folded_branch, resolve_targets,
 };
@@ -86,7 +87,8 @@ fn analyze_one(
         bits,
         function_count,
         findings,
-    ))
+    )
+    .with_radare2_version(doctor::radare2_version()))
 }
 
 // `clippy::too_many_arguments`: same rationale as `solve` / `annotate`
