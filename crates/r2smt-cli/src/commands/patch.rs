@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use r2smt_common::Arch;
 use r2smt_core::{Confidence, Finding};
-use r2smt_ir::BinaryProvider;
+use r2smt_ir::{BinaryProvider, byte_patcher::BytePatcher};
 use r2smt_patch::{
     ApplyConfig, PatchManifest, PatchStatus, apply_plan, build_plan, rollback_from_manifest,
     sha256_hex, verify_manifest,
@@ -277,9 +277,14 @@ fn post_patch_verify(
             .ok_or_else(|| {
                 anyhow::anyhow!("patched instruction {} did not redecode", record.address)
             })?;
-        if instruction.bytes != expected_bytes
-            || usize::from(instruction.size) != expected_bytes.len()
-        {
+        let bytes_match = if record.strategy == PatchStrategy::NopJcc.as_str() {
+            BytePatcher::read_bytes(&mut provider, record.address, expected_bytes.len())?
+                == expected_bytes
+        } else {
+            instruction.bytes == expected_bytes
+                && usize::from(instruction.size) == expected_bytes.len()
+        };
+        if !bytes_match {
             anyhow::bail!(
                 "patched instruction {} decoded with unexpected bytes or size",
                 record.address
