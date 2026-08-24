@@ -41,7 +41,9 @@ check_json "afvj @ $address" 'type == "object" or type == "array"'
 check_json "iSj" 'type == "array" and all(.[]; (.vaddr | type == "number") and (.vsize | type == "number") and (.perm | type == "string"))'
 
 pdgsd="$(radare2 -2q -e scr.color=false -c "aaa;pdgsd 1 @ $address;q" "$binary")"
-if [[ "$pdgsd" != *"Unknown command"* && "$pdgsd" != *"Cannot find"* ]]; then
+if [[ "$pdgsd" != *"Unknown command"* \
+  && "$pdgsd" != *"Cannot find"* \
+  && "$pdgsd" != *"You need to install the plugin"* ]]; then
   grep -Eq '^0x[0-9a-fA-F]+:' <<<"$pdgsd" || {
     echo "radare2 contract changed for 'pdgsd'" >&2
     printf '%s\n' "$pdgsd" >&2

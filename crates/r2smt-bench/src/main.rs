@@ -248,6 +248,10 @@ fn score(report: &Report, branches: &ExpectedBranches, expected: &ExpectedFindin
                 true_positive += 1;
             } else {
                 false_positive += 1;
+                eprintln!(
+                    "unexpected actionable finding: {:?}:{}",
+                    finding.kind, finding.mnemonic
+                );
             }
         }
     }
