@@ -194,6 +194,14 @@ fn percent(part: usize, total: usize) -> Option<f64> {
     (total != 0.0).then(|| part * 100.0 / total)
 }
 
+fn equivalent_mnemonic(actual: &str, expected: &str) -> bool {
+    if actual == expected {
+        return true;
+    }
+    ["je", "jz", "sete", "setz", "cmove"].contains(&actual)
+        && ["je", "jz", "sete", "setz", "cmove"].contains(&expected)
+}
+
 fn score(report: &Report, branches: &ExpectedBranches, expected: &ExpectedFindings) -> Metrics {
     let mut remaining: Vec<(FindingKind, &str)> = expected
         .actionable
@@ -240,10 +248,9 @@ fn score(report: &Report, branches: &ExpectedBranches, expected: &ExpectedFindin
             solver_disagreements += 1;
         }
         if finding.is_actionable() {
-            if let Some(index) = remaining
-                .iter()
-                .position(|(kind, mnemonic)| *kind == finding.kind && *mnemonic == finding.mnemonic)
-            {
+            if let Some(index) = remaining.iter().position(|(kind, mnemonic)| {
+                *kind == finding.kind && equivalent_mnemonic(&finding.mnemonic, mnemonic)
+            }) {
                 remaining.swap_remove(index);
                 true_positive += 1;
             } else {
@@ -332,5 +339,12 @@ mod tests {
             },
         );
         assert_eq!(metrics.false_actionable_findings, 0);
+    }
+
+    #[test]
+    fn equality_mnemonics_match_across_compilers() {
+        assert!(equivalent_mnemonic("sete", "je"));
+        assert!(equivalent_mnemonic("cmove", "jz"));
+        assert!(!equivalent_mnemonic("setne", "je"));
     }
 }
