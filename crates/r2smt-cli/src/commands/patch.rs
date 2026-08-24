@@ -292,13 +292,11 @@ fn post_patch_verify(
                         .context("original patch size does not fit address")?;
                 expected.as_slice() == [r2smt_common::Address(next)]
                     && function.blocks.iter().any(|candidate| {
-                        candidate
-                            .instructions
-                            .first()
-                            .is_some_and(|instruction| instruction.address.get() == next)
-                            || candidate.instructions.windows(2).any(|pair| {
-                                pair[0].address == record.address && pair[1].address.get() == next
-                            })
+                        candidate.successors.contains(&r2smt_common::Address(next))
+                            || candidate
+                                .instructions
+                                .iter()
+                                .any(|instruction| instruction.address.get() == next)
                     })
             } else {
                 let mut actual = block.successors.clone();
