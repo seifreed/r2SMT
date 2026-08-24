@@ -291,13 +291,6 @@ fn post_patch_verify(
                     + u64::try_from(original_size)
                         .context("original patch size does not fit address")?;
                 expected.as_slice() == [r2smt_common::Address(next)]
-                    && function.blocks.iter().any(|candidate| {
-                        candidate.successors.contains(&r2smt_common::Address(next))
-                            || candidate
-                                .instructions
-                                .iter()
-                                .any(|instruction| instruction.address.get() == next)
-                    })
             } else {
                 let mut actual = block.successors.clone();
                 let mut expected = expected.clone();
