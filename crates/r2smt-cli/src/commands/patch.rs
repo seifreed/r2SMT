@@ -262,6 +262,7 @@ fn post_patch_verify(
     verify_manifest(&mut provider, manifest, file)?;
     for record in &manifest.operations {
         let expected_bytes = record.patched_bytes()?;
+        let original_size = record.original_bytes()?.len();
         let function = provider.load_block_at(record.address)?;
         let (block, instruction) = function
             .blocks
@@ -286,7 +287,9 @@ fn post_patch_verify(
         }
         if let Some(expected) = &record.expected_successors {
             let flow_matches = if record.strategy == PatchStrategy::NopJcc.as_str() {
-                let next = record.address.get() + u64::from(instruction.size);
+                let next = record.address.get()
+                    + u64::try_from(original_size)
+                        .context("original patch size does not fit address")?;
                 expected.as_slice() == [r2smt_common::Address(next)]
                     && function.blocks.iter().any(|candidate| {
                         candidate
