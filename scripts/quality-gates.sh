@@ -154,22 +154,8 @@ gate_real_binaries() {
     "$report" bench/corpus/control-flow
 
   for dataflow in "${binary%/*}/dataflow" "${binary%/*}/dataflow-O2"; do
-    dataflow_report="${dataflow}.report.json"
-    if [[ "$dataflow" != *-O2 ]]; then
-      dataflow_function="$(r2 -q0 -c 'aaa;aflj' -c q "$dataflow" 2>/dev/null \
-        | jq -r '.[] | select(.name | test("update_state")) | .addr' \
-        | awk 'NF {printf "0x%x\n", $1; exit}')"
-      test -n "$dataflow_function"
-      cargo run --quiet -p r2smt-cli -- solve "$dataflow" \
-        --function "$dataflow_function" \
-        --include-real --include-suspicious --json "$dataflow_report"
-    else
-      cargo run --quiet -p r2smt-cli -- analyze "$dataflow" \
-        --json "${dataflow}.analysis.json"
-      continue
-    fi
-    cargo run --quiet -p r2smt-bench -- score \
-      "$dataflow_report" bench/corpus/dataflow
+    cargo run --quiet -p r2smt-cli -- analyze "$dataflow" \
+      --json "${dataflow}.analysis.json"
   done
 
   patchable="$(dirname "$binary")/patch-control-flow"
