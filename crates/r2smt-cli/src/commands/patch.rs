@@ -299,7 +299,11 @@ fn post_patch_verify(
                 actual == expected
             };
             if !flow_matches {
-                anyhow::bail!("CFG postcondition failed at {}", record.address);
+                anyhow::bail!(
+                    "CFG postcondition failed at {} (strategy={}, expected={expected:?}, original_size={original_size})",
+                    record.address,
+                    record.strategy,
+                );
             }
         }
     }
