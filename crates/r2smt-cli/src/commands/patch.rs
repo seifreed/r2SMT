@@ -296,6 +296,16 @@ fn post_patch_verify(
                     + u64::try_from(original_size)
                         .context("original patch size does not fit address")?;
                 expected.as_slice() == [r2smt_common::Address(next)]
+            } else if record.strategy == PatchStrategy::ReplaceJccWithJmp.as_str() {
+                expected.len() == 1
+                    && instruction.operands.iter().any(|operand| {
+                        let raw = operand.raw.trim().trim_start_matches('#');
+                        let value = raw
+                            .strip_prefix("0x")
+                            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                            .or_else(|| raw.parse::<u64>().ok());
+                        value == Some(expected[0].get())
+                    })
             } else {
                 let mut actual = block.successors.clone();
                 let mut expected = expected.clone();
