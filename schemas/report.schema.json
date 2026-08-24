@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/seifreed/r2SMT/schemas/report.schema.json",
+  "title": "r2SMT analysis report",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "r2smt_version",
+    "binary",
+    "arch",
+    "bits",
+    "findings"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "r2smt_version": { "type": "string" },
+    "radare2_version": { "type": "string" },
+    "r2ghidra_version": { "type": "string" },
+    "solver": { "type": "object" },
+    "ir_policy": { "type": "string" },
+    "binary_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{64}$"
+    },
+    "analysis_options": { "type": "object" },
+    "binary": { "type": "string" },
+    "arch": { "type": "string" },
+    "bits": { "type": "integer", "minimum": 1 },
+    "functions_analyzed": { "type": "integer", "minimum": 0 },
+    "branches_analyzed": { "type": "integer", "minimum": 0 },
+    "summary": { "type": "object" },
+    "metrics": { "type": "object" },
+    "diagnostics": { "type": "array" },
+    "findings": { "type": "array" }
+  },
+  "additionalProperties": true
+}

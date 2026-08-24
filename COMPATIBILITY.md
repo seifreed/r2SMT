@@ -45,6 +45,8 @@ MIT binaries. The adapter validates each R2IL JSON sidecar and fails closed if
 the paired ESIL operation is outside r2SMT's strict subset. Its fixture tracks
 r2sleigh master commit `60942f62cdd36717e08544bdfc1dafdd3fa514d9` and R2IL
 format v4; future upstream contract changes must update that fixture first.
+See [docs/R2SLEIGH.md](docs/R2SLEIGH.md) for the bounded adapter contract and
+its current architecture ceiling.
 
 ## Analysis worker isolation
 
