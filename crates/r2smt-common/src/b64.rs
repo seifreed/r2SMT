@@ -12,15 +12,14 @@ const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0
 #[must_use]
 pub fn encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    let mut chunks = input.chunks_exact(3);
-    for chunk in chunks.by_ref() {
+    let (chunks, rem) = input.as_chunks::<3>();
+    for chunk in chunks {
         let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
         out.push(char::from(TABLE[((n >> 18) & 0x3F) as usize]));
         out.push(char::from(TABLE[((n >> 12) & 0x3F) as usize]));
         out.push(char::from(TABLE[((n >> 6) & 0x3F) as usize]));
         out.push(char::from(TABLE[(n & 0x3F) as usize]));
     }
-    let rem = chunks.remainder();
     match rem.len() {
         1 => {
             let n = u32::from(rem[0]) << 16;
