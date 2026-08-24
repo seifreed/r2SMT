@@ -276,14 +276,22 @@ impl R2PipeProvider {
         if name.is_empty() {
             return Err(Error::r2pipe("project name must be non-empty"));
         }
-        if name.chars().any(|c| c == '\n' || c == '\r' || c == ';') {
+        if name
+            .chars()
+            .any(|c| c == '\n' || c == '\r' || c == ';' || c == '/' || c == '\\')
+        {
             return Err(Error::r2pipe(
-                "project name must not contain newlines or ';'",
+                "project name must be a single path component without control characters",
             ));
         }
         let response = self.cmd(&format!("Ps {name}"))?;
         let trimmed = response.trim();
-        if trimmed.to_ascii_lowercase().contains("error") {
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("error")
+            || lower.contains("cannot save project")
+            || lower.contains("invalid project")
+            || lower.contains("does not support projects")
+        {
             return Err(Error::r2pipe(format!("r2 refused 'Ps {name}': {trimmed}")));
         }
         info!(target: "r2smt::r2pipe", project = %name, "saved r2 project");
