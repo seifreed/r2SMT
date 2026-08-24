@@ -29,6 +29,14 @@
       "expected_branches": "control-flow/expected-branches.json",
       "expected_findings": "control-flow/expected-findings.json",
       "expected_patches": "control-flow/expected-patches.json"
+    },
+    {
+      "id": "dataflow",
+      "source": "dataflow/source",
+      "assembly": "dataflow/assembly",
+      "expected_branches": "dataflow/expected-branches.json",
+      "expected_findings": "dataflow/expected-findings.json",
+      "expected_patches": "dataflow/expected-patches.json"
     }
   ]
 }

@@ -153,6 +153,14 @@ gate_real_binaries() {
   cargo run --quiet -p r2smt-bench -- score \
     "$report" bench/corpus/control-flow
 
+  dataflow="$binary"
+  dataflow="${dataflow%/*}/dataflow"
+  dataflow_report="${dataflow}.report.json"
+  cargo run --quiet -p r2smt-cli -- solve "$dataflow" \
+    --include-real --include-suspicious --json "$dataflow_report"
+  cargo run --quiet -p r2smt-bench -- score \
+    "$dataflow_report" bench/corpus/dataflow
+
   patchable="$(dirname "$binary")/patch-control-flow"
   patched="${patchable}.patched"
   manifest="${patched}.r2smt.manifest.json"
