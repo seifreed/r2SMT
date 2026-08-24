@@ -20,6 +20,10 @@ fi
   bench/corpus/dataflow/source/main.c \
   -o "$out/dataflow"
 
+"$cc" -O2 -g0 "${pie_flags[@]}" \
+  bench/corpus/dataflow/source/main.c \
+  -o "$out/dataflow-O2"
+
 case "$(uname -s):$(uname -m)" in
   Darwin:arm64) patch_asm=bench/corpus/control-flow/assembly/patch_aarch64.s ;;
   *) patch_asm=bench/corpus/control-flow/assembly/patch_x86_64.s ;;
