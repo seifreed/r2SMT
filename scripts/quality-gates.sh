@@ -155,8 +155,18 @@ gate_real_binaries() {
 
   for dataflow in "${binary%/*}/dataflow" "${binary%/*}/dataflow-O2"; do
     dataflow_report="${dataflow}.report.json"
-    cargo run --quiet -p r2smt-cli -- solve "$dataflow" \
-      --include-real --include-suspicious --json "$dataflow_report"
+    if [[ "$dataflow" != *-O2 ]]; then
+      dataflow_function="$(r2 -q0 -c 'aaa;afl~update_state' -c q "$dataflow" 2>/dev/null \
+        | awk 'NF && $1 ~ /^0x/ {print $1; exit}')"
+      test -n "$dataflow_function"
+      cargo run --quiet -p r2smt-cli -- solve "$dataflow" \
+        --function "$dataflow_function" \
+        --include-real --include-suspicious --json "$dataflow_report"
+    else
+      cargo run --quiet -p r2smt-cli -- analyze "$dataflow" \
+        --json "${dataflow}.analysis.json"
+      continue
+    fi
     cargo run --quiet -p r2smt-bench -- score \
       "$dataflow_report" bench/corpus/dataflow
   done
