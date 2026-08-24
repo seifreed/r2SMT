@@ -358,7 +358,10 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut command = sandboxed_command(
             python,
-            &["-c".into(), "import socket; socket.socket()".into()],
+            &[
+                "-c".into(),
+                "import socket; socket.create_connection(('1.1.1.1', 80), timeout=1)".into(),
+            ],
             dir.path(),
         )?;
         assert!(!command.status()?.success());
