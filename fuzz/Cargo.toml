@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4.13"
 serde_json = "1"
 r2smt-common = { path = "../crates/r2smt-common" }
+r2smt-difflift = { path = "../crates/r2smt-difflift" }
 r2smt-esil = { path = "../crates/r2smt-esil" }
 r2smt-pcode = { path = "../crates/r2smt-pcode" }
 r2smt-patch = { path = "../crates/r2smt-patch" }
@@ -51,6 +52,13 @@ bench = false
 [[bin]]
 name = "r2il_r2cmd"
 path = "fuzz_targets/r2il_r2cmd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "differential_esil"
+path = "fuzz_targets/differential_esil.rs"
 test = false
 doc = false
 bench = false
