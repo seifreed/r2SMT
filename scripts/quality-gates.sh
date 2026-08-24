@@ -156,8 +156,9 @@ gate_real_binaries() {
   for dataflow in "${binary%/*}/dataflow" "${binary%/*}/dataflow-O2"; do
     dataflow_report="${dataflow}.report.json"
     if [[ "$dataflow" != *-O2 ]]; then
-      dataflow_function="$(r2 -q0 -c 'aaa;afl~update_state' -c q "$dataflow" 2>/dev/null \
-        | awk 'NF && $1 ~ /^0x/ {print $1; exit}')"
+      dataflow_function="$(r2 -q0 -c 'aaa;aflj' -c q "$dataflow" 2>/dev/null \
+        | jq -r '.[] | select(.name | test("update_state")) | .addr' \
+        | awk 'NF {printf "0x%x\n", $1; exit}')"
       test -n "$dataflow_function"
       cargo run --quiet -p r2smt-cli -- solve "$dataflow" \
         --function "$dataflow_function" \
