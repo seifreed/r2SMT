@@ -1,4 +1,4 @@
-#![allow(clippy::print_stdout)]
+#![allow(clippy::print_stderr, clippy::print_stdout)]
 //! Validate and score the public r2SMT benchmark corpus.
 
 use std::collections::{BTreeMap, BTreeSet};
