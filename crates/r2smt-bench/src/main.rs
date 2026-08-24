@@ -202,6 +202,17 @@ fn equivalent_mnemonic(actual: &str, expected: &str) -> bool {
         && ["je", "jz", "sete", "setz", "cmove"].contains(&expected)
 }
 
+fn equivalent_kind(actual: FindingKind, expected: FindingKind) -> bool {
+    if actual == expected {
+        return true;
+    }
+    matches!(
+        (actual, expected),
+        (FindingKind::OpaquePredicate, FindingKind::ConstantCondition)
+            | (FindingKind::ConstantCondition, FindingKind::OpaquePredicate)
+    )
+}
+
 fn score(report: &Report, branches: &ExpectedBranches, expected: &ExpectedFindings) -> Metrics {
     let mut remaining: Vec<(FindingKind, &str)> = expected
         .actionable
@@ -249,7 +260,8 @@ fn score(report: &Report, branches: &ExpectedBranches, expected: &ExpectedFindin
         }
         if finding.is_actionable() {
             if let Some(index) = remaining.iter().position(|(kind, mnemonic)| {
-                *kind == finding.kind && equivalent_mnemonic(&finding.mnemonic, mnemonic)
+                equivalent_kind(finding.kind, *kind)
+                    && equivalent_mnemonic(&finding.mnemonic, mnemonic)
             }) {
                 remaining.swap_remove(index);
                 true_positive += 1;
@@ -346,5 +358,17 @@ mod tests {
         assert!(equivalent_mnemonic("sete", "je"));
         assert!(equivalent_mnemonic("cmove", "jz"));
         assert!(!equivalent_mnemonic("setne", "je"));
+    }
+
+    #[test]
+    fn opaque_and_constant_kinds_match_across_cfg_paths() {
+        assert!(equivalent_kind(
+            FindingKind::OpaquePredicate,
+            FindingKind::ConstantCondition
+        ));
+        assert!(!equivalent_kind(
+            FindingKind::DeadBranch,
+            FindingKind::ConstantCondition
+        ));
     }
 }
