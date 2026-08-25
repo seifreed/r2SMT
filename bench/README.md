@@ -15,3 +15,8 @@ Run the host E2E gate with:
 Metrics that require timing, frontend counters, or a patch transaction are
 serialized as `null` until those values are present in the report rather than
 being fabricated.
+
+The host gate builds and analyzes the ELF cross-target matrix locally. The CI
+`msvc-matrix` job builds the same source with Visual C++ for x86 and x86-64 and
+publishes the COFF fixtures, so compiler coverage is not limited to the host
+toolchain.

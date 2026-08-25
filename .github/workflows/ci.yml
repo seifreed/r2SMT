@@ -174,3 +174,28 @@ jobs:
         with:
           version: 6.2.0
       - run: ./scripts/quality-gates.sh real-binaries
+
+  msvc-matrix:
+    name: MSVC portable matrix
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build MSVC relocatable fixtures
+        shell: pwsh
+        run: ./scripts/build-msvc-matrix.ps1
+      - name: Validate MSVC matrix
+        shell: pwsh
+        run: |
+          $manifest = Get-Content target/r2smt-bench-corpus/portable-matrix-msvc/manifest.json | ConvertFrom-Json
+          if ($manifest.schema_version -ne 1 -or $manifest.fixture -ne "portable-matrix") { throw "invalid matrix manifest" }
+          if (@($manifest.variants).Count -lt 3) { throw "MSVC matrix is incomplete" }
+          if (@($manifest.variants.architecture | Select-Object -Unique).Count -lt 2) { throw "MSVC architecture coverage is incomplete" }
+          foreach ($variant in $manifest.variants) {
+            if ($variant.compiler -ne "msvc" -or -not (Test-Path "target/r2smt-bench-corpus/portable-matrix-msvc/$($variant.artifact)")) {
+              throw "missing MSVC artifact $($variant.artifact)"
+            }
+          }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: portable-matrix-msvc
+          path: target/r2smt-bench-corpus/portable-matrix-msvc
