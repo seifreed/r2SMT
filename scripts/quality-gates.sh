@@ -158,6 +158,15 @@ gate_real_binaries() {
       --json "${dataflow}.analysis.json"
   done
 
+  matrix_dir="${binary%/*}/portable-matrix"
+  "${SCRIPT_DIR}/validate-bench-matrix.sh" "$matrix_dir"
+  cargo build --quiet -p r2smt-cli
+  matrix_cli="${R2SMT_CLI:-${REPO_ROOT}/target/debug/r2smt}"
+  while IFS= read -r artifact; do
+    "$matrix_cli" analyze "$matrix_dir/$artifact" \
+      --json "$matrix_dir/$artifact.analysis.json"
+  done < <(jq -r '.variants[].artifact' "$matrix_dir/manifest.json")
+
   patchable="$(dirname "$binary")/patch-control-flow"
   patched="${patchable}.patched"
   manifest="${patched}.r2smt.manifest.json"
