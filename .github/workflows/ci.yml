@@ -163,7 +163,8 @@ jobs:
           test -f "$plugin"
           test -f "$(r2pm -H R2PM_PLUGDIR)/r2smt.r2"
           ./scripts/r2-plugin-smoke.sh "$plugin" /usr/bin/true
-          corpus="$(./scripts/build-bench-corpus.sh "${RUNNER_TEMP}/r2smt-corpus")"
+          corpus_root="$(./scripts/fetch-bench-corpus.sh "${RUNNER_TEMP}/r2smt-public-corpus")"
+          corpus="$(./scripts/build-bench-corpus.sh "${RUNNER_TEMP}/r2smt-corpus" "$corpus_root")"
           ./scripts/r2pm-annotate-smoke.sh \
             "$cli" "$(dirname "$corpus")/patch-control-flow" \
             "${RUNNER_TEMP}/r2smt-annotate"

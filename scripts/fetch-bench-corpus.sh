@@ -3,7 +3,7 @@
 set -euo pipefail
 
 readonly REPO_URL="${R2SMT_CORPUS_REPO:-https://github.com/seifreed/r2smt-corpus.git}"
-readonly REVISION="${R2SMT_CORPUS_REV:-1766bea7c13e318319b8c1056afcc81b155835ea}"
+readonly REVISION="${R2SMT_CORPUS_REV:-43620f3db954e9a5a671f69fab57980a87a432f3}"
 readonly OUT="${1:-target/r2smt-corpus}"
 
 if [[ -f "$OUT/.r2smt-corpus-revision" ]] \
