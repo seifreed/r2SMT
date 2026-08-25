@@ -2,7 +2,7 @@ R2PM_BEGIN
 
 R2PM_GIT "https://github.com/seifreed/r2SMT"
 R2PM_DESC "SMT-assisted opaque-predicate deobfuscator for radare2 (MIT)"
-R2PM_NEEDS "curl tar"
+R2PM_NEEDS "curl tar make pkg-config cc"
 
 R2PM_INSTALL() {
 	VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' Cargo.toml)"
@@ -35,15 +35,18 @@ R2PM_INSTALL() {
 
 	if [ "${INSTALLED}" != 1 ]; then
 		echo "[r2smt] prebuilt unavailable; building from source"
-		make user-install || exit 1
+		make all || exit 1
+		mkdir -p "${R2PM_BINDIR}"
+		install -m 755 target/release/r2smt "${R2PM_BINDIR}/r2smt"
 	fi
 
-	mkdir -p "${R2PM_PLUGDIR}"
-	cp r2pm/r2smt.r2 "${R2PM_PLUGDIR}/r2smt.r2"
+	make -B plugin-install PLUGDIR="${R2PM_PLUGDIR}" || exit 1
 }
 
 R2PM_UNINSTALL() {
+	LIBEXT="$(r2 -H R2_LIBEXT 2>/dev/null || echo so)"
 	rm -f "${R2PM_BINDIR}/r2smt"
+	rm -f "${R2PM_PLUGDIR}/core_r2smt.${LIBEXT}"
 	rm -f "${R2PM_PLUGDIR}/r2smt.r2"
 }
 
