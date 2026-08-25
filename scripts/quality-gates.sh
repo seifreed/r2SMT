@@ -145,13 +145,24 @@ gate_r2pipe_contracts() {
 
 gate_real_binaries() {
   echo "==> labeled real-binary corpus"
-  cargo run --quiet -p r2smt-bench -- validate bench/corpus
-  binary="$("${SCRIPT_DIR}/build-bench-corpus.sh")"
+  corpus_root="${R2SMT_CORPUS_ROOT:-${REPO_ROOT}/target/r2smt-corpus}"
+  if [[ -z "${R2SMT_CORPUS_ROOT:-}" ]]; then
+    corpus_root="$("${SCRIPT_DIR}/fetch-bench-corpus.sh" "$corpus_root")"
+  fi
+  cargo run --quiet -p r2smt-bench -- validate "$corpus_root"
+  binary="$("${SCRIPT_DIR}/build-bench-corpus.sh" "target/r2smt-bench-corpus" "$corpus_root")"
   report="${binary}.report.json"
   cargo run --quiet -p r2smt-cli -- solve "$binary" \
     --include-real --include-suspicious --json "$report"
   cargo run --quiet -p r2smt-bench -- score \
-    "$report" bench/corpus/control-flow
+    "$report" "$corpus_root/control-flow"
+
+  edge_binary="${binary%/*}/edge-cases"
+  edge_report="${edge_binary}.report.json"
+  cargo run --quiet -p r2smt-cli -- solve "$edge_binary" \
+    --include-real --include-suspicious --json "$edge_report"
+  cargo run --quiet -p r2smt-bench -- score \
+    "$edge_report" "$corpus_root/edge-cases"
 
   for dataflow in "${binary%/*}/dataflow" "${binary%/*}/dataflow-O2"; do
     cargo run --quiet -p r2smt-cli -- analyze "$dataflow" \

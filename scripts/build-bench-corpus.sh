@@ -3,6 +3,7 @@
 set -euo pipefail
 
 out="${1:-target/r2smt-bench-corpus}"
+corpus_root="${2:-bench/corpus}"
 cc="${CC:-cc}"
 clang="${CLANG:-$(command -v clang || true)}"
 gcc="${GCC:-$(command -v gcc || true)}"
@@ -14,25 +15,29 @@ if [[ "$(uname -s)" == Darwin ]]; then
 fi
 
 "$cc" -O0 -g0 "${pie_flags[@]}" \
-  bench/corpus/control-flow/source/main.c \
-  bench/corpus/control-flow/source/opaque.c \
+  "$corpus_root/control-flow/source/main.c" \
+  "$corpus_root/control-flow/source/opaque.c" \
   -o "$out/control-flow"
 
 "$cc" -O0 -g0 "${pie_flags[@]}" \
-  bench/corpus/dataflow/source/main.c \
+  "$corpus_root/dataflow/source/main.c" \
   -o "$out/dataflow"
 
 "$cc" -O2 -g0 "${pie_flags[@]}" \
-  bench/corpus/dataflow/source/main.c \
+  "$corpus_root/dataflow/source/main.c" \
   -o "$out/dataflow-O2"
 
 case "$(uname -s):$(uname -m)" in
-  Darwin:arm64) patch_asm=bench/corpus/control-flow/assembly/patch_aarch64.s ;;
-  *) patch_asm=bench/corpus/control-flow/assembly/patch_x86_64.s ;;
+  Darwin:arm64) patch_asm="$corpus_root/control-flow/assembly/patch_aarch64.s" ;;
+  *) patch_asm="$corpus_root/control-flow/assembly/patch_x86_64.s" ;;
 esac
 "$cc" -O0 -g0 "${pie_flags[@]}" \
-  bench/corpus/control-flow/source/patch_main.c "$patch_asm" \
+  "$corpus_root/control-flow/source/patch_main.c" "$patch_asm" \
   -o "$out/patch-control-flow"
+
+"$cc" -O0 -g0 "${pie_flags[@]}" \
+  "$corpus_root/edge-cases/source/main.c" \
+  -o "$out/edge-cases"
 
 matrix_out="$out/portable-matrix"
 mkdir -p "$matrix_out"
@@ -45,7 +50,7 @@ if [[ -z "$gcc" || ! -x "$gcc" ]]; then
   exit 1
 fi
 
-portable_source=bench/corpus/portable-matrix/source/main.c
+portable_source="$corpus_root/portable-matrix/source/main.c"
 gcc_arch_flags=()
 if [[ "$(uname -s):$(uname -m)" == Darwin:arm64 ]]; then
   gcc_arch_flags=(-arch x86_64)
