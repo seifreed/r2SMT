@@ -13,11 +13,13 @@ grep -q '^CCu ' "$script"
 
 home="$work/home"
 project_name=triage
-mkdir -p "$home"
+data_home="$home/.local/share"
+mkdir -p "$data_home"
 git_config="$home/.gitconfig"
 HOME="$home" GIT_CONFIG_GLOBAL="$git_config" git config --global user.name "r2SMT CI"
 HOME="$home" GIT_CONFIG_GLOBAL="$git_config" git config --global user.email "r2smt-ci@example.invalid"
-HOME="$home" GIT_CONFIG_GLOBAL="$git_config" "$cli" annotate "$binary" --save-project "$project_name" >"$work/annotate.log"
-project="$home/.local/share/radare2/projects/$project_name/rc.r2"
+HOME="$home" XDG_DATA_HOME="$data_home" GIT_CONFIG_GLOBAL="$git_config" \
+  "$cli" annotate "$binary" --save-project "$project_name" >"$work/annotate.log"
+project="$data_home/radare2/projects/$project_name/rc.r2"
 test -s "$project"
 grep -q 'CCu' "$project"
