@@ -123,7 +123,7 @@ for every action and the legacy `$r2smt-*` aliases.
 cargo build --release -p r2smt-explore --features oracle-radius2
 ```
 
-> **Runtime dependency:** `radare2` ≥ 6.1 must be on your `PATH`. On 6.1.x, r2SMT automatically disables ESIL lifting for flag-writing instructions; radare2 ≥ 6.2 enables the fully validated path. Run `r2smt doctor` and see [COMPATIBILITY.md](COMPATIBILITY.md). The CVC5 and Bitwuzla portfolio backends are invoked as external binaries when selected with `--solver`.
+> **Runtime dependency:** `radare2` ≥ 6.2.0 must be on your `PATH` for the validated analysis path. Run `r2smt doctor` and see [COMPATIBILITY.md](COMPATIBILITY.md). The CVC5 and Bitwuzla portfolio backends are invoked as external binaries when selected with `--solver`.
 
 ---
 
@@ -287,7 +287,7 @@ The codebase is safe Rust throughout — no `unsafe`, no `unwrap`/`expect` in pr
 
 - **Rust 1.95+** (edition 2024) to build from source
 - A **C++ toolchain + CMake** to build the vendored Z3
-- **radare2 ≥ 6.1** on `PATH` (≥ 6.2 for ESIL flag lifting)
+- **radare2 ≥ 6.2.0** on `PATH`
 - **pkg-config + a C compiler** to build the native radare2 plugin
 - Optional: **CVC5** / **Bitwuzla** binaries for the portfolio backends
 - Optional: **r2sleigh** for the experimental process-boundary R2IL adapter
