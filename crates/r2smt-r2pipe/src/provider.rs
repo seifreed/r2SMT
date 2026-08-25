@@ -212,7 +212,11 @@ impl R2PipeProvider {
         // addresses. Pin the session instead of inheriting ~/.radare2rc;
         // an isolated worker has a clean HOME while an interactive parent
         // may not, and mixing the two address spaces corrupts patch plans.
-        r2.cmd("e io.va=false; e io.cache=false; e bin.cache=false")
+        // The provider is always driven through r2pipe, never a human tty.
+        // Keep project saves and other commands from waiting for prompts.
+        r2.cmd(
+            "e io.va=false; e io.cache=false; e bin.cache=false; e scr.interactive=false; e prj.prompt=false",
+        )
             .map_err(Error::r2pipe)?;
         let command = level.command();
         debug!(target: "r2smt::r2pipe", command, "running analysis pass");
@@ -284,7 +288,9 @@ impl R2PipeProvider {
                 "project name must be a single path component without control characters",
             ));
         }
+        self.cmd("e scr.interactive=false; e prj.prompt=false")?;
         let response = self.cmd(&format!("Ps {name}"))?;
+        self.cmd("e scr.interactive=false; e prj.prompt=false")?;
         let trimmed = response.trim();
         let lower = trimmed.to_ascii_lowercase();
         if lower.contains("error")
