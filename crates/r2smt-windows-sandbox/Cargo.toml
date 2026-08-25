@@ -1,0 +1,22 @@
+[package]
+name         = "r2smt-windows-sandbox"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+description = "Windows Job Object and outbound firewall isolation for r2SMT workers."
+
+[dependencies]
+windows-sys = { workspace = true }
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code  = "deny"
+
+[lints.clippy]
+all         = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic       = "deny"

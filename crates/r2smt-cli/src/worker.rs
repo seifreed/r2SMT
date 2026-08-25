@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use r2smt_core::AnalysisResult;
 use r2smt_slicer::SliceLimits;
 use r2smt_smt::SolveOptions;
+use r2smt_windows_sandbox::Sandbox;
 use serde::{Deserialize, Serialize};
 
 use crate::args::SolverArg;
@@ -44,7 +45,11 @@ pub(crate) fn sandbox_status() -> &'static str {
             "unavailable (install bubblewrap)"
         }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        "Windows Job Object + outbound Firewall (network denied, temp working directory)"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         "unavailable on this platform"
     }
@@ -121,12 +126,21 @@ pub(crate) fn run_isolated(request: &AnalysisWorkerRequest) -> Result<AnalysisRe
     }
 
     let mut child = command.spawn().context("spawning analysis worker")?;
+    let sandbox = match Sandbox::attach(&child, MEMORY_MIB) {
+        Ok(sandbox) => sandbox,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).context("attaching analysis worker sandbox");
+        }
+    };
     let status = wait_worker(
         &mut child,
         &stdout_path,
         &stderr_path,
         WALL_CLOCK_MS,
         MEMORY_MIB,
+        &sandbox,
     )?;
     if !status.success() {
         anyhow::bail!(
@@ -147,6 +161,7 @@ fn wait_worker(
     stderr_path: &Path,
     wall_clock_ms: u64,
     memory_mib: u64,
+    sandbox: &Sandbox,
 ) -> Result<std::process::ExitStatus> {
     let process_group = child.id();
     let deadline = Instant::now() + Duration::from_millis(wall_clock_ms);
@@ -156,19 +171,19 @@ fn wait_worker(
             return Ok(status);
         }
         if file_len(stdout_path) > MAX_LOG_BYTES || file_len(stderr_path) > MAX_LOG_BYTES {
-            kill_process_tree(child);
+            kill_process_tree(child, sandbox);
             anyhow::bail!("analysis worker exceeded the stdout/stderr limit");
         }
         if Instant::now() >= next_memory_check {
             let rss_kib = process_group_rss_kib(process_group)?;
             if rss_kib > memory_mib * 1024 {
-                kill_process_tree(child);
+                kill_process_tree(child, sandbox);
                 anyhow::bail!("analysis worker exceeded the {memory_mib} MiB memory limit");
             }
             next_memory_check = Instant::now() + Duration::from_millis(MEMORY_POLL_MS);
         }
         if Instant::now() >= deadline {
-            kill_process_tree(child);
+            kill_process_tree(child, sandbox);
             anyhow::bail!("analysis worker exceeded the {wall_clock_ms} ms wall-clock limit");
         }
         std::thread::sleep(Duration::from_millis(POLL_MS));
@@ -218,7 +233,7 @@ fn read_bounded(path: &Path, max: u64) -> Result<String> {
 }
 
 #[cfg(unix)]
-fn kill_process_tree(child: &mut std::process::Child) {
+fn kill_process_tree(child: &mut std::process::Child, _sandbox: &Sandbox) {
     let process_group = format!("-{}", child.id());
     let _ = Command::new("/bin/kill")
         .args(["-KILL", &process_group])
@@ -228,7 +243,8 @@ fn kill_process_tree(child: &mut std::process::Child) {
 }
 
 #[cfg(not(unix))]
-fn kill_process_tree(child: &mut std::process::Child) {
+fn kill_process_tree(child: &mut std::process::Child, sandbox: &Sandbox) {
+    sandbox.terminate();
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -286,8 +302,10 @@ fn sandboxed_command(executable: &Path, args: &[String], temp: &Path) -> Result<
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn sandboxed_command(_executable: &Path, _args: &[String], _temp: &Path) -> Result<Command> {
-    anyhow::bail!("analysis worker isolation is unsupported on this platform")
+fn sandboxed_command(executable: &Path, args: &[String], temp: &Path) -> Result<Command> {
+    let mut command = Command::new(executable);
+    command.args(args).current_dir(temp);
+    Ok(command)
 }
 
 #[cfg(unix)]
@@ -341,7 +359,8 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command.arg("-c").arg("sleep 30 & wait").process_group(0);
         let mut child = command.spawn()?;
-        let Err(error) = wait_worker(&mut child, &stdout, &stderr, 50, MEMORY_MIB) else {
+        let sandbox = Sandbox::attach(&child, MEMORY_MIB)?;
+        let Err(error) = wait_worker(&mut child, &stdout, &stderr, 50, MEMORY_MIB, &sandbox) else {
             anyhow::bail!("slow worker did not time out");
         };
         assert!(error.to_string().contains("wall-clock limit"));

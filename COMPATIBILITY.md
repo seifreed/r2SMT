@@ -65,11 +65,11 @@ bounded JSON result to the parent.
 
 On macOS the worker requires the system `sandbox-exec`; on Linux it requires
 `bubblewrap`. Both deny networking and expose the host filesystem read-only,
-with writes allowed only inside the worker's temporary directory. If that
-sandbox is unavailable, authoritative analysis fails closed. Windows builds
-currently retain inspection and doctor commands, but authoritative analysis is
-disabled until an equivalent restricted-token/job-object sandbox is available.
-`r2smt doctor` reports the active worker sandbox.
+with writes allowed only inside the worker's temporary directory. Windows uses
+a Job Object for process-tree lifetime and memory limits plus outbound
+Windows Firewall rules for the worker and radare2 executables; failure to
+install either control fails closed. `r2smt doctor` reports the active worker
+sandbox.
 
 ## Build hosts
 

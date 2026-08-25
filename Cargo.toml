@@ -25,6 +25,7 @@ sha2               = "0.10"
 hex                = "0.4"
 tempfile           = "3"
 rayon              = "1"
+windows-sys        = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 r2smt-common  = { path = "crates/r2smt-common",  version = "0.4.0" }
 r2smt-ir      = { path = "crates/r2smt-ir",      version = "0.4.0" }
@@ -43,6 +44,7 @@ r2smt-difflift = { path = "crates/r2smt-difflift", version = "0.4.0" }
 r2smt-explore = { path = "crates/r2smt-explore", version = "0.4.0" }
 r2smt-taint   = { path = "crates/r2smt-taint",   version = "0.4.0" }
 r2smt-z3fp    = { path = "crates/r2smt-z3fp",    version = "0.4.0" }
+r2smt-windows-sandbox = { path = "crates/r2smt-windows-sandbox", version = "0.4.0" }
 
 [workspace.lints.rust]
 missing_docs              = "deny"

@@ -1286,6 +1286,7 @@ dependencies = [
  "r2smt-solver-port",
  "r2smt-ssa",
  "r2smt-taint",
+ "r2smt-windows-sandbox",
  "rayon",
  "serde",
  "serde_json",
@@ -1485,6 +1486,13 @@ dependencies = [
  "r2smt-ssa",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "r2smt-windows-sandbox"
+version = "0.4.0"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
