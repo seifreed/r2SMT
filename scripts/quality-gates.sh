@@ -151,18 +151,38 @@ gate_real_binaries() {
   fi
   cargo run --quiet -p r2smt-bench -- validate "$corpus_root"
   binary="$("${SCRIPT_DIR}/build-bench-corpus.sh" "target/r2smt-bench-corpus" "$corpus_root")"
-  report="${binary}.report.json"
-  cargo run --quiet -p r2smt-cli -- solve "$binary" \
-    --include-real --include-suspicious --json "$report"
-  cargo run --quiet -p r2smt-bench -- score \
-    "$report" "$corpus_root/control-flow"
+  metrics_dir="target/r2smt-bench-metrics"
+  rm -rf "$metrics_dir"
+  mkdir -p "$metrics_dir"
 
-  edge_binary="${binary%/*}/edge-cases"
-  edge_report="${edge_binary}.report.json"
-  cargo run --quiet -p r2smt-cli -- solve "$edge_binary" \
-    --include-real --include-suspicious --json "$edge_report"
-  cargo run --quiet -p r2smt-bench -- score \
-    "$edge_report" "$corpus_root/edge-cases"
+  now_ms() {
+    python3 -c 'import time; print(time.time_ns() // 1_000_000)'
+  }
+
+  score_binary() {
+    local fixture="$1"
+    local sample="$2"
+    local report="$metrics_dir/$fixture.report.json"
+    local metrics="$metrics_dir/$fixture.metrics.json"
+    local started finished elapsed raw
+    started="$(now_ms)"
+    cargo run --quiet -p r2smt-cli -- solve "$sample" \
+      --include-real --include-suspicious --json "$report"
+    finished="$(now_ms)"
+    elapsed=$((finished - started))
+    raw="$metrics.raw"
+    cargo run --quiet -p r2smt-bench -- score \
+      "$report" "$corpus_root/${fixture%%-O2}" --elapsed-ms "$elapsed" \
+      --verified-patches 0 --patch-attempts 0 \
+      --rollback-successes 0 --rollback-attempts 0 > "$raw"
+    jq --arg fixture "$fixture" '. + {fixture: $fixture}' "$raw" > "$metrics"
+    rm -f "$raw"
+  }
+
+  score_binary control-flow "$binary"
+  score_binary edge-cases "${binary%/*}/edge-cases"
+  score_binary dataflow "${binary%/*}/dataflow"
+  score_binary dataflow-O2 "${binary%/*}/dataflow-O2"
 
   for dataflow in "${binary%/*}/dataflow" "${binary%/*}/dataflow-O2"; do
     cargo run --quiet -p r2smt-cli -- analyze "$dataflow" \
@@ -206,6 +226,19 @@ gate_real_binaries() {
     postcondition="$(shasum -a 256 "$in_place" | awk '{print $1}')"
   fi
   [[ "$postcondition" == "$precondition" ]]
+
+  jq '.verified_patches = 1
+      | .patch_attempts = 1
+      | .verified_patch_rate = 100
+      | .rollback_successes = 1
+      | .rollback_attempts = 1
+      | .rollback_success_rate = 100' \
+    "$metrics_dir/control-flow.metrics.json" > "$metrics_dir/control-flow.metrics.json.tmp"
+  mv "$metrics_dir/control-flow.metrics.json.tmp" "$metrics_dir/control-flow.metrics.json"
+  aggregate_output="target/r2smt-bench-metrics.json"
+  rm -f "$aggregate_output"
+  "${SCRIPT_DIR}/aggregate-bench-metrics.sh" \
+    "$aggregate_output" "$metrics_dir"/*.metrics.json
 }
 
 main() {

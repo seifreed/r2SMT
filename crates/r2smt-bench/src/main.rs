@@ -85,8 +85,12 @@ struct Metrics {
     expected_branches: usize,
     discovered_branches: usize,
     branch_discovery_recall: Option<f64>,
+    findings: usize,
+    complete_findings: usize,
     complete_slice_percent: Option<f64>,
+    definitive_findings: usize,
     definitive_percent: Option<f64>,
+    true_positive_actionable_findings: usize,
     actionable_precision: Option<f64>,
     false_actionable_findings: usize,
     false_negative_actionable_findings: usize,
@@ -94,9 +98,14 @@ struct Metrics {
     frontend_coverage: BTreeMap<String, usize>,
     lifter_disagreements: usize,
     solver_disagreements: usize,
+    elapsed_ms: Option<u64>,
     elapsed_ms_p50: Option<u64>,
     elapsed_ms_p95: Option<u64>,
+    verified_patches: usize,
+    patch_attempts: usize,
     verified_patch_rate: Option<f64>,
+    rollback_successes: usize,
+    rollback_attempts: usize,
     rollback_success_rate: Option<f64>,
 }
 
@@ -213,7 +222,21 @@ fn equivalent_kind(actual: FindingKind, expected: FindingKind) -> bool {
     )
 }
 
-fn score(report: &Report, branches: &ExpectedBranches, expected: &ExpectedFindings) -> Metrics {
+#[derive(Debug, Default)]
+struct ScoreOptions {
+    elapsed_ms: Option<u64>,
+    verified_patches: usize,
+    patch_attempts: usize,
+    rollback_successes: usize,
+    rollback_attempts: usize,
+}
+
+fn score(
+    report: &Report,
+    branches: &ExpectedBranches,
+    expected: &ExpectedFindings,
+    options: &ScoreOptions,
+) -> Metrics {
     let mut remaining: Vec<(FindingKind, &str)> = expected
         .actionable
         .iter()
@@ -283,8 +306,12 @@ fn score(report: &Report, branches: &ExpectedBranches, expected: &ExpectedFindin
             report.branches_analyzed.min(branches.total),
             branches.total,
         ),
+        findings: report.findings.len(),
+        complete_findings: complete,
         complete_slice_percent: percent(complete, report.findings.len()),
+        definitive_findings: definitive,
         definitive_percent: percent(definitive, report.findings.len()),
+        true_positive_actionable_findings: true_positive,
         actionable_precision: percent(true_positive, true_positive + false_positive),
         false_actionable_findings: false_positive,
         false_negative_actionable_findings: remaining.len(),
@@ -292,28 +319,64 @@ fn score(report: &Report, branches: &ExpectedBranches, expected: &ExpectedFindin
         frontend_coverage: BTreeMap::new(),
         lifter_disagreements,
         solver_disagreements,
-        elapsed_ms_p50: None,
-        elapsed_ms_p95: None,
-        verified_patch_rate: None,
-        rollback_success_rate: None,
+        elapsed_ms: options.elapsed_ms,
+        elapsed_ms_p50: options.elapsed_ms,
+        elapsed_ms_p95: options.elapsed_ms,
+        verified_patches: options.verified_patches,
+        patch_attempts: options.patch_attempts,
+        verified_patch_rate: percent(options.verified_patches, options.patch_attempts),
+        rollback_successes: options.rollback_successes,
+        rollback_attempts: options.rollback_attempts,
+        rollback_success_rate: percent(options.rollback_successes, options.rollback_attempts),
     }
 }
 
-fn score_files(report_path: &Path, fixture_root: &Path) -> Result<()> {
+fn score_files(report_path: &Path, fixture_root: &Path, options: &ScoreOptions) -> Result<Metrics> {
     let report: Report = read_json(report_path)?;
     let branches: ExpectedBranches = read_json(&fixture_root.join("expected-branches.json"))?;
     let expected: ExpectedFindings = read_json(&fixture_root.join("expected-findings.json"))?;
     if branches.schema_version != 1 || expected.schema_version != 1 {
         bail!("unsupported expectation schema version");
     }
-    let metrics = score(&report, &branches, &expected);
-    println!("{}", serde_json::to_string_pretty(&metrics)?);
+    let metrics = score(&report, &branches, &expected, options);
     if metrics.false_actionable_findings != 0 {
         bail!(
             "{} false actionable finding(s)",
             metrics.false_actionable_findings
         );
     }
+    Ok(metrics)
+}
+
+fn score_command(args: &[String]) -> Result<()> {
+    if args.len() < 2 {
+        bail!(
+            "usage: r2smt-bench score <report.json> <fixture-dir> \
+             [--elapsed-ms N] [--verified-patches N] [--patch-attempts N] \
+             [--rollback-successes N] [--rollback-attempts N]"
+        );
+    }
+    let mut options = ScoreOptions::default();
+    let mut index = 2;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))?
+            .parse::<u64>()
+            .with_context(|| format!("invalid value for {flag}"))?;
+        match flag {
+            "--elapsed-ms" => options.elapsed_ms = Some(value),
+            "--verified-patches" => options.verified_patches = usize::try_from(value)?,
+            "--patch-attempts" => options.patch_attempts = usize::try_from(value)?,
+            "--rollback-successes" => options.rollback_successes = usize::try_from(value)?,
+            "--rollback-attempts" => options.rollback_attempts = usize::try_from(value)?,
+            _ => bail!("unknown score option: {flag}"),
+        }
+        index += 2;
+    }
+    let metrics = score_files(Path::new(&args[0]), Path::new(&args[1]), &options)?;
+    println!("{}", serde_json::to_string_pretty(&metrics)?);
     Ok(())
 }
 
@@ -321,9 +384,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.as_slice() {
         [command, root] if command == "validate" => validate(Path::new(root)),
-        [command, report, fixture] if command == "score" => {
-            score_files(Path::new(report), Path::new(fixture))
-        }
+        [command, ..] if command == "score" => score_command(&args[1..]),
         _ => bail!("usage: r2smt-bench validate <corpus> | score <report.json> <fixture-dir>"),
     }
 }
@@ -349,6 +410,7 @@ mod tests {
                 schema_version: 1,
                 actionable: Vec::new(),
             },
+            &ScoreOptions::default(),
         );
         assert_eq!(metrics.false_actionable_findings, 0);
     }
