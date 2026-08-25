@@ -183,6 +183,8 @@ gate_real_binaries() {
   score_binary edge-cases "${binary%/*}/edge-cases"
   score_binary dataflow "${binary%/*}/dataflow"
   score_binary dataflow-O2 "${binary%/*}/dataflow-O2"
+  score_binary loop-memory "${binary%/*}/loop-memory"
+  score_binary signed-unsigned "${binary%/*}/signed-unsigned"
 
   for dataflow in "${binary%/*}/dataflow" "${binary%/*}/dataflow-O2"; do
     cargo run --quiet -p r2smt-cli -- analyze "$dataflow" \

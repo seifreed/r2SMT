@@ -39,6 +39,14 @@ esac
   "$corpus_root/edge-cases/source/main.c" \
   -o "$out/edge-cases"
 
+"$cc" -O0 -g0 "${pie_flags[@]}" \
+  "$corpus_root/loop-memory/source/main.c" \
+  -o "$out/loop-memory"
+
+"$cc" -O0 -g0 "${pie_flags[@]}" \
+  "$corpus_root/signed-unsigned/source/main.c" \
+  -o "$out/signed-unsigned"
+
 matrix_out="$out/portable-matrix"
 mkdir -p "$matrix_out"
 if [[ -z "$clang" || ! -x "$clang" ]]; then
