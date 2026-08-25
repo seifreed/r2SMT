@@ -168,6 +168,7 @@ gate_real_binaries() {
     local report="$metrics_dir/$fixture.report.json"
     local metrics="$metrics_dir/$fixture.metrics.json"
     local started finished elapsed raw
+    echo "==> scoring fixture ${fixture}"
     started="$(now_ms)"
     "$cli" solve "$sample" \
       --include-real --include-suspicious --json "$report"
