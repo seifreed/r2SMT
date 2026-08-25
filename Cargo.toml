@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version    = "0.3.0"
+version    = "0.4.0"
 edition    = "2024"
 license    = "MIT"
 repository = "https://github.com/seifreed/r2SMT"
@@ -26,23 +26,23 @@ hex                = "0.4"
 tempfile           = "3"
 rayon              = "1"
 
-r2smt-common  = { path = "crates/r2smt-common",  version = "0.3.0" }
-r2smt-ir      = { path = "crates/r2smt-ir",      version = "0.3.0" }
-r2smt-r2pipe  = { path = "crates/r2smt-r2pipe",  version = "0.3.0" }
-r2smt-r2il    = { path = "crates/r2smt-r2il",    version = "0.3.0" }
-r2smt-esil    = { path = "crates/r2smt-esil",    version = "0.3.0" }
-r2smt-pcode   = { path = "crates/r2smt-pcode",   version = "0.3.0" }
-r2smt-slicer  = { path = "crates/r2smt-slicer",  version = "0.3.0" }
-r2smt-ssa     = { path = "crates/r2smt-ssa",     version = "0.3.0" }
-r2smt-solver-port = { path = "crates/r2smt-solver-port", version = "0.3.0" }
-r2smt-smt     = { path = "crates/r2smt-smt",     version = "0.3.0" }
-r2smt-core    = { path = "crates/r2smt-core",    version = "0.3.0" }
-r2smt-report  = { path = "crates/r2smt-report",  version = "0.3.0" }
-r2smt-patch   = { path = "crates/r2smt-patch",   version = "0.3.0" }
-r2smt-difflift = { path = "crates/r2smt-difflift", version = "0.3.0" }
-r2smt-explore = { path = "crates/r2smt-explore", version = "0.3.0" }
-r2smt-taint   = { path = "crates/r2smt-taint",   version = "0.3.0" }
-r2smt-z3fp    = { path = "crates/r2smt-z3fp",    version = "0.3.0" }
+r2smt-common  = { path = "crates/r2smt-common",  version = "0.4.0" }
+r2smt-ir      = { path = "crates/r2smt-ir",      version = "0.4.0" }
+r2smt-r2pipe  = { path = "crates/r2smt-r2pipe",  version = "0.4.0" }
+r2smt-r2il    = { path = "crates/r2smt-r2il",    version = "0.4.0" }
+r2smt-esil    = { path = "crates/r2smt-esil",    version = "0.4.0" }
+r2smt-pcode   = { path = "crates/r2smt-pcode",   version = "0.4.0" }
+r2smt-slicer  = { path = "crates/r2smt-slicer",  version = "0.4.0" }
+r2smt-ssa     = { path = "crates/r2smt-ssa",     version = "0.4.0" }
+r2smt-solver-port = { path = "crates/r2smt-solver-port", version = "0.4.0" }
+r2smt-smt     = { path = "crates/r2smt-smt",     version = "0.4.0" }
+r2smt-core    = { path = "crates/r2smt-core",    version = "0.4.0" }
+r2smt-report  = { path = "crates/r2smt-report",  version = "0.4.0" }
+r2smt-patch   = { path = "crates/r2smt-patch",   version = "0.4.0" }
+r2smt-difflift = { path = "crates/r2smt-difflift", version = "0.4.0" }
+r2smt-explore = { path = "crates/r2smt-explore", version = "0.4.0" }
+r2smt-taint   = { path = "crates/r2smt-taint",   version = "0.4.0" }
+r2smt-z3fp    = { path = "crates/r2smt-z3fp",    version = "0.4.0" }
 
 [workspace.lints.rust]
 missing_docs              = "deny"
