@@ -149,7 +149,10 @@ gate_real_binaries() {
   if [[ -z "${R2SMT_CORPUS_ROOT:-}" ]]; then
     corpus_root="$("${SCRIPT_DIR}/fetch-bench-corpus.sh" "$corpus_root")"
   fi
-  cargo run --quiet -p r2smt-bench -- validate "$corpus_root"
+  cargo build --quiet -p r2smt-cli -p r2smt-bench
+  cli="${R2SMT_CLI:-${REPO_ROOT}/target/debug/r2smt}"
+  bench="${R2SMT_BENCH:-${REPO_ROOT}/target/debug/r2smt-bench}"
+  "$bench" validate "$corpus_root"
   binary="$("${SCRIPT_DIR}/build-bench-corpus.sh" "target/r2smt-bench-corpus" "$corpus_root")"
   metrics_dir="target/r2smt-bench-metrics"
   rm -rf "$metrics_dir"
@@ -166,12 +169,12 @@ gate_real_binaries() {
     local metrics="$metrics_dir/$fixture.metrics.json"
     local started finished elapsed raw
     started="$(now_ms)"
-    cargo run --quiet -p r2smt-cli -- solve "$sample" \
+    "$cli" solve "$sample" \
       --include-real --include-suspicious --json "$report"
     finished="$(now_ms)"
     elapsed=$((finished - started))
     raw="$metrics.raw"
-    cargo run --quiet -p r2smt-bench -- score \
+    "$bench" score \
       "$report" "$corpus_root/${fixture%%-O2}" --elapsed-ms "$elapsed" \
       --verified-patches 0 --patch-attempts 0 \
       --rollback-successes 0 --rollback-attempts 0 > "$raw"
@@ -187,14 +190,13 @@ gate_real_binaries() {
   score_binary signed-unsigned "${binary%/*}/signed-unsigned"
 
   for dataflow in "${binary%/*}/dataflow" "${binary%/*}/dataflow-O2"; do
-    cargo run --quiet -p r2smt-cli -- analyze "$dataflow" \
+    "$cli" analyze "$dataflow" \
       --json "${dataflow}.analysis.json"
   done
 
   matrix_dir="${binary%/*}/portable-matrix"
   "${SCRIPT_DIR}/validate-bench-matrix.sh" "$matrix_dir"
-  cargo build --quiet -p r2smt-cli
-  matrix_cli="${R2SMT_CLI:-${REPO_ROOT}/target/debug/r2smt}"
+  matrix_cli="$cli"
   while IFS= read -r artifact; do
     "$matrix_cli" analyze "$matrix_dir/$artifact" \
       --json "$matrix_dir/$artifact.analysis.json"
@@ -209,19 +211,19 @@ gate_real_binaries() {
   else
     precondition="$(shasum -a 256 "$patchable" | awk '{print $1}')"
   fi
-  cargo run --quiet -p r2smt-cli -- patch "$patchable" \
+  "$cli" patch "$patchable" \
     --apply --expect-sha256 "$precondition" --output "$patched"
-  cargo run --quiet -p r2smt-cli -- patch "$patched" --verify-only
+  "$cli" patch "$patched" --verify-only
 
   in_place="${patchable}.in-place"
   backup="${in_place}.r2smt.bak"
   in_place_manifest="${in_place}.r2smt.manifest.json"
   rm -f "$in_place" "$backup" "$in_place_manifest"
   cp "$patchable" "$in_place"
-  cargo run --quiet -p r2smt-cli -- patch "$in_place" \
+  "$cli" patch "$in_place" \
     --apply --expect-sha256 "$precondition" --in-place --backup "$backup"
-  cargo run --quiet -p r2smt-cli -- patch "$in_place" --verify-only
-  cargo run --quiet -p r2smt-cli -- patch "$in_place" --rollback
+  "$cli" patch "$in_place" --verify-only
+  "$cli" patch "$in_place" --rollback
   if command -v sha256sum >/dev/null 2>&1; then
     postcondition="$(sha256sum "$in_place" | awk '{print $1}')"
   else
