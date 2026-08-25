@@ -184,6 +184,19 @@ jobs:
           path: target/r2smt-bench-metrics.json
           if-no-files-found: error
 
+  unicorn-differential:
+    name: Unicorn external differential
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Install Python execution oracles
+        run: python3 -m pip install --disable-pip-version-check --user unicorn==2.1.4 capstone==5.0.3 keystone-engine==0.9.2
+      - name: Install radare2
+        uses: radareorg/github-actions@4ae27a8b29a049ac0fd5119f6eda37ecfc64ead8 # main 2026-08-23
+        with:
+          version: 6.2.0
+      - run: python3 scripts/unicorn-differential.py --iterations 8
+
   msvc-matrix:
     name: MSVC portable matrix
     runs-on: windows-latest
