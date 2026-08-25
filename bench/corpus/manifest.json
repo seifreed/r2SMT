@@ -37,6 +37,14 @@
       "expected_branches": "dataflow/expected-branches.json",
       "expected_findings": "dataflow/expected-findings.json",
       "expected_patches": "dataflow/expected-patches.json"
+    },
+    {
+      "id": "portable-matrix",
+      "source": "portable-matrix/source",
+      "assembly": "portable-matrix/assembly",
+      "expected_branches": "portable-matrix/expected-branches.json",
+      "expected_findings": "portable-matrix/expected-findings.json",
+      "expected_patches": "portable-matrix/expected-patches.json"
     }
   ]
 }
