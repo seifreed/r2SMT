@@ -7,6 +7,7 @@ use std::thread;
 #[cfg(windows)]
 use std::time::Duration;
 
+#[cfg(windows)]
 use r2smt_windows_sandbox::Sandbox;
 
 #[cfg(windows)]
