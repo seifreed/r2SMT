@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add an auto-loaded native radare2 core plugin with direct file/seek/function
+  state, parent-session annotations, ABI-local builds, and smoke coverage.
+- Replace shell-dependent `$r2smt-*` macros whose seek/function substitutions
+  and multi-command patch aliases were invalid on current radare2.
+
 ## 0.3.0 - 2026-08-23
 
 - Gate radare2 capabilities and verify 6.1.8, 6.2.0, and master in CI.

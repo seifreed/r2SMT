@@ -85,6 +85,37 @@ cargo build --release
 ./target/release/r2smt version
 ```
 
+### radare2 Plugin
+
+The r2pm package installs both the CLI and a native core plugin compiled
+against the active radare2 ABI:
+
+```bash
+# From this checkout
+R2PM_DBDIR="$PWD/r2pm" r2pm -ci r2smt
+
+# Or install/symlink a development checkout directly
+make user-install
+# make symstall
+```
+
+The plugin is auto-loaded by r2; no `-i` script is needed:
+
+```text
+$ r2 sample
+[0x00401000]> aaa
+[0x00401000]> r2smt?
+[0x00401000]> r2smt explain
+[0x00401000]> r2smt sweep
+[0x00401000]> r2smt annotate
+```
+
+It is a thin in-process bridge: file, seek, and function state come directly
+from the current r2 session, while the isolated Rust CLI performs the analysis.
+`r2smt patch` writes a verified sibling file; `r2smt rollback` reopens the
+current file after a manifest-backed rollback. See [r2pm/README.md](r2pm/README.md)
+for every action and the legacy `$r2smt-*` aliases.
+
 ### Optional Features
 
 ```bash
@@ -257,6 +288,7 @@ The codebase is safe Rust throughout — no `unsafe`, no `unwrap`/`expect` in pr
 - **Rust 1.95+** (edition 2024) to build from source
 - A **C++ toolchain + CMake** to build the vendored Z3
 - **radare2 ≥ 6.1** on `PATH` (≥ 6.2 for ESIL flag lifting)
+- **pkg-config + a C compiler** to build the native radare2 plugin
 - Optional: **CVC5** / **Bitwuzla** binaries for the portfolio backends
 - Optional: **r2sleigh** for the experimental process-boundary R2IL adapter
 

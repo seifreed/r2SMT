@@ -21,6 +21,12 @@ Architecture support means the pipeline recognizes and models a documented
 subset of instructions; unsupported instructions fail closed as described in
 [SOUNDNESS.md](SOUNDNESS.md).
 
+The optional `core_r2smt` integration is a native r2 core plugin. It is built
+locally by `r2pm -ci r2smt` (or `make plugin`) against the active radare2 ABI,
+then auto-loaded from `R2_USER_PLUGINS`. The plugin supports the same radare2
+6.1+ range as the CLI and delegates authoritative analysis to the isolated
+`r2smt` executable. Set `R2SMT_CLI` when that executable is outside `PATH`.
+
 ## Optional tools
 
 | Tool | Purpose | Required |

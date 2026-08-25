@@ -155,7 +155,10 @@ jobs:
           USE_PREBUILT=0 R2PM_GITSKIP=1 r2pm -i r2smt
           cli="$(r2pm -H R2PM_BINDIR)/r2smt"
           "$cli" version
+          plugin="$(r2pm -H R2PM_PLUGDIR)/core_r2smt.$(r2 -H R2_LIBEXT)"
+          test -f "$plugin"
           test -f "$(r2pm -H R2PM_PLUGDIR)/r2smt.r2"
+          ./scripts/r2-plugin-smoke.sh "$plugin" /usr/bin/true
           corpus="$(./scripts/build-bench-corpus.sh "${RUNNER_TEMP}/r2smt-corpus")"
           ./scripts/r2pm-annotate-smoke.sh \
             "$cli" "$(dirname "$corpus")/patch-control-flow" \

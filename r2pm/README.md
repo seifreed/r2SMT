@@ -1,8 +1,7 @@
 # r2SMT — r2pm package
 
 This directory ships an [r2pm](https://github.com/radareorg/radare2-pm)
-manifest so radare2 users can install the `r2smt` CLI without
-manually invoking `cargo`.
+manifest for the `r2smt` CLI and its native radare2 core plugin.
 
 ## Install (local clone)
 
@@ -11,50 +10,59 @@ manually invoking `cargo`.
 R2PM_DBDIR="$PWD/r2pm" r2pm -ci r2smt
 ```
 
-`r2pm -ci` installs the matching prebuilt release for supported Linux
-and macOS hosts. If that download is unavailable, it falls back to a
-source build. The manifest:
+`r2pm -ci` installs the matching prebuilt CLI for supported Linux and macOS
+hosts. If that download is unavailable, it falls back to a source build. The
+small core plugin is always compiled locally so its ABI matches the installed
+radare2. The manifest:
 
 1. Reads the package version from the workspace `Cargo.toml`.
 2. Downloads the matching release archive, or runs
    `cargo build --release -p r2smt-cli` as a fallback.
-3. Installs `r2smt` into r2pm's `BINDIR` (the binary the
-   `!r2smt ...` shell-out relies on).
-4. Copies `r2smt.r2` into r2pm's `PLUGDIR` so the cursor-aware macros
-   are discoverable.
+3. Installs `r2smt` into r2pm's `BINDIR`.
+4. Builds and installs `core_r2smt` into r2pm's `PLUGDIR`, where r2 discovers
+   it automatically.
+5. Installs `r2smt.r2` as an optional compatibility layer for the old
+   `$r2smt-*` aliases.
 
 ## Use inside radare2
 
-Load the macros and your binary in one shot:
+Open a binary normally. The native plugin is auto-loaded:
+
+```text
+$ r2 sample.exe
+[0x00401000]> aaa
+[0x00401000]> r2smt explain
+```
+
+Position the cursor on a conditional branch and use one of these actions:
+
+| Command | Behaviour |
+|---|---|
+| `r2smt` / `r2smt at` | One-line verdict for the branch at the current seek. |
+| `r2smt explain` | Verdict plus solver-simplified formula and slice evidence. |
+| `r2smt ctx` | Verdict plus best-effort r2ghidra/r2dec context. |
+| `r2smt solve` | Full finding for the branch at the current seek. |
+| `r2smt solve-deep` | Same after radare2's deeper `aaaa` analysis. |
+| `r2smt sweep` | Solve every branch in the current analyzed function. |
+| `r2smt annotate` | Generate `CCu` commands and apply them in the parent r2 session. |
+| `r2smt patch` | Apply a high-confidence patch to a verified sibling `.r2smt.patched` file. |
+| `r2smt patch-dry` | Show the patch plan and required input SHA-256 without writing. |
+| `r2smt rollback` | Restore an in-place patch from its manifest, then reopen the file in r2. |
+| `r2smt doctor` | Report dependency versions and compatibility gates. |
+
+Additional CLI options may follow each action, for example
+`r2smt explain --solver portfolio`. Set `R2SMT_CLI=/path/to/r2smt` to override
+the companion executable. Analysis output uses stable file offsets because the
+CLI pins `io.va=false`; live annotations are rebased to the parent r2 session's
+virtual addresses by the plugin.
+
+The old aliases remain available when explicitly requested:
 
 ```bash
 r2 -i "$(r2pm -H R2PM_PLUGDIR)/r2smt.r2" sample.exe
 ```
 
-From the r2 prompt, position the cursor on a conditional branch and
-run one of the helpers:
-
-| Macro                 | Behaviour                                                                                            |
-|-----------------------|------------------------------------------------------------------------------------------------------|
-| `$r2smt-at`           | One-line verdict for the branch under the cursor (terse; quick check).                               |
-| `$r2smt-at-v`         | Same, plus the solver-simplified formula and slice evidence (`--explain`).                           |
-| `$r2smt-at-ctx`       | Verdict plus the owning function's decompiled pseudocode (`--with-decompiler`).                      |
-| `$r2smt-at-patch`     | Verdict, apply the high-confidence patch, then `oo; pd 8` so the patched bytes show in the view.     |
-| `$r2smt-solve`        | Classify the branch under the cursor (`opaque_predicate` / `dead_branch` / …) and print the report.  |
-| `$r2smt-solve-deep`   | Same, but with `--deep-analysis` (runs `aaaa` for harder samples).                                   |
-| `$r2smt-ctx`          | `$r2smt-solve` plus r2ghidra / r2dec pseudocode context for the finding.                             |
-| `$r2smt-sweep`        | One-line verdict for **every** branch in the current function (`--function $FB`).                    |
-| `$r2smt-annotate`     | Generate `CCu` commands in r2SMT and interpret them in the current r2 session.                       |
-| `$r2smt-patch`        | Full-file backup, apply the byte patch, persist a manifest, then refresh the disasm view.            |
-| `$r2smt-patch-dry`    | Show the planned patch without writing anything.                                                     |
-| `$r2smt-rollback`     | Reverse the most recent patch using the sibling manifest, then refresh the disasm view.              |
-
-After a patch, the `-patch` / `-rollback` macros run `oo` (reopen the
-now-modified file) and `pd 8` so the live disassembly reflects the
-change immediately — the closest CLI/macro analog to IDA's
-`plan_and_wait` post-patch reanalysis. The decompiler macros are
-best-effort: with no r2ghidra / r2dec plugin present they simply omit
-the context block.
+They now delegate to the native command, avoiding shell expansion of r2 state.
 
 ## Uninstall
 
@@ -64,9 +72,8 @@ r2pm -u r2smt
 
 ## Notes
 
-- Prebuilt installs require `curl` and `tar`. Source fallback additionally
-  requires Rust, Cargo, CMake, and a C++ toolchain; Z3 is vendored.
-- The macros shell out to the installed `r2smt` binary; they do not
-  run analysis inside the r2 process. `$r2smt-annotate` is the exception
-  for write-back: radare2 interprets the generated `CCu` commands in the
-  parent session, so `CC` shows the comments immediately.
+- Installation requires `make`, `pkg-config`, and a C compiler for the native
+  bridge. Prebuilt CLI installs also require `curl` and `tar`; source fallback
+  additionally requires Rust, Cargo, CMake, and a C++ toolchain.
+- Analysis remains out of process and uses r2SMT's worker isolation. Only the
+  small session bridge and generated annotation commands run inside r2.
