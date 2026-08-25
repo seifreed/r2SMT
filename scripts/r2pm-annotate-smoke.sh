@@ -14,6 +14,8 @@ grep -q '^CCu ' "$script"
 home="$work/home"
 project_name=triage
 mkdir -p "$home"
+HOME="$home" git config --global user.name "r2SMT CI"
+HOME="$home" git config --global user.email "r2smt-ci@example.invalid"
 HOME="$home" "$cli" annotate "$binary" --save-project "$project_name" >"$work/annotate.log"
 project="$home/.local/share/radare2/projects/$project_name/rc.r2"
 test -s "$project"
