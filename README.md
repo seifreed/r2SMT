@@ -283,6 +283,18 @@ The codebase is safe Rust throughout — no `unsafe`, no `unwrap`/`expect` in pr
 
 ---
 
+## Benchmark Evidence
+
+The reproducible real-binary corpus lives at
+[`seifreed/r2smt-corpus`](https://github.com/seifreed/r2smt-corpus). Its checked-in
+[`metrics-baseline.json`](https://github.com/seifreed/r2smt-corpus/blob/main/metrics-baseline.json)
+publishes branch recall, actionable precision, Unknown reasons, p50/p95
+runtime, and verified patch/rollback rates for the pinned fixtures. Run the
+same gate locally with `scripts/quality-gates.sh real-binaries`; independent
+validation runs are described in [VALIDATION.md](VALIDATION.md).
+
+---
+
 ## Requirements
 
 - **Rust 1.95+** (edition 2024) to build from source
