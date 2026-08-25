@@ -185,6 +185,8 @@ jobs:
       - name: Publish workspace crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
+          Z3_SYS_Z3_VERSION: 4.16.0
         run: |
           set -euo pipefail
 
