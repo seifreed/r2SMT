@@ -29,6 +29,7 @@ jq -s '
   | (sum_by("false_actionable_findings")) as $false_positive
   | (sum_by("expected_branches")) as $expected
   | (sum_by("discovered_branches")) as $discovered
+  | ([$metrics[] | [(.discovered_branches // 0), (.expected_branches // 0)] | min] | add) as $covered
   | (sum_by("findings")) as $findings
   | (sum_by("complete_findings")) as $complete
   | (sum_by("definitive_findings")) as $definitive
@@ -42,7 +43,8 @@ jq -s '
       fixtures: ($metrics | map(.fixture // "unknown")),
       expected_branches: $expected,
       discovered_branches: $discovered,
-      branch_discovery_recall: percent($discovered; $expected),
+      covered_branches: $covered,
+      branch_discovery_recall: percent($covered; $expected),
       findings: $findings,
       complete_findings: $complete,
       complete_slice_percent: percent($complete; $findings),
