@@ -21,6 +21,25 @@ The pinned corpus publishes its current aggregate at
 The gate writes the same schema to `target/r2smt-bench-metrics.json` and keeps
 per-fixture reports under `target/r2smt-bench-metrics/`.
 
+The published x86_64 reference (r2SMT commit
+`fda0aee6e1bc4a41656ba4ba0cd933a41e37933c`, corpus source commit
+`5fafa2f4c4db3a5147d789b8fbbc9be12204b341`, radare2 `6.2.0`) reports:
+
+| Metric | Value |
+|---|---:|
+| Covered branches / expected | 15 / 15 (100%) |
+| Actionable precision | 100% |
+| False actionable findings | 0 |
+| Expected actionables not observed | 2 |
+| Unknown findings | 16 |
+| Runtime p50 / p95 | 107 / 108 ms |
+| Verified patch rate | 100% |
+| Rollback success rate | 100% |
+
+This is a benchmark reference, not a claim about arbitrary malware or
+unsupported instructions. The exact CI provenance is recorded in the JSON
+(`ci_run: 32913427778`).
+
 ## Report a real-binary run
 
 Do not upload malware or proprietary binaries. Attach a redacted JSON summary
