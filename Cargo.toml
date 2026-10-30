@@ -66,6 +66,7 @@ print_stderr       = "deny"
 missing_errors_doc = "warn"
 missing_panics_doc = "warn"
 mod_module_files   = "deny"
+assert_is_empty     = "allow"
 
 [profile.profiling]
 inherits = "release"
