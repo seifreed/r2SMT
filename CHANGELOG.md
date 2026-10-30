@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0 - 2026-10-30
+
+- Isolate Windows analysis workers with Job Objects and outbound firewall rules;
+  fail closed if either control cannot be installed.
+- Publish reproducible benchmark metrics and a pinned public corpus baseline,
+  with an independent validation protocol and Unicorn differential checks.
+- Expand CI coverage for Windows sandboxing, radare2 compatibility, benchmark
+  fixtures, and dependency security.
+- Update Cargo dependencies and GitHub Actions, including Z3 0.22 and rustls
+  security fixes.
+
 ## 0.4.0 - 2026-08-25
 
 - Add an auto-loaded native radare2 core plugin with direct file/seek/function
@@ -7,8 +18,6 @@
 - Replace shell-dependent `$r2smt-*` macros whose seek/function substitutions
   and multi-command patch aliases were invalid on current radare2.
 - Thanks to @trufae for preparing the native plugin integration.
-
-## Unreleased
 
 ## 0.3.0 - 2026-08-23
 
