@@ -1,11 +1,11 @@
 //! Audited FFI shim for the two Z3 floating-point *reinterpret*
-//! constructors that the safe `z3` 0.20 API does not expose:
+//! constructors that the safe `z3` 0.22 API does not expose:
 //! bit-vector → float (`Z3_mk_fpa_to_fp_bv`) and signed-integer → float
 //! (`Z3_mk_fpa_to_fp_signed`). Both are needed to bridge x86 SSE — where
 //! an `xmm` lane is a raw bit-vector — into Z3's floating-point theory.
 //!
 //! The rest of the FP API (`add_with_rounding_mode`, `eq_fpa`,
-//! `to_ieee_bv`, …) is already safe in `z3` 0.20; only these two
+//! `to_ieee_bv`, …) is already safe in `z3` 0.22; only these two
 //! reinterprets require `unsafe`, and they are isolated here behind a
 //! safe, `Option`-returning surface so callers never touch a raw handle
 //! and degrade gracefully (a `None` becomes a sound free value upstream).

@@ -6,7 +6,7 @@ license.workspace      = true
 repository.workspace   = true
 authors.workspace      = true
 rust-version.workspace = true
-description = "Thin, audited FFI shim for the Z3 floating-point reinterpret constructors missing from the safe `z3` 0.20 API (BV→FP and signed-int→FP)."
+description = "Thin, audited FFI shim for the Z3 floating-point reinterpret constructors missing from the safe `z3` 0.22 API (BV→FP and signed-int→FP)."
 
 # This crate intentionally does NOT inherit `[lints] workspace = true`:
 # the workspace forbids `unsafe_code`, which cannot be relaxed by an inner
