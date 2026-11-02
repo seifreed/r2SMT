@@ -132,7 +132,7 @@ jobs:
           $installedPlugin = Join-Path $pluginDir 'core_r2smt.dll'
           Copy-Item $env:plugin $installedPlugin -Force
           $env:R2SMT_CLI = (Resolve-Path "target/${{ matrix.triple }}/release/r2smt.exe").Path
-          $output = & r2 -2Nq -e scr.color=false -c 'r2smt version;q' "$env:SystemRoot\System32\where.exe"
+          $output = & r2 -Nq -e scr.color=false -c 'r2smt version;q' "$env:SystemRoot\System32\where.exe"
           if ($LASTEXITCODE -ne 0 -or ($output -join "`n") -notmatch '(?m)^r2smt ') {
             throw "r2smt core plugin smoke test failed: $output"
           }

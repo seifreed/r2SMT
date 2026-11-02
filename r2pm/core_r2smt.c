@@ -213,11 +213,17 @@ static RStrBuf *command_begin(void) {
 	if (!cli) {
 		return NULL;
 	}
-	RStrBuf *command = r_strbuf_new ("");
+	RStrBuf *command;
+#if R2__WINDOWS__
+	/* CreateProcess resolves argv[0] before command-line backslashes are unescaped. */
+	command = strchr (cli, '"')? NULL: r_strbuf_newf ("\"%s\"", cli);
+#else
+	command = r_strbuf_new ("");
 	if (command && !append_arg (command, cli)) {
 		r_strbuf_free (command);
 		command = NULL;
 	}
+#endif
 	free (cli);
 	return command;
 }

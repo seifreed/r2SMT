@@ -53,7 +53,10 @@ patch_dry=$(run_r2 -c 'r2smt patch-dry;q' "$test_binary")
 grep -Eq '^patch .*sample binary --at 0x[[:xdigit:]]+$' <<<"$patch_dry"
 
 annotate=$(run_r2 -c 'r2smt annotate;CC.;q' "$test_binary")
-grep -q 'r2smt-plugin-smoke' <<<"$annotate"
+if ! grep -q 'r2smt-plugin-smoke' <<<"$annotate"; then
+  printf 'annotation smoke output:\n%s\n' "$annotate" >&2
+  exit 1
+fi
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 legacy=$(run_r2 -i "$repo_root/r2pm/r2smt.r2" -c '$r2smt-at-v;q' "$test_binary")
