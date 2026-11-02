@@ -30,6 +30,9 @@
 
 The pipeline is `radare2 disasm → typed IR → backward slice → SSA → SMT → verdict`. It is **sound under explicit assumptions and fail-closed**: it emits a verdict only when it can prove one, and says *unknown* rather than guessing. It is also **sample-agnostic** by design — no hardcoded malware-family IOCs, so it applies to arbitrary binaries. The exact boundary is documented in [SOUNDNESS.md](SOUNDNESS.md).
 
+Production logging, JSON event fields, correlation, redaction, configuration,
+and diagnostic recipes are documented in [OBSERVABILITY.md](OBSERVABILITY.md).
+
 ### Key Features
 
 | Feature | Description |
