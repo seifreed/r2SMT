@@ -160,7 +160,7 @@ jobs:
           cp r2pm/r2smt "$dbdir/r2smt"
           r2pm -sj r2smt | jq -e '.[0].binary == true and (.[0].platforms | index("linux"))'
           git clone --local "$GITHUB_WORKSPACE" "$gitdir/r2smt"
-          USE_PREBUILT=0 R2PM_GITSKIP=1 r2pm -i r2smt
+          R2PM_GITSKIP=1 r2pm -i r2smt
           cli="$(r2pm -H R2PM_BINDIR)/r2smt"
           "$cli" version
           plugin="$(r2pm -H R2PM_PLUGDIR)/core_r2smt.$(r2 -H R2_LIBEXT)"
@@ -172,6 +172,11 @@ jobs:
           ./scripts/r2pm-annotate-smoke.sh \
             "$cli" "$(dirname "$corpus")/patch-control-flow" \
             "${RUNNER_TEMP}/r2smt-annotate"
+          command_script="$(r2pm -H R2PM_PLUGDIR)/r2smt.r2"
+          r2pm -u r2smt
+          test ! -e "$cli"
+          test ! -e "$plugin"
+          test ! -e "$command_script"
 
   real-binaries:
     name: zero false actionable findings
