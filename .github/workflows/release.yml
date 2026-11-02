@@ -5,6 +5,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      r2pm_smoke_version:
+        description: Existing release version to validate through r2pm -b (for example 0.6.1)
+        required: false
+        type: string
 
 permissions:
   attestations: write
@@ -19,6 +24,7 @@ env:
 jobs:
   build:
     name: ${{ matrix.triple }}
+    if: inputs.r2pm_smoke_version == ''
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -338,7 +344,14 @@ jobs:
     name: r2pm binary install ${{ matrix.r2pm_triplet }}
     runs-on: ${{ matrix.os }}
     needs: publish-release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      ${{
+        !cancelled() &&
+        ((startsWith(github.ref, 'refs/tags/v') && needs.publish-release.result == 'success') ||
+        (github.event_name == 'workflow_dispatch' && inputs.r2pm_smoke_version != ''))
+      }}
+    env:
+      R2PM_VERSION: ${{ inputs.r2pm_smoke_version }}
     strategy:
       fail-fast: false
       matrix:
@@ -409,10 +422,11 @@ jobs:
           $plugdir = (& r2pm -H R2PM_PLUGDIR).Trim()
           $cli = Join-Path $bindir 'r2smt.exe'
           $plugin = Join-Path $plugdir 'core_r2smt.dll'
-          & $cli version
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $plugin) -or -not (Test-Path (Join-Path $plugdir 'r2smt.r2'))) {
+          if (-not (Test-Path $cli) -or -not (Test-Path $plugin) -or -not (Test-Path (Join-Path $plugdir 'r2smt.r2'))) {
             throw 'r2pm binary package contents are incomplete'
           }
+          & $cli version
+          if ($LASTEXITCODE -ne 0) { throw 'installed r2smt CLI failed' }
           $env:R2SMT_CLI = $cli
           $output = & r2 -2Nq -e scr.color=false -c 'r2smt version;q' "$env:SystemRoot\System32\where.exe"
           if ($LASTEXITCODE -ne 0 -or ($output -join "`n") -notmatch '(?m)^r2smt ') {
