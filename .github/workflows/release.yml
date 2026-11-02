@@ -39,9 +39,11 @@ jobs:
           - os: windows-2025
             triple: x86_64-pc-windows-msvc
             r2pm_triplet: windows-x86-64
+            msvc_arch: amd64
           - os: windows-11-arm
             triple: aarch64-pc-windows-msvc
             r2pm_triplet: windows-arm-64
+            msvc_arch: amd64_arm64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -86,6 +88,12 @@ jobs:
         uses: radareorg/github-actions@4ae27a8b29a049ac0fd5119f6eda37ecfc64ead8 # main 2026-08-23
         with:
           version: ${{ env.R2_RELEASE_VERSION }}
+
+      - name: Configure MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: ${{ matrix.msvc_arch }}
 
       - name: Build radare2 plugin (Unix)
         if: runner.os != 'Windows'

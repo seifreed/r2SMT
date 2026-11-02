@@ -34,7 +34,7 @@ chmod +x "$fixture_cli"
 
 run_r2() {
   XDG_DATA_HOME="$work" R2SMT_CLI="$fixture_cli" \
-    R2SMT_PLUGIN_FIXTURE_CLI=1 r2 -2Nq -e scr.color=false "$@"
+    R2SMT_PLUGIN_FIXTURE_CLI=1 r2 -Nq -e scr.color=false "$@"
 }
 
 help=$(run_r2 -c 'r2smt?;q' "$test_binary")
