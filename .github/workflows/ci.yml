@@ -111,6 +111,9 @@ jobs:
           - name: 6.2.0
             version: 6.2.0
             from_git: "false"
+          - name: 6.2.4
+            version: 6.2.4
+            from_git: "false"
           - name: master
             version: ""
             from_git: "true"
@@ -146,7 +149,7 @@ jobs:
       - name: Install radare2
         uses: radareorg/github-actions@4ae27a8b29a049ac0fd5119f6eda37ecfc64ead8 # main 2026-08-23
         with:
-          version: 6.2.0
+          version: 6.2.4
       - name: Install current checkout through r2pm
         env:
           XDG_DATA_HOME: ${{ runner.temp }}/r2pm
@@ -155,6 +158,7 @@ jobs:
           dbdir="$(r2pm -H R2PM_DBDIR)"
           gitdir="$(r2pm -H R2PM_GITDIR)"
           cp r2pm/r2smt "$dbdir/r2smt"
+          r2pm -sj r2smt | jq -e '.[0].binary == true and (.[0].platforms | index("linux"))'
           git clone --local "$GITHUB_WORKSPACE" "$gitdir/r2smt"
           USE_PREBUILT=0 R2PM_GITSKIP=1 r2pm -i r2smt
           cli="$(r2pm -H R2PM_BINDIR)/r2smt"

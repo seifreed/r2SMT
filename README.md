@@ -95,6 +95,10 @@ The r2pm package installs both the CLI and a native core plugin compiled
 against the active radare2 ABI:
 
 ```bash
+# Released binary install: no compiler or Rust toolchain required
+r2pm -U
+r2pm -bi r2smt
+
 # From this checkout
 R2PM_DBDIR="$PWD/r2pm" r2pm -ci r2smt
 

@@ -2,7 +2,50 @@ R2PM_BEGIN
 
 R2PM_GIT "https://github.com/seifreed/r2SMT"
 R2PM_DESC "SMT-assisted opaque-predicate deobfuscator for radare2 (MIT)"
+R2PM_PLATFORMS "linux darwin windows"
 R2PM_NEEDS "curl tar make pkg-config cc"
+
+R2PM_VERSION_MAP "6.2.4:0.6.1"
+
+R2PM_BINSTALL() {
+	[ "${R2PM_OFFLINE:-0}" != 1 ] || R2PM_FAIL "r2smt binary installation requires network access"
+	command -v curl >/dev/null 2>&1 || R2PM_FAIL "r2smt binary installation requires curl"
+	command -v unzip >/dev/null 2>&1 || R2PM_FAIL "r2smt binary installation requires unzip"
+
+	PACKAGE_VERSION="${R2PM_VERSION:-0.6.1}"
+	ASSET="r2smt-r2pm-v${PACKAGE_VERSION}-r2-${R2V}-${R2PM_TRIPLET}.zip"
+	WORKDIR="$(mktemp -d)"
+	URL="https://github.com/seifreed/r2SMT/releases/download/v${PACKAGE_VERSION}/${ASSET}"
+	curl -fLsS --retry 5 --retry-delay 3 --retry-all-errors -o "${WORKDIR}/${ASSET}" "${URL}" || R2PM_FAIL "No r2smt ${PACKAGE_VERSION} binary for radare2 ${R2V} on ${R2PM_TRIPLET}"
+	mkdir -p "${R2PM_BINDIR}" "${R2PM_PLUGDIR}"
+	unzip -qjo "${WORKDIR}/${ASSET}" 'bin/*' -d "${R2PM_BINDIR}"
+	unzip -qjo "${WORKDIR}/${ASSET}" 'plugins/*' -d "${R2PM_PLUGDIR}"
+	chmod 755 "${R2PM_BINDIR}/r2smt"
+	rm -rf "${WORKDIR}"
+}
+
+R2PM_BINSTALL_WINDOWS() {
+	if "%R2PM_OFFLINE%"=="1" (echo r2smt binary installation requires network access & exit 1)
+	if "%R2PM_VERSION%"=="" (set "R2PM_VERSION=0.6.1")
+	set "R2SMT_ASSET=r2smt-r2pm-v%R2PM_VERSION%-r2-%R2V%-%R2PM_TRIPLET%.zip"
+	set "R2SMT_ARCHIVE=%TEMP%\r2smt-r2pm-%RANDOM%.zip"
+	curl -fLsS --retry 5 --retry-delay 3 --retry-all-errors -o "%R2SMT_ARCHIVE%" "https://github.com/seifreed/r2SMT/releases/download/v%R2PM_VERSION%/%R2SMT_ASSET%" || (echo No r2smt %R2PM_VERSION% binary for radare2 %R2V% on %R2PM_TRIPLET% & exit 1)
+	(mkdir "%R2PM_BINDIR%" "%R2PM_PLUGDIR%" 2>nul || cd .)
+	tar -xf "%R2SMT_ARCHIVE%" --strip-components=1 -C "%R2PM_BINDIR%" bin
+	tar -xf "%R2SMT_ARCHIVE%" --strip-components=1 -C "%R2PM_PLUGDIR%" plugins
+	del "%R2SMT_ARCHIVE%"
+}
+
+R2PM_BUNINSTALL() {
+	rm -f "${R2PM_BINDIR}/r2smt"
+	rm -f "${R2PM_PLUGDIR}/core_r2smt.${R2_LIBEXT}"
+	rm -f "${R2PM_PLUGDIR}/r2smt.r2"
+}
+
+R2PM_BUNINSTALL_WINDOWS() {
+	del /q "%R2PM_BINDIR%\r2smt.exe" "%R2PM_BINDIR%\libz3.dll" 2>nul
+	del /q "%R2PM_PLUGDIR%\core_r2smt.dll" "%R2PM_PLUGDIR%\r2smt.r2" 2>nul
+}
 
 R2PM_INSTALL() {
 	VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' Cargo.toml)"

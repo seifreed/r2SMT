@@ -5,6 +5,12 @@
 #include <r_core.h>
 #include <errno.h>
 
+#if R2_VERSION_NUMBER >= 60204
+#define r2smt_cmdctx_help r_cmdctx_help
+#else
+#define r2smt_cmdctx_help r_cmd_ctx_help
+#endif
+
 static RCoreHelpMessage help_msg_r2smt = {
 	"Usage:", "r2smt [action] [options]", "Run r2SMT against the current file and seek",
 	"r2smt", " [options]", "analyze the conditional at the current seek",
@@ -294,7 +300,7 @@ static RCmdResult run_selected(
 static RCmdResult r2smt_callback(RCmdContext *ctx) {
 	const size_t argc = RVecRStrs_length (&ctx->args);
 	RStrs *args = R_VEC_START_ITER (&ctx->args);
-	if (r_cmd_ctx_help (ctx) || (argc == 1 && strs_eq (args[0], "?"))) {
+	if (r2smt_cmdctx_help (ctx) || (argc == 1 && strs_eq (args[0], "?"))) {
 		r_cons_cmd_help (ctx->cons, help_msg_r2smt);
 		return (RCmdResult) { 0 };
 	}
