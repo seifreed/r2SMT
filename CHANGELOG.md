@@ -12,7 +12,7 @@
 - Capture uncaught panics with structured critical diagnostics and optional
   backtraces while preserving the original panic behavior.
 - Add observability contract, concurrency, destination-failure, timeout, panic,
-  and security tests plus production logging documentation and contributor rules.
+  and security tests, with production configuration guidance in the README.
 
 ## 0.5.0 - 2026-10-30
 

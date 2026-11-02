@@ -30,8 +30,9 @@
 
 The pipeline is `radare2 disasm → typed IR → backward slice → SSA → SMT → verdict`. It is **sound under explicit assumptions and fail-closed**: it emits a verdict only when it can prove one, and says *unknown* rather than guessing. It is also **sample-agnostic** by design — no hardcoded malware-family IOCs, so it applies to arbitrary binaries. The exact boundary is documented in [SOUNDNESS.md](SOUNDNESS.md).
 
-Production logging, JSON event fields, correlation, redaction, configuration,
-and diagnostic recipes are documented in [OBSERVABILITY.md](OBSERVABILITY.md).
+Production diagnostics use structured logging on stderr, leaving functional
+CLI output stable. Compact output is the default; JSON is available for log
+collectors and automated diagnosis.
 
 ### Key Features
 
@@ -260,6 +261,28 @@ r2smt-cli          the `r2smt` binary (composition root)
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for dependency rules and the runtime flow.
+
+---
+
+## Logging
+
+Use `-v` for DEBUG or `-vv` for TRACE diagnostics. Production deployments can
+enable structured JSON and carry a caller-supplied correlation identifier:
+
+```bash
+R2SMT_LOG_FORMAT=json \
+R2SMT_ENVIRONMENT=production \
+R2SMT_CORRELATION_ID=case-2026-11-02-001 \
+r2smt solve sample --json report.json 2>events.jsonl
+```
+
+`RUST_LOG` selects per-module levels, and `R2SMT_WORKER_LOG` controls captured
+analysis-worker verbosity (default `warn`). Invalid formats, filters,
+environments, and correlation identifiers fail before the command runs. Logs
+redact likely credentials, escape control characters, bound untrusted fields,
+and never include binary contents or complete command payloads by default.
+Storage, rotation, and retention remain the responsibility of stderr's process
+supervisor, such as journald, Docker, or shell redirection.
 
 ---
 
