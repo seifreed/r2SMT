@@ -831,6 +831,30 @@ pub(crate) enum Command {
     },
 }
 
+impl Command {
+    /// Stable operation name used by process-level telemetry.
+    pub(crate) const fn name(&self) -> &'static str {
+        match self {
+            Self::AnalysisWorker { .. } => "analysis_worker",
+            Self::Version => "version",
+            Self::Doctor => "doctor",
+            Self::R2il { .. } => "r2il",
+            Self::Analyze { .. } => "analyze",
+            Self::Branches { .. } => "branches",
+            Self::Annotate { .. } => "annotate",
+            Self::Patch { .. } => "patch",
+            Self::Solve { .. } => "solve",
+            Self::Batch { .. } => "batch",
+            Self::At { .. } => "at",
+            Self::Ssa { .. } => "ssa",
+            Self::Lift { .. } => "lift",
+            Self::Slice { .. } => "slice",
+            Self::Taint { .. } => "taint",
+            Self::Why { .. } => "why",
+        }
+    }
+}
+
 /// Minimum-confidence threshold exposed via `--min-confidence`.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub(crate) enum ConfidenceArg {

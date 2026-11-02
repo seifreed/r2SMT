@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -20,12 +21,12 @@ use r2smt_ir::Annotator;
 use r2smt_ir::program::Function;
 use r2smt_slicer::SliceLimits;
 use r2smt_smt::SolveOptions;
-use tracing::{debug, error, warn};
-use tracing_subscriber::EnvFilter;
+use tracing::{debug, error, info, info_span, warn};
 
 mod args;
 use args::{Cli, Command, SolverArg};
 mod doctor;
+mod observability;
 mod render;
 use render::{print_annotation_preview, print_findings_summary};
 mod support;
@@ -42,36 +43,65 @@ use commands::taint::{TaintCli, taint};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    if let Err(e) = init_tracing(cli.verbose) {
-        eprintln!("r2smt: failed to initialise tracing: {e:#}");
-        return ExitCode::FAILURE;
+    let context = match observability::init(cli.verbose) {
+        Ok(context) => context,
+        Err(error) => {
+            eprintln!(
+                "r2smt: failed to initialise tracing: {}",
+                observability::safe_value(&format!("{error:#}"))
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let operation = cli.command.name();
+    let span = info_span!(
+        target: "r2smt::cli",
+        "command",
+        service = "r2smt",
+        component = "cli",
+        environment = %context.environment,
+        operation,
+        correlation_id = tracing::field::Empty,
+    );
+    if let Some(correlation_id) = context.correlation_id.as_deref() {
+        span.record("correlation_id", correlation_id);
     }
+    let _entered = span.enter();
+    let started = Instant::now();
+    info!(
+        target: "r2smt::cli",
+        event_name = "command.started",
+        status = "started",
+        "command started"
+    );
 
     match run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            info!(
+                target: "r2smt::cli",
+                event_name = "command.completed",
+                status = "ok",
+                duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "command completed"
+            );
+            ExitCode::SUCCESS
+        }
         Err(err) => {
-            error!(target: "r2smt::cli", "{err:#}");
-            eprintln!("r2smt: {err:#}");
+            let error_message = format!("{err:#}");
+            let safe_error = observability::safe_value(&error_message);
+            error!(
+                target: "r2smt::cli",
+                event_name = "command.failed",
+                status = "error",
+                duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                error_type = "operation_error",
+                error = %safe_error,
+                "command failed"
+            );
+            eprintln!("r2smt: {safe_error}");
             ExitCode::FAILURE
         }
     }
-}
-
-fn init_tracing(verbosity: u8) -> Result<()> {
-    let default_level = match verbosity {
-        0 => "info",
-        1 => "debug",
-        _ => "trace",
-    };
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .try_init()
-        .map_err(|e| anyhow::anyhow!("tracing init failed: {e}"))?;
-    Ok(())
 }
 
 /// Assemble [`SliceLimits`] from the shared slicing CLI flags. Every
