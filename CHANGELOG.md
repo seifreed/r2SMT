@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.1 - 2026-11-02
+
+- Add compiler-free `r2pm -bi r2smt` installation mapped to radare2 6.2.4
+  on Linux, macOS, and Windows for x86-64 and ARM64.
+- Publish self-contained r2pm bundles with the CLI, native core plugin, legacy
+  macros, Windows Z3 runtime, checksums, SPDX SBOMs, and build provenance.
+- Build and smoke-test native Windows plugins with MSVC, including reliable CLI
+  execution from absolute Windows paths.
+- Fix current-seek annotation rebasing for universal Mach-O binaries.
+- Verify binary installation, CLI/plugin execution, and uninstallation from the
+  published GitHub release on every supported platform.
+
 ## 0.6.0 - 2026-11-02
 
 - Add centralized structured logging with compact development output and JSON
