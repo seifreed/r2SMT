@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.0 - 2026-11-02
+
+- Add centralized structured logging with compact development output and JSON
+  production output, validated environment configuration, stable event names,
+  and correlation context.
+- Instrument CLI lifecycle, analysis, exploration workers, external processes,
+  patching, rollback, timeouts, cancellation, and concurrent task boundaries.
+- Redact secrets and control characters by default, bound untrusted fields, and
+  keep diagnostic logs on stderr so functional CLI output remains stable.
+- Capture uncaught panics with structured critical diagnostics and optional
+  backtraces while preserving the original panic behavior.
+- Add observability contract, concurrency, destination-failure, timeout, panic,
+  and security tests plus production logging documentation and contributor rules.
+
 ## 0.5.0 - 2026-10-30
 
 - Isolate Windows analysis workers with Job Objects and outbound firewall rules;
