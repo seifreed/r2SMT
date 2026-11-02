@@ -1,5 +1,6 @@
 //! Process-level logging configuration and safety policy.
 
+use std::backtrace::Backtrace;
 use std::borrow::Cow;
 use std::io::IsTerminal as _;
 
@@ -114,10 +115,42 @@ pub(crate) fn init(verbosity: u8) -> Result<ProcessContext> {
             .try_init(),
     }
     .map_err(|error| anyhow::anyhow!("tracing init failed: {error}"))?;
+    install_panic_hook();
     Ok(ProcessContext {
         environment: config.environment,
         correlation_id: config.correlation_id,
     })
+}
+
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|panic| {
+        let message = panic
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic payload");
+        report_panic(
+            message,
+            panic.location().map(std::panic::Location::line),
+            panic.location().map(std::panic::Location::column),
+        );
+    }));
+}
+
+fn report_panic(message: &str, line: Option<u32>, column: Option<u32>) {
+    let backtrace = Backtrace::force_capture().to_string();
+    tracing::error!(
+        target: "r2smt::cli",
+        event_name = "process.panicked",
+        status = "fatal",
+        error_type = "panic",
+        error = %safe_value(message),
+        line,
+        column,
+        stack_trace = %safe_value(&backtrace),
+        "process panicked"
+    );
 }
 
 /// Redact likely credentials, bound field size, and neutralize log injection.
@@ -300,5 +333,23 @@ mod tests {
             });
         }));
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_panic_event_is_structured_and_redacted() {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            report_panic("password=hunter2", Some(10), Some(20));
+        });
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("process.panicked")
+                && output.contains("[REDACTED]")
+                && !output.contains("hunter2")
+        );
     }
 }

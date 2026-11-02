@@ -105,3 +105,17 @@ fn test_invalid_format_fails_closed() {
         .expect("r2smt process must start");
     assert!(!output.status.success());
 }
+
+#[test]
+fn test_empty_batch_emits_route_lifecycle() {
+    let directory = tempfile::tempdir().expect("temporary batch directory");
+    let output = run(&["batch", &directory.path().to_string_lossy()]);
+    let names: Vec<_> = events(&output)
+        .into_iter()
+        .filter_map(|event| event["event_name"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        names,
+        ["command.started", "batch.completed", "command.completed"]
+    );
+}
