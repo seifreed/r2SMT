@@ -8,6 +8,8 @@
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use tracing::{debug, debug_span, warn};
+
 use crate::model::{ExploreBudget, ExploreError, ExploreRequest, ExploreResult};
 
 /// How often the watchdog polls the child for exit.
@@ -45,20 +47,43 @@ pub enum WaitOutcome {
 /// Returns [`ExploreError::WorkerSpawn`] if the process cannot start and
 /// [`ExploreError::WorkerIo`] if polling it fails.
 pub fn spawn_and_wait(mut cmd: Command, wall_clock_ms: u64) -> Result<WaitOutcome, ExploreError> {
+    let started = Instant::now();
     let mut child = cmd
         .spawn()
         .map_err(|err| ExploreError::WorkerSpawn(err.to_string()))?;
+    debug!(
+        target: "r2smt::explore",
+        event_name = "explore.worker_spawned",
+        worker_pid = child.id(),
+        wall_clock_ms,
+        "exploration worker spawned"
+    );
     let deadline = Instant::now() + Duration::from_millis(wall_clock_ms);
     loop {
         if let Some(status) = child
             .try_wait()
             .map_err(|err| ExploreError::WorkerIo(err.to_string()))?
         {
+            debug!(
+                target: "r2smt::explore",
+                event_name = "explore.worker_exited",
+                status = if status.success() { "ok" } else { "error" },
+                duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "exploration worker exited"
+            );
             return Ok(WaitOutcome::Exited(status.success()));
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            warn!(
+                target: "r2smt::explore",
+                event_name = "explore.worker_timed_out",
+                status = "timeout",
+                duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                wall_clock_ms,
+                "exploration worker exceeded its wall-clock budget"
+            );
             return Ok(WaitOutcome::TimedOut);
         }
         std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
@@ -81,6 +106,15 @@ pub fn run_worker(
     request: &ExploreRequest,
     budget: ExploreBudget,
 ) -> Result<ExploreResult, ExploreError> {
+    let span = debug_span!(
+        target: "r2smt::explore",
+        "explore",
+        component = "explore_driver",
+        operation = "explore",
+        wall_clock_ms = budget.wall_clock_ms,
+        max_paths = budget.max_paths,
+    );
+    let _entered = span.enter();
     let dir = tempfile::tempdir().map_err(|err| ExploreError::WorkerIo(err.to_string()))?;
     let req_path = dir.path().join("request.json");
     let out_path = dir.path().join("result.json");
@@ -100,15 +134,32 @@ pub fn run_worker(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    match spawn_and_wait(cmd, budget.wall_clock_ms)? {
-        WaitOutcome::TimedOut => Ok(ExploreResult::not_found(
-            "wall-clock budget exhausted before target reached",
-        )),
-        WaitOutcome::Exited(false) => Ok(ExploreResult::inconclusive(
-            "explore worker exited non-zero",
-        )),
-        WaitOutcome::Exited(true) => read_result(&out_path),
-    }
+    let result = match spawn_and_wait(cmd, budget.wall_clock_ms)? {
+        WaitOutcome::TimedOut => {
+            ExploreResult::not_found("wall-clock budget exhausted before target reached")
+        }
+        WaitOutcome::Exited(false) => {
+            warn!(
+                target: "r2smt::explore",
+                event_name = "explore.worker_failed",
+                status = "error",
+                "exploration worker exited non-zero"
+            );
+            ExploreResult::inconclusive("explore worker exited non-zero")
+        }
+        WaitOutcome::Exited(true) => read_result(&out_path)?,
+    };
+    debug!(
+        target: "r2smt::explore",
+        event_name = "explore.completed",
+        status = match &result {
+            ExploreResult::ReachedWith(_) => "reached",
+            ExploreResult::NotFoundWithinBudget { .. } => "not_found",
+            ExploreResult::Inconclusive { .. } => "inconclusive",
+        },
+        "exploration completed"
+    );
+    Ok(result)
 }
 
 /// Read and parse the worker's result file, clamping any witness to the

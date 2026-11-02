@@ -28,7 +28,9 @@ serde        = { workspace = true }
 serde_json   = { workspace = true }
 thiserror    = { workspace = true }
 tempfile     = { workspace = true }
+tracing      = { workspace = true }
 radius2      = { version = "1.0.28", optional = true }
 
 [dev-dependencies]
 trybuild = "1"
+tracing-subscriber = { workspace = true }

@@ -4,15 +4,18 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use r2smt_report::{BatchOutcome, BatchReport, BatchSampleEntry, BatchSampleSummary, Report};
 use r2smt_slicer::SliceLimits;
 use r2smt_smt::SolveOptions;
 use rayon::ThreadPoolBuilder;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use tracing::{Span, debug, debug_span, info, warn};
 
 use crate::args::SolverArg;
+use crate::observability::safe_value;
 use crate::support::{ReportRun, report_from_findings};
 use crate::worker::{AnalysisWorkerRequest, run_isolated};
 
@@ -69,10 +72,9 @@ fn analyze_one(
     )
 }
 
-// `clippy::too_many_arguments`: same rationale as `solve` / `annotate`
-// — a CLI driver threading through independent, read-at-distinct-stages
-// knobs. Splitting into a struct would only move the noise.
-#[allow(clippy::too_many_arguments)]
+// This linear command driver owns validation, parallel dispatch, telemetry,
+// and output; extracting those short phases would only hide their ordering.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn batch(
     dir: &Path,
     deep: bool,
@@ -85,6 +87,7 @@ pub(crate) fn batch(
     json_out: Option<&Path>,
     markdown_out: Option<&Path>,
 ) -> Result<()> {
+    let started = Instant::now();
     if !dir.is_dir() {
         anyhow::bail!("not a directory: {}", dir.display());
     }
@@ -96,6 +99,15 @@ pub(crate) fn batch(
         .collect();
     files.sort();
     if files.is_empty() {
+        info!(
+            target: "r2smt::batch",
+            event_name = "batch.completed",
+            status = "ok",
+            samples = 0,
+            failed = 0,
+            duration_ms = 0,
+            "batch completed without input files"
+        );
         println!("no files to analyze in {}", dir.display());
         return Ok(());
     }
@@ -104,6 +116,15 @@ pub(crate) fn batch(
         .num_threads(threads.unwrap_or(0))
         .build()
         .context("building rayon thread pool")?;
+    info!(
+        target: "r2smt::batch",
+        event_name = "batch.started",
+        status = "started",
+        samples = files.len(),
+        worker_threads = pool.current_num_threads(),
+        "batch analysis started"
+    );
+    let parent_span = Span::current();
 
     // `collect()` on an indexed parallel iterator preserves input
     // order, so the aggregate is deterministic regardless of
@@ -113,30 +134,73 @@ pub(crate) fn batch(
     let entries: Vec<BatchSampleEntry> = pool.install(|| {
         files
             .par_iter()
-            .map(|path| {
-                let outcome = match analyze_one(
-                    path,
-                    deep,
-                    limits,
-                    options,
-                    solver,
-                    with_decompiler,
-                    ir_pcode,
-                ) {
-                    Ok(report) => BatchOutcome::Analyzed {
-                        summary: Box::new(BatchSampleSummary::from_report(&report)),
-                    },
-                    Err(err) => BatchOutcome::Failed {
-                        error: format!("{err:#}"),
-                    },
-                };
-                BatchSampleEntry {
-                    path: path.display().to_string(),
-                    outcome,
-                }
+            .enumerate()
+            .map(|(sample_index, path)| {
+                let span = debug_span!(
+                    target: "r2smt::batch",
+                    parent: &parent_span,
+                    "batch_sample",
+                    component = "batch",
+                    operation = "analyze_sample",
+                    sample_index,
+                );
+                span.in_scope(|| {
+                    let outcome = match analyze_one(
+                        path,
+                        deep,
+                        limits,
+                        options,
+                        solver,
+                        with_decompiler,
+                        ir_pcode,
+                    ) {
+                        Ok(report) => {
+                            debug!(
+                                target: "r2smt::batch",
+                                event_name = "batch.sample_completed",
+                                status = "ok",
+                                functions = report.functions_analyzed,
+                                branches = report.branches_analyzed,
+                                "batch sample completed"
+                            );
+                            BatchOutcome::Analyzed {
+                                summary: Box::new(BatchSampleSummary::from_report(&report)),
+                            }
+                        }
+                        Err(err) => {
+                            let error = format!("{err:#}");
+                            warn!(
+                                target: "r2smt::batch",
+                                event_name = "batch.sample_failed",
+                                status = "error",
+                                error_type = "analysis_error",
+                                error = %safe_value(&error),
+                                "batch sample failed"
+                            );
+                            BatchOutcome::Failed { error }
+                        }
+                    };
+                    BatchSampleEntry {
+                        path: path.display().to_string(),
+                        outcome,
+                    }
+                })
             })
             .collect()
     });
+    let failed = entries
+        .iter()
+        .filter(|entry| matches!(entry.outcome, BatchOutcome::Failed { .. }))
+        .count();
+    info!(
+        target: "r2smt::batch",
+        event_name = "batch.completed",
+        status = if failed == 0 { "ok" } else { "partial" },
+        samples = entries.len(),
+        failed,
+        duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "batch analysis completed"
+    );
 
     let report = BatchReport::new(
         env!("CARGO_PKG_VERSION"),

@@ -2,6 +2,7 @@
 //! durable [`PatchManifest`].
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use r2smt_common::{Error, Result};
 use r2smt_ir::byte_patcher::BytePatcher;
@@ -53,6 +54,7 @@ pub fn apply_plan(
     plan: &PatchPlan,
     config: &ApplyConfig,
 ) -> Result<PatchManifest> {
+    let started = Instant::now();
     let binary_sha256_before = sha256_hex(&config.binary_path)?;
     if binary_sha256_before != config.expected_sha256 {
         let message = format!(
@@ -71,7 +73,8 @@ pub fn apply_plan(
     }
     info!(
         target: "r2smt::patch",
-        binary = %config.binary_path.display(),
+        event_name = "patch.started",
+        status = "started",
         ops = plan.operations.len(),
         skipped = plan.skipped.len(),
         sha256_before = %binary_sha256_before,
@@ -165,8 +168,11 @@ pub fn apply_plan(
     let binary_sha256_after = sha256_hex(&config.binary_path)?;
     info!(
         target: "r2smt::patch",
+        event_name = "patch.completed",
+        status = "ok",
         applied = records.len(),
         sha256_after = %binary_sha256_after,
+        duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "patch run completed"
     );
 
@@ -274,10 +280,12 @@ pub fn rollback_from_manifest(
     patcher: &mut dyn BytePatcher,
     manifest: &PatchManifest,
 ) -> Result<()> {
+    let started = Instant::now();
     info!(
         target: "r2smt::patch",
+        event_name = "rollback.started",
+        status = "started",
         ops = manifest.operations.len(),
-        binary = %manifest.binary,
         "starting rollback"
     );
     for record in manifest.operations.iter().rev() {
@@ -318,7 +326,13 @@ pub fn rollback_from_manifest(
         }
         patcher.write_bytes(record.address, &original)?;
     }
-    info!(target: "r2smt::patch", "rollback completed");
+    info!(
+        target: "r2smt::patch",
+        event_name = "rollback.completed",
+        status = "ok",
+        duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "rollback completed"
+    );
     Ok(())
 }
 

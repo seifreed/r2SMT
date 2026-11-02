@@ -12,6 +12,7 @@ use r2smt_slicer::SliceLimits;
 use r2smt_smt::SolveOptions;
 use r2smt_windows_sandbox::Sandbox;
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 use crate::args::SolverArg;
 use crate::support::{analyze_provider_with_caps, attach_pseudocode, open_provider};
@@ -96,6 +97,16 @@ impl AnalysisWorkerRequest {
 }
 
 pub(crate) fn run_isolated(request: &AnalysisWorkerRequest) -> Result<AnalysisResult> {
+    let started = Instant::now();
+    debug!(
+        target: "r2smt::worker",
+        event_name = "analysis_worker.starting",
+        operation = "analyze",
+        deep = request.deep,
+        with_decompiler = request.with_decompiler,
+        pcode = request.ir_pcode,
+        "starting isolated analysis worker"
+    );
     let dir = tempfile::tempdir().context("creating isolated analysis directory")?;
     let request_path = dir.path().join("request.json");
     let result_path = dir.path().join("result.json");
@@ -116,6 +127,10 @@ pub(crate) fn run_isolated(request: &AnalysisWorkerRequest) -> Result<AnalysisRe
         .current_dir(dir.path())
         .env("HOME", dir.path())
         .env("TMPDIR", dir.path())
+        .env(
+            "RUST_LOG",
+            std::env::var("R2SMT_WORKER_LOG").unwrap_or_else(|_| "warn".to_string()),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::from(File::create(&stdout_path)?))
         .stderr(Stdio::from(File::create(&stderr_path)?));
@@ -126,6 +141,14 @@ pub(crate) fn run_isolated(request: &AnalysisWorkerRequest) -> Result<AnalysisRe
     }
 
     let mut child = command.spawn().context("spawning analysis worker")?;
+    debug!(
+        target: "r2smt::worker",
+        event_name = "analysis_worker.spawned",
+        worker_pid = child.id(),
+        memory_limit_mib = MEMORY_MIB,
+        wall_clock_ms = WALL_CLOCK_MS,
+        "isolated analysis worker spawned"
+    );
     let sandbox = match Sandbox::attach(&child, MEMORY_MIB) {
         Ok(sandbox) => sandbox,
         Err(error) => {
@@ -152,7 +175,19 @@ pub(crate) fn run_isolated(request: &AnalysisWorkerRequest) -> Result<AnalysisRe
         anyhow::bail!("analysis worker result exceeded {MAX_RESULT_BYTES} bytes");
     }
     let bytes = fs::read(&result_path).context("reading analysis worker result")?;
-    serde_json::from_slice(&bytes).context("parsing analysis worker result")
+    let result: AnalysisResult =
+        serde_json::from_slice(&bytes).context("parsing analysis worker result")?;
+    debug!(
+        target: "r2smt::worker",
+        event_name = "analysis_worker.completed",
+        status = "ok",
+        duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        functions = result.metrics.functions_analyzed,
+        branches = result.metrics.branches_analyzed,
+        actionable_findings = result.metrics.actionable_findings,
+        "isolated analysis worker completed"
+    );
+    Ok(result)
 }
 
 fn wait_worker(

@@ -1244,14 +1244,14 @@ fn dump_disagreement(
     debug!(
         target: "r2smt::difflift",
         address = %insn.address,
-        mnemonic = %insn.mnemonic,
+        mnemonic = ?insn.mnemonic,
         thumb = insn.is_thumb,
-        esil = insn.esil.as_deref().unwrap_or("<none>"),
-        "{a_name}:\n{a_body}\n{b_name}:\n{b_body}",
+        esil = ?insn.esil,
         a_name = lowering_a.as_str(),
-        a_body = render_lowering(a),
+        a_body = ?render_lowering(a),
         b_name = lowering_b.as_str(),
-        b_body = render_lowering(b),
+        b_body = ?render_lowering(b),
+        "differential lowering disagreement",
     );
 }
 

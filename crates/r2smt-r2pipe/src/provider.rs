@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use r2pipe::{R2Pipe, R2PipeSpawnOptions};
 use r2smt_common::{Address, Error, Result};
@@ -166,24 +166,33 @@ impl R2PipeProvider {
         let path_str = path_ref
             .to_str()
             .ok_or_else(|| Error::r2pipe("non-UTF-8 binary path"))?;
-        info!(
-            target: "r2smt::r2pipe",
-            path = %path_str,
-            writable,
-            level = level.command(),
-            "spawning radare2"
-        );
+        let started = Instant::now();
+        let file_size_bytes = path_ref.metadata().map_or(0, |metadata| metadata.len());
         let mut attempt = 0usize;
         loop {
             attempt += 1;
             match Self::try_spawn(path_str, writable, level) {
-                Ok(provider) => return Ok(provider),
+                Ok(provider) => {
+                    info!(
+                        target: "r2smt::r2pipe",
+                        event_name = "radare2.ready",
+                        status = "ok",
+                        writable,
+                        analysis_level = level.command(),
+                        file_size_bytes,
+                        attempts = attempt,
+                        duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        "radare2 analysis session ready"
+                    );
+                    return Ok(provider);
+                }
                 Err(err) if attempt < SPAWN_MAX_ATTEMPTS && is_transient_spawn_error(&err) => {
                     warn!(
                         target: "r2smt::r2pipe",
+                        event_name = "radare2.spawn_retry",
+                        status = "retrying",
                         attempt,
                         max_attempts = SPAWN_MAX_ATTEMPTS,
-                        error = %err,
                         "transient radare2 spawn failure — retrying"
                     );
                     sleep(Duration::from_millis(
@@ -264,7 +273,11 @@ impl R2PipeProvider {
     }
 
     fn cmd(&mut self, command: &str) -> Result<String> {
-        debug!(target: "r2smt::r2pipe", command, "issuing r2 command");
+        debug!(
+            target: "r2smt::r2pipe",
+            command = command.split_whitespace().next().unwrap_or("<empty>"),
+            "issuing r2 command"
+        );
         self.r2.cmd(command).map_err(Error::r2pipe)
     }
 
@@ -282,7 +295,7 @@ impl R2PipeProvider {
         }
         if name
             .chars()
-            .any(|c| c == '\n' || c == '\r' || c == ';' || c == '/' || c == '\\')
+            .any(|c| c.is_control() || c == ';' || c == '/' || c == '\\')
         {
             return Err(Error::r2pipe(
                 "project name must be a single path component without control characters",
@@ -300,7 +313,7 @@ impl R2PipeProvider {
         {
             return Err(Error::r2pipe(format!("r2 refused 'Ps {name}': {trimmed}")));
         }
-        info!(target: "r2smt::r2pipe", project = %name, "saved r2 project");
+        info!(target: "r2smt::r2pipe", event_name = "radare2.project_saved", "saved r2 project");
         Ok(())
     }
 

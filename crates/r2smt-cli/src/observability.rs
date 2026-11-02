@@ -163,9 +163,53 @@ fn validate_context(name: &str, value: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used)]
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for Capture {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("destination unavailable"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for FailingWriter {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     #[test]
     fn test_config_rejects_unknown_format() {
@@ -213,5 +257,48 @@ mod tests {
     fn test_safe_value_bounds_untrusted_text() {
         let value = "x".repeat(MAX_LOG_VALUE_CHARS + 1);
         assert!(safe_value(&value).ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn test_concurrent_events_remain_valid_json() {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let dispatch = dispatch.clone();
+                scope.spawn(move || {
+                    tracing::dispatcher::with_default(&dispatch, || {
+                        for sequence in 0..16 {
+                            tracing::info!(worker, sequence, "concurrent test event");
+                        }
+                    });
+                });
+            }
+        });
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+                .count(),
+            128
+        );
+    }
+
+    #[test]
+    fn test_destination_failure_does_not_panic_caller() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(FailingWriter)
+            .finish();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::error!("destination failure test");
+            });
+        }));
+        assert!(result.is_ok());
     }
 }
