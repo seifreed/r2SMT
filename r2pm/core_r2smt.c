@@ -85,6 +85,9 @@ static ut64 session_address(RCore *core, ut64 physical) {
 	if (!core || !r_config_get_b (core->config, "io.va")) {
 		return physical;
 	}
+	if (file_offset (core, core->addr) == physical) {
+		return core->addr;
+	}
 	RBinObject *object = core->bin? r_bin_cur_object (core->bin): NULL;
 	RBinSection *section = object? r_bin_get_section_at (object, physical, false): NULL;
 	if (section && physical >= section->paddr
@@ -94,9 +97,6 @@ static ut64 session_address(RCore *core, ut64 physical) {
 			return r_bin_get_vaddr (
 				core->bin, physical, section->vaddr + section_offset);
 		}
-	}
-	if (file_offset (core, core->addr) == physical) {
-		return core->addr;
 	}
 	ut64 address;
 	if (core->io && r_io_p2v (core->io, physical, &address)) {
