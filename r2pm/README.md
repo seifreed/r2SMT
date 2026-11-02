@@ -88,7 +88,7 @@ r2pm -u r2smt
 ## Notes
 
 - Binary bundles are available only for radare2 versions listed in
-  `R2PM_VERSION_MAP`; the package currently maps radare2 6.2.4 to r2SMT 0.6.1.
+  `R2PM_VERSION_MAP`; the package currently maps radare2 6.2.4 to r2SMT 0.6.2.
 - Windows bundles contain `r2smt.exe`, `libz3.dll`, `core_r2smt.dll`, and
   `r2smt.r2`; no build toolchain is used by `r2pm -bi`.
 - Installation requires `make`, `pkg-config`, and a C compiler for the native

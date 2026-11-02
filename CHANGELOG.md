@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.2 - 2026-11-02
+
+- Fix compiler-free `r2pm -bi r2smt` installation on Windows by isolating
+  conditionals after r2pm flattens the manifest block into one command line.
+- Validate binary installation and removal against published artifacts on all
+  six supported operating-system and architecture combinations.
+
 ## 0.6.1 - 2026-11-02
 
 - Add compiler-free `r2pm -bi r2smt` installation mapped to radare2 6.2.4
